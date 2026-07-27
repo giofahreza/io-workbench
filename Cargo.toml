@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "crates/iowb-cli",
+    "crates/iowb-core",
+    "crates/iowb-fs",
+    "crates/iowb-process",
+    "crates/iowb-protocol",
+    "crates/iowb-server",
+    "crates/iowb-storage",
+    "crates/iowb-ui",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+authors = ["io-workbench contributors"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
+base64 = "0.22"
+bcrypt = "0.17"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+mime_guess = "2"
+notify = "8"
+portable-pty = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "any", "chrono", "json"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["compression-full", "cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+
+iowb-core = { path = "crates/iowb-core" }
+iowb-fs = { path = "crates/iowb-fs" }
+iowb-process = { path = "crates/iowb-process" }
+iowb-protocol = { path = "crates/iowb-protocol" }
+iowb-server = { path = "crates/iowb-server" }
+iowb-storage = { path = "crates/iowb-storage" }
+iowb-ui = { path = "crates/iowb-ui" }

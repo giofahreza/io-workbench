@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>API Docs - io-workbench</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;500;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css?v=20260727-02" />
+  </head>
+  <body class="standalone-page">
+    <main class="standalone-panel docs-panel">
+      <header class="row-title">
+        <h1>API Docs</h1>
+        <div class="row-actions">
+          <a class="button-link" href="/openapi.json" target="_blank" rel="noreferrer">OpenAPI</a>
+          <a class="button-link" href="/">Open App</a>
+        </div>
+      </header>
+      <section>
+        <h2>Endpoint Index</h2>
+        <div id="api-index" class="api-index">
+          <p class="empty">Loading endpoint index.</p>
+        </div>
+      </section>
+      <section>
+        <h2>Fallback</h2>
+        <pre>GET  /health
+GET  /api/auth/status
+GET  /api/projects
+POST /api/projects/create
+GET  /api/projects/{name}/files
+GET  /api/projects/{name}/files/content
+PUT  /api/projects/{name}/file</pre>
+      </section>
+      <section>
+        <h2>Sessions And Process</h2>
+        <pre>GET  /api/sessions/{session_id}/messages
+GET  /api/sessions/{session_id}/model
+PUT  /api/sessions/{session_id}/model
+GET  /api/process
+POST /api/process
+POST /api/process/{process_id}/input
+POST /api/process/{process_id}/resize
+GET  /ws</pre>
+      </section>
+      <section>
+        <h2>Git</h2>
+        <pre>GET  /api/git/status
+GET  /api/git/diff
+GET  /api/git/file-with-diff
+GET  /api/git/conflicts
+GET  /api/git/conflict-file
+POST /api/git/resolve-conflict
+POST /api/git/stage
+POST /api/git/unstage
+POST /api/git/apply-hunks
+POST /api/git/commit</pre>
+      </section>
+      <section>
+        <h2>Database And Tools</h2>
+        <pre>GET  /api/database/connections
+POST /api/database/connections
+GET  /api/database/connections/{id}/explorer
+GET  /api/database/connections/{id}/object-details
+POST /api/database/connections/{id}/query
+GET  /api/tool-runs/{namespace}
+POST /api/mcp/tools/call</pre>
+      </section>
+    </main>
+    <script>
+      const methodOrder = ["get", "post", "put", "patch", "delete", "x-any"];
+      const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[char]);
+      const labelMethod = (method) => method === "x-any" ? "ANY" : method.toUpperCase();
+
+      fetch("/openapi.json")
+        .then((response) => response.json())
+        .then((spec) => {
+          const groups = new Map();
+          for (const [path, methods] of Object.entries(spec.paths || {})) {
+            for (const method of methodOrder) {
+              const operation = methods[method];
+              if (!operation) continue;
+              const tag = operation.tags?.[0] || "Other";
+              if (!groups.has(tag)) groups.set(tag, []);
+              groups.get(tag).push({
+                method,
+                path,
+                summary: operation.summary || "",
+              });
+            }
+          }
+          const html = [...groups.entries()].map(([tag, operations]) => `<details open>
+            <summary>${escapeHtml(tag)} <span class="meta">${operations.length}</span></summary>
+            <div class="api-route-list">
+              ${operations.map((operation) => `<article class="api-route">
+                <span class="api-method">${escapeHtml(labelMethod(operation.method))}</span>
+                <code>${escapeHtml(operation.path)}</code>
+                <span>${escapeHtml(operation.summary)}</span>
+              </article>`).join("")}
+            </div>
+          </details>`).join("");
+          document.querySelector("#api-index").innerHTML = html || '<p class="empty">No endpoints found.</p>';
+        })
+        .catch(() => {
+          document.querySelector("#api-index").innerHTML = '<p class="empty">OpenAPI index unavailable.</p>';
+        });
+    </script>
+  </body>
+</html>

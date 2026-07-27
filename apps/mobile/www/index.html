@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0f766e" />
+    <title>io-workbench Mobile</title>
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f7f7f4;
+        color: #17211f;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: #f7f7f4;
+      }
+
+      main {
+        min-height: 100vh;
+        padding: max(18px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+
+      h1,
+      h2 {
+        margin: 0;
+        letter-spacing: 0;
+      }
+
+      h1 {
+        font-size: 1.25rem;
+      }
+
+      h2 {
+        font-size: 1rem;
+      }
+
+      section {
+        margin: 0 0 16px;
+      }
+
+      .panel,
+      .project {
+        border: 1px solid #d7dbd4;
+        border-radius: 8px;
+        background: #ffffff;
+        padding: 14px;
+      }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 0.85rem;
+        color: #4b5a56;
+        white-space: nowrap;
+      }
+
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #9ca3af;
+      }
+
+      .dot.ok {
+        background: #0f766e;
+      }
+
+      .dot.error {
+        background: #b91c1c;
+      }
+
+      form {
+        display: grid;
+        gap: 10px;
+      }
+
+      label {
+        display: grid;
+        gap: 5px;
+        font-size: 0.8rem;
+        color: #4b5a56;
+      }
+
+      input,
+      button,
+      textarea {
+        width: 100%;
+        border-radius: 8px;
+        border: 1px solid #cbd5d1;
+        font: inherit;
+        min-height: 44px;
+      }
+
+      input,
+      textarea {
+        padding: 10px;
+        background: #fff;
+        color: #17211f;
+      }
+
+      button {
+        border: 0;
+        background: #0f766e;
+        color: white;
+        font-weight: 650;
+      }
+
+      button.secondary {
+        background: #334155;
+      }
+
+      .grid {
+        display: grid;
+        gap: 10px;
+      }
+
+      .project strong,
+      .project span {
+        display: block;
+        overflow-wrap: anywhere;
+      }
+
+      .project span {
+        margin-top: 4px;
+        color: #4b5a56;
+        font-size: 0.86rem;
+      }
+
+      .log {
+        min-height: 120px;
+        max-height: 280px;
+        overflow: auto;
+        white-space: pre-wrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.8rem;
+        line-height: 1.45;
+      }
+
+      .hidden {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>io-workbench</h1>
+        <div class="header-actions">
+          <button id="refresh" class="secondary compact" type="button">Refresh</button>
+          <span class="status"><span id="dot" class="dot"></span><span id="status">Disconnected</span></span>
+        </div>
+      </header>
+
+      <section class="panel">
+        <form id="connect-form">
+          <label>
+            Server URL
+            <input id="server-url" name="serverUrl" inputmode="url" autocomplete="url" placeholder="https://example.com" />
+          </label>
+          <label>
+            Token
+            <input id="token" name="token" autocomplete="off" placeholder="Bearer token" />
+          </label>
+          <button type="submit">Connect</button>
+        </form>
+      </section>
+
+      <section>
+        <div class="section-header">
+          <h2>Projects</h2>
+          <span id="project-count" class="meta">0</span>
+        </div>
+        <div id="projects" class="grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Files</h2>
+        <form id="browse-form">
+          <label>
+            Project
+            <select id="file-project"></select>
+          </label>
+          <div class="inline-fields">
+            <label>
+              Path
+              <input id="file-path" name="path" value="." />
+            </label>
+            <button id="file-parent" class="secondary compact" type="button">Up</button>
+          </div>
+          <button type="submit">Browse</button>
+        </form>
+        <div id="files" class="grid file-list"></div>
+        <pre id="file-preview" class="log hidden"></pre>
+        <form id="upload-form">
+          <label>
+            Project
+            <select id="upload-project"></select>
+          </label>
+          <label>
+            Target Path
+            <input id="upload-path" name="path" value="." />
+          </label>
+          <label>
+            Files
+            <input id="upload-files" name="files" type="file" multiple />
+          </label>
+          <button type="submit">Upload</button>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>Live</h2>
+        <div id="log" class="log"></div>
+      </section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>

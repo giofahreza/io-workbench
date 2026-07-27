@@ -1,0 +1,782 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>io-workbench</title>
+    <meta name="theme-color" content="#0f766e" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;500;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/vendor/codemirror/codemirror.css" />
+    <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260727-06" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">io</span>
+        <span>
+          <strong>io-workbench</strong>
+          <small>Rust workspace server</small>
+        </span>
+      </div>
+      <section class="sidebar-topnav" aria-label="Workspace controls">
+        <label class="quick-project">
+          <span>Project</span>
+          <select id="active-project"></select>
+        </label>
+        <div class="status">
+          <span id="ws-dot" class="dot"></span>
+          <span id="ws-label">Connecting</span>
+        </div>
+      </section>
+      <section class="sidebar-context" aria-label="Projects">
+        <div class="sidebar-tools">
+          <input id="sidebar-search" type="search" placeholder="Search projects" />
+          <div class="sidebar-tool-actions">
+            <button id="sidebar-new-project" type="button" title="Add project">+</button>
+            <button id="sidebar-refresh" class="icon-button" type="button" aria-label="Refresh workspace" title="Refresh workspace" data-symbol="refresh"></button>
+          </div>
+        </div>
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">
+            <span>Projects</span>
+          </div>
+          <div id="sidebar-projects" class="sidebar-list"></div>
+        </div>
+      </section>
+      <div class="sidebar-bottom">
+        <button id="sidebar-command-palette" type="button" data-symbol="nav-command" aria-label="Command palette" title="Command palette">Command</button>
+        <button data-view="settings" data-symbol="nav-settings" aria-label="Settings" title="Settings">Settings</button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <section id="auth-panel" class="panel auth-panel hidden">
+        <div class="auth-card">
+          <div class="auth-logo">io</div>
+          <h2 id="auth-title">Setup</h2>
+          <p id="auth-description">Create or enter your io-workbench credentials.</p>
+          <form id="auth-form" class="auth-form">
+            <label id="auth-username-label">
+              <span>Username</span>
+              <input id="auth-username" name="username" autocomplete="username" placeholder="Enter your username" />
+            </label>
+            <label id="auth-password-label">
+              <span id="auth-password-text">Password</span>
+              <span class="password-field">
+                <input
+                  id="auth-password"
+                  name="password"
+                  type="password"
+                  autocomplete="current-password"
+                  placeholder="Enter your password"
+                />
+                <button id="auth-password-toggle" type="button" title="Show password">Show</button>
+              </span>
+            </label>
+            <button id="auth-submit" type="submit" class="primary-action">Continue</button>
+          </form>
+          <p id="auth-message" class="empty"></p>
+        </div>
+      </section>
+
+      <header class="main-content-header">
+        <div class="main-title-group">
+          <button id="main-sidebar-toggle" class="icon-button" type="button" aria-label="Toggle sidebar" title="Toggle sidebar" data-symbol="nav-menu"></button>
+          <div class="main-title-text">
+            <h1 id="view-title">Chat</h1>
+            <span id="view-subtitle">Start or resume agent sessions in the selected project.</span>
+            <span id="server-summary" class="hidden">Connecting...</span>
+          </div>
+        </div>
+        <nav class="main-tab-switcher" aria-label="Workspace views">
+          <button data-view="shell" data-symbol="nav-shell" aria-label="Shell" title="Shell">Shell</button>
+          <button data-view="files" data-symbol="nav-files" aria-label="Files" title="Files">Files</button>
+          <button data-view="chat" data-symbol="nav-chat" aria-label="Chat" title="Chat">Chat</button>
+          <button data-view="git" data-symbol="nav-git" aria-label="Git" title="Git">Git</button>
+        </nav>
+      </header>
+
+      <section id="files-view" class="panel view workbench-panel files-panel">
+        <div class="files-workbench">
+          <aside class="files-sidebar">
+            <div class="files-tree-header">
+              <h3>Files</h3>
+              <div class="row-actions">
+                <button id="refresh-files" class="icon-button" type="button" aria-label="Refresh files" title="Refresh files" data-symbol="refresh"></button>
+              </div>
+            </div>
+            <div class="files-toolbar-grid">
+              <label>
+                <span>Path</span>
+                <input id="files-path" name="path" value="." />
+              </label>
+            </div>
+            <div class="files-search-row">
+              <label>
+                <span>Filter</span>
+                <input id="files-filter" name="filter" placeholder="Filter visible files" />
+              </label>
+              <button id="files-parent" class="icon-button" type="button" aria-label="Go to parent folder" title="Go to parent folder" data-symbol="up"></button>
+            </div>
+            <div id="files-breadcrumbs" class="breadcrumb-list files-breadcrumbs"></div>
+            <div id="files-tree" class="list scroll-pane file-tree-list"></div>
+          </aside>
+          <form id="file-editor-form" class="file-editor-pane">
+            <div class="editor-topbar">
+              <label class="editor-path-field">
+                <span>File</span>
+                <input id="file-editor-path" name="filePath" />
+              </label>
+              <div class="editor-primary-actions">
+                <button type="submit" class="primary-action icon-button" aria-label="Save file" title="Save file" data-symbol="save"></button>
+                <button id="reload-file" class="icon-button" type="button" aria-label="Reload file" title="Reload file" data-symbol="refresh"></button>
+                <button id="copy-file-path" class="icon-button" type="button" aria-label="Copy file path" title="Copy file path" data-symbol="copy"></button>
+              </div>
+            </div>
+            <div class="editor-toolbar">
+              <span id="file-editor-status">No file loaded</span>
+              <span id="file-editor-position">Ln 1, Col 1</span>
+            </div>
+            <div class="editor-command-grid">
+              <label>
+                <span>Search</span>
+                <input id="editor-search" name="search" />
+              </label>
+              <label>
+                <span>Replace</span>
+                <input id="editor-replace" name="replace" />
+              </label>
+              <label>
+                <span>Line</span>
+                <input id="editor-goto-line" name="line" type="number" min="1" value="1" />
+              </label>
+            </div>
+            <div class="editor-command-row">
+              <span id="editor-search-status" class="meta">No search</span>
+              <div class="row-actions">
+                <button id="editor-find-prev" class="icon-button" type="button" aria-label="Previous match" title="Previous match" data-symbol="chevron-up"></button>
+                <button id="editor-find-next" class="icon-button" type="button" aria-label="Next match" title="Next match" data-symbol="chevron-down"></button>
+                <button id="editor-replace-one" class="icon-button" type="button" aria-label="Replace match" title="Replace match" data-symbol="replace"></button>
+                <button id="editor-replace-all" class="icon-button" type="button" aria-label="Replace all matches" title="Replace all matches" data-symbol="replace-all"></button>
+                <button id="editor-go-line" class="icon-button" type="button" aria-label="Go to line" title="Go to line" data-symbol="corner-down-right"></button>
+              </div>
+            </div>
+            <div class="editor-shell">
+              <pre id="file-editor-lines" aria-hidden="true">1</pre>
+              <textarea id="file-editor-content" rows="18" spellcheck="false"></textarea>
+            </div>
+            <div class="file-ops-strip">
+              <button id="create-file" class="icon-button" type="button" aria-label="Create file" title="Create file" data-symbol="file-plus"></button>
+              <button id="create-directory" class="icon-button" type="button" aria-label="Create directory" title="Create directory" data-symbol="folder-plus"></button>
+              <button id="delete-file" class="icon-button" type="button" aria-label="Delete path" title="Delete path" data-symbol="trash"></button>
+              <button id="download-file" class="icon-button" type="button" aria-label="Download file" title="Download file" data-symbol="download"></button>
+              <span class="ops-separator"></span>
+              <label class="rename-field">
+                <span>Rename To</span>
+                <input id="file-rename-path" name="newPath" />
+              </label>
+              <button id="rename-file" class="icon-button" type="button" aria-label="Rename path" title="Rename path" data-symbol="rename"></button>
+            </div>
+            <div class="upload-strip">
+              <label>
+                <span>Upload</span>
+                <input id="file-upload-input" type="file" multiple />
+              </label>
+              <button id="upload-files" class="icon-button" type="button" aria-label="Upload files" title="Upload files" data-symbol="upload"></button>
+              <label>
+                <span>Folder Upload</span>
+                <input id="folder-upload-input" type="file" multiple webkitdirectory directory />
+              </label>
+              <button id="upload-folder" class="icon-button" type="button" aria-label="Upload folder" title="Upload folder" data-symbol="folder-up"></button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section id="chat-view" class="panel view active workbench-panel chat-panel">
+        <div class="chat-workbench">
+          <pre id="chat-output" class="terminal-output chat-transcript"></pre>
+          <form id="chat-form" class="chat-composer">
+            <div class="composer-input-row">
+              <button id="chat-upload-images" class="icon-button" type="button" aria-label="Attach images" title="Attach images" data-symbol="image-plus"></button>
+              <textarea id="chat-prompt" rows="1" placeholder="Ask the agent"></textarea>
+              <button id="clear-chat" class="icon-button" type="button" aria-label="Clear chat" title="Clear chat" data-symbol="trash"></button>
+              <button id="abort-session" class="icon-button" type="button" aria-label="Abort session" title="Abort session" data-symbol="stop"></button>
+              <button type="submit" class="primary-action icon-button" aria-label="Start session" title="Start session" data-symbol="send"></button>
+            </div>
+            <div class="composer-tools">
+              <label class="file-input-field">
+                <span>Images</span>
+                <input id="chat-image-input" type="file" accept="image/*" multiple />
+              </label>
+              <button id="chat-clear-images" class="icon-button" type="button" aria-label="Clear images" title="Clear images" data-symbol="image-off"></button>
+            </div>
+            <div id="chat-image-preview" class="image-preview-list"></div>
+          </form>
+        </div>
+      </section>
+
+      <section id="shell-view" class="panel view workbench-panel shell-panel">
+        <div class="shell-workbench">
+          <div class="shell-status-header">
+            <div class="shell-status-left">
+              <span id="shell-status-dot" class="shell-status-dot"></span>
+              <span id="shell-status-label">Terminal</span>
+            </div>
+            <div class="shell-header-actions">
+              <button id="clear-shell" class="icon-button" type="button" aria-label="Clear shell" title="Clear shell" data-symbol="trash"></button>
+              <button id="restart-shell" class="icon-button" type="button" aria-label="Restart shell" title="Restart shell" data-symbol="refresh"></button>
+              <button id="refresh-processes" class="icon-button" type="button" aria-label="List processes" title="List processes" data-symbol="list"></button>
+              <button id="stop-shell" class="icon-button" type="button" aria-label="Stop shell" title="Stop shell" data-symbol="stop"></button>
+            </div>
+          </div>
+          <div id="shell-output" class="terminal-output shell-terminal" tabindex="0"></div>
+          <div class="shell-bottom-bar">
+            <div class="shell-actions terminal-shortcuts" aria-label="Terminal shortcuts">
+              <button id="shell-copy-selection" class="icon-button" type="button" aria-label="Copy selection" title="Copy selection" data-symbol="copy"></button>
+              <button id="shell-copy-latest-link" class="icon-button" type="button" aria-label="Copy latest link" title="Copy latest link" data-symbol="link"></button>
+              <button id="shell-paste" class="icon-button" type="button" aria-label="Paste" title="Paste" data-symbol="clipboard"></button>
+              <button class="terminal-key" type="button" data-shell-sequence="\u001b">Esc</button>
+              <button class="terminal-key" type="button" data-shell-sequence="\t">Tab</button>
+              <button class="terminal-key" type="button" data-shell-sequence="\u001b[Z">Shift Tab</button>
+              <button id="shell-mod-ctrl" class="terminal-key modifier-key" type="button" data-shell-modifier="ctrl">CTRL</button>
+              <button id="shell-mod-alt" class="terminal-key modifier-key" type="button" data-shell-modifier="alt">ALT</button>
+              <button class="icon-button" type="button" aria-label="Arrow up" title="Arrow up" data-symbol="arrow-up" data-shell-sequence="\u001b[A"></button>
+              <button class="icon-button" type="button" aria-label="Arrow down" title="Arrow down" data-symbol="arrow-down" data-shell-sequence="\u001b[B"></button>
+              <button class="icon-button" type="button" aria-label="Arrow left" title="Arrow left" data-symbol="arrow-left" data-shell-sequence="\u001b[D"></button>
+              <button class="icon-button" type="button" aria-label="Arrow right" title="Arrow right" data-symbol="arrow-right" data-shell-sequence="\u001b[C"></button>
+              <button id="shell-scroll-bottom" class="icon-button" type="button" aria-label="Scroll to bottom" title="Scroll to bottom" data-symbol="scroll-bottom"></button>
+            </div>
+          </div>
+          <div id="process-list" class="list process-list shell-process-list"></div>
+        </div>
+      </section>
+
+      <section id="git-view" class="panel view workbench-panel git-panel">
+        <div class="git-action-header">
+          <label>
+            <span>Branch</span>
+            <input id="git-branch" name="branch" />
+          </label>
+          <div class="git-header-actions">
+            <button id="git-fetch" class="icon-button" type="button" aria-label="Fetch" title="Fetch" data-symbol="refresh">Fetch</button>
+            <button id="git-pull" class="icon-button" type="button" aria-label="Pull" title="Pull" data-symbol="download">Pull</button>
+            <button id="git-push" class="icon-button" type="button" aria-label="Push" title="Push" data-symbol="upload">Push</button>
+            <button id="git-publish" class="icon-button" type="button" aria-label="Publish branch" title="Publish branch" data-symbol="upload">Publish</button>
+            <button id="git-revert-local" class="icon-button" type="button" aria-label="Revert local changes" title="Revert local changes" data-symbol="undo">Revert Local</button>
+            <button id="refresh-git" class="icon-button" type="button" aria-label="Refresh git" title="Refresh git" data-symbol="refresh"></button>
+          </div>
+        </div>
+        <div class="git-view-tabs" role="tablist" aria-label="Git views">
+          <button type="button" class="active" data-git-view-tab="changes" data-symbol="file-search" role="tab" aria-selected="true">
+            <span>Changes</span>
+            <span id="git-change-count" class="git-tab-count">0</span>
+          </button>
+          <button type="button" data-git-view-tab="history" data-symbol="clock" role="tab" aria-selected="false">Commits</button>
+          <button type="button" data-git-view-tab="branches" data-symbol="nav-git" role="tab" aria-selected="false">Branches</button>
+        </div>
+        <div class="form-grid git-project-row git-changes-controls">
+          <label>
+            <span>Commit Message</span>
+            <input id="git-message" name="message" />
+          </label>
+          <label class="compact-field">
+            <span>Filter Files</span>
+            <input id="git-filter" name="filter" placeholder="Filter changed files" />
+          </label>
+        </div>
+        <div class="button-row git-toolbar git-changes-controls">
+          <button id="git-init" class="icon-button" type="button" aria-label="Init repository" title="Init repository" data-symbol="plus">Init</button>
+          <button id="git-initial-commit" class="icon-button" type="button" aria-label="Initial commit" title="Initial commit" data-symbol="check">Initial</button>
+          <button id="git-stage" class="icon-button" type="button" aria-label="Stage selected files" title="Stage selected files" data-symbol="plus">Stage</button>
+          <button id="git-unstage" class="icon-button" type="button" aria-label="Unstage selected files" title="Unstage selected files" data-symbol="minus">Unstage</button>
+          <button id="git-discard" class="icon-button" type="button" aria-label="Discard selected changes" title="Discard selected changes" data-symbol="trash">Discard</button>
+        </div>
+        <div class="form-grid git-branch-row git-branches-controls">
+          <label>
+            <span>Remote URL</span>
+            <input id="git-remote-url" name="remoteUrl" />
+          </label>
+        </div>
+        <div class="button-row git-toolbar secondary git-branches-controls">
+          <button id="git-checkout" class="icon-button" type="button" aria-label="Checkout branch" title="Checkout branch" data-symbol="switch">Checkout</button>
+          <button id="git-create-branch" class="icon-button" type="button" aria-label="Create branch" title="Create branch" data-symbol="branch-plus">Create Branch</button>
+          <button id="git-delete-branch" class="icon-button" type="button" aria-label="Delete branch" title="Delete branch" data-symbol="trash">Delete Branch</button>
+          <button id="git-set-remote" class="icon-button" type="button" aria-label="Set remote" title="Set remote" data-symbol="link">Set Remote</button>
+          <button id="git-delete-untracked" class="icon-button" type="button" aria-label="Delete untracked files" title="Delete untracked files" data-symbol="trash">Delete Untracked</button>
+          <button id="git-branches" class="icon-button" type="button" aria-label="Branches" title="Branches" data-symbol="nav-git">Branches</button>
+          <button id="git-commits" class="icon-button" type="button" aria-label="History" title="History" data-symbol="clock">History</button>
+          <button id="git-remote-status" class="icon-button" type="button" aria-label="Remote status" title="Remote status" data-symbol="globe">Remote</button>
+        </div>
+        <div class="button-row git-selection-row git-changes-controls">
+          <button id="git-select-all" class="icon-button" type="button" aria-label="Select all changed files" title="Select all changed files" data-symbol="check-square">Select All</button>
+          <button id="git-select-none" class="icon-button" type="button" aria-label="Select no files" title="Select no files" data-symbol="square">Select None</button>
+          <button id="git-generate-message" class="icon-button" type="button" aria-label="Generate commit message" title="Generate commit message" data-symbol="sparkles">Generate Message</button>
+          <button id="git-commit" class="icon-button" type="button" aria-label="Commit selected files" title="Commit selected files" data-symbol="check">Commit Selected</button>
+          <button id="git-diff" class="icon-button" type="button" aria-label="Show diff" title="Show diff" data-symbol="diff">Diff</button>
+          <button id="git-file-diff" class="icon-button" type="button" aria-label="Review selected file" title="Review selected file" data-symbol="file-search">File Review</button>
+          <button id="git-conflicts" class="icon-button" type="button" aria-label="Show conflicts" title="Show conflicts" data-symbol="alert">Conflicts</button>
+        </div>
+        <div id="git-summary" class="summary-grid"></div>
+        <div class="git-main">
+          <div id="git-files" class="list git-file-list"></div>
+          <div id="git-output" class="output-panel git-output"></div>
+        </div>
+      </section>
+
+      <section id="database-view" class="panel view">
+        <div class="panel-header">
+          <h2>Database</h2>
+          <button id="refresh-db" type="button">Refresh</button>
+        </div>
+        <form id="db-create-form" class="stack-form">
+          <div class="form-grid">
+            <label>
+              <span>Name</span>
+              <input id="db-name" name="name" />
+            </label>
+            <label>
+              <span>Type</span>
+              <select id="db-type">
+                <option value="sqlite">SQLite</option>
+                <option value="postgresql">PostgreSQL</option>
+                <option value="mysql">MySQL</option>
+                <option value="mariadb">MariaDB</option>
+              </select>
+            </label>
+          </div>
+          <div class="form-grid">
+            <label>
+              <span>File Path or Host</span>
+              <input id="db-location" name="location" />
+            </label>
+            <label>
+              <span>Database</span>
+              <input id="db-database" name="databaseName" />
+            </label>
+          </div>
+          <div class="form-grid">
+            <label>
+              <span>Username</span>
+              <input id="db-username" name="username" autocomplete="username" />
+            </label>
+            <label>
+              <span>Password</span>
+              <input id="db-password" name="password" type="password" autocomplete="current-password" />
+            </label>
+          </div>
+          <div class="form-grid">
+            <label>
+              <span>Port</span>
+              <input id="db-port" name="port" type="number" min="1" max="65535" />
+            </label>
+            <label class="toolbar-check db-option">
+              <input id="db-show-all" type="checkbox" />
+              <span>Show all databases</span>
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="db-save-button" type="submit">Save Connection</button>
+            <button id="db-new-connection" type="button">New</button>
+            <button id="db-test-unsaved" type="button">Test Form</button>
+            <button id="db-delete-selected" type="button">Delete Selected</button>
+          </div>
+        </form>
+        <label class="compact-field">
+          <span>Filter Connections</span>
+          <input id="db-filter" name="filter" placeholder="Filter saved connections" />
+        </label>
+        <div class="split-view">
+          <div class="stack-form">
+            <div id="db-connections" class="list scroll-pane"></div>
+            <div id="db-explorer-tree" class="list scroll-pane"></div>
+          </div>
+          <form id="db-query-form" class="stack-form">
+            <label>
+              <span>SQL</span>
+              <textarea id="db-sql" rows="8">SELECT 1 AS value</textarea>
+            </label>
+            <button type="submit">Run Query</button>
+            <div class="form-grid">
+              <label>
+                <span>Table</span>
+                <input id="db-table" name="tableName" />
+              </label>
+              <label>
+                <span>Database</span>
+                <input id="db-context-database" name="databaseName" />
+              </label>
+            </div>
+            <div class="form-grid">
+              <label>
+                <span>Schema</span>
+                <input id="db-context-schema" name="schemaName" />
+              </label>
+              <label>
+                <span>File Path</span>
+                <input id="db-file-path" name="filePath" />
+              </label>
+            </div>
+            <div class="form-grid">
+              <label>
+                <span>Offset</span>
+                <input id="db-offset" name="offset" type="number" min="0" value="0" />
+              </label>
+              <label>
+                <span>Limit</span>
+                <input id="db-limit" name="limit" type="number" min="1" max="500" value="50" />
+              </label>
+            </div>
+            <label>
+              <span>Target Connection</span>
+              <select id="db-target-connection"></select>
+            </label>
+            <div class="form-grid">
+              <label>
+                <span>Transfer Mode</span>
+                <select id="db-transfer-mode">
+                  <option value="schema-and-data">Schema and Data</option>
+                  <option value="schema-only">Schema Only</option>
+                  <option value="table-copy">Table Copy</option>
+                </select>
+              </label>
+              <label>
+                <span>Target Table</span>
+                <input id="db-target-table" name="targetTableName" />
+              </label>
+            </div>
+            <div class="button-row">
+              <button id="db-explorer" type="button">Explorer</button>
+              <button id="db-describe" type="button">Describe</button>
+              <button id="db-diagram" type="button">Diagram</button>
+              <button id="db-select-sql" type="button">SELECT SQL</button>
+              <button id="db-count-sql" type="button">COUNT SQL</button>
+              <button id="db-prev-page" type="button">Previous Page</button>
+              <button id="db-table-data" type="button">Table Data</button>
+              <button id="db-export" type="button">Export JSON</button>
+              <button id="db-import" type="button">Import JSON</button>
+              <button id="db-transfer" type="button">Transfer To Selected</button>
+              <button id="db-jobs" type="button">Jobs</button>
+            </div>
+            <pre id="db-output"></pre>
+          </form>
+        </div>
+      </section>
+
+      <section id="settings-view" class="panel view">
+        <div class="panel-header">
+          <h2>Server Settings</h2>
+          <button id="refresh-settings" class="icon-button" type="button" aria-label="Refresh settings" title="Refresh settings" data-symbol="refresh"></button>
+        </div>
+        <section class="settings-server-status">
+          <div id="settings-server-status" class="summary-grid"></div>
+        </section>
+        <section class="settings-preferences">
+          <label class="toolbar-check">
+            <input id="pref-compact" type="checkbox" />
+            <span>Compact</span>
+          </label>
+          <label class="toolbar-check">
+            <input id="pref-wrap" type="checkbox" />
+            <span>Wrap</span>
+          </label>
+          <label class="terminal-size-field">
+            <span>Terminal Columns</span>
+            <input id="shell-cols" name="cols" type="number" min="20" max="300" value="100" />
+          </label>
+          <label class="terminal-size-field">
+            <span>Terminal Rows</span>
+            <input id="shell-rows" name="rows" type="number" min="8" max="120" value="30" />
+          </label>
+          <label class="terminal-size-field">
+            <span>Chat CLI App</span>
+            <select id="chat-provider-setting">
+              <option value="codex">Codex</option>
+              <option value="claude">Claude</option>
+              <option value="cursor">Cursor</option>
+              <option value="gemini">Gemini</option>
+            </select>
+          </label>
+          <a class="button-link" href="/api-docs.html" target="_blank" rel="noreferrer">AI Docs</a>
+          <a class="button-link" href="/clear-cache.html" target="_blank" rel="noreferrer">Cache Tools</a>
+          <button id="auth-logout" class="hidden">Sign Out</button>
+        </section>
+        <div class="button-row">
+          <button id="load-cli-status" type="button">CLI Status</button>
+          <button id="load-user-settings" type="button">User</button>
+          <button id="load-api-keys" type="button">API Keys</button>
+          <button id="load-credentials" type="button">Credentials</button>
+          <button id="load-notifications" type="button">Notifications</button>
+          <button id="load-direct-ai" type="button">Direct AI</button>
+          <button id="load-direct-ai-models" type="button">AI Models</button>
+          <button id="load-git-config" type="button">Git Config</button>
+        </div>
+        <section class="settings-notifications">
+          <header class="row-title">
+            <h3>Browser Notifications</h3>
+            <span id="notification-status" class="badge warn">Unknown</span>
+          </header>
+          <div class="check-grid">
+            <label class="toolbar-check">
+              <input id="notify-browser" type="checkbox" />
+              <span>Browser</span>
+            </label>
+            <label class="toolbar-check">
+              <input id="notify-web-push" type="checkbox" />
+              <span>Web Push</span>
+            </label>
+            <label class="toolbar-check">
+              <input id="notify-session-complete" type="checkbox" />
+              <span>Session Complete</span>
+            </label>
+            <label class="toolbar-check">
+              <input id="notify-permission-required" type="checkbox" />
+              <span>Permission Required</span>
+            </label>
+            <label class="toolbar-check">
+              <input id="notify-process-failed" type="checkbox" />
+              <span>Process Failed</span>
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="notification-save" type="button">Save Preferences</button>
+            <button id="notification-permission" type="button">Enable Browser</button>
+            <button id="notification-preview" type="button">Preview</button>
+            <button id="notification-test-push" type="button">Test Push Command</button>
+          </div>
+        </section>
+        <form id="settings-action-form" class="stack-form">
+          <div class="form-grid">
+            <label>
+              <span>Action</span>
+              <select id="settings-action">
+                <option value="api-key">Create API Key</option>
+                <option value="api-key-delete">Delete API Key</option>
+                <option value="api-key-toggle">Toggle API Key</option>
+                <option value="credential">Create Credential</option>
+                <option value="credential-delete">Delete Credential</option>
+                <option value="credential-toggle">Toggle Credential</option>
+                <option value="git-config">Save Git Config</option>
+                <option value="notification">Save Notifications JSON</option>
+                <option value="direct-ai">Save Direct AI JSON</option>
+                <option value="onboarding">Complete Onboarding</option>
+              </select>
+            </label>
+            <label>
+              <span>Name</span>
+              <input id="settings-name" name="name" />
+            </label>
+          </div>
+          <div class="form-grid">
+            <label>
+              <span>Type / Email</span>
+              <input id="settings-type" name="type" />
+            </label>
+            <label>
+              <span>Value</span>
+              <input id="settings-value" name="value" />
+            </label>
+          </div>
+          <label>
+            <span>JSON</span>
+            <textarea id="settings-json-input" rows="6">{}</textarea>
+          </label>
+          <button type="submit">Apply</button>
+        </form>
+        <label class="compact-field">
+          <span>Filter Settings Rows</span>
+          <input id="settings-filter" name="filter" placeholder="Filter API keys, credentials, or output rows" />
+        </label>
+        <pre id="settings-json"></pre>
+        <div id="settings-integrations" class="settings-integrations"></div>
+        <section class="settings-tools">
+          <div class="panel-header">
+            <h2>Tools</h2>
+            <button id="refresh-tool-runs" class="icon-button" type="button" aria-label="Refresh tool runs" title="Refresh tool runs" data-symbol="refresh"></button>
+          </div>
+          <form id="tool-run-form" class="stack-form">
+            <div class="form-grid">
+              <label>
+                <span>Tool</span>
+                <select id="tool-kind">
+                  <option value="mcp">MCP</option>
+                  <option value="mcp-utils">MCP Utils</option>
+                  <option value="commands">Commands</option>
+                  <option value="plugins">Plugins</option>
+                  <option value="taskmaster">Taskmaster</option>
+                  <option value="danger">Danger</option>
+                  <option value="notifications">Notifications</option>
+                </select>
+              </label>
+              <label>
+                <span>Command</span>
+                <input id="tool-command" name="command" placeholder="/bin/echo" />
+              </label>
+            </div>
+            <label>
+              <span>Args JSON</span>
+              <input id="tool-args" name="args" value="[&quot;tool-smoke&quot;]" />
+            </label>
+            <label>
+              <span>Payload JSON</span>
+              <textarea id="tool-payload" rows="6">{}</textarea>
+            </label>
+            <button type="submit">Run Tool</button>
+          </form>
+          <label class="compact-field">
+            <span>Filter Runs</span>
+            <input id="tool-filter" name="filter" placeholder="Filter by command, action, output, or status" />
+          </label>
+          <form id="mcp-server-form" class="stack-form">
+            <div class="form-grid">
+              <label>
+                <span>MCP Server Name</span>
+                <input id="mcp-server-name" name="name" />
+              </label>
+              <label>
+                <span>MCP Server Command</span>
+                <input id="mcp-server-command" name="command" />
+              </label>
+            </div>
+            <label>
+              <span>MCP Server Args JSON</span>
+              <input id="mcp-server-args" name="args" value="[]" />
+            </label>
+            <label>
+              <span>MCP Server ID</span>
+              <input id="mcp-server-id" name="serverId" />
+            </label>
+            <div class="button-row">
+              <button type="submit">Start MCP Server</button>
+              <button id="refresh-mcp-servers" type="button">List MCP Servers</button>
+              <button id="stop-mcp-server" type="button">Stop MCP Server</button>
+            </div>
+          </form>
+          <form id="audio-transcribe-form" class="stack-form">
+            <label>
+              <span>Audio</span>
+              <input id="audio-file" type="file" accept="audio/*" />
+            </label>
+            <button type="submit">Transcribe Audio</button>
+          </form>
+          <pre id="tools-output"></pre>
+        </section>
+        <section class="settings-metrics">
+          <div class="panel-header">
+            <h2>Runtime Metrics</h2>
+            <button id="refresh-metrics" class="icon-button" type="button" aria-label="Refresh runtime metrics" title="Refresh runtime metrics" data-symbol="refresh"></button>
+          </div>
+          <div id="metrics-grid" class="metric-grid"></div>
+          <pre id="metrics-json"></pre>
+        </section>
+      </section>
+    </main>
+
+    <div id="project-modal" class="project-modal hidden" role="dialog" aria-modal="true" aria-label="Manage projects">
+      <div class="project-modal-panel">
+        <div class="project-modal-header">
+          <strong>Projects</strong>
+          <div class="row-actions">
+            <button id="refresh-projects" class="secondary-action icon-button" aria-label="Refresh projects" title="Refresh projects" data-symbol="refresh"></button>
+            <button id="project-modal-close" class="icon-button" type="button" aria-label="Close projects" title="Close" data-symbol="close"></button>
+          </div>
+        </div>
+        <form id="add-project-form" class="inline-form">
+          <input id="project-path" name="path" placeholder="Project path under workspace root" />
+          <button id="browse-project-path" type="button" class="secondary-action icon-button" aria-label="Browse project folder" title="Browse project folder" data-symbol="folder"></button>
+          <button type="submit" class="primary-action icon-button" aria-label="Add project" title="Add project" data-symbol="plus"></button>
+        </form>
+        <form id="workspace-form" class="stack-form">
+          <div class="form-grid">
+            <label>
+              <span>Workspace Type</span>
+              <select id="workspace-type">
+                <option value="existing">Existing</option>
+                <option value="new">New</option>
+              </select>
+            </label>
+            <label>
+              <span>Path</span>
+              <span class="input-action-row">
+                <input id="workspace-path" name="path" />
+                <button id="browse-workspace-path" type="button" class="secondary-action icon-button" aria-label="Browse workspace folder" title="Browse workspace folder" data-symbol="folder"></button>
+              </span>
+            </label>
+          </div>
+          <label>
+            <span>GitHub URL</span>
+            <input id="workspace-github-url" name="githubUrl" />
+          </label>
+          <button type="submit" class="primary-action icon-button" aria-label="Create workspace" title="Create workspace" data-symbol="plus"></button>
+        </form>
+        <div id="projects-list" class="list project-modal-list"></div>
+      </div>
+    </div>
+
+    <div id="command-palette" class="command-palette hidden" role="dialog" aria-modal="true" aria-label="Command palette">
+      <div class="command-panel">
+        <input id="command-search" autocomplete="off" placeholder="Search commands" />
+        <div id="command-results" class="command-results"></div>
+      </div>
+    </div>
+    <div id="folder-browser" class="folder-browser hidden" role="dialog" aria-modal="true" aria-label="Select project folder">
+      <div class="folder-browser-panel">
+        <div class="folder-browser-header">
+          <div>
+            <strong>Select Folder</strong>
+            <code id="folder-browser-path">~</code>
+          </div>
+          <button id="folder-browser-close" class="icon-button" type="button" aria-label="Close folder picker" title="Close" data-symbol="close"></button>
+        </div>
+        <div class="folder-browser-toolbar">
+          <button id="folder-browser-home" class="icon-button" type="button" aria-label="Go to home folder" title="Home" data-symbol="home"></button>
+          <button id="folder-browser-up" class="icon-button" type="button" aria-label="Go to parent folder" title="Up" data-symbol="up"></button>
+          <button id="folder-browser-hidden" class="icon-button" type="button" aria-label="Show hidden folders" title="Show hidden folders" data-symbol="eye"></button>
+          <input id="folder-browser-filter" type="search" placeholder="Filter folders" />
+        </div>
+        <div class="folder-create-row">
+          <input id="folder-create-name" placeholder="New folder name" />
+          <button id="folder-create-submit" class="icon-button" type="button" aria-label="Create folder" title="Create folder" data-symbol="plus"></button>
+        </div>
+        <div id="folder-browser-status" class="empty"></div>
+        <div id="folder-browser-list" class="folder-browser-list"></div>
+        <div class="folder-browser-footer">
+          <button id="folder-browser-use" type="button" class="primary-action icon-button" aria-label="Use for project" title="Use for project" data-symbol="check"></button>
+        </div>
+      </div>
+    </div>
+    <nav class="bottom-nav" aria-label="Mobile workspace views">
+      <button id="bottom-sidebar" type="button" data-symbol="nav-menu" aria-label="Toggle sidebar" title="Menu">Menu</button>
+      <button data-view="shell" data-symbol="nav-shell" aria-label="Shell" title="Shell">Shell</button>
+      <button data-view="files" data-symbol="nav-files" aria-label="Files" title="Files">Files</button>
+      <button data-view="chat" data-symbol="nav-chat" aria-label="Chat" title="Chat">Chat</button>
+      <button data-view="git" data-symbol="nav-git" aria-label="Git" title="Git">Git</button>
+      <button data-view="database" data-symbol="nav-database" aria-label="Database" title="Database">Database</button>
+    </nav>
+    <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
+
+    <script src="/vendor/codemirror/codemirror.js"></script>
+    <script src="/vendor/codemirror/addon/matchbrackets.js"></script>
+    <script src="/vendor/codemirror/addon/closebrackets.js"></script>
+    <script src="/vendor/codemirror/addon/simple.js"></script>
+    <script src="/vendor/codemirror/mode/javascript.js"></script>
+    <script src="/vendor/codemirror/mode/xml.js"></script>
+    <script src="/vendor/codemirror/mode/css.js"></script>
+    <script src="/vendor/codemirror/mode/htmlmixed.js"></script>
+    <script src="/vendor/codemirror/mode/markdown.js"></script>
+    <script src="/vendor/codemirror/mode/gfm.js"></script>
+    <script src="/vendor/codemirror/mode/rust.js"></script>
+    <script src="/vendor/codemirror/mode/shell.js"></script>
+    <script src="/vendor/codemirror/mode/python.js"></script>
+    <script src="/vendor/codemirror/mode/sql.js"></script>
+    <script src="/vendor/codemirror/mode/yaml.js"></script>
+    <script src="/vendor/codemirror/mode/toml.js"></script>
+    <script src="/vendor/xterm/xterm.js"></script>
+    <script src="/app.js?v=20260727-06" type="module"></script>
+  </body>
+</html>

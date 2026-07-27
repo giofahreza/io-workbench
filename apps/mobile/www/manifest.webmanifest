@@ -1,0 +1,28 @@
+{
+  "name": "io-workbench Mobile",
+  "short_name": "io-workbench",
+  "description": "Mobile companion for io-workbench projects, file uploads, and live workspace events.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f7f7f4",
+  "theme_color": "#0f766e",
+  "share_target": {
+    "action": "./index.html",
+    "method": "GET",
+    "enctype": "application/x-www-form-urlencoded",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url"
+    }
+  },
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

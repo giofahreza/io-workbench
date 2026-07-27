@@ -1,0 +1,402 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "io-workbench API",
+    "version": "0.1.0",
+    "description": "HTTP and WebSocket API exposed by the io-workbench Rust server."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    { "name": "Core" },
+    { "name": "Auth" },
+    { "name": "Projects" },
+    { "name": "Files" },
+    { "name": "Sessions" },
+    { "name": "Git" },
+    { "name": "Database" },
+    { "name": "Process" },
+    { "name": "Settings" },
+    { "name": "Tools" },
+    { "name": "Compatibility" }
+  ],
+  "paths": {
+    "/health": {
+      "get": { "tags": ["Core"], "summary": "Read server health", "security": [] }
+    },
+    "/ws": {
+      "get": { "tags": ["Core"], "summary": "Open the workspace WebSocket stream" }
+    },
+    "/api/auth/status": {
+      "get": { "tags": ["Auth"], "summary": "Read authentication status", "security": [] }
+    },
+    "/api/auth/register": {
+      "post": { "tags": ["Auth"], "summary": "Create the first local account", "security": [] }
+    },
+    "/api/auth/login": {
+      "post": { "tags": ["Auth"], "summary": "Create an auth token", "security": [] }
+    },
+    "/api/auth/logout": {
+      "post": { "tags": ["Auth"], "summary": "Invalidate the current auth token" }
+    },
+    "/api/auth/user": {
+      "get": { "tags": ["Auth"], "summary": "Read the current user" }
+    },
+    "/api/projects": {
+      "get": { "tags": ["Projects"], "summary": "List indexed projects" }
+    },
+    "/api/projects/create": {
+      "post": { "tags": ["Projects"], "summary": "Add an existing project path" }
+    },
+    "/api/projects/create-workspace": {
+      "post": { "tags": ["Projects"], "summary": "Create or clone a workspace" }
+    },
+    "/api/projects/clone-progress": {
+      "get": { "tags": ["Projects"], "summary": "Stream clone progress events" }
+    },
+    "/api/projects/{project_name}": {
+      "delete": { "tags": ["Projects"], "summary": "Delete a project record" }
+    },
+    "/api/projects/{project_name}/sessions": {
+      "get": { "tags": ["Sessions"], "summary": "List persisted sessions for a project" }
+    },
+    "/api/projects/{project_name}/sessions/{session_id}/token-usage": {
+      "get": { "tags": ["Sessions"], "summary": "Read token usage for a project session" }
+    },
+    "/api/projects/{project_name}/files": {
+      "get": { "tags": ["Files"], "summary": "List files under a project path" },
+      "delete": { "tags": ["Files"], "summary": "Delete a project file or directory" }
+    },
+    "/api/projects/{project_name}/files/content": {
+      "get": { "tags": ["Files"], "summary": "Read file content" }
+    },
+    "/api/projects/{project_name}/file": {
+      "put": { "tags": ["Files"], "summary": "Write file content" }
+    },
+    "/api/projects/{project_name}/files/create": {
+      "post": { "tags": ["Files"], "summary": "Create a file or directory" }
+    },
+    "/api/projects/{project_name}/files/rename": {
+      "put": { "tags": ["Files"], "summary": "Rename a file or directory" }
+    },
+    "/api/projects/{project_name}/files/upload": {
+      "post": { "tags": ["Files"], "summary": "Upload one or more files" }
+    },
+    "/api/projects/{project_name}/upload-images": {
+      "post": { "tags": ["Files"], "summary": "Upload chat image attachments" }
+    },
+    "/api/sessions/{session_id}/messages": {
+      "get": { "tags": ["Sessions"], "summary": "Read session messages" }
+    },
+    "/api/sessions/{session_id}/model": {
+      "get": { "tags": ["Sessions"], "summary": "Read a session model override" },
+      "put": { "tags": ["Sessions"], "summary": "Update a session model override" }
+    },
+    "/api/sessions/{session_id}/rename": {
+      "put": { "tags": ["Sessions"], "summary": "Rename a session" }
+    },
+    "/api/search/conversations": {
+      "get": { "tags": ["Sessions"], "summary": "Search stored conversations" }
+    },
+    "/api/git/status": {
+      "get": { "tags": ["Git"], "summary": "Read Git working-tree status" }
+    },
+    "/api/git/conflicts": {
+      "get": { "tags": ["Git"], "summary": "List unresolved merge conflicts" }
+    },
+    "/api/git/conflict-file": {
+      "get": { "tags": ["Git"], "summary": "Read a conflicted file with conflict regions" }
+    },
+    "/api/git/resolve-conflict": {
+      "post": { "tags": ["Git"], "summary": "Resolve and optionally stage a conflicted file" }
+    },
+    "/api/git/init": {
+      "post": { "tags": ["Git"], "summary": "Initialize a repository" }
+    },
+    "/api/git/diff": {
+      "get": { "tags": ["Git"], "summary": "Read a file diff" }
+    },
+    "/api/git/file-with-diff": {
+      "get": { "tags": ["Git"], "summary": "Read before/current file content for review" }
+    },
+    "/api/git/initial-commit": {
+      "post": { "tags": ["Git"], "summary": "Create an initial commit" }
+    },
+    "/api/git/commit": {
+      "post": { "tags": ["Git"], "summary": "Commit selected files" }
+    },
+    "/api/git/revert-local-commit": {
+      "post": { "tags": ["Git"], "summary": "Revert the latest local commit" }
+    },
+    "/api/git/branches": {
+      "get": { "tags": ["Git"], "summary": "List branches" }
+    },
+    "/api/git/checkout": {
+      "post": { "tags": ["Git"], "summary": "Checkout a branch" }
+    },
+    "/api/git/create-branch": {
+      "post": { "tags": ["Git"], "summary": "Create a branch" }
+    },
+    "/api/git/delete-branch": {
+      "post": { "tags": ["Git"], "summary": "Delete a branch" }
+    },
+    "/api/git/commits": {
+      "get": { "tags": ["Git"], "summary": "List commits" }
+    },
+    "/api/git/commit-diff": {
+      "get": { "tags": ["Git"], "summary": "Read a commit diff" }
+    },
+    "/api/git/generate-commit-message": {
+      "post": { "tags": ["Git"], "summary": "Generate a commit message" }
+    },
+    "/api/git/remote-status": {
+      "get": { "tags": ["Git"], "summary": "Read remote tracking status" }
+    },
+    "/api/git/remote": {
+      "post": { "tags": ["Git"], "summary": "Set a Git remote" }
+    },
+    "/api/git/fetch": {
+      "post": { "tags": ["Git"], "summary": "Fetch from remote" }
+    },
+    "/api/git/pull": {
+      "post": { "tags": ["Git"], "summary": "Pull from remote" }
+    },
+    "/api/git/push": {
+      "post": { "tags": ["Git"], "summary": "Push to remote" }
+    },
+    "/api/git/publish": {
+      "post": { "tags": ["Git"], "summary": "Publish the current branch" }
+    },
+    "/api/git/stage": {
+      "post": { "tags": ["Git"], "summary": "Stage selected files" }
+    },
+    "/api/git/unstage": {
+      "post": { "tags": ["Git"], "summary": "Unstage selected files" }
+    },
+    "/api/git/apply-hunks": {
+      "post": { "tags": ["Git"], "summary": "Stage or unstage selected diff hunks" }
+    },
+    "/api/git/discard": {
+      "post": { "tags": ["Git"], "summary": "Discard selected working-tree files" }
+    },
+    "/api/git/delete-untracked": {
+      "post": { "tags": ["Git"], "summary": "Delete selected untracked files" }
+    },
+    "/api/database": {
+      "get": { "tags": ["Database"], "summary": "Read database adapter status" }
+    },
+    "/api/database/connections": {
+      "get": { "tags": ["Database"], "summary": "List saved database connections" },
+      "post": { "tags": ["Database"], "summary": "Create a database connection" }
+    },
+    "/api/database/connections/test": {
+      "post": { "tags": ["Database"], "summary": "Test an unsaved database connection" }
+    },
+    "/api/database/connections/{connection_id}": {
+      "put": { "tags": ["Database"], "summary": "Update a database connection" },
+      "delete": { "tags": ["Database"], "summary": "Delete a database connection" }
+    },
+    "/api/database/connections/{connection_id}/test": {
+      "post": { "tags": ["Database"], "summary": "Test a saved database connection" }
+    },
+    "/api/database/connections/{connection_id}/explorer": {
+      "get": { "tags": ["Database"], "summary": "Read database explorer nodes" }
+    },
+    "/api/database/connections/{connection_id}/object-details": {
+      "get": { "tags": ["Database"], "summary": "Read object details and relational schema" }
+    },
+    "/api/database/connections/{connection_id}/query": {
+      "post": { "tags": ["Database"], "summary": "Execute SQL" }
+    },
+    "/api/database/connections/{connection_id}/table-data": {
+      "get": { "tags": ["Database"], "summary": "Read paginated table data" }
+    },
+    "/api/database/transfers": {
+      "post": { "tags": ["Database"], "summary": "Create a table transfer job" }
+    },
+    "/api/database/export": {
+      "post": { "tags": ["Database"], "summary": "Export a table to JSON" }
+    },
+    "/api/database/import": {
+      "post": { "tags": ["Database"], "summary": "Import table rows from JSON" }
+    },
+    "/api/database/jobs": {
+      "get": { "tags": ["Database"], "summary": "List database jobs" }
+    },
+    "/api/database/jobs/{job_id}": {
+      "get": { "tags": ["Database"], "summary": "Read a database job" }
+    },
+    "/api/process": {
+      "get": { "tags": ["Process"], "summary": "List supervised processes" },
+      "post": { "tags": ["Process"], "summary": "Start a supervised process or PTY" }
+    },
+    "/api/process/{process_id}": {
+      "delete": { "tags": ["Process"], "summary": "Stop a supervised process" }
+    },
+    "/api/process/{process_id}/input": {
+      "post": { "tags": ["Process"], "summary": "Write process input" }
+    },
+    "/api/process/{process_id}/resize": {
+      "post": { "tags": ["Process"], "summary": "Resize a PTY process" }
+    },
+    "/api/settings/server-status": {
+      "get": { "tags": ["Settings"], "summary": "Read server configuration status" }
+    },
+    "/api/metrics/runtime": {
+      "get": { "tags": ["Settings"], "summary": "Read runtime metrics" }
+    },
+    "/api/settings": {
+      "get": { "tags": ["Settings"], "summary": "List raw settings" }
+    },
+    "/api/settings/value/{key}": {
+      "get": { "tags": ["Settings"], "summary": "Read a raw setting value" },
+      "put": { "tags": ["Settings"], "summary": "Write a raw setting value" }
+    },
+    "/api/settings/notification-preferences": {
+      "get": { "tags": ["Settings"], "summary": "Read notification preferences" },
+      "put": { "tags": ["Settings"], "summary": "Save notification preferences" }
+    },
+    "/api/settings/sidebar-active-sessions": {
+      "get": { "tags": ["Settings"], "summary": "Read sidebar active sessions" },
+      "put": { "tags": ["Settings"], "summary": "Save sidebar active sessions" }
+    },
+    "/api/settings/direct-ai": {
+      "get": { "tags": ["Settings"], "summary": "Read Direct AI configuration" },
+      "put": { "tags": ["Settings"], "summary": "Save Direct AI configuration" }
+    },
+    "/api/settings/direct-ai/models": {
+      "get": { "tags": ["Settings"], "summary": "List Direct AI models" }
+    },
+    "/api/settings/api-keys": {
+      "get": { "tags": ["Settings"], "summary": "List API keys" },
+      "post": { "tags": ["Settings"], "summary": "Create an API key" }
+    },
+    "/api/settings/api-keys/{key_id}": {
+      "delete": { "tags": ["Settings"], "summary": "Delete an API key" }
+    },
+    "/api/settings/api-keys/{key_id}/toggle": {
+      "patch": { "tags": ["Settings"], "summary": "Toggle an API key" }
+    },
+    "/api/settings/credentials": {
+      "get": { "tags": ["Settings"], "summary": "List stored credentials" },
+      "post": { "tags": ["Settings"], "summary": "Create a stored credential" }
+    },
+    "/api/settings/credentials/{credential_id}": {
+      "delete": { "tags": ["Settings"], "summary": "Delete a stored credential" }
+    },
+    "/api/settings/credentials/{credential_id}/toggle": {
+      "patch": { "tags": ["Settings"], "summary": "Toggle a stored credential" }
+    },
+    "/api/user": {
+      "get": { "tags": ["Settings"], "summary": "Read user settings overview" }
+    },
+    "/api/user/git-config": {
+      "get": { "tags": ["Settings"], "summary": "Read Git config" },
+      "post": { "tags": ["Settings"], "summary": "Save Git config" }
+    },
+    "/api/user/onboarding-status": {
+      "get": { "tags": ["Settings"], "summary": "Read onboarding status" }
+    },
+    "/api/user/complete-onboarding": {
+      "post": { "tags": ["Settings"], "summary": "Mark onboarding complete" }
+    },
+    "/api/browse-filesystem": {
+      "get": { "tags": ["Files"], "summary": "Browse allowed filesystem paths" }
+    },
+    "/api/create-folder": {
+      "post": { "tags": ["Files"], "summary": "Create an allowed folder" }
+    },
+    "/api/audio/transcribe": {
+      "post": { "tags": ["Tools"], "summary": "Run command-backed audio transcription" }
+    },
+    "/api/mcp/servers": {
+      "get": { "tags": ["Tools"], "summary": "List MCP server processes" },
+      "post": { "tags": ["Tools"], "summary": "Start an MCP server process" }
+    },
+    "/api/mcp/servers/{server_id}": {
+      "delete": { "tags": ["Tools"], "summary": "Stop an MCP server process" }
+    },
+    "/api/mcp/tools/call": {
+      "post": { "tags": ["Tools"], "summary": "Run a command-backed MCP tool call" }
+    },
+    "/api/mcp-utils/run": {
+      "post": { "tags": ["Tools"], "summary": "Run mcp-utils command integration" }
+    },
+    "/api/commands/run": {
+      "post": { "tags": ["Tools"], "summary": "Run slash command integration" }
+    },
+    "/api/commands/taskmaster/run": {
+      "post": { "tags": ["Tools"], "summary": "Run Taskmaster command integration" }
+    },
+    "/api/taskmaster/run": {
+      "post": { "tags": ["Tools"], "summary": "Run Taskmaster command integration" }
+    },
+    "/api/plugins/install": {
+      "post": { "tags": ["Tools"], "summary": "Run plugin install command integration" }
+    },
+    "/api/plugins/remove": {
+      "post": { "tags": ["Tools"], "summary": "Run plugin removal command integration" }
+    },
+    "/api/plugins/run": {
+      "post": { "tags": ["Tools"], "summary": "Run plugin command integration" }
+    },
+    "/api/danger/run": {
+      "post": { "tags": ["Tools"], "summary": "Run danger command integration" }
+    },
+    "/api/danger/runs": {
+      "get": { "tags": ["Tools"], "summary": "List danger command runs" }
+    },
+    "/api/notifications/push": {
+      "post": { "tags": ["Tools"], "summary": "Run push notification command integration" }
+    },
+    "/api/notifications/test": {
+      "post": { "tags": ["Tools"], "summary": "Run test notification command integration" }
+    },
+    "/api/tool-runs/{namespace}": {
+      "get": { "tags": ["Tools"], "summary": "List command-backed tool runs" }
+    },
+    "/api/cli": {
+      "get": { "tags": ["Compatibility"], "summary": "Read CLI provider overview" }
+    },
+    "/api/cli/{provider}/status": {
+      "get": { "tags": ["Compatibility"], "summary": "Read provider CLI status" }
+    },
+    "/api/agent/{path}": {
+      "x-any": { "tags": ["Compatibility"], "summary": "Legacy agent compatibility endpoint" }
+    },
+    "/api/codex/{path}": {
+      "x-any": { "tags": ["Compatibility"], "summary": "Provider compatibility endpoint" }
+    },
+    "/api/cursor/{path}": {
+      "x-any": { "tags": ["Compatibility"], "summary": "Provider compatibility endpoint" }
+    },
+    "/api/gemini/{path}": {
+      "x-any": { "tags": ["Compatibility"], "summary": "Provider compatibility endpoint" }
+    },
+    "/api/plugins/{path}": {
+      "x-any": { "tags": ["Compatibility"], "summary": "Plugin compatibility endpoint" }
+    },
+    "/api/danger/{path}": {
+      "x-any": { "tags": ["Compatibility"], "summary": "Danger compatibility endpoint" }
+    },
+    "/api/settings/{path}": {
+      "x-any": { "tags": ["Compatibility"], "summary": "Settings compatibility endpoint" }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  }
+}

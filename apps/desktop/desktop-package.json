@@ -1,0 +1,13 @@
+{
+  "name": "io-workbench-desktop",
+  "productName": "io-workbench",
+  "version": "0.1.0",
+  "description": "Desktop wrapper metadata for the io-workbench Rust server and embedded UI.",
+  "mainCommand": "apps/desktop/io-workbench-desktop.sh",
+  "dataDirectory": "~/.io-workbench",
+  "server": {
+    "hostEnv": "IO_WORKBENCH_HOST",
+    "portEnv": "IO_WORKBENCH_PORT",
+    "defaultUrl": "http://127.0.0.1:8787"
+  }
+}
