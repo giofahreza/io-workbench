@@ -30,6 +30,34 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "image/svg+xml; charset=utf-8",
             bytes: include_bytes!("../static/icon.svg"),
         }),
+        "icons/codex.svg" => Some(UiAsset {
+            content_type: "image/svg+xml; charset=utf-8",
+            bytes: include_bytes!("../static/icons/codex.svg"),
+        }),
+        "icons/codex-white.svg" => Some(UiAsset {
+            content_type: "image/svg+xml; charset=utf-8",
+            bytes: include_bytes!("../static/icons/codex-white.svg"),
+        }),
+        "icons/claude-ai-icon.svg" => Some(UiAsset {
+            content_type: "image/svg+xml; charset=utf-8",
+            bytes: include_bytes!("../static/icons/claude-ai-icon.svg"),
+        }),
+        "icons/claude-white.svg" => Some(UiAsset {
+            content_type: "image/svg+xml; charset=utf-8",
+            bytes: include_bytes!("../static/icons/claude-white.svg"),
+        }),
+        "icons/gemini-ai-icon.svg" => Some(UiAsset {
+            content_type: "image/svg+xml; charset=utf-8",
+            bytes: include_bytes!("../static/icons/gemini-ai-icon.svg"),
+        }),
+        "icons/cursor.svg" => Some(UiAsset {
+            content_type: "image/svg+xml; charset=utf-8",
+            bytes: include_bytes!("../static/icons/cursor.svg"),
+        }),
+        "icons/cursor-white.svg" => Some(UiAsset {
+            content_type: "image/svg+xml; charset=utf-8",
+            bytes: include_bytes!("../static/icons/cursor-white.svg"),
+        }),
         "sw.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/sw.js"),

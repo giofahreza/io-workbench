@@ -70,7 +70,7 @@ Environment variables use the `IO_WORKBENCH_` prefix:
 - `IO_WORKBENCH_CONFIG_DIR`
 - `IO_WORKBENCH_DATABASE_PATH`
 - `IO_WORKBENCH_WORKSPACE_ROOT`
-- `IO_WORKBENCH_AUTH_REQUIRED`
+- `IO_WORKBENCH_AUTH_REQUIRED` (defaults to `true`; set to `false` only for a trusted local dev server)
 - `IO_WORKBENCH_TOKEN`
 - `IO_WORKBENCH_MAX_SESSIONS`
 - `IO_WORKBENCH_MAX_SCAN_DEPTH`
@@ -145,6 +145,13 @@ Build desktop release archives:
 
 ```sh
 apps/desktop/package-release.sh
+```
+
+Build the native C++/wxWidgets desktop client:
+
+```sh
+cmake -S apps/desktop/native -B apps/desktop/native/build
+cmake --build apps/desktop/native/build
 ```
 
 Build the mobile PWA archive:

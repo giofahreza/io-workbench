@@ -1,7 +1,36 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
+const APP_VERSION = "20260729-03";
+const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
+const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
+const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
+const APP_VERSION_STORAGE_KEY = "iowb.web.version";
+const APP_RELOAD_STORAGE_KEY = `iowb.web.reloaded.${APP_VERSION}`;
+const WS_CONNECT_TIMEOUT_MS = 8000;
+const WS_RETRY_BASE_MS = 1200;
+const WS_RETRY_MAX_MS = 10000;
+
+// Minimum time the user must hold the project grip before movement becomes a
+// drag-to-reorder gesture. Only the grip starts dragging; the rest of the row
+// stays available for normal click and vertical sidebar scroll.
+const SIDEBAR_DRAG_HOLD_MS = 160;
+const SIDEBAR_DRAG_MOVE_PX = 5;
+const CHAT_SWIPE_MIN_DISTANCE = 72;
+const CHAT_SWIPE_MAX_VERTICAL_DRIFT = 64;
+const CHAT_SWIPE_DIRECTION_RATIO = 1.5;
+
 const CHAT_PROVIDERS = new Set(["codex", "claude", "cursor", "gemini"]);
+
+function readJsonStorage(key, fallback) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    window.localStorage.removeItem(key);
+    return fallback;
+  }
+}
 
 const state = {
   auth: null,
@@ -29,7 +58,16 @@ const state = {
   currentGitDiffFile: null,
   currentConflictFile: null,
   gitSelectedFiles: new Set(),
+  gitCollapsedFolders: new Set(),
+  gitCommitMessage: "",
   fileEntries: [],
+  fileExpandedPaths: new Set(),
+  fileSelectedPaths: new Set(),
+  fileCreating: null,
+  fileRenamingPath: "",
+  fileContextMenu: null,
+  fileUploadTargetPath: "",
+  fileViewMode: window.localStorage.getItem("iowb.fileViewMode") || "detailed",
   editorSearch: {
     query: "",
     matches: [],
@@ -37,6 +75,7 @@ const state = {
   },
   currentFileDirty: false,
   chatBuffer: "",
+  chatProcessing: null,
   lastSessionMessages: [],
   shellBuffer: "",
   virtualLists: {},
@@ -52,10 +91,16 @@ const state = {
   shellAltActive: false,
   shellTouchScrollY: null,
   shellTouchScrollRemainder: 0,
-  preferences: JSON.parse(window.localStorage.getItem("iowb.webPreferences") || "{}"),
-  projectOrder: JSON.parse(window.localStorage.getItem("iowb.projectOrder") || "[]"),
-  projectMeta: JSON.parse(window.localStorage.getItem("iowb.projectMeta") || "{}"),
-  expandedProjectPaths: new Set(JSON.parse(window.localStorage.getItem("iowb.expandedProjects") || "[]")),
+  preferences: (() => {
+    const parsed = readJsonStorage("iowb.webPreferences", {});
+    if (!parsed.chatSessionOverrides) parsed.chatSessionOverrides = {};
+    return parsed;
+  })(),
+  projectOrder: readJsonStorage("iowb.projectOrder", []),
+  projectMeta: readJsonStorage("iowb.projectMeta", {}),
+  pinnedChatSessions: readJsonStorage(PINNED_CHAT_SESSIONS_KEY, []),
+  activeProjectPath: window.localStorage.getItem("iowb.activeProjectPath") || "",
+  expandedProjectPaths: new Set(readJsonStorage("iowb.expandedProjects", [])),
   limits: {
     files: 250,
     sessions: 100,
@@ -68,6 +113,10 @@ const state = {
   token: window.sessionStorage.getItem(TOKEN_STORAGE_KEY) || "",
   ws: null,
   wsRetry: null,
+  wsRetryAttempt: 0,
+  wsConnectTimer: null,
+  wsGeneration: 0,
+  wsLastDetail: "",
   currentSession: null,
   pendingChatSessionId: "",
   currentShellProcess: null,
@@ -77,10 +126,12 @@ const state = {
   suppressEditorChange: false,
   shellTerm: null,
   sidebarSearch: "",
-  draggedProjectPath: "",
   openProjectMenuPath: "",
   pointerProjectDrag: null,
+  chatSwipe: null,
+  activeSettingsTab: window.localStorage.getItem("iowb.settingsTab") || "agents",
   suppressSidebarProjectClickUntil: 0,
+  sidebarStatePersistTimer: null,
   commandPalette: {
     open: false,
     query: "",
@@ -88,7 +139,8 @@ const state = {
   },
   folderBrowser: {
     open: false,
-    targetInput: "#project-path",
+    action: "select",
+    targetInput: "",
     path: "~",
     homePath: "",
     entries: [],
@@ -100,8 +152,70 @@ const state = {
 
 const qs = (selector) => document.querySelector(selector);
 
+const AUTH_PROTECTED_SELECTORS = [
+  ".sidebar",
+  ".topbar",
+  ".main-content-header",
+  ".workspace > .view",
+  "#command-palette",
+  "#folder-browser",
+  ".bottom-nav",
+];
+
+const authProtectedSlots = [];
+
+function collectAuthProtectedSlots() {
+  if (authProtectedSlots.length) return;
+  const seen = new Set();
+  for (const selector of AUTH_PROTECTED_SELECTORS) {
+    document.querySelectorAll(selector).forEach((node) => {
+      if (!(node instanceof HTMLElement) || seen.has(node)) return;
+      seen.add(node);
+      authProtectedSlots.push({
+        node,
+        marker: document.createComment(`auth-protected:${node.id || selector}`),
+      });
+    });
+  }
+}
+
+function detachAuthProtectedShell() {
+  collectAuthProtectedSlots();
+  document.body.classList.add("auth-active");
+  document.body.classList.remove("auth-pending", "sidebar-open");
+  document.body.classList.remove(
+    "code-editor-active",
+    "xterm-active",
+    "files-editor-open",
+    "sidebar-project-dragging",
+  );
+  closeCommandPalette();
+  closeFolderBrowser();
+  authProtectedSlots.forEach(({ node, marker }) => {
+    node.setAttribute("aria-hidden", "true");
+    node.setAttribute("inert", "");
+    if (!node.isConnected) return;
+    node.parentNode.insertBefore(marker, node);
+    node.remove();
+  });
+}
+
+function attachAuthProtectedShell() {
+  collectAuthProtectedSlots();
+  authProtectedSlots.forEach(({ node, marker }) => {
+    node.removeAttribute("aria-hidden");
+    node.removeAttribute("inert");
+    if (!node.isConnected && marker.parentNode) {
+      marker.replaceWith(node);
+    }
+  });
+  if (state.codeEditor) document.body.classList.add("code-editor-active");
+  if (state.shellTerm) document.body.classList.add("xterm-active");
+  document.body.classList.remove("auth-active", "auth-pending");
+}
+
 const VIEW_NAMES = {
-  files: "Files",
+  files: "Project Files",
   chat: "Chat",
   shell: "Shell",
   git: "Git",
@@ -157,8 +271,23 @@ async function apiUpload(path, formData) {
   return body;
 }
 
+async function withButtonLoading(button, task) {
+  const target = typeof button === "string" ? qs(button) : button;
+  if (!target) return task();
+  target.classList.add("is-loading");
+  target.disabled = true;
+  try {
+    return await task();
+  } finally {
+    target.classList.remove("is-loading");
+    target.disabled = false;
+  }
+}
+
 function activeProjectPath(selector = "#active-project") {
-  return qs(selector)?.value || state.projects[0]?.path || "";
+  const selected = qs(selector)?.value || state.activeProjectPath || state.projects[0]?.path || "";
+  if (!selected) return "";
+  return state.projects.some((project) => project.path === selected) ? selected : state.projects[0]?.path || "";
 }
 
 function activeProjectName(selectId = "#active-project") {
@@ -167,16 +296,35 @@ function activeProjectName(selectId = "#active-project") {
 }
 
 function chatProvider() {
-  const value = qs("#chat-provider-setting")?.value || state.preferences.chatProvider || "codex";
+  // The composer no longer exposes a CLI/Thinking picker — those values are
+  // driven by the stored preference and the sidebar provider buttons.
+  const setting = qs("#chat-provider-setting")?.value;
+  if (setting && CHAT_PROVIDERS.has(setting)) return setting;
+  const value = state.preferences.chatProvider || "codex";
   return CHAT_PROVIDERS.has(value) ? value : "codex";
+}
+
+function canLoadProtectedData() {
+  return Boolean(state.auth && (!state.auth.enabled || state.auth.isAuthenticated || state.token));
 }
 
 function setChatProvider(provider) {
   const value = CHAT_PROVIDERS.has(provider) ? provider : "codex";
   state.preferences.chatProvider = value;
-  const select = qs("#chat-provider-setting");
-  if (select) select.value = value;
+  state.preferences.chatCli = value;
+  state.preferences.chatModel = "";
+  const settingSelect = qs("#chat-provider-setting");
+  if (settingSelect) settingSelect.value = value;
+  const modelSelect = qs("#chat-model");
+  if (modelSelect) {
+    modelSelect.disabled = true;
+    modelSelect.innerHTML = canLoadProtectedData()
+      ? `<option value="">Loading models...</option>`
+      : `<option value="">Sign in to load models</option>`;
+  }
   savePreferences();
+  renderChatProviderPicker();
+  if (canLoadProtectedData()) loadChatModelsIntoSelect(value).catch(() => {});
 }
 
 function orderedProjects() {
@@ -196,19 +344,87 @@ function syncProjectOrder() {
     if (!ordered.includes(project.path)) ordered.push(project.path);
   }
   state.projectOrder = ordered;
-  window.localStorage.setItem("iowb.projectOrder", JSON.stringify(state.projectOrder));
+  saveSidebarStateLocal();
 }
 
 function saveProjectMeta() {
-  window.localStorage.setItem("iowb.projectMeta", JSON.stringify(state.projectMeta));
+  persistSidebarState();
 }
 
 function saveExpandedProjectPaths() {
-  window.localStorage.setItem("iowb.expandedProjects", JSON.stringify([...state.expandedProjectPaths]));
+  persistSidebarState();
 }
 
 function hapticFeedback(pattern = 12) {
-  if (navigator.vibrate) navigator.vibrate(pattern);
+  try {
+    if (navigator.vibrate) navigator.vibrate(pattern);
+  } catch {
+    // Browser haptics are best effort and not supported on every platform.
+  }
+}
+
+function sidebarStatePayload() {
+  return {
+    projectOrder: state.projectOrder,
+    projectMeta: state.projectMeta,
+    expandedProjectPaths: [...state.expandedProjectPaths],
+    pinnedChatSessions: state.pinnedChatSessions,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function saveSidebarStateLocal(payload = sidebarStatePayload()) {
+  window.localStorage.setItem("iowb.projectOrder", JSON.stringify(payload.projectOrder || []));
+  window.localStorage.setItem("iowb.projectMeta", JSON.stringify(payload.projectMeta || {}));
+  window.localStorage.setItem("iowb.expandedProjects", JSON.stringify(payload.expandedProjectPaths || []));
+  window.localStorage.setItem(PINNED_CHAT_SESSIONS_KEY, JSON.stringify(payload.pinnedChatSessions || []));
+  if (payload.updatedAt) window.localStorage.setItem(SIDEBAR_STATE_UPDATED_KEY, payload.updatedAt);
+}
+
+function applySidebarStatePayload(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  if (Array.isArray(payload.projectOrder)) {
+    state.projectOrder = payload.projectOrder.filter((path) => typeof path === "string");
+  }
+  if (payload.projectMeta && typeof payload.projectMeta === "object" && !Array.isArray(payload.projectMeta)) {
+    state.projectMeta = payload.projectMeta;
+  }
+  if (Array.isArray(payload.expandedProjectPaths)) {
+    state.expandedProjectPaths = new Set(payload.expandedProjectPaths.filter((path) => typeof path === "string"));
+  }
+  if (Array.isArray(payload.pinnedChatSessions)) {
+    state.pinnedChatSessions = normalizePinnedChatSessions(payload.pinnedChatSessions);
+  }
+  saveSidebarStateLocal(payload);
+  return true;
+}
+
+async function loadSidebarState() {
+  try {
+    const body = await api("/api/settings");
+    const remote = (body?.settings || []).find((entry) => entry.key === SIDEBAR_STATE_SETTING_KEY)?.value;
+    if (!remote || typeof remote !== "object") return false;
+    const localUpdatedAt = Date.parse(window.localStorage.getItem(SIDEBAR_STATE_UPDATED_KEY) || "") || 0;
+    const remoteUpdatedAt = Date.parse(remote.updatedAt || "") || 0;
+    if (!localUpdatedAt || (remoteUpdatedAt && remoteUpdatedAt >= localUpdatedAt)) {
+      return applySidebarStatePayload(remote);
+    }
+  } catch (error) {
+    console.debug("sidebar state load skipped", error);
+  }
+  return false;
+}
+
+function persistSidebarState() {
+  const payload = sidebarStatePayload();
+  saveSidebarStateLocal(payload);
+  window.clearTimeout(state.sidebarStatePersistTimer);
+  state.sidebarStatePersistTimer = window.setTimeout(() => {
+    api(`/api/settings/value/${encodeURIComponent(SIDEBAR_STATE_SETTING_KEY)}`, {
+      method: "PUT",
+      body: JSON.stringify({ value: payload }),
+    }).catch(() => {});
+  }, 450);
 }
 
 function sidebarProjectMeta(path) {
@@ -226,9 +442,15 @@ function selectedProjectLabel(selector = "#active-project") {
 }
 
 function updateMainHeader(view = activeView()) {
-  qs("#view-title").textContent = VIEW_NAMES[view] || view;
+  const title = qs("#view-title");
+  const headerSubtitle = qs("#view-subtitle");
+  if (title) title.textContent = VIEW_NAMES[view] || view;
   const subtitle = selectedProjectLabel("#active-project");
-  qs("#view-subtitle").textContent = subtitle;
+  if (headerSubtitle) headerSubtitle.textContent = subtitle;
+  const bottomTitle = qs("#bottom-view-title");
+  const bottomMeta = qs("#bottom-view-meta");
+  if (bottomTitle) bottomTitle.textContent = VIEW_NAMES[view] || view;
+  if (bottomMeta) bottomMeta.textContent = subtitle;
 }
 
 function renameSidebarProject(path) {
@@ -266,12 +488,6 @@ function hideSidebarProject(path) {
 }
 
 function projectDropPlacement(sourcePath, targetPath, event, target) {
-  const currentOrder = orderedProjects().map((project) => project.path);
-  const sourceIndex = currentOrder.indexOf(sourcePath);
-  const targetIndex = currentOrder.indexOf(targetPath);
-  if (sourceIndex >= 0 && targetIndex >= 0 && sourceIndex !== targetIndex) {
-    return sourceIndex < targetIndex ? "after" : "before";
-  }
   const rect = target.getBoundingClientRect();
   return event.clientY >= rect.top + rect.height / 2 ? "after" : "before";
 }
@@ -284,33 +500,39 @@ function moveProjectOrder(sourcePath, targetPath, placement = "before") {
   const insertIndex = targetIndex < 0 ? order.length : targetIndex + (placement === "after" ? 1 : 0);
   order.splice(insertIndex, 0, sourcePath);
   state.projectOrder = order;
-  window.localStorage.setItem("iowb.projectOrder", JSON.stringify(state.projectOrder));
+  persistSidebarState();
   hapticFeedback(8);
   renderSidebarProjects();
 }
 
-function setWsStatus(status) {
+function setWsStatus(status, detail = "") {
   const dot = qs("#ws-dot");
   const label = qs("#ws-label");
+  if (!dot || !label) return;
   dot.className = "dot";
   if (status === "connected") {
     dot.classList.add("ok");
     label.textContent = "Connected";
-    label.title = "WebSocket connected";
+    label.title = detail || "WebSocket connected";
+  } else if (status === "reconnecting") {
+    label.textContent = "Reconnecting";
+    label.title = detail || "WebSocket reconnecting";
   } else if (status === "error") {
     dot.classList.add("error");
     label.textContent = "Disconnected";
-    label.title = "WebSocket disconnected";
+    label.title = detail || "WebSocket disconnected";
   } else {
     label.textContent = "Connecting";
-    label.title = "WebSocket connecting";
+    label.title = detail || "WebSocket connecting";
   }
+  state.wsLastDetail = label.title;
 }
 
 function showAuthPanel(mode) {
   const otpMode = mode === "otp";
   const passwordInput = qs("#auth-password");
-  document.body.classList.add("auth-active");
+  if (state.auth) state.auth = { ...state.auth, isAuthenticated: false };
+  detachAuthProtectedShell();
   qs("#auth-panel").classList.remove("hidden");
   qs("#auth-title").textContent = mode === "setup" ? "Create Account" : otpMode ? "Enter OTP" : "Welcome Back";
   qs("#auth-description").textContent = mode === "setup"
@@ -337,7 +559,7 @@ function showAuthPanel(mode) {
   }
   passwordInput.placeholder = otpMode ? "Enter 6-digit OTP" : "Enter your password";
   qs("#auth-password-toggle").classList.toggle("hidden", otpMode);
-  qs("#auth-logout").classList.add("hidden");
+  qs("#auth-logout")?.classList.add("hidden");
 }
 
 function authPanelMode() {
@@ -346,45 +568,15 @@ function authPanelMode() {
 }
 
 function hideAuthPanel() {
-  document.body.classList.remove("auth-active");
+  attachAuthProtectedShell();
   qs("#auth-panel").classList.add("hidden");
   qs("#auth-message").textContent = "";
   if (state.token) {
-    qs("#auth-logout").classList.remove("hidden");
+    qs("#auth-logout")?.classList.remove("hidden");
   }
 }
 
 function renderProjects() {
-  const list = qs("#projects-list");
-  if (!list) return;
-  if (!state.projects.length) {
-    list.innerHTML = '<p class="empty">No projects have been added yet.</p>';
-    renderProjectOptions();
-    renderSidebarProjects();
-    renderSidebarSessions();
-    return;
-  }
-
-  list.innerHTML = orderedProjects()
-    .map((project) => {
-      const sessions = project.sessions?.length || 0;
-      return `<article class="row">
-        <strong>${escapeHtml(project.name)}</strong>
-        <span>${escapeHtml(project.path)}</span>
-        <span class="meta">${sessions} sessions</span>
-        <div class="row-actions">
-          <button type="button" class="icon-button" data-project-use="${escapeHtml(project.path)}" aria-label="Use project" title="Use project" data-symbol="check"></button>
-          <button type="button" class="icon-button" data-project-delete="${escapeHtml(project.name)}" aria-label="Delete project" title="Delete project" data-symbol="trash"></button>
-        </div>
-      </article>`;
-    })
-    .join("");
-  list.querySelectorAll("[data-project-use]").forEach((button) => {
-    button.addEventListener("click", () => setActiveProject(button.dataset.projectUse));
-  });
-  list.querySelectorAll("[data-project-delete]").forEach((button) => {
-    button.addEventListener("click", () => deleteProject(button.dataset.projectDelete).catch(showError));
-  });
   renderProjectOptions();
   renderSidebarProjects();
   renderSidebarSessions();
@@ -407,6 +599,8 @@ function renderProjectOptions() {
 }
 
 function setActiveProject(projectPath) {
+  state.activeProjectPath = projectPath || "";
+  window.localStorage.setItem("iowb.activeProjectPath", state.activeProjectPath);
   ["#active-project"].forEach((selector) => {
     const select = qs(selector);
     if (select) select.value = projectPath;
@@ -475,10 +669,139 @@ function sidebarProjectSessions(project) {
   });
 }
 
-function clearSidebarProjectDragClasses() {
-  document.querySelectorAll(".project-sidebar-row.dragging, .project-sidebar-row.drag-over").forEach((row) => {
-    row.classList.remove("dragging", "drag-over");
+function pinnedChatKey(projectPath, sessionId, provider = "") {
+  return [projectPath || "", sessionId || "", provider || ""].join("::");
+}
+
+function normalizePinnedChatSessions(entries) {
+  const seen = new Set();
+  return (Array.isArray(entries) ? entries : [])
+    .map((entry) => {
+      if (typeof entry === "string") {
+        const [projectPath = "", sessionId = "", provider = ""] = entry.split("::");
+        return { projectPath, sessionId, provider };
+      }
+      if (!entry || typeof entry !== "object") return null;
+      return {
+        key: entry.key || pinnedChatKey(entry.projectPath, entry.sessionId, entry.provider),
+        projectPath: entry.projectPath || "",
+        projectName: entry.projectName || "",
+        sessionId: entry.sessionId || "",
+        provider: entry.provider || "",
+        pinnedAt: entry.pinnedAt || new Date().toISOString(),
+      };
+    })
+    .filter((entry) => {
+      if (!entry?.sessionId) return false;
+      entry.key = entry.key || pinnedChatKey(entry.projectPath, entry.sessionId, entry.provider);
+      if (seen.has(entry.key)) return false;
+      seen.add(entry.key);
+      return true;
+    });
+}
+
+function persistPinnedChatSessions() {
+  state.pinnedChatSessions = normalizePinnedChatSessions(state.pinnedChatSessions);
+  persistSidebarState();
+}
+
+function sessionProjectPath(session, fallback = "") {
+  if (!session) return fallback;
+  if (session.projectPath) return session.projectPath;
+  if (fallback) return fallback;
+  const project = (state.projects || []).find((item) => item.name === session.projectName);
+  return project?.path || "";
+}
+
+function sessionProvider(session) {
+  return String(session?.provider || session?.__provider || "codex").toLowerCase();
+}
+
+function isChatSessionPinned(session, projectPath = "") {
+  const path = sessionProjectPath(session, projectPath);
+  const provider = sessionProvider(session);
+  const exactKey = pinnedChatKey(path, session?.id, provider);
+  return state.pinnedChatSessions.some((entry) => {
+    if (entry.key === exactKey) return true;
+    return entry.sessionId === session?.id
+      && (!entry.projectPath || !path || entry.projectPath === path)
+      && (!entry.provider || !provider || entry.provider === provider);
   });
+}
+
+function pinnedChatEntries() {
+  const entries = [];
+  const pinned = normalizePinnedChatSessions(state.pinnedChatSessions);
+  for (const pin of pinned) {
+    const project = (state.projects || []).find((item) => item.path === pin.projectPath || item.name === pin.projectName);
+    const session = findChatSession(pin.sessionId);
+    if (!session) continue;
+    const projectPath = pin.projectPath || sessionProjectPath(session, project?.path || "");
+    entries.push({
+      ...session,
+      provider: pin.provider || sessionProvider(session),
+      projectPath,
+      projectName: pin.projectName || session.projectName || project?.name || "",
+      pinKey: pin.key || pinnedChatKey(projectPath, pin.sessionId, pin.provider || sessionProvider(session)),
+    });
+  }
+  return entries;
+}
+
+function togglePinnedChatSession(sessionId, projectPath = "", provider = "") {
+  const session = findChatSession(sessionId);
+  if (!session) return;
+  const path = sessionProjectPath(session, projectPath);
+  const project = (state.projects || []).find((item) => item.path === path || item.name === session.projectName);
+  const normalizedProvider = provider || sessionProvider(session);
+  const key = pinnedChatKey(path, sessionId, normalizedProvider);
+  const existing = state.pinnedChatSessions.findIndex((entry) => entry.key === key || (
+    entry.sessionId === sessionId
+    && (!entry.projectPath || !path || entry.projectPath === path)
+    && (!entry.provider || entry.provider === normalizedProvider)
+  ));
+  if (existing >= 0) {
+    state.pinnedChatSessions.splice(existing, 1);
+    showToast("Chat unpinned", "ok");
+  } else {
+    state.pinnedChatSessions.unshift({
+      key,
+      sessionId,
+      provider: normalizedProvider,
+      projectPath: path,
+      projectName: session.projectName || project?.name || "",
+      pinnedAt: new Date().toISOString(),
+    });
+    showToast("Chat pinned", "ok");
+  }
+  hapticFeedback(10);
+  persistPinnedChatSessions();
+  renderSidebarProjects();
+}
+
+function clearSidebarProjectDragClasses() {
+  document.querySelectorAll(".project-sidebar-row.dragging, .project-sidebar-row.drag-over, .project-sidebar-row.drag-over-before, .project-sidebar-row.drag-over-after").forEach((row) => {
+    row.classList.remove("dragging", "drag-over", "drag-over-before", "drag-over-after");
+  });
+}
+
+function sidebarProjectDragScrollContainer() {
+  return qs(".sidebar-context") || qs(".sidebar");
+}
+
+function autoScrollSidebarDuringProjectDrag(event) {
+  const container = sidebarProjectDragScrollContainer();
+  if (!container) return;
+  const rect = container.getBoundingClientRect();
+  const edge = 54;
+  const maxStep = 18;
+  if (event.clientY < rect.top + edge) {
+    const intensity = 1 - Math.max(0, event.clientY - rect.top) / edge;
+    container.scrollTop -= Math.ceil(maxStep * intensity);
+  } else if (event.clientY > rect.bottom - edge) {
+    const intensity = 1 - Math.max(0, rect.bottom - event.clientY) / edge;
+    container.scrollTop += Math.ceil(maxStep * intensity);
+  }
 }
 
 function finishSidebarProjectPointerDrag() {
@@ -501,35 +824,303 @@ function finishSidebarProjectPointerDrag() {
 function handleSidebarProjectPointerMove(event) {
   const drag = state.pointerProjectDrag;
   if (!drag) return;
-  const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
-  if (!drag.dragging && distance < 8) return;
-  drag.dragging = true;
+  const dx = event.clientX - drag.startX;
+  const dy = event.clientY - drag.startY;
+  const absDx = Math.abs(dx);
+  const absDy = Math.abs(dy);
+  if (!drag.dragging) {
+    const heldMs = Date.now() - (drag.startedAt || 0);
+    const distance = Math.hypot(absDx, absDy);
+    if (heldMs < SIDEBAR_DRAG_HOLD_MS || distance < SIDEBAR_DRAG_MOVE_PX) return;
+    drag.dragging = true;
+    hapticFeedback(12);
+  }
   event.preventDefault();
   document.body.classList.add("sidebar-project-dragging");
+  autoScrollSidebarDuringProjectDrag(event);
+  clearSidebarProjectDragClasses();
   const sourceRow = document.querySelector(`[data-sidebar-project-row="${CSS.escape(drag.path)}"]`);
   sourceRow?.classList.add("dragging");
   const overRow = document.elementFromPoint(event.clientX, event.clientY)?.closest("[data-sidebar-project-row]");
-  if (!overRow || overRow.dataset.sidebarProjectRow === drag.path) return;
-  clearSidebarProjectDragClasses();
-  overRow.classList.add("drag-over");
-  drag.overPath = overRow.dataset.sidebarProjectRow;
-  drag.placement = projectDropPlacement(drag.path, overRow.dataset.sidebarProjectRow, event, overRow);
-  hapticFeedback(8);
+  if (!overRow || overRow.dataset.sidebarProjectRow === drag.path) {
+    drag.overPath = "";
+    drag.placement = "";
+    return;
+  }
+  const nextOverPath = overRow.dataset.sidebarProjectRow;
+  const nextPlacement = projectDropPlacement(drag.path, nextOverPath, event, overRow);
+  overRow.classList.add("drag-over", `drag-over-${nextPlacement}`);
+  if (drag.overPath !== nextOverPath || drag.placement !== nextPlacement) {
+    hapticFeedback(8);
+  }
+  drag.overPath = nextOverPath;
+  drag.placement = nextPlacement;
 }
 
-function handleSidebarProjectDragEnd() {
-  state.draggedProjectPath = "";
-  state.suppressSidebarProjectClickUntil = Date.now() + 350;
-  clearSidebarProjectDragClasses();
+function sidebarProviderLabel(provider) {
+  if (provider === "claude") return "Claude";
+  if (provider === "gemini") return "Gemini";
+  if (provider === "cursor") return "Cursor";
+  return "Codex";
+}
+
+function sidebarProviderIcon(provider) {
+  if (provider === "claude") return "/icons/claude-white.svg";
+  if (provider === "gemini") return "/icons/gemini-ai-icon.svg";
+  if (provider === "cursor") return "/icons/cursor-white.svg";
+  return "/icons/codex-white.svg";
+}
+
+function sidebarSessionCardHtml(session, options = {}) {
+  const title = session.title || session.summary || session.id;
+  const projectPath = options.projectPath || session.projectPath || "";
+  const cli = (session.provider || "codex").toLowerCase();
+  const cliLabel = sidebarProviderLabel(cli);
+  const cliIcon = sidebarProviderIcon(cli);
+  const isActive = options.active ?? session.id === state.chatSessionId;
+  const pinned = options.pinned ?? isChatSessionPinned(session, projectPath);
+  const showProject = Boolean(options.showProject);
+  const lastActivity = session.lastActivity || session.updatedAt || session.createdAt;
+  const relative = formatRelativeTime(lastActivity);
+  const messageCount = Number(session.messageCount || 0);
+  const pending = session.pending ? "true" : "false";
+  const projectLabel = showProject
+    ? (options.projectName || session.projectName || projectPath || "")
+    : "";
+  return `<article class="sidebar-history-item${isActive ? " active" : ""}${pinned ? " pinned" : ""}" data-sidebar-session-card="${escapeHtml(session.id)}" data-pending="${pending}">
+    <button type="button" class="sidebar-history-main" data-sidebar-session="${escapeHtml(session.id)}" data-sidebar-provider="${escapeHtml(cli)}" data-sidebar-project-path="${escapeHtml(projectPath)}" data-pending="${pending}">
+      <div class="session-title">${escapeHtml(title)}</div>
+      ${projectLabel ? `<div class="session-project">${escapeHtml(projectLabel)}</div>` : ""}
+      <div class="session-bottom">
+        <span class="meta-time">${escapeHtml(relative || "never")}</span>
+        <span class="meta-right">
+          <span class="meta-count" title="${messageCount} messages">${messageCount}</span>
+          <span class="cli-badge ${escapeHtml(cli)}" aria-label="${escapeHtml(cliLabel)}" title="${escapeHtml(cliLabel)}">
+            <img src="${escapeHtml(cliIcon)}" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+          </span>
+        </span>
+      </div>
+    </button>
+    <button type="button" class="session-pin icon-button${pinned ? " active" : ""}" data-sidebar-session-pin="${escapeHtml(session.id)}" data-sidebar-project-path="${escapeHtml(projectPath)}" data-sidebar-provider="${escapeHtml(cli)}" aria-label="${pinned ? "Unpin chat session" : "Pin chat session"}" title="${pinned ? "Unpin chat session" : "Pin chat session"}" data-symbol="pin"></button>
+    <button type="button" class="session-delete icon-button" data-sidebar-session-delete="${escapeHtml(session.id)}" data-sidebar-project-path="${escapeHtml(projectPath)}" aria-label="Delete chat session" title="Delete chat session" data-symbol="trash"></button>
+  </article>`;
+}
+
+function findChatSession(sessionId) {
+  if (!sessionId) return null;
+  for (const project of state.projects || []) {
+    const session = (project.sessions || []).find((item) => item.id === sessionId);
+    if (session) return session;
+  }
+  return (state.sessions || []).find((item) => item.id === sessionId) || null;
+}
+
+function removeChatSessionFromState(sessionId) {
+  state.sessions = (state.sessions || []).filter((session) => session.id !== sessionId);
+  for (const project of state.projects || []) {
+    if (Array.isArray(project.sessions)) {
+      project.sessions = project.sessions.filter((session) => session.id !== sessionId);
+    }
+  }
+}
+
+function deleteSessionOverride(sessionId) {
+  const all = readSessionOverrides();
+  if (!Object.prototype.hasOwnProperty.call(all, sessionId)) return;
+  delete all[sessionId];
+  writeSessionOverrides(all);
+}
+
+function clearSelectedChatSession(sessionId) {
+  if (state.chatSessionId !== sessionId && state.pendingChatSessionId !== sessionId) return;
+  state.chatSessionId = "";
+  state.pendingChatSessionId = "";
+  state.currentSession = null;
+  if (state.preferences.lastChatSessionId === sessionId) {
+    state.preferences.lastChatSessionId = "";
+    savePreferences();
+  }
+  resetChatOutputDom();
+  const prompt = qs("#chat-prompt");
+  if (prompt) {
+    prompt.value = "";
+    autosizeChatPrompt();
+  }
+}
+
+async function deleteChatSession(sessionId, projectPath = "", button = null) {
+  const id = (sessionId || "").trim();
+  if (!id) return;
+  const session = findChatSession(id);
+  const pending = Boolean(session?.pending);
+  const title = session?.title || session?.summary || id;
+  if (!pending && !window.confirm(`Delete chat session "${title}"?`)) return;
+
+  const removeLocal = () => {
+    removeChatSessionFromState(id);
+    state.pinnedChatSessions = state.pinnedChatSessions.filter((entry) => entry.sessionId !== id);
+    persistPinnedChatSessions();
+    deleteSessionOverride(id);
+    clearSelectedChatSession(id);
+    renderProjects();
+    renderSidebarProjects();
+    renderSidebarSessions();
+    updateChatEmptyState();
+  };
+
+  if (pending) {
+    removeLocal();
+    showToast("Chat draft deleted", "ok");
+    return;
+  }
+
+  await withButtonLoading(button, () => api(`/api/sessions/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  }));
+  removeLocal();
+  await loadProjects().catch(() => {});
+  showToast("Chat session deleted", "ok");
+}
+
+function updatePendingChatProvider(provider) {
+  const value = CHAT_PROVIDERS_LOCAL.includes(provider) ? provider : "codex";
+  if (!state.pendingChatSessionId) return;
+  const pending = findChatSession(state.pendingChatSessionId);
+  if (!pending?.pending) return;
+  pending.provider = value;
+  saveSessionOverrides(state.pendingChatSessionId, {
+    cli: value,
+    model: chatModelValue(),
+    effort: chatEffortValue(),
+    mode: chatModeValue(),
+    thinking: chatThinkingValue(),
+  });
+  renderSidebarProjects();
+}
+
+function renderChatProviderPicker() {
+  const selected = chatCliValue();
+  document.querySelectorAll("[data-chat-provider-option]").forEach((button) => {
+    const active = button.dataset.chatProviderOption === selected;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+}
+
+function chatOutputIsEmpty() {
+  const output = chatOutputRoot();
+  if (!output) return true;
+  return output.children.length === 0 && !output.textContent.trim();
+}
+
+function selectedChatIsFreshDraft() {
+  if (!state.chatSessionId) return true;
+  const session = findChatSession(state.chatSessionId);
+  return Boolean(session?.pending || state.pendingChatSessionId === state.chatSessionId);
+}
+
+function chatSessionIdForSubmit() {
+  const pendingId = state.pendingChatSessionId;
+  const pending = pendingId ? findChatSession(pendingId) : null;
+  if (pending?.pending) return pendingId;
+  return state.chatSessionId || "";
+}
+
+function updateChatEmptyState() {
+  const emptyState = qs("#chat-empty-state");
+  if (!emptyState) return;
+  const shouldShow = activeView() === "chat" && chatOutputIsEmpty() && selectedChatIsFreshDraft();
+  emptyState.classList.toggle("hidden", !shouldShow);
+  renderChatProviderPicker();
+}
+
+function chooseNewChatProvider(provider) {
+  if (!CHAT_PROVIDERS_LOCAL.includes(provider)) return;
+  setChatProvider(provider);
+  updatePendingChatProvider(provider);
+  renderChatProviderPicker();
+  qs("#chat-prompt")?.focus();
+}
+
+function bindSidebarSessionActions(target) {
+  target.querySelectorAll("[data-sidebar-session]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      hapticFeedback(6);
+      if (button.dataset.sidebarProvider) setChatProvider(button.dataset.sidebarProvider);
+      await pickChatSession(
+        button.dataset.sidebarSession || "",
+        button.dataset.sidebarProjectPath || "",
+      );
+      renderSidebarSessions();
+    });
+  });
+  target.querySelectorAll("[data-sidebar-session-delete]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      hapticFeedback(10);
+      await deleteChatSession(
+        button.dataset.sidebarSessionDelete || "",
+        button.dataset.sidebarProjectPath || "",
+        button,
+      ).catch(showError);
+    });
+  });
+  target.querySelectorAll("[data-sidebar-session-pin]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      togglePinnedChatSession(
+        button.dataset.sidebarSessionPin || "",
+        button.dataset.sidebarProjectPath || "",
+        button.dataset.sidebarProvider || "",
+      );
+    });
+  });
+}
+
+function renderPinnedSidebarSessions() {
+  const section = qs("#sidebar-pinned-section");
+  const target = qs("#sidebar-pinned-sessions");
+  const count = qs("#sidebar-pinned-count");
+  if (!section || !target) return;
+  const search = sidebarFilterText();
+  const sessions = pinnedChatEntries().filter((session) => !search || sessionMatchesSidebarSearch(session));
+  section.classList.toggle("hidden", sessions.length === 0);
+  if (count) count.textContent = String(sessions.length);
+  if (!sessions.length) {
+    target.innerHTML = "";
+    return;
+  }
+  target.innerHTML = sessions.map((session) => sidebarSessionCardHtml(session, {
+    projectName: session.projectName,
+    projectPath: session.projectPath,
+    pinned: true,
+    showProject: true,
+  })).join("");
+  bindSidebarSessionActions(target);
 }
 
 function renderSidebarProjects() {
   const target = qs("#sidebar-projects");
   if (!target) return;
-  const activePath = activeProjectPath("#active-project");
-  const projects = orderedProjects()
-    .filter((project) => !sidebarProjectMeta(project.path).hidden)
-    .filter(projectMatchesSidebarSearch);
+  renderPinnedSidebarSessions();
+  const activePath = activeProjectPath();
+  const ordered = orderedProjects();
+  let visibleProjects = ordered.filter((project) => !sidebarProjectMeta(project.path).hidden);
+  if (state.projects.length && !visibleProjects.length) {
+    state.projectMeta = Object.fromEntries(
+      Object.entries(state.projectMeta)
+        .map(([path, meta]) => [path, { ...meta, hidden: undefined }])
+        .filter(([, meta]) => meta.label),
+    );
+    persistSidebarState();
+    visibleProjects = ordered;
+    showToast("Restored hidden projects", "ok");
+  }
+  const projects = visibleProjects.filter(projectMatchesSidebarSearch);
   if (!projects.length) {
     target.innerHTML = `<p class="sidebar-empty">${state.projects.length ? "No matching visible projects." : "No projects yet."}</p>`;
     return;
@@ -543,27 +1134,32 @@ function renderSidebarProjects() {
     const menuOpen = state.openProjectMenuPath === project.path;
     const sessionHtml = expanded
       ? `<div class="project-session-list" data-sidebar-project-sessions="${escapeHtml(project.path)}">
+        <button type="button" class="project-session-new-chat" data-sidebar-new-chat="${escapeHtml(project.path)}" aria-label="Start new chat in ${escapeHtml(displayName)}" title="Start new chat" data-symbol="plus">
+          <span aria-hidden="true"></span>
+          <strong>New chat</strong>
+        </button>
         ${sessions.length
-    ? sessions.slice(0, 12).map((session) => {
-      const title = session.title || session.summary || session.id;
-      return `<button type="button" class="sidebar-item" data-sidebar-session="${escapeHtml(session.id)}" data-sidebar-provider="${escapeHtml(session.provider || "codex")}" data-sidebar-project-path="${escapeHtml(project.path)}">
-            <strong>${escapeHtml(title)}</strong>
-            <span>${escapeHtml(session.provider || "agent")}</span>
-            <em>${session.messageCount || 0} messages</em>
-          </button>`;
-    }).join("")
+    ? sessions.slice(0, 12).map((session) => sidebarSessionCardHtml(session, {
+      projectName: displayName,
+      projectPath: project.path,
+    })).join("")
     : '<p class="sidebar-empty">No chat sessions.</p>'}
       </div>`
       : "";
     return `<div class="project-sidebar-wrapper${expanded ? " expanded" : ""}" data-sidebar-project-wrap="${escapeHtml(project.path)}">
-      <div class="project-sidebar-row${active}" data-sidebar-project-row="${escapeHtml(project.path)}" draggable="true">
-        <button type="button" class="sidebar-item project-sidebar-item" data-sidebar-project="${escapeHtml(project.path)}" draggable="true" aria-label="Open ${escapeHtml(displayName)} sessions">
-          <strong>${escapeHtml(displayName)}</strong>
-          <span>${escapeHtml(project.path)}</span>
-          <em>${sessionCount} sessions</em>
+      <div class="project-sidebar-row project-sidebar-card${active}" data-sidebar-project-row="${escapeHtml(project.path)}">
+        <button type="button" class="project-drag-handle" data-sidebar-drag-handle="${escapeHtml(project.path)}" aria-label="Drag to reorder ${escapeHtml(displayName)}" title="Drag to reorder">
+          <i></i><i></i><i></i><i></i><i></i><i></i>
+        </button>
+        <button type="button" class="sidebar-item project-sidebar-item" data-sidebar-project="${escapeHtml(project.path)}" aria-label="Select ${escapeHtml(displayName)} and show sessions" aria-expanded="${expanded ? "true" : "false"}"${active ? ' aria-current="true"' : ""}>
+          <span class="project-sidebar-text">
+            <strong>${escapeHtml(displayName)}</strong>
+            <span>${escapeHtml(project.path)}</span>
+            <em>${sessionCount} sessions</em>
+          </span>
         </button>
         <div class="project-menu-wrap">
-          <button type="button" class="icon-button${menuOpen ? " active" : ""}" data-project-menu-button="${escapeHtml(project.path)}" aria-label="Project options" title="Project options" data-symbol="dots"></button>
+          <button type="button" class="icon-button${menuOpen ? " active" : ""}" data-project-menu-button="${escapeHtml(project.path)}" aria-label="Project options" title="Project options" data-symbol="dots-vertical"></button>
           <div class="project-menu${menuOpen ? "" : " hidden"}" role="menu">
             <button type="button" data-project-rename="${escapeHtml(project.path)}">Rename</button>
             <button type="button" class="danger" data-project-hide="${escapeHtml(project.path)}">Remove from sidebar</button>
@@ -574,50 +1170,32 @@ function renderSidebarProjects() {
     </div>`;
   }).join("");
   target.querySelectorAll("[data-sidebar-project]").forEach((button) => {
-    button.addEventListener("dragstart", (event) => {
-      event.stopPropagation();
-      state.pointerProjectDrag = null;
-      document.removeEventListener("pointermove", handleSidebarProjectPointerMove);
-      state.draggedProjectPath = button.dataset.sidebarProject;
-      button.closest("[data-sidebar-project-row]")?.classList.add("dragging");
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData("text/plain", state.draggedProjectPath);
-      hapticFeedback(12);
-    });
-    button.addEventListener("dragover", (event) => {
-      event.stopPropagation();
-      const sourcePath = state.draggedProjectPath || event.dataTransfer.getData("text/plain");
-      if (!sourcePath || sourcePath === button.dataset.sidebarProject) return;
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "move";
-      clearSidebarProjectDragClasses();
-      button.closest("[data-sidebar-project-row]")?.classList.add("drag-over");
-    });
-    button.addEventListener("drop", (event) => {
-      event.stopPropagation();
-      const sourcePath = state.draggedProjectPath || event.dataTransfer.getData("text/plain");
-      if (!sourcePath) return;
-      event.preventDefault();
-      moveProjectOrder(
-        sourcePath,
-        button.dataset.sidebarProject,
-        projectDropPlacement(sourcePath, button.dataset.sidebarProject, event, button),
-      );
-      handleSidebarProjectDragEnd();
-      hapticFeedback([8, 20, 8]);
-    });
-    button.addEventListener("dragend", handleSidebarProjectDragEnd);
-    button.addEventListener("click", () => {
+    button.addEventListener("click", (event) => {
       if (Date.now() < state.suppressSidebarProjectClickUntil) return;
-      setActiveProject(button.dataset.sidebarProject);
-      if (state.expandedProjectPaths.has(button.dataset.sidebarProject)) {
-        state.expandedProjectPaths.delete(button.dataset.sidebarProject);
+      event.preventDefault();
+      event.stopPropagation();
+      const isMobile = window.matchMedia("(max-width: 760px)").matches;
+      const path = button.dataset.sidebarProject;
+      const wasActive = path === activeProjectPath();
+      const wasExpanded = state.expandedProjectPaths.has(path);
+      setActiveProject(path);
+      // Switching projects should reveal its sessions. Clicking the already
+      // active expanded project is the intentional collapse gesture.
+      if (wasActive && wasExpanded) {
+        state.expandedProjectPaths.delete(path);
       } else {
-        state.expandedProjectPaths.add(button.dataset.sidebarProject);
+        state.expandedProjectPaths.add(path);
       }
       saveExpandedProjectPaths();
-      loadView(activeView()).catch(showError);
+      // On mobile, do NOT trigger loadView — it would auto-close the
+      // sidebar via switchView, hiding the session list the user just
+      // expanded. The full chat view will fire when the user taps a
+      // session below.
+      if (!isMobile) {
+        loadView(activeView()).catch(showError);
+      }
       renderSidebarProjects();
+      renderSidebarSessions();
     });
   });
   target.querySelectorAll("[data-project-menu-button]").forEach((button) => {
@@ -641,106 +1219,640 @@ function renderSidebarProjects() {
       hideSidebarProject(button.dataset.projectHide);
     });
   });
-  target.querySelectorAll("[data-sidebar-session]").forEach((button) => {
-    button.addEventListener("click", async (event) => {
+	  target.querySelectorAll("[data-sidebar-new-chat]").forEach((button) => {
+	    button.addEventListener("click", (event) => {
+	      event.stopPropagation();
+	      event.preventDefault();
+	      hapticFeedback(8);
+	      startNewChatForProject(button.dataset.sidebarNewChat).catch(showError);
+	    });
+    button.addEventListener("pointerdown", (event) => {
+      // Keep this control isolated from surrounding project/session clicks.
       event.stopPropagation();
-      if (button.dataset.sidebarProjectPath) setActiveProject(button.dataset.sidebarProjectPath);
-      state.pendingChatSessionId = button.dataset.sidebarSession || "";
-      const sessionIdInput = qs("#session-id-input");
-      if (sessionIdInput) sessionIdInput.value = button.dataset.sidebarSession;
-      const sessionProvider = qs("#session-provider");
-      if (sessionProvider) sessionProvider.value = button.dataset.sidebarProvider || sessionProvider.value;
-      setChatProvider(button.dataset.sidebarProvider || chatProvider());
-      await switchView("chat");
     });
   });
-  target.querySelectorAll("[data-sidebar-project-row]").forEach((row) => {
-    row.addEventListener("dragstart", (event) => {
-      if (event.target.closest(".project-menu-wrap")) {
-        event.preventDefault();
-        return;
-      }
-      state.pointerProjectDrag = null;
-      document.removeEventListener("pointermove", handleSidebarProjectPointerMove);
-      state.draggedProjectPath = row.dataset.sidebarProjectRow;
-      row.classList.add("dragging");
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData("text/plain", state.draggedProjectPath);
-      hapticFeedback(12);
-    });
-    row.addEventListener("dragover", (event) => {
-      const sourcePath = state.draggedProjectPath || event.dataTransfer.getData("text/plain");
-      if (!sourcePath || sourcePath === row.dataset.sidebarProjectRow) return;
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "move";
-      clearSidebarProjectDragClasses();
-      row.classList.add("drag-over");
-    });
-    row.addEventListener("drop", (event) => {
-      const sourcePath = state.draggedProjectPath || event.dataTransfer.getData("text/plain");
-      if (!sourcePath) return;
-      event.preventDefault();
-      moveProjectOrder(
-        sourcePath,
-        row.dataset.sidebarProjectRow,
-        projectDropPlacement(sourcePath, row.dataset.sidebarProjectRow, event, row),
-      );
-      handleSidebarProjectDragEnd();
-      hapticFeedback([8, 20, 8]);
-    });
-    row.addEventListener("dragend", handleSidebarProjectDragEnd);
-    row.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 || event.target.closest(".project-menu-wrap")) return;
-      row.setPointerCapture?.(event.pointerId);
+  bindSidebarSessionActions(target);
+  target.querySelectorAll("[data-sidebar-drag-handle]").forEach((handle) => {
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      // Initiate drag only from the dedicated grip handle, never from the
+      // rest of the row. This frees the rest of the row for vertical scroll
+      // gestures on touch devices and for ordinary click-to-open on desktop.
+      const projectPath = handle.dataset.sidebarDragHandle;
+      const row = handle.closest("[data-sidebar-project-row]");
+      if (!projectPath || !row) return;
       state.pointerProjectDrag = {
-        path: row.dataset.sidebarProjectRow,
+        path: projectPath,
         startX: event.clientX,
         startY: event.clientY,
+        startedAt: Date.now(),
         dragging: false,
       };
       hapticFeedback(6);
+      // The handle lives inside the project button. Suppress the next
+      // button click so a tap on the grip doesn't toggle the project.
+      state.suppressSidebarProjectClickUntil = Date.now() + 600;
+      // Stop the project-item button click that would otherwise fire on the
+      // same pointerup once the drag ends without committing to a reorder.
+      event.stopPropagation();
+      event.preventDefault();
       document.addEventListener("pointermove", handleSidebarProjectPointerMove, { passive: false });
       document.addEventListener("pointerup", finishSidebarProjectPointerDrag, { once: true });
       document.addEventListener("pointercancel", finishSidebarProjectPointerDrag, { once: true });
     });
+    // Keyboard fallback: focus the handle and press Space/Enter to "pick up"
+    // the project, then arrow keys to move it within the sidebar list.
+    handle.addEventListener("keydown", (event) => {
+      if (![" ", "Enter", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+      event.preventDefault();
+      const projectPath = handle.dataset.sidebarDragHandle;
+      const projects = orderedProjects()
+        .filter((project) => !sidebarProjectMeta(project.path).hidden)
+        .filter(projectMatchesSidebarSearch)
+        .map((p) => p.path);
+      const fromIndex = projects.indexOf(projectPath);
+      if (fromIndex < 0) return;
+      let toIndex = fromIndex;
+      if (event.key === "ArrowUp") toIndex = Math.max(0, fromIndex - 1);
+      if (event.key === "ArrowDown") toIndex = Math.min(projects.length - 1, fromIndex + 1);
+      if (toIndex === fromIndex) return;
+      const target = projects[toIndex];
+      const placement = toIndex < fromIndex ? "before" : "after";
+      moveProjectOrder(projectPath, target, placement);
+      hapticFeedback([8, 20, 8]);
+      // Restore focus to the handle after the re-render so the user can
+      // keep arrow-keying the row around the list.
+      requestAnimationFrame(() => {
+        const next = document.querySelector(`[data-sidebar-drag-handle="${CSS.escape(projectPath)}"]`);
+        next?.focus();
+      });
+    });
   });
+}
+
+function formatRelativeTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const diffMs = Date.now() - date.getTime();
+  const sec = Math.round(diffMs / 1000);
+  if (sec < 0) return "just now";
+  if (sec < 30) return "just now";
+  if (sec < 60) return `${sec} seconds ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} minute${min === 1 ? "" : "s"} ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr} hour${hr === 1 ? "" : "s"} ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day} day${day === 1 ? "" : "s"} ago`;
+  const mon = Math.floor(day / 30);
+  if (mon < 12) return `${mon} month${mon === 1 ? "" : "s"} ago`;
+  const yr = Math.floor(day / 365);
+  return `${yr} year${yr === 1 ? "" : "s"} ago`;
 }
 
 function renderSidebarSessions() {
   const target = qs("#sidebar-sessions");
   if (!target) return;
-  const sessions = sidebarSessions().filter(sessionMatchesSidebarSearch).slice(0, 8);
+  const search = (qs("#sidebar-search")?.value || "").trim().toLowerCase();
+  const sessions = sidebarSessions()
+    .filter((session) => !search || sessionMatchesSidebarSearch(session))
+    .sort((a, b) => new Date(b.lastActivity || b.updatedAt || 0) - new Date(a.lastActivity || a.updatedAt || 0))
+    .slice(0, 30);
   if (!sessions.length) {
     target.innerHTML = '<p class="sidebar-empty">No recent sessions.</p>';
     return;
   }
   target.innerHTML = sessions.map((session) => {
-    const title = session.title || session.summary || session.id;
-    const project = session.projectName || activeProjectName("#active-project") || session.projectPath || "Project";
-    return `<button type="button" class="sidebar-item" data-sidebar-session="${escapeHtml(session.id)}" data-sidebar-provider="${escapeHtml(session.provider || "codex")}" data-sidebar-project-path="${escapeHtml(session.projectPath || "")}">
-      <strong>${escapeHtml(title)}</strong>
-      <span>${escapeHtml(project)} · ${escapeHtml(session.provider || "")}</span>
-      <em>${session.messageCount || 0} messages</em>
-    </button>`;
+    return sidebarSessionCardHtml(session);
   }).join("");
-  target.querySelectorAll("[data-sidebar-session]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      if (button.dataset.sidebarProjectPath) setActiveProject(button.dataset.sidebarProjectPath);
-      state.pendingChatSessionId = button.dataset.sidebarSession || "";
-      const sessionIdInput = qs("#session-id-input");
-      if (sessionIdInput) sessionIdInput.value = button.dataset.sidebarSession;
-      const sessionProvider = qs("#session-provider");
-      if (sessionProvider) sessionProvider.value = button.dataset.sidebarProvider || sessionProvider.value;
-      setChatProvider(button.dataset.sidebarProvider || chatProvider());
-      await switchView("chat");
-    });
-  });
+  bindSidebarSessionActions(target);
 }
 
-async function deleteProject(projectName) {
-  if (!projectName) return;
-  await api(`/api/projects/${encodeURIComponent(projectName)}`, { method: "DELETE" });
-  await loadProjects();
+
+// ---------------------------------------------------------------------------
+// Chat history loaders.  When the user opens a chat session from the sidebar
+// (or when bootstrap auto-picks the most recent session), we hydrate the
+// transcript by replaying the persisted messages into `#chat-output` with
+// the user prompts floated right and assistant replies left-aligned. We also
+// restore the per-session overrides + footer metadata so the chat looks
+// identical to the live session it was when the user last used it.
+// ---------------------------------------------------------------------------
+
+function resetChatOutputDom() {
+  const output = qs("#chat-output");
+  if (output) output.innerHTML = "";
+  chatStream = { role: null, node: null, text: null, buffer: "" };
+  state.chatProcessing = null;
+  state.chatBuffer = "";
+  renderChatFooter(null);
+  updateChatEmptyState();
+}
+
+// The current assistant message that's being streamed into.  We keep
+// references so each new chunk renders into the right text node without
+// tearing down the existing struct.
+let chatStream = { role: null, node: null, text: null, buffer: "" };
+
+function chatOutputRoot() {
+  return qs("#chat-output");
+}
+
+function scrollChatToBottom() {
+  const output = chatOutputRoot();
+  if (!output) return;
+  output.scrollTop = output.scrollHeight;
+}
+
+function buildChatLineNode(role) {
+  const node = document.createElement("div");
+  node.className = role === "user" ? "chat-line-user" : "chat-line-assistant";
+  const text = document.createElement("div");
+  text.className = "chat-line-text";
+  const footer = document.createElement("div");
+  footer.className = "chat-line-footer";
+  node.appendChild(text);
+  node.appendChild(footer);
+  return { node, text, footer };
+}
+
+function chatEventSessionIds() {
+  return new Set([
+    state.chatSessionId,
+    state.pendingChatSessionId,
+    state.currentSession?.sessionId,
+    state.preferences?.lastChatSessionId,
+  ].filter(Boolean));
+}
+
+function isActiveChatSessionEvent(payload = {}) {
+  if (!payload.sessionId) return false;
+  const ids = chatEventSessionIds();
+  if (!ids.size) return true;
+  return ids.has(payload.sessionId);
+}
+
+function sessionMetaForStatus(payload = {}) {
+  const sid = payload.sessionId || state.chatSessionId || state.pendingChatSessionId;
+  const persisted = getSessionOverridesFor(sid) || {};
+  const normalized = normalizeMessageMeta(persisted);
+  return {
+    ...normalized,
+    cli: payload.provider || normalized.cli || state.preferences.chatCli || state.preferences.chatProvider || "codex",
+    model: normalized.model || state.preferences.chatModel || "",
+    mode: normalized.mode || state.preferences.chatMode || "",
+    effort: normalized.effort || state.preferences.chatEffort || "",
+    thinking: normalized.thinking ?? state.preferences.chatThinking,
+  };
+}
+
+function setProcessingText(textNode, label = "Processing") {
+  if (!textNode) return;
+  textNode.innerHTML = `<span class="chat-processing-label">${escapeHtml(label)}</span><span class="chat-processing-dots" aria-hidden="true"></span>`;
+}
+
+function ensureChatProcessing(payload = {}) {
+  if (!isActiveChatSessionEvent(payload)) return null;
+  const output = chatOutputRoot();
+  if (!output) return null;
+  if (chatStream.node?.isConnected && chatStream.role === "assistant" && state.chatBuffer) {
+    return null;
+  }
+  if (state.chatProcessing?.node?.isConnected) {
+    renderChatLineFooter(state.chatProcessing.footer, sessionMetaForStatus(payload));
+    scrollChatToBottom();
+    updateChatEmptyState();
+    return state.chatProcessing;
+  }
+  const line = buildChatLineNode("assistant");
+  line.node.classList.add("chat-line-processing");
+  line.node.dataset.processingSessionId = payload.sessionId || "";
+  setProcessingText(line.text);
+  renderChatLineFooter(line.footer, sessionMetaForStatus(payload));
+  output.appendChild(line.node);
+  state.chatProcessing = {
+    provider: payload.provider || "",
+    sessionId: payload.sessionId || "",
+    ...line,
+  };
+  scrollChatToBottom();
+  updateChatEmptyState();
+  return state.chatProcessing;
+}
+
+function adoptChatProcessingForStream() {
+  const processing = state.chatProcessing;
+  if (!processing?.node?.isConnected) return false;
+  processing.node.classList.remove("chat-line-processing");
+  delete processing.node.dataset.processingSessionId;
+  if (processing.text) processing.text.textContent = "";
+  chatStream = {
+    role: "assistant",
+    node: processing.node,
+    text: processing.text,
+    footer: processing.footer,
+    buffer: "",
+  };
+  state.chatProcessing = null;
+  return true;
+}
+
+function clearChatProcessing() {
+  const processing = state.chatProcessing;
+  if (processing?.node?.isConnected) processing.node.remove();
+  state.chatProcessing = null;
+}
+
+function finishChatProcessing(payload = {}, label = "") {
+  if (!state.chatProcessing?.node?.isConnected) return false;
+  if (payload.sessionId && state.chatProcessing.sessionId && payload.sessionId !== state.chatProcessing.sessionId) {
+    return false;
+  }
+  if (!label) {
+    clearChatProcessing();
+    updateChatEmptyState();
+    return true;
+  }
+  state.chatProcessing.node.classList.remove("chat-line-processing");
+  state.chatProcessing.node.classList.add("chat-line-system");
+  state.chatProcessing.text.textContent = label;
+  renderChatLineFooter(state.chatProcessing.footer, sessionMetaForStatus(payload));
+  state.chatProcessing = null;
+  scrollChatToBottom();
+  updateChatEmptyState();
+  return true;
+}
+
+function renderChatLineFooter(footer, meta) {
+  if (!footer) return;
+  if (!meta || typeof meta !== "object") {
+    footer.innerHTML = "";
+    return;
+  }
+  const items = [];
+  if (meta.cli) items.push(`<span>Cli: <strong>${escapeHtml(meta.cli)}</strong></span>`);
+  if (meta.model) items.push(`<span>Model: <strong>${escapeHtml(meta.model)}</strong></span>`);
+  // Mode / effort are persisted as strings (including "default"/"medium").
+  // Show them whenever the field is present and non-empty so the footer
+  // reflects what was actually sent.
+  if (meta.mode !== undefined && meta.mode !== null && meta.mode !== "") {
+    items.push(`<span>Mode: <strong>${escapeHtml(meta.mode)}</strong></span>`);
+  }
+  if (meta.effort !== undefined && meta.effort !== null && meta.effort !== "") {
+    items.push(`<span>Effort: <strong>${escapeHtml(meta.effort)}</strong></span>`);
+  }
+  if (meta.thinking) items.push(`<span>Thinking on</span>`);
+  if (meta.tokenUsage) items.push(`<span>Tokens: <strong>${escapeHtml(meta.tokenUsage)}</strong></span>`);
+  if (meta.receivedAt) items.push(`<span>Received: <strong>${escapeHtml(meta.receivedAt)}</strong></span>`);
+  if (meta.elapsed) items.push(`<span>Elapsed: <strong>${escapeHtml(meta.elapsed)}</strong></span>`);
+  if (meta.sentAt) items.push(`<span>Sent: <strong>${escapeHtml(meta.sentAt)}</strong></span>`);
+  footer.innerHTML = items.join("");
+}
+
+function replayUserPromptLine(prompt, meta) {
+  const output = chatOutputRoot();
+  if (!output) return;
+  const isHtml = typeof prompt === "string" && /<[a-z][^>]*>/i.test(prompt);
+  const { node, text, footer } = buildChatLineNode("user");
+  if (isHtml) text.innerHTML = prompt;
+  else text.textContent = String(prompt);
+  renderChatLineFooter(footer, meta);
+  output.appendChild(node);
+}
+
+function replayAssistantLine(content, meta) {
+  const output = chatOutputRoot();
+  if (!output) return;
+  const isHtml = typeof content === "string" && /<[a-z][^>]*>/i.test(content);
+  const { node, text, footer } = buildChatLineNode("assistant");
+  if (isHtml) text.innerHTML = content;
+  else text.textContent = String(content);
+  renderChatLineFooter(footer, meta);
+  output.appendChild(node);
+}
+
+function replayChatMessages(messages) {
+  for (const raw of messages) {
+    if (!raw) continue;
+    const role = String(raw.role || "").toLowerCase();
+    const content = raw.content == null ? "" : String(raw.content);
+    // Per-turn metadata (cli / model / sentAt / receivedAt / tokenUsage /
+    // elapsed) is stored on each message row in storage. Fall back to the
+    // legacy `meta` alias in case older sessions used it.
+    const persistedMeta = raw.metadata && typeof raw.metadata === "object"
+      ? raw.metadata
+      : (raw.meta && typeof raw.meta === "object" ? raw.meta : {});
+    const meta = normalizeMessageMeta(persistedMeta);
+    if (role === "user") replayUserPromptLine(content, meta);
+    else if (role === "assistant") replayAssistantLine(content, meta);
+    else if (role === "system") {
+      const output = chatOutputRoot();
+      if (!output) return;
+      const node = document.createElement("div");
+      node.className = "chat-line-system";
+      node.textContent = content;
+      output.appendChild(node);
+    }
+  }
+  scrollChatToBottom();
+}
+
+// Normalize raw metadata stored in storage. ISO timestamps become the
+// format used by `renderChatLineFooter` and `elapsedMs` is converted into
+// the human-friendly `elapsed` string the footer expects.
+function formatTokenUsage(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (typeof value !== "object") return "";
+  const used = Number(value.used) || 0;
+  const input = Number(value.input) || 0;
+  const output = Number(value.output) || 0;
+  if (!used && !input && !output) return "";
+  return `${used} (in ${input} / out ${output})`;
+}
+
+function normalizeMessageMeta(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const meta = { ...raw };
+  if (typeof meta.receivedAt === "string" && !Number.isNaN(new Date(meta.receivedAt).getTime())) {
+    meta.receivedAt = formatReceivedDateTime(meta.receivedAt);
+  }
+  if (typeof meta.sentAt === "string" && !Number.isNaN(new Date(meta.sentAt).getTime())) {
+    meta.sentAt = formatReceivedDateTime(meta.sentAt);
+  }
+  if (typeof meta.elapsedMs === "number" && meta.elapsedMs >= 0 && !meta.elapsed) {
+    const totalMs = meta.elapsedMs;
+    if (totalMs < 1000) meta.elapsed = "<1s";
+    else {
+      const s = Math.round(totalMs / 1000);
+      if (s < 60) meta.elapsed = `${s}s`;
+      else {
+        const m = Math.floor(s / 60);
+        const r = s % 60;
+        meta.elapsed = r ? `${m}m ${r}s` : `${m}m`;
+      }
+    }
+  }
+  // tokenUsage may be persisted as an object {used,input,output,...} on the
+  // message row; flatten it to the display string the footer expects.
+  if (meta.tokenUsage && typeof meta.tokenUsage === "object") {
+    meta.tokenUsage = formatTokenUsage(meta.tokenUsage);
+  }
+  delete meta.elapsedMs;
+  return meta;
+}
+
+async function loadChatHistoryForSession(sessionId, opts = {}) {
+  if (!sessionId) return false;
+  try {
+    const url = `/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=200&offset=0`;
+    const body = await api(url);
+    const messages = Array.isArray(body) ? body : (body.messages || []);
+    resetChatOutputDom();
+    const persisted = getSessionOverridesFor(sessionId) || {};
+    const all = readSessionOverrides();
+    const overrides = all[sessionId] || {};
+    const replayMeta = (msg, role) => {
+      // Prefer the per-message metadata persisted on the message row by the
+      // server. Fall back to the legacy per-session override so older turns
+      // still render something useful in the footer.
+      const stored = msg.metadata && typeof msg.metadata === "object"
+        ? msg.metadata
+        : (msg.meta && typeof msg.meta === "object" ? msg.meta : null);
+      if (stored) {
+        const normalized = normalizeMessageMeta(stored);
+        if (Object.keys(normalized).length) return normalized;
+      }
+      const isLatest = messages.indexOf(msg) === messages.length - 1;
+      if (role === "user") {
+        return {
+          cli: persisted.cli || persisted.provider,
+          model: persisted.model,
+          mode: persisted.mode,
+          effort: persisted.effort,
+          sentAt: persisted.sentAt,
+        };
+      }
+      return {
+        cli: persisted.cli || persisted.provider,
+        model: persisted.model,
+        mode: persisted.mode,
+        effort: persisted.effort,
+        tokenUsage: isLatest ? persisted.tokenUsage : "",
+        receivedAt: isLatest ? persisted.receivedAt : "",
+        elapsed: isLatest ? persisted.elapsed : "",
+      };
+    };
+    for (const raw of messages) {
+      if (!raw) continue;
+      const role = String(raw.role || "").toLowerCase();
+      const content = raw.content == null ? "" : String(raw.content);
+      const meta = replayMeta(raw, role);
+      if (role === "user") replayUserPromptLine(content, meta);
+      else if (role === "assistant") replayAssistantLine(content, meta);
+      else if (role === "system") {
+        const output = chatOutputRoot();
+        if (!output) continue;
+        const node = document.createElement("div");
+        node.className = "chat-line-system";
+        node.textContent = content;
+        output.appendChild(node);
+      }
+    }
+    scrollChatToBottom();
+    // Restore the per-session overrides + footer (legacy slot).
+    loadSessionOverridesIntoState(sessionId);
+    renderChatFooter(getSessionOverridesFor(sessionId));
+    updateChatEmptyState();
+    return true;
+  } catch (error) {
+    showError(new Error(`Could not load chat history: ${error.message}`));
+    return false;
+  }
+}
+
+async function pickChatSession(sessionId, projectPath) {
+  const id = (sessionId || "").trim();
+  if (!id) return;
+  const session = findChatSession(id);
+  state.pendingChatSessionId = id;
+  state.chatSessionId = id;
+  state.preferences.lastChatSessionId = id;
+  savePreferences();
+  if (projectPath) setActiveProject(projectPath);
+  await switchView("chat");
+  if (session?.pending) {
+    resetChatOutputDom();
+    updateChatEmptyState();
+    return;
+  }
+  state.pendingChatSessionId = "";
+  await loadChatHistoryForSession(id);
+}
+
+// Start a fresh chat session for a given project. Wipes any active session
+// pointer, makes the project the active one, focuses the prompt, and clears
+// the chat output so the user can type and send right away. Also inserts a
+// placeholder session entry under the project in the sidebar so the user
+// can see where the new chat will live before they type anything; the
+// server adopts this id when the first message is submitted, so the entry
+// transitions seamlessly from placeholder to real session.
+async function startNewChatForProject(projectPath) {
+  if (!projectPath) return;
+  setActiveProject(projectPath);
+  const project = (state.projects || []).find((p) => p.path === projectPath);
+  const cli = chatCliValue();
+  const placeholderId = `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  if (!Array.isArray(state.sessions)) state.sessions = [];
+  // Remove any other placeholder session we created earlier in this project
+  // so the sidebar only ever shows one "new chat" pending entry.
+  state.sessions = state.sessions.filter((session) => {
+    if (!session || !session.pending) return true;
+    const sessionPath = session.projectPath || session.projectName;
+    return sessionPath !== projectPath && sessionPath !== (project && project.name);
+  });
+  state.sessions.push({
+    id: placeholderId,
+    provider: cli,
+    projectPath,
+    projectName: project && project.name,
+    title: "New chat",
+    messageCount: 0,
+    pending: true,
+    lastActivity: new Date().toISOString(),
+  });
+  state.chatSessionId = placeholderId;
+  state.pendingChatSessionId = placeholderId;
+  state.preferences.lastChatSessionId = placeholderId;
+  state.chatBuffer = "";
+  if (!state.expandedProjectPaths.has(projectPath)) {
+    state.expandedProjectPaths.add(projectPath);
+    saveExpandedProjectPaths();
+  }
+  savePreferences();
+  renderProjects();
+  renderSidebarProjects();
+  await switchView("chat");
+  resetChatOutputDom();
+  updateChatEmptyState();
+  const prompt = qs("#chat-prompt");
+  if (prompt) {
+    prompt.value = "";
+    prompt.focus();
+    autosizeChatPrompt();
+  }
+}
+
+function pickDefaultChatSession() {
+  // Choose the most recent session we can find.  If the active project has
+  // sessions, prefer those; otherwise fall back to the single most-recent
+  // session across all projects.
+  const allSessions = []
+    .concat(
+      ...(state.projects || []).map((p) => (p.sessions || []).map((s) => ({ ...s, projectPath: p.path }))),
+    )
+    .concat((state.sessions || []).map((s) => ({ ...s })));
+  if (!allSessions.length) return null;
+  const activePath = activeProjectPath();
+  const activeProject = activePath
+    ? (state.projects || []).find((p) => p.path === activePath)
+    : null;
+  const activeSessions = activeProject ? (activeProject.sessions || []) : [];
+  if (activeSessions.length) {
+    return activeSessions
+      .slice()
+      .sort((a, b) => new Date(b.lastActivity || 0) - new Date(a.lastActivity || 0))[0];
+  }
+  // No active project (or no sessions in it): pick topmost project with the
+  // most recent chat history.
+  const projectsWithSessions = (state.projects || [])
+    .filter((p) => (p.sessions || []).length > 0);
+  if (!projectsWithSessions.length) return null;
+  // Collect all sessions, attach their project path, and pick the newest.
+  return projectsWithSessions
+    .flatMap((p) => (p.sessions || []).map((s) => ({ ...s, projectPath: p.path })))
+    .sort((a, b) => new Date(b.lastActivity || 0) - new Date(a.lastActivity || 0))[0];
+}
+
+async function autoOpenLatestChatSession() {
+  const target = pickDefaultChatSession();
+  if (!target) return false;
+  if (target.projectPath) {
+    setActiveProject(target.projectPath);
+  }
+  await pickChatSession(target.id, target.projectPath);
+  return true;
+}
+
+function activeProjectChatSessions() {
+  const project = (state.projects || []).find((item) => item.path === activeProjectPath());
+  return project ? sidebarProjectSessions(project) : [];
+}
+
+function currentChatNavigationEntries() {
+  const current = findChatSession(state.chatSessionId);
+  if (current && isChatSessionPinned(current, sessionProjectPath(current, activeProjectPath()))) {
+    return pinnedChatEntries();
+  }
+  return activeProjectChatSessions();
+}
+
+async function navigateAdjacentChatSession(direction) {
+  if (!state.chatSessionId) return false;
+  const entries = currentChatNavigationEntries();
+  if (entries.length < 2) return false;
+  const currentIndex = entries.findIndex((session) => session.id === state.chatSessionId);
+  if (currentIndex < 0) return false;
+  const nextIndex = currentIndex + direction;
+  if (nextIndex < 0 || nextIndex >= entries.length) return false;
+  const next = entries[nextIndex];
+  if (!next?.id) return false;
+  hapticFeedback(8);
+  await pickChatSession(next.id, sessionProjectPath(next, activeProjectPath()));
+  renderSidebarProjects();
+  return true;
+}
+
+function chatSwipeIgnoredTarget(target) {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest("button, a, input, textarea, select, .chat-composer, .chat-provider-picker"));
+}
+
+function handleChatTouchStart(event) {
+  if (window.innerWidth >= 640 || chatSwipeIgnoredTarget(event.target)) return;
+  const touch = event.touches?.[0];
+  if (!touch) return;
+  state.chatSwipe = {
+    startX: touch.clientX,
+    startY: touch.clientY,
+    deltaX: 0,
+    deltaY: 0,
+  };
+}
+
+function handleChatTouchMove(event) {
+  if (!state.chatSwipe) return;
+  const touch = event.touches?.[0];
+  if (!touch) return;
+  state.chatSwipe.deltaX = touch.clientX - state.chatSwipe.startX;
+  state.chatSwipe.deltaY = touch.clientY - state.chatSwipe.startY;
+}
+
+function resetChatSwipe() {
+  state.chatSwipe = null;
+}
+
+function handleChatTouchEnd() {
+  const swipe = state.chatSwipe;
+  resetChatSwipe();
+  if (!swipe || window.innerWidth >= 640) return;
+  const horizontalDistance = Math.abs(swipe.deltaX);
+  const verticalDistance = Math.abs(swipe.deltaY);
+  const horizontal = horizontalDistance >= CHAT_SWIPE_MIN_DISTANCE
+    && verticalDistance <= CHAT_SWIPE_MAX_VERTICAL_DRIFT
+    && horizontalDistance > verticalDistance * CHAT_SWIPE_DIRECTION_RATIO;
+  if (!horizontal) return;
+  navigateAdjacentChatSession(swipe.deltaX > 0 ? -1 : 1).catch(showError);
 }
 
 function renderSessions() {
@@ -801,8 +1913,23 @@ function resetVirtualList(key) {
 }
 
 function renderSettings() {
+  setSettingsTab(state.activeSettingsTab);
   renderSettingsServerStatus(state.settings);
   renderSettingsResponse(state.settings);
+}
+
+function setSettingsTab(tab) {
+  const next = tab || "agents";
+  state.activeSettingsTab = next;
+  window.localStorage.setItem("iowb.settingsTab", next);
+  document.querySelectorAll("[data-settings-tab]").forEach((button) => {
+    const active = button.dataset.settingsTab === next;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  document.querySelectorAll("[data-settings-panel]").forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset.settingsPanel === next);
+  });
 }
 
 function renderSettingsServerStatus(body) {
@@ -825,8 +1952,10 @@ function renderSettingsServerStatus(body) {
 }
 
 function renderMetrics() {
+  const grid = qs("#metrics-grid");
+  if (!grid) return;
   const metrics = state.metrics?.metrics || {};
-  qs("#metrics-grid").innerHTML = [
+  grid.innerHTML = [
     metricCard(metrics.projects?.count ?? 0, "Projects"),
     metricCard(metrics.sessions?.active ?? 0, "Active Sessions"),
     metricCard(metrics.processes?.active ?? 0, "Processes"),
@@ -889,6 +2018,21 @@ function bindCopyButtons(root = document) {
   });
 }
 
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value || "");
+    return;
+  }
+  const area = document.createElement("textarea");
+  area.value = value || "";
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+}
+
 function savePreferences() {
   window.localStorage.setItem("iowb.webPreferences", JSON.stringify(state.preferences));
 }
@@ -919,8 +2063,12 @@ function applyChatProviderPreference() {
     ? state.preferences.chatProvider
     : "codex";
   state.preferences.chatProvider = provider;
-  const select = qs("#chat-provider-setting");
-  if (select) select.value = provider;
+  state.preferences.chatCli = provider;
+  // The legacy settings-panel chat-provider dropdown may still exist; keep
+  // it in sync if present.
+  const settingSelect = qs("#chat-provider-setting");
+  if (settingSelect) settingSelect.value = provider;
+  renderChatProviderPicker();
 }
 
 async function applyTerminalSizePreference(syncServer = false) {
@@ -931,6 +2079,176 @@ async function applyTerminalSizePreference(syncServer = false) {
   }
 }
 
+// Chat override controls (Model / Mode / Effort) live directly above the
+// prompt input. The CLI and Thinking toggles were removed from the
+// composer — they're driven by the stored preferences (and the sidebar
+// provider buttons). Per-session overrides are persisted to
+// iowb.webPreferences.chatSessionOverrides so the chat "remembers" what
+// the user picked across refreshes.
+const CHAT_PROVIDERS_LOCAL = ["codex", "claude", "gemini"];
+
+function chatCliValue() {
+  const v = state.preferences.chatCli || state.preferences.chatProvider;
+  return CHAT_PROVIDERS_LOCAL.includes(v) ? v : "codex";
+}
+
+function isGatewayModelValue(value) {
+  return /^[a-z][a-z0-9_-]{1,12}:/i.test(String(value || "").trim());
+}
+
+function runtimeProviderForModel(provider, model) {
+  return provider === "codex" && isGatewayModelValue(model) ? "codex" : provider;
+}
+
+function shouldFetchTokenUsage(provider, model) {
+  return provider === "codex" || !isGatewayModelValue(model);
+}
+
+function chatModelValue() {
+  return qs("#chat-model")?.value || state.preferences.chatModel || "";
+}
+
+function chatModeValue() {
+  return qs("#chat-mode")?.value || state.preferences.chatMode || "default";
+}
+
+function chatEffortValue() {
+  return qs("#chat-effort")?.value || state.preferences.chatEffort || "medium";
+}
+
+function chatThinkingValue() {
+  return Boolean(state.preferences.chatThinking);
+}
+
+async function loadChatModelsIntoSelect(provider) {
+  const select = qs("#chat-model");
+  if (!select) return;
+  if (!canLoadProtectedData()) {
+    select.disabled = true;
+    select.innerHTML = `<option value="">Sign in to load models</option>`;
+    return;
+  }
+  const targetProvider = CHAT_PROVIDERS_LOCAL.includes(provider) ? provider : "codex";
+  select.dataset.modelProvider = targetProvider;
+  select.disabled = true;
+  try {
+    const body = await api(`/api/chat/models?provider=${encodeURIComponent(targetProvider)}`);
+    if (select.dataset.modelProvider !== targetProvider) return;
+    const list = Array.isArray(body.models) ? body.models : [];
+    // Normalize each entry to {value,label}. The server may return either a
+    // plain string or an object {value,label} depending on which catalog
+    // contributed the row (CLI, curated fallback, or AI proxy).
+    const entries = list
+      .map((entry) => {
+        if (entry === null || entry === undefined) return null;
+        if (typeof entry === "string") return { value: entry, label: entry };
+        if (typeof entry === "object") {
+          const value = entry.value ?? entry.id ?? entry.name ?? "";
+          if (!value) return null;
+          return { value: String(value), label: String(entry.label ?? value) };
+        }
+        return null;
+      })
+      .filter(Boolean);
+    const current = select.value;
+    select.innerHTML = entries.length
+      ? entries.map((m) => `<option value="${escapeHtml(m.value)}">${escapeHtml(m.label)}</option>`).join("")
+      : `<option value="">No models available</option>`;
+    const values = entries.map((m) => m.value);
+    if (current && values.includes(current)) select.value = current;
+    else if (state.preferences.chatModel && values.includes(state.preferences.chatModel)) {
+      select.value = state.preferences.chatModel;
+    } else if (values.length) {
+      select.value = values[0];
+    }
+    state.preferences.chatModel = select.value || "";
+    savePreferences();
+  } catch (error) {
+    console.warn("[io-workbench] could not load chat models", error);
+  } finally {
+    if (select.dataset.modelProvider === targetProvider) select.disabled = false;
+  }
+}
+
+function readSessionOverrides() {
+  return (state.preferences && state.preferences.chatSessionOverrides) || {};
+}
+
+function writeSessionOverrides(next) {
+  if (!state.preferences) state.preferences = {};
+  state.preferences.chatSessionOverrides = next || {};
+  savePreferences();
+}
+
+function getSessionOverridesFor(sessionId) {
+  return sessionId ? readSessionOverrides()[sessionId] || null : null;
+}
+
+function saveSessionOverrides(sessionId, patch) {
+  if (!sessionId) return;
+  const all = readSessionOverrides();
+  all[sessionId] = Object.assign({}, all[sessionId] || {}, patch);
+  writeSessionOverrides(all);
+}
+
+function loadSessionOverridesIntoState(sessionId) {
+  const entry = getSessionOverridesFor(sessionId);
+  if (!entry) return;
+  if (entry.cli) {
+    state.preferences.chatCli = entry.cli;
+    state.preferences.chatProvider = entry.cli;
+  }
+  if (entry.model !== undefined) {
+    state.preferences.chatModel = entry.model;
+    const s = qs("#chat-model");
+    if (s) s.value = entry.model;
+  }
+  if (entry.effort !== undefined) {
+    state.preferences.chatEffort = entry.effort;
+    const s = qs("#chat-effort");
+    if (s) s.value = entry.effort;
+  }
+  if (entry.mode !== undefined) {
+    state.preferences.chatMode = entry.mode;
+    const s = qs("#chat-mode");
+    if (s) s.value = entry.mode;
+  }
+  if (entry.thinking !== undefined) {
+    state.preferences.chatThinking = entry.thinking;
+  }
+  renderChatProviderPicker();
+}
+
+function savePreferencesToLocal() {
+  if (!state.preferences) state.preferences = {};
+  savePreferences();
+}
+
+function renderChatFooter(meta) {
+  const root = qs("#chat-footer");
+  if (!root) return;
+  if (!meta || typeof meta !== "object") {
+    root.classList.add("hidden");
+    root.innerHTML = "";
+    return;
+  }
+  const items = [];
+  if (meta.cli) items.push(`<span class="meta">Cli: <strong>${escapeHtml(meta.cli)}</strong></span>`);
+  if (meta.model) items.push(`<span class="meta">Model: <strong>${escapeHtml(meta.model)}</strong></span>`);
+  if (meta.mode) items.push(`<span class="meta">Mode: <strong>${escapeHtml(meta.mode)}</strong></span>`);
+  if (meta.effort) items.push(`<span class="meta">Effort: <strong>${escapeHtml(meta.effort)}</strong></span>`);
+  if (meta.tokenUsage) items.push(`<span class="meta">Tokens: <strong>${escapeHtml(meta.tokenUsage)}</strong></span>`);
+  if (meta.receivedAt) items.push(`<span class="meta">Received: <strong>${escapeHtml(meta.receivedAt)}</strong></span>`);
+  if (meta.elapsed) items.push(`<span class="meta">Elapsed: <strong>${escapeHtml(meta.elapsed)}</strong></span>`);
+  if (items.length) {
+    root.classList.remove("hidden");
+    root.innerHTML = items.join("");
+  } else {
+    root.classList.add("hidden");
+    root.innerHTML = "";
+  }
+}
+
 function applyPreferences() {
   document.body.classList.toggle("compact", !!state.preferences.compact);
   document.body.classList.toggle("wrap-output", !!state.preferences.wrapOutput);
@@ -938,6 +2256,12 @@ function applyPreferences() {
   qs("#pref-wrap").checked = !!state.preferences.wrapOutput;
   applyTerminalSizeToInputs();
   applyChatProviderPreference();
+  // Populate the chat-controls select widgets from current preferences.
+  if (qs("#chat-effort")) qs("#chat-effort").value = state.preferences.chatEffort || "medium";
+  if (qs("#chat-mode")) qs("#chat-mode").value = state.preferences.chatMode || "default";
+  if (qs("#chat-model")) {
+    loadChatModelsIntoSelect(state.preferences.chatCli || state.preferences.chatProvider || "codex").catch(() => {});
+  }
   if (state.codeEditor) {
     state.codeEditor.setOption("lineWrapping", !!state.preferences.wrapOutput);
   }
@@ -1037,14 +2361,21 @@ async function loadAuthStatus() {
 
 async function loadHealth() {
   const health = await api("/health");
-  qs("#server-summary").textContent =
-    `${health.service} ${health.version} · ${health.config_dir}`;
+  const summary = qs("#server-summary");
+  if (summary) {
+    summary.textContent = `${health.service} ${health.version} · ${health.config_dir}`;
+  }
 }
 
 async function loadProjects() {
   const body = await api("/api/projects");
   state.projects = body.projects || [];
   syncProjectOrder();
+  const activeExists = state.projects.some((project) => project.path === state.activeProjectPath);
+  if (!activeExists) {
+    state.activeProjectPath = state.projects[0]?.path || "";
+    window.localStorage.setItem("iowb.activeProjectPath", state.activeProjectPath);
+  }
   renderProjects();
 }
 
@@ -1064,7 +2395,7 @@ async function loadFiles() {
   const path = qs("#files-path").value.trim() || ".";
   const body = await api(`/api/projects/${encodeURIComponent(project)}/files?path=${encodeURIComponent(path)}`);
   state.fileEntries = Array.isArray(body) ? body : body.entries || [];
-  renderFileBreadcrumbs(path);
+  state.fileSelectedPaths = new Set([...state.fileSelectedPaths].filter((selectedPath) => findFileEntryByPath(state.fileEntries, selectedPath)));
   renderFileEntries();
 }
 
@@ -1072,42 +2403,85 @@ function renderFileEntries(entries = state.fileEntries) {
   const target = qs("#files-tree");
   const filter = qs("#files-filter")?.value.trim().toLowerCase() || "";
   const visibleEntries = filterFileEntries(entries, filter);
+  renderFileToolbar(visibleEntries, filter);
   if (!visibleEntries.length) {
-    target.innerHTML = '<p class="empty">No files at this path.</p>';
+    target.innerHTML = `<div class="file-tree-empty">
+      <span class="file-tree-empty-icon" aria-hidden="true"></span>
+      <strong>${filter ? "No matches found" : "No files found"}</strong>
+      <span>${filter ? "Try a different search." : "Check the selected project path."}</span>
+    </div>`;
     return;
   }
-  const flattened = flattenFileEntries(visibleEntries);
-  renderVirtualList(target, "files", flattened, {
-    rowHeight: 40,
-    minRows: 12,
-    fillViewport: true,
-    maxHeight: target.clientHeight || Math.max(360, window.innerHeight - 360),
-    render: ({ entry, depth }) => fileEntryHtml(entry, depth),
-    bind: (root) => {
-      root.querySelectorAll("[data-file-path]").forEach((row) => {
-        row.addEventListener("click", () => openFile(row.dataset.filePath));
-        row.addEventListener("keydown", (event) => {
-          if (event.key !== "Enter" && event.key !== " ") return;
-          event.preventDefault();
-          openFile(row.dataset.filePath);
-        });
-      });
-      root.querySelectorAll("[data-dir-path]").forEach((row) => {
-        const openDirectory = () => {
-          if (!confirmDiscardDirtyFile()) return;
-          qs("#files-path").value = row.dataset.dirPath;
-          resetVirtualList("files");
-          loadFiles().catch(showError);
-        };
-        row.addEventListener("click", openDirectory);
-        row.addEventListener("keydown", (event) => {
-          if (event.key !== "Enter" && event.key !== " ") return;
-          event.preventDefault();
-          openDirectory();
-        });
-      });
-    },
+
+  const flattened = flattenVisibleFileEntries(visibleEntries, 0, !!filter);
+  target.classList.toggle("files-view-simple", state.fileViewMode === "simple");
+  target.classList.toggle("files-view-compact", state.fileViewMode === "compact");
+  target.classList.toggle("files-view-detailed", state.fileViewMode === "detailed");
+  const rows = [];
+  if (state.fileCreating && normalizeProjectPath(state.fileCreating.parentPath) === ".") {
+    rows.push(fileCreateRowHtml(state.fileCreating, 0));
+  }
+  flattened.forEach(({ entry, depth }) => {
+    rows.push(fileEntryHtml(entry, depth));
+    if (
+      state.fileCreating
+      && entry.type === "directory"
+      && normalizeProjectPath(state.fileCreating.parentPath) === normalizeProjectPath(entry.path)
+    ) {
+      rows.push(fileCreateRowHtml(state.fileCreating, depth + 1));
+    }
   });
+  target.innerHTML = rows.join("");
+
+  target.querySelectorAll("[data-file-select]").forEach((checkbox) => {
+    checkbox.addEventListener("click", (event) => event.stopPropagation());
+    checkbox.addEventListener("change", (event) => {
+      const path = event.currentTarget.dataset.fileSelect;
+      if (!path) return;
+      if (event.currentTarget.checked) {
+        state.fileSelectedPaths.add(path);
+      } else {
+        state.fileSelectedPaths.delete(path);
+      }
+      renderFileEntries();
+    });
+  });
+
+  target.querySelectorAll("[data-file-row-path]").forEach((row) => {
+    const activate = () => {
+      const path = row.dataset.fileRowPath;
+      if (!path) return;
+      if (row.dataset.kind === "directory") {
+        toggleFileDirectory(path);
+        return;
+      }
+      openFile(path).catch(showError);
+    };
+    row.addEventListener("click", (event) => {
+      if (event.target.closest("input, button")) return;
+      activate();
+    });
+    row.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      activate();
+    });
+    row.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      const entry = findFileEntryByPath(state.fileEntries, row.dataset.fileRowPath);
+      if (entry) openFileContextMenu(entry, event.clientX, event.clientY);
+    });
+  });
+  target.querySelectorAll("[data-file-menu]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const entry = findFileEntryByPath(state.fileEntries, button.dataset.fileMenu);
+      const rect = button.getBoundingClientRect();
+      if (entry) openFileContextMenu(entry, rect.left, rect.bottom + 4);
+    });
+  });
+  bindFileInlineInputs(target);
 }
 
 function renderFileBreadcrumbs(path) {
@@ -1182,14 +2556,6 @@ function resolvedBrowsePath(requestedPath, entries = []) {
   return firstAbsolute ? filesystemDirname(firstAbsolute.path) : requested;
 }
 
-function joinFilesystemPath(basePath, folderName) {
-  const base = String(basePath || "~").replaceAll("\\", "/").replace(/\/+$/, "");
-  const name = String(folderName || "").replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
-  if (!name) return base || "~";
-  if (!base || base === "/") return `/${name}`;
-  return `${base}/${name}`;
-}
-
 function folderBrowserEntries() {
   const filter = state.folderBrowser.filter.trim().toLowerCase();
   return (state.folderBrowser.entries || [])
@@ -1199,11 +2565,12 @@ function folderBrowserEntries() {
 }
 
 function folderBrowserActionLabel() {
-  return state.folderBrowser.targetInput === "#workspace-path" ? "Use For Workspace" : "Use For Project";
+  return state.folderBrowser.action === "add-project" ? "Add Project" : "Use Folder";
 }
 
 function renderFolderBrowser() {
   const browser = state.folderBrowser;
+  qs("#folder-browser-title").textContent = browser.action === "add-project" ? "Add Project" : "Select Folder";
   qs("#folder-browser-path").textContent = browser.path || "~";
   qs("#folder-browser-filter").value = browser.filter;
   const parentPath = parentFilesystemPath(browser.path);
@@ -1211,6 +2578,7 @@ function renderFolderBrowser() {
   qs("#folder-browser-use").disabled = browser.loading;
   qs("#folder-browser-use").setAttribute("aria-label", folderBrowserActionLabel());
   qs("#folder-browser-use").title = folderBrowserActionLabel();
+  qs("#folder-browser-use").dataset.symbol = browser.action === "add-project" ? "plus" : "check";
   qs("#folder-browser-hidden").classList.toggle("active", browser.showHidden);
   qs("#folder-browser-hidden").setAttribute(
     "aria-label",
@@ -1226,6 +2594,8 @@ function renderFolderBrowser() {
   }
   const entries = folderBrowserEntries();
   const hiddenCount = (browser.entries || []).filter((entry) => entry.type === "directory" && entry.name.startsWith(".")).length;
+  const selectLabel = browser.action === "add-project" ? "Add Project" : "Use Folder";
+  const selectIcon = browser.action === "add-project" ? "plus" : "check";
   status.textContent = entries.length
     ? `${entries.length} folder${entries.length === 1 ? "" : "s"}${!browser.showHidden && hiddenCount ? ` · ${hiddenCount} hidden` : ""}`
     : "No folders found.";
@@ -1237,7 +2607,7 @@ function renderFolderBrowser() {
       </div>
       <div class="folder-row-actions">
         <button type="button" class="icon-button" data-folder-open="${escapeHtml(entry.path)}" aria-label="Open folder" title="Open folder" data-symbol="open"></button>
-        <button type="button" class="icon-button secondary-action" data-folder-select="${escapeHtml(entry.path)}" aria-label="Use folder" title="Use folder" data-symbol="check"></button>
+        <button type="button" class="icon-button secondary-action" data-folder-select="${escapeHtml(entry.path)}" aria-label="${selectLabel}" title="${selectLabel}" data-symbol="${selectIcon}"></button>
       </div>
     </article>
   `).join("");
@@ -1257,7 +2627,7 @@ function renderFolderBrowser() {
     button.addEventListener("click", () => loadFolderBrowser(button.dataset.folderOpen).catch(showError));
   });
   list.querySelectorAll("[data-folder-select]").forEach((button) => {
-    button.addEventListener("click", () => selectFolderBrowserPath(button.dataset.folderSelect));
+    button.addEventListener("click", () => selectFolderBrowserPath(button.dataset.folderSelect).catch(showError));
   });
 }
 
@@ -1274,11 +2644,12 @@ async function loadFolderBrowser(path = state.folderBrowser.path || "~") {
   renderFolderBrowser();
 }
 
-function openFolderBrowser(targetInput = "#project-path") {
-  const currentValue = qs(targetInput)?.value.trim();
+function openFolderBrowser(targetInput = "", options = {}) {
+  const currentValue = targetInput ? qs(targetInput)?.value.trim() : "";
   state.folderBrowser.open = true;
+  state.folderBrowser.action = options.action || "select";
   state.folderBrowser.targetInput = targetInput;
-  state.folderBrowser.path = currentValue || "~";
+  state.folderBrowser.path = options.path || currentValue || "~";
   state.folderBrowser.filter = "";
   state.folderBrowser.entries = [];
   state.folderBrowser.showHidden = false;
@@ -1292,11 +2663,29 @@ function openFolderBrowser(targetInput = "#project-path") {
 
 function closeFolderBrowser() {
   state.folderBrowser.open = false;
-  qs("#folder-browser").classList.add("hidden");
+  qs("#folder-browser")?.classList.add("hidden");
 }
 
-function selectFolderBrowserPath(path = state.folderBrowser.path) {
-  const target = qs(state.folderBrowser.targetInput || "#project-path");
+async function addProjectPath(path) {
+  const trimmed = String(path || "").trim();
+  if (!trimmed) return null;
+  const project = await api("/api/projects/create", {
+    method: "POST",
+    body: JSON.stringify({ path: trimmed }),
+  });
+  await loadProjects();
+  setActiveProject(project?.path || trimmed);
+  showToast("Project added", "ok");
+  return project;
+}
+
+async function selectFolderBrowserPath(path = state.folderBrowser.path) {
+  if (state.folderBrowser.action === "add-project") {
+    await addProjectPath(path);
+    closeFolderBrowser();
+    return;
+  }
+  const target = qs(state.folderBrowser.targetInput || "");
   if (target) {
     target.value = path || "";
     target.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1305,25 +2694,22 @@ function selectFolderBrowserPath(path = state.folderBrowser.path) {
   showToast("Folder selected", "ok");
 }
 
-async function createFolderBrowserFolder() {
-  const input = qs("#folder-create-name");
-  const folderName = input.value.trim();
-  if (!folderName) return;
-  const path = joinFilesystemPath(state.folderBrowser.path, folderName);
-  await api("/api/create-folder", {
-    method: "POST",
-    body: JSON.stringify({ path }),
-  });
-  input.value = "";
-  await loadFolderBrowser(path);
-  showToast("Folder created", "ok");
-}
-
 function flattenFileEntries(entries, depth = 0) {
   return entries.flatMap((entry) => [
     { entry, depth },
     ...flattenFileEntries(entry.children || [], depth + 1),
   ]);
+}
+
+function flattenVisibleFileEntries(entries, depth = 0, forceExpanded = false) {
+  return entries.flatMap((entry) => {
+    const isDirectory = entry.type === "directory";
+    const isExpanded = forceExpanded || state.fileExpandedPaths.has(entry.path);
+    const children = isDirectory && isExpanded
+      ? flattenVisibleFileEntries(entry.children || [], depth + 1, forceExpanded)
+      : [];
+    return [{ entry, depth }, ...children];
+  });
 }
 
 function filterFileEntries(entries, filter) {
@@ -1340,21 +2726,311 @@ function filterFileEntries(entries, filter) {
     .filter(Boolean);
 }
 
+function findFileEntryByPath(entries, path) {
+  for (const entry of entries || []) {
+    if (entry.path === path) return entry;
+    const child = findFileEntryByPath(entry.children || [], path);
+    if (child) return child;
+  }
+  return null;
+}
+
+function fileEntriesSelectable(entries) {
+  return flattenFileEntries(entries).map(({ entry }) => entry);
+}
+
+function setFileTreeViewMode(mode) {
+  state.fileViewMode = ["simple", "compact", "detailed"].includes(mode) ? mode : "detailed";
+  window.localStorage.setItem("iowb.fileViewMode", state.fileViewMode);
+  renderFileEntries();
+}
+
+function renderFileToolbar(visibleEntries, filter) {
+  const selectable = fileEntriesSelectable(visibleEntries);
+  const selectablePaths = new Set(selectable.map((entry) => entry.path));
+  state.fileSelectedPaths = new Set([...state.fileSelectedPaths].filter((path) => selectablePaths.has(path)));
+  const selectedCount = state.fileSelectedPaths.size;
+  const allSelected = selectable.length > 0 && selectable.every((entry) => state.fileSelectedPaths.has(entry.path));
+  const partialSelected = selectedCount > 0 && !allSelected;
+  const selectAll = qs("#files-select-all");
+  if (selectAll) {
+    selectAll.dataset.symbol = allSelected ? "check-square" : "square";
+    selectAll.classList.toggle("active", allSelected || partialSelected);
+    selectAll.disabled = selectable.length === 0;
+    selectAll.title = allSelected ? "Deselect all" : "Select all";
+    selectAll.setAttribute("aria-label", selectAll.title);
+  }
+  qs("#files-selection-chip")?.classList.toggle("hidden", selectedCount === 0);
+  const count = qs("#files-selection-count");
+  if (count) count.textContent = `${selectedCount} selected`;
+  qs("#files-clear-filter")?.classList.toggle("hidden", !filter);
+  qs("#files-columns")?.classList.toggle("hidden", state.fileViewMode !== "detailed");
+  document.querySelectorAll("[data-file-view-mode]").forEach((button) => {
+    const active = button.dataset.fileViewMode === state.fileViewMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+}
+
+function toggleFileDirectory(path) {
+  if (state.fileExpandedPaths.has(path)) {
+    state.fileExpandedPaths.delete(path);
+  } else {
+    state.fileExpandedPaths.add(path);
+  }
+  renderFileEntries();
+}
+
+function toggleAllVisibleFilesSelection() {
+  const filter = qs("#files-filter")?.value.trim().toLowerCase() || "";
+  const visibleEntries = filterFileEntries(state.fileEntries, filter);
+  const selectable = fileEntriesSelectable(visibleEntries);
+  const allSelected = selectable.length > 0 && selectable.every((entry) => state.fileSelectedPaths.has(entry.path));
+  if (allSelected) {
+    selectable.forEach((entry) => state.fileSelectedPaths.delete(entry.path));
+  } else {
+    selectable.forEach((entry) => state.fileSelectedPaths.add(entry.path));
+  }
+  renderFileEntries();
+}
+
+function fileCreateRowHtml(createState, depth) {
+  const name = escapeHtml(createState.name || (createState.directory ? "untitled-folder" : "untitled.txt"));
+  const iconKind = createState.directory ? "folder" : "file";
+  return `<article class="file-tree-row creating file-tree-row-${escapeHtml(state.fileViewMode)}" data-file-inline-row="create" data-kind="${createState.directory ? "directory" : "file"}">
+    <div class="file-tree-name" style="--file-depth:${depth}">
+      <span></span>
+      <span class="file-disclosure file" aria-hidden="true"></span>
+      <span class="file-icon file-icon-${iconKind}" aria-hidden="true"></span>
+      <input class="file-inline-input" data-file-create-input value="${name}" aria-label="${createState.directory ? "New folder name" : "New file name"}" />
+    </div>
+    <span class="file-tree-size"></span>
+    <span class="file-tree-modified"></span>
+    <span class="file-tree-permissions"></span>
+  </article>`;
+}
+
+function startCreateFileTreePath(directory, parentPath = ".") {
+  const parent = normalizeProjectPath(parentPath || ".");
+  state.fileCreating = {
+    directory: !!directory,
+    parentPath: parent,
+    name: directory ? "untitled-folder" : "untitled.txt",
+  };
+  state.fileRenamingPath = "";
+  closeFileContextMenu();
+  if (parent !== ".") state.fileExpandedPaths.add(parent);
+  renderFileEntries();
+  requestAnimationFrame(() => {
+    const input = qs("[data-file-create-input]");
+    input?.focus();
+    input?.select();
+  });
+}
+
+function cancelFileCreate() {
+  state.fileCreating = null;
+  renderFileEntries();
+}
+
+async function commitFileCreate() {
+  const createState = state.fileCreating;
+  const input = qs("[data-file-create-input]");
+  const name = normalizeProjectPath(input?.value || "");
+  if (!createState || !name || name === ".") {
+    cancelFileCreate();
+    return;
+  }
+  await createFileTreePath(createState.directory, createState.parentPath, name);
+}
+
+async function createFileTreePath(directory, parentPath = ".", name = "") {
+  const project = activeProjectName();
+  if (!project) return;
+  const base = normalizeProjectPath(parentPath || qs("#files-path")?.value || ".");
+  const trimmed = normalizeProjectPath(name || "");
+  if (!trimmed || trimmed === ".") return;
+  const filePath = normalizeProjectPath(base === "." ? trimmed : `${base}/${trimmed}`);
+  await api(`/api/projects/${encodeURIComponent(project)}/files/create`, {
+    method: "POST",
+    body: JSON.stringify({
+      filePath,
+      content: "",
+      directory,
+    }),
+  });
+  if (base !== ".") state.fileExpandedPaths.add(base);
+  state.fileCreating = null;
+  await loadFiles();
+  showToast(`${directory ? "Folder" : "File"} created`, "ok");
+}
+
+function startRenameFilePath(filePath) {
+  if (!filePath) return;
+  state.fileRenamingPath = filePath;
+  state.fileCreating = null;
+  closeFileContextMenu();
+  renderFileEntries();
+  requestAnimationFrame(() => {
+    const input = qs("[data-file-rename-input]");
+    input?.focus();
+    input?.select();
+  });
+}
+
+function cancelFileRename() {
+  state.fileRenamingPath = "";
+  renderFileEntries();
+}
+
+async function commitFileRename(oldPath) {
+  const input = qs("[data-file-rename-input]");
+  const name = normalizeProjectPath(input?.value || "");
+  if (!oldPath || !name || name === ".") {
+    cancelFileRename();
+    return;
+  }
+  const parent = parentProjectPath(oldPath);
+  const newPath = normalizeProjectPath(parent === "." ? name : `${parent}/${name}`);
+  if (newPath === oldPath) {
+    cancelFileRename();
+    return;
+  }
+  await renameFilePath(oldPath, newPath);
+}
+
+function bindFileInlineInputs(root) {
+  root.querySelector("[data-file-create-input]")?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelFileCreate();
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      commitFileCreate().catch(showError);
+    }
+  });
+  root.querySelector("[data-file-create-input]")?.addEventListener("blur", () => {
+    commitFileCreate().catch(showError);
+  });
+  root.querySelector("[data-file-rename-input]")?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelFileRename();
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      commitFileRename(event.currentTarget.dataset.fileRenameInput).catch(showError);
+    }
+  });
+  root.querySelector("[data-file-rename-input]")?.addEventListener("blur", (event) => {
+    commitFileRename(event.currentTarget.dataset.fileRenameInput).catch(showError);
+  });
+}
+
+function filePermissions(entry) {
+  return entry.type === "directory" ? "rwxr-xr-x" : "rw-r--r--";
+}
+
+function fileIconKind(name) {
+  const lower = String(name || "").toLowerCase();
+  if (/\.(png|jpe?g|gif|webp|svg|ico|avif)$/.test(lower)) return "image";
+  if (/\.(json|toml|ya?ml|lock)$/.test(lower)) return "code";
+  if (/\.(md|markdown|txt)$/.test(lower)) return "text";
+  if (/\.(rs|js|jsx|ts|tsx|css|html|py|sh|sql)$/.test(lower)) return "code";
+  return "file";
+}
+
 function fileEntryHtml(entry, depth) {
-  const padding = `style="padding-left:${depth * 12}px"`;
   const path = escapeHtml(entry.path);
   const name = escapeHtml(entry.name);
-  if (entry.type === "directory") {
-    return `<article class="row file-tree-row" data-kind="directory" data-dir-path="${path}" role="button" tabindex="0" ${padding}>
-      <span class="row-main"><span class="file-icon" aria-hidden="true"></span><strong>${name}</strong></span>
-      <div class="row-actions"><button class="icon-button" type="button" aria-label="Open folder" title="Open folder" data-symbol="open"></button></div>
-    </article>`;
-  }
-  return `<article class="row file-tree-row" data-kind="file" data-file-path="${path}" role="button" tabindex="0" ${padding}>
-    <span class="row-main"><span class="file-icon" aria-hidden="true"></span><strong>${name}</strong></span>
-    <span class="meta">${entry.size || 0} bytes</span>
-    <div class="row-actions"><button class="icon-button" type="button" aria-label="Edit file" title="Edit file" data-symbol="open"></button></div>
+  const isDirectory = entry.type === "directory";
+  const expanded = isDirectory && state.fileExpandedPaths.has(entry.path);
+  const renaming = state.fileRenamingPath === entry.path;
+  const checked = state.fileSelectedPaths.has(entry.path) ? " checked" : "";
+  const iconKind = isDirectory ? (expanded ? "folder-open" : "folder") : fileIconKind(entry.name);
+  const size = isDirectory ? "" : escapeHtml(formatBytes(entry.size || 0));
+  const modified = escapeHtml(formatRelativeTime(entry.modified));
+  const permissions = escapeHtml(filePermissions(entry));
+  const rowMode = escapeHtml(state.fileViewMode);
+  const displayName = renaming
+    ? `<input class="file-inline-input" data-file-rename-input="${path}" value="${name}" aria-label="Rename ${name}" />`
+    : `<span class="file-name">${name}</span>`;
+  return `<article class="file-tree-row${renaming ? " renaming" : ""} file-tree-row-${rowMode}" data-kind="${isDirectory ? "directory" : "file"}" data-file-row-path="${path}" role="button" tabindex="0" aria-label="${isDirectory ? "Open" : "Open file"} ${name}"${isDirectory ? ` aria-expanded="${expanded ? "true" : "false"}"` : ""}>
+    <div class="file-tree-name" style="--file-depth:${depth}">
+      <input class="file-tree-checkbox" type="checkbox" data-file-select="${path}" aria-label="Select ${name}"${checked} />
+      <span class="file-disclosure${expanded ? " open" : ""}${isDirectory ? "" : " file"}" aria-hidden="true"></span>
+      <span class="file-icon file-icon-${iconKind}" aria-hidden="true"></span>
+      ${displayName}
+      <span class="file-tree-actions">
+        <button type="button" class="icon-button" data-file-menu="${path}" aria-label="File actions" title="File actions" data-symbol="dots-vertical"></button>
+      </span>
+    </div>
+    <span class="file-tree-size">${size}</span>
+    <span class="file-tree-modified">${modified}</span>
+    <span class="file-tree-permissions">${permissions}</span>
   </article>`;
+}
+
+function fileContextMenuHtml(entry) {
+  const isDirectory = entry.type === "directory";
+  const path = escapeHtml(entry.path);
+  return `<div id="file-context-menu" class="file-context-menu" role="menu">
+    <button type="button" data-symbol="open" data-file-context-action="open" data-file-context-path="${path}">${isDirectory ? "Expand" : "Open"}</button>
+    ${isDirectory ? `<button type="button" data-symbol="file-plus" data-file-context-action="new-file" data-file-context-path="${path}">New File</button>
+    <button type="button" data-symbol="folder-plus" data-file-context-action="new-folder" data-file-context-path="${path}">New Folder</button>
+    <button type="button" data-symbol="upload" data-file-context-action="upload" data-file-context-path="${path}">Upload Files</button>` : ""}
+    <hr />
+    <button type="button" data-symbol="rename" data-file-context-action="rename" data-file-context-path="${path}">Rename</button>
+    <button type="button" data-symbol="copy" data-file-context-action="copy-path" data-file-context-path="${path}">Copy Path</button>
+    ${!isDirectory ? `<button type="button" data-symbol="download" data-file-context-action="download" data-file-context-path="${path}">Download</button>` : ""}
+    <button type="button" class="danger" data-symbol="trash" data-file-context-action="delete" data-file-context-path="${path}">Delete</button>
+  </div>`;
+}
+
+function closeFileContextMenu() {
+  state.fileContextMenu = null;
+  qs("#file-context-menu")?.remove();
+}
+
+function openFileContextMenu(entry, x, y) {
+  closeFileContextMenu();
+  state.fileContextMenu = { path: entry.path };
+  document.body.insertAdjacentHTML("beforeend", fileContextMenuHtml(entry));
+  const menu = qs("#file-context-menu");
+  const left = Math.min(Math.max(8, x), window.innerWidth - menu.offsetWidth - 8);
+  const top = Math.min(Math.max(8, y), window.innerHeight - menu.offsetHeight - 8);
+  menu.style.left = `${Math.round(left)}px`;
+  menu.style.top = `${Math.round(top)}px`;
+  menu.querySelectorAll("[data-file-context-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      handleFileContextAction(button.dataset.fileContextAction, button.dataset.fileContextPath).catch(showError);
+    });
+  });
+}
+
+async function handleFileContextAction(action, path) {
+  const entry = findFileEntryByPath(state.fileEntries, path);
+  closeFileContextMenu();
+  if (!entry && !["copy-path"].includes(action)) return;
+  if (action === "open") {
+    if (entry.type === "directory") toggleFileDirectory(path);
+    else await openFile(path);
+  } else if (action === "new-file") {
+    startCreateFileTreePath(false, path);
+  } else if (action === "new-folder") {
+    startCreateFileTreePath(true, path);
+  } else if (action === "upload") {
+    state.fileUploadTargetPath = normalizeProjectPath(path || ".");
+    qs("#file-upload-input")?.click();
+  } else if (action === "rename") {
+    startRenameFilePath(path);
+  } else if (action === "copy-path") {
+    await copyText(path);
+    showToast("File path copied", "ok");
+  } else if (action === "download") {
+    await downloadFilePath(path);
+  } else if (action === "delete") {
+    if (window.confirm(`Delete ${path}?`)) await deleteFilePath(path);
+  }
 }
 
 function editorText() {
@@ -1460,24 +3136,6 @@ async function saveFile(event) {
   showToast(`Saved ${filePath}`, "ok");
 }
 
-async function createWorkspace(event) {
-  event.preventDefault();
-  const path = qs("#workspace-path").value.trim();
-  if (!path) return;
-  const body = {
-    workspaceType: qs("#workspace-type").value,
-    path,
-  };
-  const githubUrl = qs("#workspace-github-url").value.trim();
-  if (githubUrl) body.githubUrl = githubUrl;
-  await api("/api/projects/create-workspace", {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
-  await loadProjects();
-  showToast("Workspace created", "ok");
-}
-
 async function createPath(directory) {
   const project = activeProjectName();
   const filePath = qs("#file-editor-path").value.trim();
@@ -1495,33 +3153,49 @@ async function createPath(directory) {
 }
 
 async function deletePath() {
-  const project = activeProjectName();
   const filePath = qs("#file-editor-path").value.trim();
+  if (!filePath) return;
+  if (!window.confirm(`Delete ${filePath}?`)) return;
+  await deleteFilePath(filePath);
+}
+
+async function deleteFilePath(filePath) {
+  const project = activeProjectName();
   if (!project || !filePath) return;
   await api(`/api/projects/${encodeURIComponent(project)}/files`, {
     method: "DELETE",
     body: JSON.stringify({ filePath }),
   });
-  setEditorText("");
-  state.currentFileDirty = false;
-  updateEditorChrome();
+  if (qs("#file-editor-path").value.trim() === filePath) {
+    qs("#file-editor-path").value = "";
+    setEditorText("");
+    state.currentFileDirty = false;
+    updateEditorChrome();
+  }
   await loadFiles();
   showToast(`Deleted ${filePath}`, "ok");
 }
 
 async function renamePath() {
-  const project = activeProjectName();
   const oldPath = qs("#file-editor-path").value.trim();
   const newPath = qs("#file-rename-path").value.trim();
+  await renameFilePath(oldPath, newPath);
+  qs("#file-rename-path").value = "";
+}
+
+async function renameFilePath(oldPath, newPath) {
+  const project = activeProjectName();
   if (!project || !oldPath || !newPath) return;
   await api(`/api/projects/${encodeURIComponent(project)}/files/rename`, {
     method: "PUT",
     body: JSON.stringify({ oldPath, newPath }),
   });
-  qs("#file-editor-path").value = newPath;
-  qs("#file-rename-path").value = "";
-  refreshEditorWidget(newPath);
-  updateEditorChrome();
+  if (qs("#file-editor-path").value.trim() === oldPath) {
+    qs("#file-editor-path").value = newPath;
+    refreshEditorWidget(newPath);
+    updateEditorChrome();
+  }
+  state.fileRenamingPath = "";
   await loadFiles();
   showToast(`Renamed to ${newPath}`, "ok");
 }
@@ -1531,13 +3205,14 @@ async function uploadProjectFiles() {
   const files = [...qs("#file-upload-input").files];
   if (!project || !files.length) return;
   const formData = new FormData();
-  formData.append("targetPath", qs("#files-path").value.trim() || ".");
+  formData.append("targetPath", state.fileUploadTargetPath || qs("#files-path").value.trim() || ".");
   files.forEach((file) => formData.append("files", file));
   const body = await apiUpload(`/api/projects/${encodeURIComponent(project)}/files/upload`, formData);
   setEditorText(JSON.stringify(body, null, 2));
   state.currentFileDirty = false;
   updateEditorChrome();
   qs("#file-upload-input").value = "";
+  state.fileUploadTargetPath = "";
   await loadFiles();
   showToast(`Uploaded ${files.length} file${files.length === 1 ? "" : "s"}`, "ok");
 }
@@ -1564,6 +3239,20 @@ function downloadCurrentFile() {
   const filePath = qs("#file-editor-path").value.trim();
   if (!filePath) return;
   const blob = new Blob([editorText()], { type: "text/plain;charset=utf-8" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = filePath.split("/").filter(Boolean).pop() || "download.txt";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(link.href);
+}
+
+async function downloadFilePath(filePath) {
+  const project = activeProjectName();
+  if (!project || !filePath) return;
+  const body = await api(`/api/projects/${encodeURIComponent(project)}/files/content?path=${encodeURIComponent(filePath)}`);
+  const blob = new Blob([body.content || ""], { type: "text/plain;charset=utf-8" });
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
   link.download = filePath.split("/").filter(Boolean).pop() || "download.txt";
@@ -1763,14 +3452,23 @@ async function loadGitStatus() {
     return;
   }
   state.gitStatus = body;
-  state.gitSelectedFiles = new Set((body.files || []).map((file) => file.path));
+  const nextFiles = gitFilesFromStatus(body);
+  const available = new Set(nextFiles.map((file) => file.path));
+  state.gitSelectedFiles = new Set([...state.gitSelectedFiles].filter((path) => available.has(path)));
   if (body.branch && !qs("#git-branch").value.trim()) {
     qs("#git-branch").value = body.branch;
   }
   renderGitSummary(body);
   renderGitFiles();
   if (state.gitActiveView === "changes") {
-    renderGitStatus(body);
+    const previewFile = state.currentGitDiffFile && available.has(state.currentGitDiffFile)
+      ? state.currentGitDiffFile
+      : nextFiles[0]?.path;
+    if (previewFile) {
+      await gitDiffForFile(previewFile);
+    } else {
+      renderGitStatus(body);
+    }
   } else {
     setGitActiveView(state.gitActiveView, { load: true });
   }
@@ -1778,20 +3476,10 @@ async function loadGitStatus() {
 
 function renderGitSummary(status = state.gitStatus) {
   const target = qs("#git-summary");
-  const count = status?.files?.length ?? 0;
+  const count = gitFilesFromStatus(status).length;
   const countTarget = qs("#git-change-count");
   if (countTarget) countTarget.textContent = String(count);
-  if (!status) {
-    target.innerHTML = "";
-    return;
-  }
-  target.innerHTML = [
-    metricCard(status.branch || "n/a", "Branch"),
-    metricCard(status.clean ? "Clean" : "Changed", "Working Tree"),
-    metricCard(status.files?.length ?? 0, "Changed Files"),
-    metricCard(status.conflicted?.length ?? 0, "Conflicts"),
-    metricCard(status.hasCommits ? "Yes" : "No", "Has Commits"),
-  ].join("");
+  if (target) target.innerHTML = "";
 }
 
 function setGitActiveView(view, options = {}) {
@@ -1817,78 +3505,226 @@ function setGitActiveView(view, options = {}) {
   }
 }
 
+function gitFilesFromStatus(status = state.gitStatus) {
+  if (!status) return [];
+  if (Array.isArray(status.files) && status.files.length) return status.files;
+  const groups = [
+    ["modified", "M"],
+    ["conflicted", "UU"],
+    ["added", "A"],
+    ["deleted", "D"],
+    ["untracked", "U"],
+  ];
+  return groups.flatMap(([key, code]) => (status[key] || []).map((path) => ({ path, status: code })));
+}
+
+function gitStatusLabel(status) {
+  if (isGitConflictStatus(status)) return "Conflicted";
+  if (status === "M") return "Modified";
+  if (status === "A") return "Added";
+  if (status === "D") return "Deleted";
+  if (status === "U" || status === "??") return "Untracked";
+  return status || "Changed";
+}
+
+function gitStatusClass(status) {
+  if (isGitConflictStatus(status)) return "status-conflict";
+  if (status === "A") return "status-a";
+  if (status === "D") return "status-d";
+  if (status === "U" || status === "??") return "status-u";
+  return "status-m";
+}
+
+function createGitFolderNode(name = "", path = "") {
+  return { name, path, folders: [], files: [] };
+}
+
+function buildGitFileTree(files) {
+  const root = createGitFolderNode();
+  const folderMap = new Map([["", root]]);
+  files.forEach((file) => {
+    const parts = String(file.path || "").split("/").filter(Boolean);
+    if (!parts.length) return;
+    let parent = root;
+    let currentPath = "";
+    parts.slice(0, -1).forEach((part) => {
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
+      let folder = folderMap.get(currentPath);
+      if (!folder) {
+        folder = createGitFolderNode(part, currentPath);
+        folderMap.set(currentPath, folder);
+        parent.folders.push(folder);
+      }
+      parent = folder;
+    });
+    parent.files.push({ ...file, name: parts.at(-1) || file.path });
+  });
+  const sort = (node) => {
+    node.folders.sort((a, b) => a.name.localeCompare(b.name));
+    node.files.sort((a, b) => a.name.localeCompare(b.name));
+    node.folders.forEach(sort);
+  };
+  sort(root);
+  return root;
+}
+
+function countGitFolderFiles(node) {
+  return node.files.length + node.folders.reduce((total, folder) => total + countGitFolderFiles(folder), 0);
+}
+
+function gitFolderFiles(node) {
+  return [...node.files.map((file) => file.path), ...node.folders.flatMap(gitFolderFiles)];
+}
+
+function gitChangeSectionHtml(group, label, files, emptyText, actionLabel) {
+  const action = actionLabel
+    ? `<button type="button" data-git-section-action="${group}">${escapeHtml(actionLabel)}</button>`
+    : "";
+  const body = files.length
+    ? gitTreeHtml(buildGitFileTree(files), group, 0)
+    : `<div class="git-change-empty">${escapeHtml(emptyText)}</div>`;
+  return `<section class="git-change-section" data-git-change-section="${escapeHtml(group)}">
+    <header class="git-change-header">
+      <span>${escapeHtml(label)} (${files.length})</span>
+      ${action}
+    </header>
+    ${body}
+  </section>`;
+}
+
+function gitTreeHtml(node, group, depth) {
+  const folders = node.folders.map((folder) => gitFolderHtml(folder, group, depth)).join("");
+  const files = node.files.map((file) => gitFileRowHtml(file, depth)).join("");
+  return `${folders}${files}`;
+}
+
+function gitFolderHtml(folder, group, depth) {
+  const key = `${group}:${folder.path}`;
+  const collapsed = state.gitCollapsedFolders.has(key);
+  const files = gitFolderFiles(folder).join("\n");
+  return `<div class="git-folder-block">
+    <button type="button" class="git-folder-row" data-git-folder-toggle="${escapeHtml(key)}" aria-expanded="${collapsed ? "false" : "true"}" style="padding-left:${12 + depth * 16}px">
+      <span class="git-folder-main">
+        <span class="git-folder-chevron" aria-hidden="true"></span>
+        <strong>${escapeHtml(folder.name)}</strong>
+      </span>
+      <span class="git-change-count">${countGitFolderFiles(folder)}</span>
+    </button>
+    ${collapsed ? "" : gitTreeHtml(folder, group, depth + 1)}
+    <template data-git-folder-files="${escapeHtml(key)}">${escapeHtml(files)}</template>
+  </div>`;
+}
+
+function gitFileRowHtml(file, depth) {
+  const active = state.currentGitDiffFile === file.path ? " active" : "";
+  const statusLabel = gitStatusLabel(file.status);
+  const statusClass = gitStatusClass(file.status);
+  const checked = state.gitSelectedFiles.has(file.path) ? " checked" : "";
+  const isUntracked = file.status === "U" || file.status === "??";
+  return `<article class="git-file-row${active}${isGitConflictStatus(file.status) ? " conflicted" : ""}" data-git-file-row="${escapeHtml(file.path)}" style="padding-left:${12 + depth * 16}px">
+    <input type="checkbox" data-git-file="${escapeHtml(file.path)}" aria-label="Stage ${escapeHtml(file.path)}"${checked} />
+    <button type="button" class="git-file-main" data-git-file-preview="${escapeHtml(file.path)}" title="${escapeHtml(file.path)}">
+      <span class="git-file-icon" aria-hidden="true"></span>
+      <strong>${escapeHtml(file.name || file.path)}</strong>
+    </button>
+    <span class="git-row-actions">
+      <button type="button" class="icon-button" data-git-open-file="${escapeHtml(file.path)}" aria-label="Open file" title="Open file" data-symbol="open"></button>
+      <button type="button" class="icon-button" data-git-file-diff="${escapeHtml(file.path)}" aria-label="Show diff" title="Show diff" data-symbol="diff"></button>
+      ${isGitConflictStatus(file.status) ? `<button type="button" class="icon-button" data-git-conflict-file="${escapeHtml(file.path)}" aria-label="Resolve conflict" title="Resolve conflict" data-symbol="alert"></button>` : ""}
+      ${["M", "D", "U", "??"].includes(file.status) || isGitConflictStatus(file.status)
+    ? `<button type="button" class="icon-button" data-git-file-action="${escapeHtml(file.path)}" data-git-file-status="${escapeHtml(file.status)}" aria-label="${isUntracked ? "Delete untracked file" : "Discard changes"}" title="${isUntracked ? "Delete untracked file" : "Discard changes"}" data-symbol="trash"></button>`
+    : ""}
+      <span class="git-status-badge ${statusClass}" title="${escapeHtml(statusLabel)}">${escapeHtml(file.status)}</span>
+    </span>
+  </article>`;
+}
+
+function bindGitFileTree(root) {
+  root.querySelector("[data-git-open-commit]")?.addEventListener("click", openGitCommitModal);
+  root.querySelectorAll("[data-git-section-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const files = gitFilesFromStatus(state.gitStatus).map((file) => file.path);
+      if (button.dataset.gitSectionAction === "changes") {
+        state.gitSelectedFiles = new Set(files);
+      } else {
+        state.gitSelectedFiles = new Set();
+      }
+      renderGitFiles();
+    });
+  });
+  root.querySelectorAll("[data-git-folder-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const key = button.dataset.gitFolderToggle;
+      if (state.gitCollapsedFolders.has(key)) state.gitCollapsedFolders.delete(key);
+      else state.gitCollapsedFolders.add(key);
+      renderGitFiles();
+    });
+  });
+  root.querySelectorAll("[data-git-file]").forEach((input) => {
+    input.addEventListener("change", () => {
+      if (input.checked) state.gitSelectedFiles.add(input.dataset.gitFile);
+      else state.gitSelectedFiles.delete(input.dataset.gitFile);
+      renderGitFiles();
+    });
+  });
+  root.querySelectorAll("[data-git-file-preview], [data-git-file-diff]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      gitDiffForFile(button.dataset.gitFilePreview || button.dataset.gitFileDiff).catch(showError);
+    });
+  });
+  root.querySelectorAll("[data-git-open-file]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      openGitChangedFile(button.dataset.gitOpenFile).catch(showError);
+    });
+  });
+  root.querySelectorAll("[data-git-file-action]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      requestGitFileAction(button.dataset.gitFileAction, button.dataset.gitFileStatus).catch(showError);
+    });
+  });
+  root.querySelectorAll("[data-git-conflict-file]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      loadGitConflictFile(button.dataset.gitConflictFile).catch(showError);
+    });
+  });
+}
+
 function renderGitFiles() {
-  const files = (state.gitStatus?.files || []).filter((file) => {
+  const files = gitFilesFromStatus(state.gitStatus).filter((file) => {
     const filter = qs("#git-filter")?.value.trim().toLowerCase() || "";
     return !filter || `${file.status} ${file.path}`.toLowerCase().includes(filter);
   });
   const target = qs("#git-files");
   if (!files.length) {
-    target.innerHTML = '<p class="empty">Working tree is clean.</p>';
+    target.innerHTML = `<div class="git-commit-inline">
+      <span>0 files selected</span>
+      <button type="button" disabled data-symbol="check">Commit</button>
+    </div>
+    <div class="git-change-empty">Working tree is clean.</div>`;
     return;
   }
-  renderVirtualList(target, "gitFiles", files, {
-    rowHeight: 58,
-    render: (file) => `<label class="row check-row git-file-row ${isGitConflictStatus(file.status) ? "conflicted" : ""}">
-        <input type="checkbox" data-git-file="${escapeHtml(file.path)}" ${state.gitSelectedFiles.has(file.path) ? "checked" : ""} />
-        <span class="git-file-main"><span class="badge">${escapeHtml(file.status)}</span><strong>${escapeHtml(file.path)}</strong></span>
-        <div class="row-actions">
-          <button type="button" data-git-file-diff="${escapeHtml(file.path)}">Diff</button>
-          <button type="button" data-git-file-review="${escapeHtml(file.path)}">Review</button>
-          ${isGitConflictStatus(file.status) ? `<button type="button" data-git-conflict-file="${escapeHtml(file.path)}">Resolve</button>` : ""}
-        </div>
-      </label>`,
-    bind: (root) => {
-      root.querySelectorAll("[data-git-file]").forEach((input) => {
-        input.addEventListener("change", () => {
-          if (input.checked) {
-            state.gitSelectedFiles.add(input.dataset.gitFile);
-          } else {
-            state.gitSelectedFiles.delete(input.dataset.gitFile);
-          }
-        });
-      });
-      root.querySelectorAll("[data-git-file-diff]").forEach((button) => {
-        button.addEventListener("click", (event) => {
-          event.preventDefault();
-          gitDiffForFile(button.dataset.gitFileDiff).catch(showError);
-        });
-      });
-      root.querySelectorAll("[data-git-file-review]").forEach((button) => {
-        button.addEventListener("click", (event) => {
-          event.preventDefault();
-          gitFileReviewForFile(button.dataset.gitFileReview).catch(showError);
-        });
-      });
-      root.querySelectorAll("[data-git-conflict-file]").forEach((button) => {
-        button.addEventListener("click", (event) => {
-          event.preventDefault();
-          loadGitConflictFile(button.dataset.gitConflictFile).catch(showError);
-        });
-      });
-    },
-  });
+  const staged = files.filter((file) => state.gitSelectedFiles.has(file.path));
+  const changes = files.filter((file) => !state.gitSelectedFiles.has(file.path));
+  target.innerHTML = `<div class="git-commit-inline">
+      <span>${staged.length} file${staged.length === 1 ? "" : "s"} selected</span>
+      <button type="button" data-git-open-commit${staged.length ? "" : " disabled"} data-symbol="check">Commit</button>
+    </div>
+    ${gitChangeSectionHtml("staged", "Staged", staged, "No staged files", staged.length ? "Unstage All" : "")}
+    ${gitChangeSectionHtml("changes", "Changes", changes, changes.length ? "" : "All changes staged", changes.length ? "Stage All" : "")}`;
+  bindGitFileTree(target);
 }
 
 function renderGitStatus(status) {
   const target = qs("#git-output");
-  target.className = "output-panel result-list";
-  const files = status.files || [];
-  const groups = [
-    ["Modified", status.modified || []],
-    ["Conflicted", status.conflicted || []],
-    ["Added", status.added || []],
-    ["Deleted", status.deleted || []],
-    ["Untracked", status.untracked || []],
-  ];
-  const groupHtml = groups
-    .filter(([, values]) => values.length)
-    .map(([label, values]) => `<article class="result-row">
-      <strong>${escapeHtml(label)}</strong>
-      <span>${values.map(escapeHtml).join("<br />")}</span>
-    </article>`)
-    .join("");
-  target.innerHTML = groupHtml || `<p class="empty">${files.length ? "No categorized changes." : "Working tree is clean."}</p>`;
+  target.className = "output-panel git-output";
+  const files = gitFilesFromStatus(status);
+  target.innerHTML = files.length
+    ? '<div class="git-change-empty">Select a changed file to preview its diff.</div>'
+    : '<div class="git-change-empty">No changes detected.</div>';
 }
 
 function isGitConflictStatus(status = "") {
@@ -1901,10 +3737,104 @@ function selectedGitFiles() {
 }
 
 function setGitFileSelection(checked) {
-  const files = state.gitStatus?.files || [];
+  const files = gitFilesFromStatus(state.gitStatus);
   state.gitSelectedFiles = checked ? new Set(files.map((file) => file.path)) : new Set();
   document.querySelectorAll("[data-git-file]").forEach((input) => {
     input.checked = checked;
+  });
+  renderGitFiles();
+}
+
+async function openGitChangedFile(file) {
+  if (!file) return;
+  if (await switchView("files")) {
+    await openFile(file);
+  }
+}
+
+async function requestGitFileAction(file, status) {
+  if (!file) return;
+  const untracked = status === "U" || status === "??";
+  const message = untracked
+    ? `Delete untracked file "${file}"?`
+    : `Discard changes to "${file}"?`;
+  if (!window.confirm(message)) return;
+  await gitFileOperation(untracked ? "/api/git/delete-untracked" : "/api/git/discard", file);
+}
+
+async function gitFileOperation(path, file) {
+  const project = activeProjectName();
+  if (!project || !file) return;
+  const body = await api(path, {
+    method: "POST",
+    body: JSON.stringify({ project, file }),
+  });
+  renderGitOperation(body);
+  await loadGitStatus().catch(() => {});
+}
+
+function closeGitCommitModal() {
+  state.gitCommitMessage = qs("#git-commit-message-input")?.value || state.gitCommitMessage || "";
+  qs("#git-commit-modal")?.remove();
+}
+
+function openGitCommitModal() {
+  const files = selectedGitFiles();
+  if (!files.length) return;
+  qs("#git-commit-modal")?.remove();
+  const message = escapeHtml(state.gitCommitMessage || qs("#git-message")?.value || "");
+  document.body.insertAdjacentHTML("beforeend", `<div id="git-commit-modal" class="git-commit-modal">
+    <section class="git-commit-dialog" role="dialog" aria-modal="true" aria-labelledby="git-commit-title">
+      <header>
+        <div>
+          <h3 id="git-commit-title">Commit Changes</h3>
+          <span class="meta">${files.length} file${files.length === 1 ? "" : "s"} selected</span>
+        </div>
+        <button type="button" class="icon-button" data-git-commit-close aria-label="Close" title="Close" data-symbol="close"></button>
+      </header>
+      <textarea id="git-commit-message-input" placeholder="Message (Ctrl+Enter to commit)">${message}</textarea>
+      <div class="button-row">
+        <button type="button" class="icon-button" data-git-commit-generate aria-label="Generate commit message" title="Generate commit message" data-symbol="sparkles"></button>
+        <span class="grow"></span>
+        <button type="button" data-git-commit-close>Cancel</button>
+        <button type="button" class="primary-action" data-git-commit-submit>Commit</button>
+      </div>
+    </section>
+  </div>`);
+  const modal = qs("#git-commit-modal");
+  const input = qs("#git-commit-message-input");
+  input?.focus();
+  input?.setSelectionRange(input.value.length, input.value.length);
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) closeGitCommitModal();
+  });
+  modal.querySelectorAll("[data-git-commit-close]").forEach((button) => {
+    button.addEventListener("click", closeGitCommitModal);
+  });
+  modal.querySelector("[data-git-commit-generate]")?.addEventListener("click", (event) => {
+    withButtonLoading(event.currentTarget, async () => {
+      await generateGitMessage();
+      input.value = qs("#git-message").value;
+      state.gitCommitMessage = input.value;
+    }).catch(showError);
+  });
+  modal.querySelector("[data-git-commit-submit]")?.addEventListener("click", (event) => {
+    withButtonLoading(event.currentTarget, async () => {
+      state.gitCommitMessage = input.value.trim();
+      qs("#git-message").value = state.gitCommitMessage;
+      await commitGitSelection();
+      closeGitCommitModal();
+    }).catch(showError);
+  });
+  input?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeGitCommitModal();
+    } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      state.gitCommitMessage = input.value.trim();
+      qs("#git-message").value = state.gitCommitMessage;
+      commitGitSelection().then(closeGitCommitModal).catch(showError);
+    }
   });
 }
 
@@ -2002,6 +3932,7 @@ function renderChatImages() {
       <span>${escapeHtml(image.name || "image")} · ${escapeHtml(formatBytes(image.size || 0))}</span>
     </article>`).join("")
     : "";
+  updateChatComposerState();
 }
 
 function chatPromptWithImages(prompt) {
@@ -2016,8 +3947,26 @@ function autosizeChatPrompt() {
   const input = qs("#chat-prompt");
   if (!input) return;
   input.style.height = "0px";
-  const maxHeight = Number.parseFloat(getComputedStyle(input).maxHeight) || 180;
-  input.style.height = `${Math.min(maxHeight, input.scrollHeight)}px`;
+  const styles = getComputedStyle(input);
+  const maxHeight = Number.parseFloat(styles.maxHeight) || 180;
+  const minHeight = Number.parseFloat(styles.minHeight) || 50;
+  input.style.height = `${Math.min(maxHeight, Math.max(minHeight, input.scrollHeight))}px`;
+  updateChatComposerState();
+}
+
+function updateChatComposerState() {
+  const input = qs("#chat-prompt");
+  const clear = qs("#clear-chat");
+  const submit = qs("#chat-submit");
+  const hasPrompt = Boolean(input?.value.trim());
+  const canSubmit = hasPrompt || state.chatImages.length > 0;
+
+  if (clear) {
+    clear.classList.toggle("is-empty", !hasPrompt);
+    clear.setAttribute("aria-hidden", hasPrompt ? "false" : "true");
+    clear.tabIndex = hasPrompt ? 0 : -1;
+  }
+  if (submit) submit.disabled = !canSubmit;
 }
 
 function formatBytes(value) {
@@ -2251,6 +4200,8 @@ async function gitDiffSelected() {
 async function gitDiffForFile(file) {
   const project = activeProjectName();
   if (!project || !file) return;
+  state.currentGitDiffFile = file;
+  renderGitFiles();
   const body = await api(`/api/git/diff?project=${encodeURIComponent(project)}&file=${encodeURIComponent(file)}`);
   renderGitDiff(file, body);
 }
@@ -2374,15 +4325,30 @@ function renderGitDiff(file, body) {
   const target = qs("#git-output");
   state.currentGitDiffFile = file;
   target.className = "output-panel diff-view";
+  const status = gitFilesFromStatus(state.gitStatus).find((item) => item.path === file)?.status || "";
+  const statusBadge = status
+    ? `<span class="git-status-badge ${gitStatusClass(status)}" title="${escapeHtml(gitStatusLabel(status))}">${escapeHtml(status)}</span>`
+    : "";
+  const header = `<div class="git-diff-header">
+    <div class="git-diff-title">
+      <strong>${escapeHtml(file)}</strong>
+      <span>${escapeHtml(status ? gitStatusLabel(status) : "Diff preview")}</span>
+    </div>
+    <div class="git-diff-actions">
+      ${statusBadge}
+      <button type="button" class="icon-button" data-git-diff-open="${escapeHtml(file)}" aria-label="Open file" title="Open file" data-symbol="open"></button>
+    </div>
+  </div>`;
   if (!diff.trim()) {
-    target.innerHTML = `<div class="output-title">${escapeHtml(file)}</div><p class="empty">No diff for this file.</p>`;
+    target.innerHTML = `${header}<div class="git-diff-scroll"><div class="git-diff-card"><p class="empty">No diff for this file.</p></div></div>`;
+    target.querySelector("[data-git-diff-open]")?.addEventListener("click", () => openGitChangedFile(file).catch(showError));
     return;
   }
   const parsed = parseDiffHunks(diff);
   const truncated = body.isTruncated ? '<span class="badge warn">truncated</span>' : "";
   const controls = parsed.hunks.length
     ? `<div class="diff-toolbar">
-        <span>${parsed.hunks.length} hunk(s)</span>
+        <span>${parsed.hunks.length} hunk(s) ${truncated}</span>
         <button type="button" data-git-hunks-select="all">Select All</button>
         <button type="button" data-git-hunks-select="none">Select None</button>
         <button type="button" data-git-hunks-apply="stage">Stage Hunks</button>
@@ -2399,7 +4365,8 @@ function renderGitDiff(file, body) {
     </label>
     <pre>${hunk.lines.map(diffLineHtml).join("")}</pre>
   </section>`).join("");
-  target.innerHTML = `<div class="output-title">${escapeHtml(file)} ${truncated}</div>${controls}${prelude}${hunks}`;
+  target.innerHTML = `${header}<div class="git-diff-scroll"><div class="git-diff-card">${controls}${prelude}${hunks}</div></div>`;
+  target.querySelector("[data-git-diff-open]")?.addEventListener("click", () => openGitChangedFile(file).catch(showError));
   target.querySelectorAll("[data-git-hunks-select]").forEach((button) => {
     button.addEventListener("click", () => setGitHunkSelection(button.dataset.gitHunksSelect === "all"));
   });
@@ -3433,6 +5400,8 @@ function renderToolResponse(body) {
 
 function renderToolRuns(selector, body) {
   state.lastToolRuns = body;
+  const target = qs(selector);
+  if (!target) return;
   const filter = qs("#tool-filter")?.value || "";
   const runs = filteredItems(body.runs || [], filter, [
     "namespace",
@@ -3442,7 +5411,6 @@ function renderToolRuns(selector, body) {
     "stderr",
     (run) => run.success ? "success ok" : "failed error",
   ]);
-  const target = qs(selector);
   target.className = "output-panel result-list";
   if (!runs.length) {
     target.innerHTML = `<p class="empty">No ${escapeHtml(body.namespace || "tool")} runs yet.</p>`;
@@ -3465,6 +5433,7 @@ function renderToolRuns(selector, body) {
 function renderMcpServers(selector, body) {
   const servers = body.servers || (body.server ? [body.server] : []);
   const target = qs(selector);
+  if (!target) return;
   target.className = "output-panel result-list";
   if (!servers.length) {
     target.innerHTML = '<p class="empty">No MCP servers recorded.</p>';
@@ -4256,27 +6225,51 @@ function parseJsonField(selector, fallback) {
 
 function connectWs() {
   if (state.ws) {
-    state.ws.close();
+    const previous = state.ws;
+    state.ws = null;
+    previous.close();
   }
   if (state.wsRetry) {
     window.clearTimeout(state.wsRetry);
     state.wsRetry = null;
   }
+  if (state.wsConnectTimer) {
+    window.clearTimeout(state.wsConnectTimer);
+    state.wsConnectTimer = null;
+  }
 
-  setWsStatus("connecting");
+  const generation = ++state.wsGeneration;
+  const reconnecting = state.wsRetryAttempt > 0;
+  setWsStatus(reconnecting ? "reconnecting" : "connecting", reconnecting ? `Reconnect attempt ${state.wsRetryAttempt + 1}` : "Opening WebSocket");
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const token = state.token ? `?token=${encodeURIComponent(state.token)}` : "";
   const ws = new WebSocket(`${protocol}//${window.location.host}/ws${token}`);
+  ws._iowbGeneration = generation;
   state.ws = ws;
+  state.wsConnectTimer = window.setTimeout(() => {
+    if (state.ws !== ws || ws.readyState === WebSocket.OPEN) return;
+    setWsStatus("error", "WebSocket connection timed out");
+    ws.close();
+  }, WS_CONNECT_TIMEOUT_MS);
 
   ws.addEventListener("open", () => {
+    if (state.ws !== ws || ws._iowbGeneration !== state.wsGeneration) return;
+    window.clearTimeout(state.wsConnectTimer);
+    state.wsConnectTimer = null;
+    state.wsRetryAttempt = 0;
     setWsStatus("connected");
     ws.send(JSON.stringify({ type: "ping", nonce: String(Date.now()) }));
     ws.send(JSON.stringify({ type: "subscribe", topics: ["sessions", "processes", "projects"] }));
   });
 
   ws.addEventListener("message", (event) => {
-    const payload = JSON.parse(event.data);
+    let payload;
+    try {
+      payload = JSON.parse(event.data);
+    } catch (error) {
+      setWsStatus("error", `Invalid WebSocket payload: ${error.message}`);
+      return;
+    }
     if (payload.type === "projects_updated") {
       state.projects = payload.projects || [];
       syncProjectOrder();
@@ -4287,7 +6280,25 @@ function connectWs() {
       renderSessions();
     }
     if (payload.type === "session_status") {
-      appendChatLine(`[${payload.status}] ${payload.provider}:${payload.sessionId}`);
+      const status = String(payload.status || "").toLowerCase();
+      if (isActiveChatSessionEvent(payload)) {
+        state.currentSession = {
+          provider: payload.provider,
+          sessionId: payload.sessionId,
+        };
+      }
+      if (status === "starting" || status === "running" || status === "waiting-for-input") {
+        ensureChatProcessing(payload);
+      } else if (status === "completed") {
+        if (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer) {
+          finishChatProcessing(payload);
+        }
+      } else if (status === "failed" || status === "aborted") {
+        const label = status === "aborted" ? "Aborted" : "Failed";
+        if (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer.trim()) {
+          finishChatProcessing(payload, label);
+        }
+      }
     }
     if (payload.type === "output") {
       state.currentSession = {
@@ -4295,7 +6306,99 @@ function connectWs() {
         sessionId: payload.sessionId,
       };
       if (payload.content) appendChat(payload.content);
-      if (payload.done) appendChatLine("[done]");
+      if (payload.done) {
+        // Finalize the assistant stream node: store the received-at time,
+        // capture token usage, and write the footer into the bubble so the
+        // data persists with the message itself.
+        const hasAssistantContent = Boolean(state.chatBuffer.trim());
+        if (!hasAssistantContent && state.chatProcessing?.sessionId === payload.sessionId) {
+          finishChatProcessing(payload);
+        }
+        if (!hasAssistantContent) return;
+        const receivedAt = new Date().toISOString();
+        const sid = payload.sessionId;
+        const proj = state.preferences.chatCli || state.preferences.chatProvider || "codex";
+        const finalizeBubble = (entry) => {
+          if (chatStream.node && chatStream.role === "assistant") {
+            renderChatLineFooter(chatStream.node.querySelector(".chat-line-footer"), entry);
+          }
+        };
+        if (sid) {
+          // Optimistically write a provisional entry so the user sees the
+          // footer immediately, then refine it with token usage.
+          const all = readSessionOverrides();
+          const prev = all[sid] || {};
+          const provisional = {
+            ...prev,
+            cli: proj,
+            model: prev.model || state.preferences.chatModel || "",
+            effort: prev.effort || state.preferences.chatEffort || "",
+            mode: prev.mode || state.preferences.chatMode || "",
+            receivedAt: formatReceivedDateTime(receivedAt),
+          };
+          if (prev.sentAt) provisional.elapsed = formatElapsed(prev.sentAt, receivedAt);
+          finalizeBubble(provisional);
+          const usageProvider = runtimeProviderForModel(
+            proj,
+            provisional.model || state.preferences.chatModel || "",
+          );
+          const usageModel = provisional.model || state.preferences.chatModel || "";
+          if (shouldFetchTokenUsage(proj, usageModel) && findChatSession(sid)) {
+            api(`/api/projects/${encodeURIComponent(state.activeProjectPath || "")}/sessions/${encodeURIComponent(sid)}/token-usage?provider=${encodeURIComponent(usageProvider)}`).then((usage) => {
+              const tokenUsage = usage?.used ? `${usage.used} (in ${usage.breakdown?.input || 0} / out ${usage.breakdown?.output || 0})` : "";
+              const all2 = readSessionOverrides();
+              const prev2 = all2[sid] || {};
+              const persistedEntry = {
+                ...prev2,
+                cli: proj,
+                model: prev2.model || state.preferences.chatModel || "",
+                effort: prev2.effort || state.preferences.chatEffort || "",
+                mode: prev2.mode || state.preferences.chatMode || "",
+                receivedAt: formatReceivedDateTime(receivedAt),
+                tokenUsage,
+              };
+              if (prev2.sentAt) persistedEntry.elapsed = formatElapsed(prev2.sentAt, receivedAt);
+              all2[sid] = persistedEntry;
+              writeSessionOverrides(all2);
+              if (state.chatSessionId === sid || state.pendingChatSessionId === sid) {
+                finalizeBubble(persistedEntry);
+              }
+            }).catch(() => {});
+          }
+        }
+      }
+    }
+    if (payload.type === "session_metadata") {
+      // Server broadcasts final metadata when the agent finishes. Update the
+      // footer stored on the active stream node and persist it.
+      const sid = payload.sessionId;
+      if (sid) {
+        const all = readSessionOverrides();
+        const prev = all[sid] || {};
+        const receivedAt = payload.receivedAt || prev.receivedAt || new Date().toISOString();
+        const tokenUsage = payload.tokenUsage
+          ? (typeof payload.tokenUsage.used === "number"
+            ? `${payload.tokenUsage.used} (in ${payload.tokenUsage.input || 0} / out ${payload.tokenUsage.output || 0})`
+            : "")
+          : prev.tokenUsage || "";
+        const entry = {
+          ...prev,
+          cli: payload.provider || prev.cli,
+          model: payload.model || prev.model || state.preferences.chatModel || "",
+          effort: payload.effort || prev.effort || state.preferences.chatEffort || "",
+          mode: payload.mode || prev.mode || state.preferences.chatMode || "",
+          receivedAt: formatReceivedDateTime(receivedAt),
+          tokenUsage,
+        };
+        if (prev.sentAt) entry.elapsed = formatElapsed(prev.sentAt, receivedAt);
+        all[sid] = entry;
+        writeSessionOverrides(all);
+        if (state.chatSessionId === sid || state.pendingChatSessionId === sid) {
+          if (chatStream.node && chatStream.role === "assistant") {
+            renderChatLineFooter(chatStream.node.querySelector(".chat-line-footer"), entry);
+          }
+        }
+      }
     }
     if (payload.type === "process_output") {
       appendShell(payload.data);
@@ -4315,13 +6418,24 @@ function connectWs() {
   });
 
   ws.addEventListener("close", () => {
-    setWsStatus("error");
+    if (state.ws !== ws || ws._iowbGeneration !== state.wsGeneration) return;
+    window.clearTimeout(state.wsConnectTimer);
+    state.wsConnectTimer = null;
+    state.ws = null;
     if (!state.auth?.enabled || state.token) {
-      state.wsRetry = window.setTimeout(connectWs, 1500);
+      const delay = Math.min(WS_RETRY_MAX_MS, WS_RETRY_BASE_MS * (2 ** state.wsRetryAttempt));
+      state.wsRetryAttempt += 1;
+      setWsStatus("reconnecting", `WebSocket closed. Retrying in ${Math.round(delay / 1000)}s`);
+      state.wsRetry = window.setTimeout(connectWs, delay);
+      return;
     }
+    setWsStatus("error", "WebSocket closed before authentication");
   });
 
-  ws.addEventListener("error", () => setWsStatus("error"));
+  ws.addEventListener("error", () => {
+    if (state.ws !== ws || ws._iowbGeneration !== state.wsGeneration) return;
+    setWsStatus("error", "WebSocket error");
+  });
 }
 
 function bindNavigation() {
@@ -4471,16 +6585,22 @@ async function switchView(view) {
   document.body.dataset.activeView = view;
   panel.classList.add("active");
   panel.setAttribute("aria-hidden", "false");
-  qs("#view-title").textContent = VIEW_NAMES[view] || view;
-  qs("#view-subtitle").textContent = VIEW_SUBTITLES[view] || "";
+  const title = qs("#view-title");
+  const subtitle = qs("#view-subtitle");
+  if (title) title.textContent = VIEW_NAMES[view] || view;
+  if (subtitle) subtitle.textContent = VIEW_SUBTITLES[view] || "";
   closeMoreSheet();
   closeSidebar();
   window.localStorage.setItem("iowb.lastView", view);
   await loadView(view);
+  if (!panel.isConnected) return false;
   updateMainHeader(view);
   if (view === "shell") {
     await ensureShellRunningForActiveProject();
     scheduleShellFit(true);
+  }
+  if (view === "chat") {
+    updateChatEmptyState();
   }
   return true;
 }
@@ -4496,6 +6616,11 @@ async function loadView(view) {
       loadMetrics().catch(showError),
       loadToolRuns().catch(showError),
     ]);
+  }
+  if (view === "chat" && !state.chatSessionId) {
+    // No session is open yet — auto-open the most recent session so the chat
+    // tab is never blank when the user lands on it.
+    await autoOpenLatestChatSession().catch(showError);
   }
 }
 
@@ -4537,16 +6662,8 @@ function commandPaletteCommands() {
     section: "Sessions",
     keywords: `${session.id} ${session.provider || ""} ${session.projectPath || ""} chat history conversation`,
     run: async () => {
-      if (session.projectPath) setActiveProject(session.projectPath);
-      state.pendingChatSessionId = session.id;
-      const sessionIdInput = qs("#session-id-input");
-      if (sessionIdInput) sessionIdInput.value = session.id;
-      if (session.provider) {
-        setChatProvider(session.provider);
-        const sessionProvider = qs("#session-provider");
-        if (sessionProvider) sessionProvider.value = session.provider;
-      }
-      await switchView("chat");
+      if (session.provider) setChatProvider(session.provider);
+      await pickChatSession(session.id, session.projectPath || "");
     },
   }));
   const fileCommands = flattenFileEntries(state.fileEntries)
@@ -4692,7 +6809,7 @@ function commandPaletteCommands() {
       run: async () => {
         if (await switchView("chat")) {
           state.chatBuffer = "";
-          qs("#chat-output").textContent = "";
+          resetChatOutputDom();
         }
       },
     },
@@ -4749,7 +6866,10 @@ function commandPaletteCommands() {
       section: "Settings",
       keywords: "mcp commands plugins history",
       run: async () => {
-        if (await switchView("settings")) await loadToolRuns();
+        if (await switchView("settings")) {
+          setSettingsTab("tools");
+          await loadToolRuns();
+        }
       },
     },
     {
@@ -4758,7 +6878,10 @@ function commandPaletteCommands() {
       section: "Settings",
       keywords: "credentials tokens settings",
       run: async () => {
-        if (await switchView("settings")) await loadSettingsView("/api/settings/api-keys");
+        if (await switchView("settings")) {
+          setSettingsTab("api");
+          await loadSettingsView("/api/settings/api-keys");
+        }
       },
     },
     {
@@ -4767,7 +6890,10 @@ function commandPaletteCommands() {
       section: "Settings",
       keywords: "browser push permission preferences",
       run: async () => {
-        if (await switchView("settings")) await loadSettingsView("/api/settings/notification-preferences");
+        if (await switchView("settings")) {
+          setSettingsTab("notifications");
+          await loadSettingsView("/api/settings/notification-preferences");
+        }
       },
     },
     {
@@ -4819,15 +6945,16 @@ function openCommandPalette() {
   state.commandPalette.open = true;
   state.commandPalette.query = "";
   state.commandPalette.selectedIndex = 0;
-  qs("#command-palette").classList.remove("hidden");
-  qs("#command-search").value = "";
+  qs("#command-palette")?.classList.remove("hidden");
+  const search = qs("#command-search");
+  if (search) search.value = "";
   renderCommandPalette();
   window.setTimeout(() => qs("#command-search")?.focus(), 0);
 }
 
 function closeCommandPalette() {
   state.commandPalette.open = false;
-  qs("#command-palette").classList.add("hidden");
+  qs("#command-palette")?.classList.add("hidden");
 }
 
 function openMoreSheet() {
@@ -4838,14 +6965,9 @@ function closeMoreSheet() {
   qs("#more-sheet")?.classList.add("hidden");
 }
 
-function openProjectModal() {
-  qs("#project-modal")?.classList.remove("hidden");
+function openAddProjectFolderBrowser() {
   closeSidebar();
-  window.setTimeout(() => qs("#project-path")?.focus(), 0);
-}
-
-function closeProjectModal() {
-  qs("#project-modal")?.classList.add("hidden");
+  openFolderBrowser("", { action: "add-project" });
 }
 
 function toggleSidebar() {
@@ -4967,9 +7089,6 @@ function bindCommandPalette() {
     } else if (event.key === "Escape" && state.folderBrowser.open) {
       event.preventDefault();
       closeFolderBrowser();
-    } else if (event.key === "Escape" && !qs("#project-modal")?.classList.contains("hidden")) {
-      event.preventDefault();
-      closeProjectModal();
     } else if (event.key === "Escape" && document.body.classList.contains("sidebar-open")) {
       event.preventDefault();
       closeSidebar();
@@ -4982,8 +7101,45 @@ function bindCommandPalette() {
 
 function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
-  const register = () => {
-    navigator.serviceWorker.register("/sw.js?v=20260727-06").catch(() => {});
+  window.localStorage.setItem(APP_VERSION_STORAGE_KEY, APP_VERSION);
+  const hadController = Boolean(navigator.serviceWorker.controller);
+
+  const reloadForUpdatedShell = (reason = "service-worker") => {
+    if (window.sessionStorage.getItem(APP_RELOAD_STORAGE_KEY)) return;
+    window.sessionStorage.setItem(APP_RELOAD_STORAGE_KEY, reason);
+    const url = new URL(window.location.href);
+    url.searchParams.set("v", APP_VERSION);
+    window.location.replace(url.href);
+  };
+
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController) return;
+    reloadForUpdatedShell("controllerchange");
+  });
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    const message = event.data || {};
+    if (message.type === "iowb_app_updated" && message.version !== APP_VERSION) {
+      reloadForUpdatedShell("app-updated");
+    }
+  });
+
+  const register = async () => {
+    try {
+      const registration = await navigator.serviceWorker.register(`/sw.js?v=${APP_VERSION}`);
+      if (registration.waiting) {
+        registration.waiting.postMessage({ type: "iowb_skip_waiting" });
+      }
+      registration.addEventListener("updatefound", () => {
+        const worker = registration.installing;
+        worker?.addEventListener("statechange", () => {
+          if (worker.state === "installed" && navigator.serviceWorker.controller) {
+            worker.postMessage({ type: "iowb_skip_waiting" });
+          }
+        });
+      });
+    } catch {
+      // The app still works without the service worker.
+    }
   };
   if (document.readyState === "complete") {
     register();
@@ -5001,6 +7157,11 @@ function bindForms() {
   window.addEventListener("resize", () => {
     scheduleShellFit(true, 320);
   });
+  const chatBody = qs(".chat-body");
+  chatBody?.addEventListener("touchstart", handleChatTouchStart, { passive: true });
+  chatBody?.addEventListener("touchmove", handleChatTouchMove, { passive: true });
+  chatBody?.addEventListener("touchend", handleChatTouchEnd, { passive: true });
+  chatBody?.addEventListener("touchcancel", resetChatSwipe, { passive: true });
   qs("#pref-compact").addEventListener("change", (event) => {
     state.preferences.compact = event.currentTarget.checked;
     savePreferences();
@@ -5011,10 +7172,13 @@ function bindForms() {
     savePreferences();
     applyPreferences();
   });
+  document.querySelectorAll("[data-settings-tab]").forEach((button) => {
+    button.addEventListener("click", () => setSettingsTab(button.dataset.settingsTab));
+  });
   qs("#chat-provider-setting")?.addEventListener("change", (event) => {
     setChatProvider(event.currentTarget.value);
   });
-  qs("#active-project").addEventListener("change", (event) => {
+  qs("#active-project")?.addEventListener("change", (event) => {
     setActiveProject(event.currentTarget.value);
     loadView(activeView()).catch(showError);
   });
@@ -5023,17 +7187,29 @@ function bindForms() {
     renderSidebarProjects();
     renderSidebarSessions();
   });
-  qs("#sidebar-new-project")?.addEventListener("click", openProjectModal);
-  qs("#sidebar-manage-projects")?.addEventListener("click", openProjectModal);
-  qs("#sidebar-refresh")?.addEventListener("click", () => {
-    Promise.all([
-      loadProjects().catch(showError),
-      loadView(activeView()).catch(showError),
-    ]).then(() => showToast("Workspace refreshed", "ok"));
+  qs("#sidebar-new-project")?.addEventListener("click", openAddProjectFolderBrowser);
+  qs("#sidebar-manage-projects")?.addEventListener("click", openAddProjectFolderBrowser);
+  qs("#sidebar-refresh")?.addEventListener("click", (event) => {
+    withButtonLoading(event.currentTarget, async () => {
+      await Promise.all([
+        loadProjects().catch(showError),
+        loadView(activeView()).catch(showError),
+      ]);
+      showToast("Workspace refreshed", "ok");
+    }).catch(showError);
   });
   qs("#bottom-sidebar")?.addEventListener("click", toggleSidebar);
   qs("#main-sidebar-toggle")?.addEventListener("click", toggleSidebar);
+  document.addEventListener("pointerdown", (event) => {
+    if (!document.body.classList.contains("sidebar-open")) return;
+    if (!window.matchMedia("(max-width: 760px)").matches) return;
+    if (event.target.closest(".sidebar") || event.target.closest("#bottom-sidebar")) return;
+    closeSidebar();
+  }, true);
   document.addEventListener("click", (event) => {
+    if (state.fileContextMenu && !event.target.closest("#file-context-menu") && !event.target.closest("[data-file-menu]")) {
+      closeFileContextMenu();
+    }
     if (state.openProjectMenuPath && !event.target.closest(".project-menu-wrap")) {
       state.openProjectMenuPath = "";
       renderSidebarProjects();
@@ -5043,14 +7219,13 @@ function bindForms() {
     if (event.target.closest(".sidebar") || event.target.closest("#bottom-sidebar")) return;
     closeSidebar();
   });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeFileContextMenu();
+  });
   qs("#bottom-more")?.addEventListener("click", openMoreSheet);
   qs("#more-close")?.addEventListener("click", closeMoreSheet);
   qs("#more-sheet")?.addEventListener("click", (event) => {
     if (event.target === event.currentTarget) closeMoreSheet();
-  });
-  qs("#project-modal-close")?.addEventListener("click", closeProjectModal);
-  qs("#project-modal")?.addEventListener("click", (event) => {
-    if (event.target === event.currentTarget) closeProjectModal();
   });
   qs("#auth-password-toggle")?.addEventListener("click", () => {
     const input = qs("#auth-password");
@@ -5060,16 +7235,17 @@ function bindForms() {
     button.textContent = showing ? "Show" : "Hide";
     button.title = showing ? "Show password" : "Hide password";
   });
-  qs("#refresh-projects").addEventListener("click", () => loadProjects().catch(showError));
-  qs("#refresh-files").addEventListener("click", () => loadFiles().catch(showError));
+  qs("#refresh-projects")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadProjects).catch(showError));
+  qs("#refresh-files").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadFiles).catch(showError));
   qs("#refresh-sessions")?.addEventListener("click", renderSessions);
-  qs("#refresh-git").addEventListener("click", () => loadGitStatus().catch(showError));
-  qs("#refresh-db").addEventListener("click", () => loadDbConnections().catch(showError));
-  qs("#refresh-tool-runs").addEventListener("click", () => loadToolRuns().catch(showError));
-  qs("#refresh-metrics").addEventListener("click", () => loadMetrics().catch(showError));
-  qs("#refresh-settings").addEventListener("click", () => loadSettings().catch(showError));
-  qs("#browse-project-path").addEventListener("click", () => openFolderBrowser("#project-path"));
-  qs("#browse-workspace-path").addEventListener("click", () => openFolderBrowser("#workspace-path"));
+  qs("#refresh-git").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadGitStatus).catch(showError));
+  qs("#refresh-db").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadDbConnections).catch(showError));
+  qs("#refresh-tool-runs").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadToolRuns).catch(showError));
+  qs("#refresh-metrics").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadMetrics).catch(showError));
+  qs("#refresh-settings").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadSettings).catch(showError));
+  document.querySelectorAll("[data-chat-provider-option]").forEach((button) => {
+    button.addEventListener("click", () => chooseNewChatProvider(button.dataset.chatProviderOption));
+  });
   qs("#folder-browser-close").addEventListener("click", closeFolderBrowser);
   qs("#folder-browser").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) closeFolderBrowser();
@@ -5087,13 +7263,7 @@ function bindForms() {
     state.folderBrowser.filter = event.currentTarget.value;
     renderFolderBrowser();
   });
-  qs("#folder-browser-use").addEventListener("click", () => selectFolderBrowserPath());
-  qs("#folder-create-submit").addEventListener("click", () => createFolderBrowserFolder().catch(showError));
-  qs("#folder-create-name").addEventListener("keydown", (event) => {
-    if (event.key !== "Enter") return;
-    event.preventDefault();
-    createFolderBrowserFolder().catch(showError);
-  });
+  qs("#folder-browser-use").addEventListener("click", () => selectFolderBrowserPath().catch(showError));
   qs("#files-path").addEventListener("change", () => {
     if (confirmDiscardDirtyFile()) {
       resetVirtualList("files");
@@ -5104,10 +7274,23 @@ function bindForms() {
     resetVirtualList("files");
     renderFileEntries();
   });
-  qs("#files-parent").addEventListener("click", () => {
-    if (!confirmDiscardDirtyFile()) return;
-    qs("#files-path").value = parentProjectPath(qs("#files-path").value);
-    loadFiles().catch(showError);
+  qs("#files-clear-filter")?.addEventListener("click", () => {
+    qs("#files-filter").value = "";
+    resetVirtualList("files");
+    renderFileEntries();
+    qs("#files-filter").focus();
+  });
+  qs("#files-select-all")?.addEventListener("click", toggleAllVisibleFilesSelection);
+  qs("#files-clear-selection")?.addEventListener("click", () => {
+    state.fileSelectedPaths.clear();
+    renderFileEntries();
+  });
+  qs("#files-collapse-all")?.addEventListener("click", () => {
+    state.fileExpandedPaths.clear();
+    renderFileEntries();
+  });
+  document.querySelectorAll("[data-file-view-mode]").forEach((button) => {
+    button.addEventListener("click", () => setFileTreeViewMode(button.dataset.fileViewMode));
   });
   qs("#git-filter").addEventListener("input", () => {
     resetVirtualList("gitFiles");
@@ -5156,16 +7339,19 @@ function bindForms() {
     goToEditorLine();
   });
   qs("#file-editor-form").addEventListener("submit", (event) => saveFile(event).catch(showError));
-  qs("#workspace-form").addEventListener("submit", (event) => createWorkspace(event).catch(showError));
-  qs("#create-file").addEventListener("click", () => createPath(false).catch(showError));
-  qs("#create-directory").addEventListener("click", () => createPath(true).catch(showError));
+  qs("#create-file").addEventListener("click", () => startCreateFileTreePath(false, qs("#files-path")?.value || "."));
+  qs("#create-directory").addEventListener("click", () => startCreateFileTreePath(true, qs("#files-path")?.value || "."));
   qs("#delete-file").addEventListener("click", () => deletePath().catch(showError));
   qs("#download-file").addEventListener("click", downloadCurrentFile);
-  qs("#reload-file").addEventListener("click", () => reloadCurrentFile().catch(showError));
+  qs("#reload-file").addEventListener("click", (event) => withButtonLoading(event.currentTarget, reloadCurrentFile).catch(showError));
   qs("#copy-file-path").addEventListener("click", (event) => copyCurrentFilePath(event).catch(showError));
   qs("#rename-file").addEventListener("click", () => renamePath().catch(showError));
-  qs("#upload-files").addEventListener("click", () => uploadProjectFiles().catch(showError));
-  qs("#upload-folder").addEventListener("click", () => uploadProjectFolder().catch(showError));
+  qs("#upload-files").addEventListener("click", () => {
+    state.fileUploadTargetPath = qs("#files-path")?.value.trim() || ".";
+    qs("#file-upload-input")?.click();
+  });
+  qs("#file-upload-input").addEventListener("change", () => uploadProjectFiles().catch(showError));
+  qs("#folder-upload-input")?.addEventListener("change", () => uploadProjectFolder().catch(showError));
   qs("#session-search-form")?.addEventListener("submit", (event) => searchSessions(event).catch(showError));
   qs("#load-project-sessions")?.addEventListener("click", () => loadProjectSessions().catch(showError));
   qs("#load-session-messages")?.addEventListener("click", () => loadSessionMessages().catch(showError));
@@ -5183,7 +7369,7 @@ function bindForms() {
   qs("#git-branches").addEventListener("click", () => setGitActiveView("branches"));
   qs("#git-commits").addEventListener("click", () => setGitActiveView("history"));
   qs("#git-remote-status").addEventListener("click", () => gitRead("/api/git/remote-status", renderGitRemoteStatus).catch(showError));
-  qs("#git-fetch").addEventListener("click", () => gitOperation("/api/git/fetch").catch(showError));
+  qs("#git-fetch").addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => gitOperation("/api/git/fetch")).catch(showError));
   qs("#git-pull").addEventListener("click", () => gitOperation("/api/git/pull").catch(showError));
   qs("#git-push").addEventListener("click", () => gitOperation("/api/git/push").catch(showError));
   qs("#git-stage").addEventListener("click", () => gitSelectedFileOperation("/api/git/stage").catch(showError));
@@ -5217,7 +7403,7 @@ function bindForms() {
   qs("#db-jobs").addEventListener("click", () => loadDbJobs().catch(showError));
   qs("#tool-run-form").addEventListener("submit", (event) => runTool(event).catch(showError));
   qs("#mcp-server-form").addEventListener("submit", (event) => startMcpServer(event).catch(showError));
-  qs("#refresh-mcp-servers").addEventListener("click", () => loadMcpServers().catch(showError));
+  qs("#refresh-mcp-servers").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadMcpServers).catch(showError));
   qs("#stop-mcp-server").addEventListener("click", () => stopMcpServer().catch(showError));
   qs("#audio-transcribe-form").addEventListener("submit", (event) => transcribeAudio(event).catch(showError));
   qs("#settings-action-form").addEventListener("submit", (event) => applySettingsAction(event).catch(showError));
@@ -5235,18 +7421,19 @@ function bindForms() {
   qs("#load-git-config").addEventListener("click", () => loadSettingsView("/api/user/git-config").catch(showError));
   qs("#chat-upload-images").addEventListener("click", () => qs("#chat-image-input").click());
   qs("#chat-image-input").addEventListener("change", () => uploadChatImages().catch(showError));
-  qs("#chat-clear-images").addEventListener("click", clearChatImages);
   qs("#chat-prompt").addEventListener("input", autosizeChatPrompt);
   qs("#chat-prompt").addEventListener("focus", autosizeChatPrompt);
   qs("#clear-chat").addEventListener("click", () => {
-    state.chatBuffer = "";
-    qs("#chat-output").textContent = "";
+    const prompt = qs("#chat-prompt");
+    prompt.value = "";
+    autosizeChatPrompt();
+    prompt.focus();
   });
   qs("#clear-shell").addEventListener("click", () => {
     state.shellBuffer = "";
     renderShell();
   });
-  qs("#restart-shell").addEventListener("click", () => startShell({ force: true }).catch(showError));
+  qs("#restart-shell").addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => startShell({ force: true })).catch(showError));
   const shellOutput = qs("#shell-output");
   shellOutput.addEventListener("keydown", handleShellOutputKey);
   shellOutput.addEventListener("mousedown", focusShellTerm);
@@ -5265,19 +7452,6 @@ function bindForms() {
     applyTerminalSizePreference(true).catch(showError);
   });
   bindShellShortcuts();
-
-  qs("#add-project-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const path = qs("#project-path").value.trim();
-    if (!path) return;
-    await api("/api/projects/create", {
-      method: "POST",
-      body: JSON.stringify({ path }),
-    });
-    qs("#project-path").value = "";
-    await loadProjects();
-    closeProjectModal();
-  });
 
   qs("#auth-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -5302,7 +7476,7 @@ function bindForms() {
     }
   });
 
-  qs("#auth-logout").addEventListener("click", async () => {
+  qs("#auth-logout")?.addEventListener("click", async () => {
     try {
       await api("/api/auth/logout", { method: "POST" });
     } catch {
@@ -5319,33 +7493,103 @@ function bindForms() {
   qs("#chat-form").addEventListener("submit", (event) => {
     event.preventDefault();
     const projectPath = activeProjectPath();
-    const provider = chatProvider();
-    const prompt = chatPromptWithImages(qs("#chat-prompt").value.trim());
     if (!projectPath) {
       showError(new Error("Select a project before sending chat."));
       return;
     }
+    const cli = chatCliValue();
+    const prompt = chatPromptWithImages(qs("#chat-prompt").value.trim());
     if (!prompt) return;
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
       connectWs();
       showError(new Error("Chat connection is not ready. Reconnecting now."));
       return;
     }
+    clearChatProcessing();
+    chatStream = { role: null, node: null, text: null, buffer: "" };
     state.chatBuffer = "";
-    qs("#chat-output").textContent = "";
+    // Capture per-session overrides so refresh reopens the same setup.
+    const model = chatModelValue();
+    const effort = chatEffortValue();
+    const mode = chatModeValue();
+    const thinking = chatThinkingValue();
+    state.preferences.chatCli = cli;
+    state.preferences.chatModel = model;
+    state.preferences.chatEffort = effort;
+    state.preferences.chatMode = mode;
+    state.preferences.chatThinking = thinking;
+    savePreferences();
+
+    const startedAt = new Date().toISOString();
+    const sessionId = chatSessionIdForSubmit();
+    if (sessionId) {
+      saveSessionOverrides(sessionId, { cli, model, effort, mode, thinking, sentAt: startedAt });
+    }
     const message = {
       type: "start_session",
-      provider,
+      provider: cli,
       projectPath,
       prompt,
+      model,
+      effort,
+      mode,
+      thinking: thinking || undefined,
     };
-    const sessionId = state.pendingChatSessionId;
     if (sessionId) message.sessionId = sessionId;
     state.ws.send(JSON.stringify(message));
+    // Drop the placeholder entry for this session; the server will adopt the
+    // id and the next `projects_updated` broadcast will surface the real
+    // session row in its place.
+    if (sessionId && Array.isArray(state.sessions)) {
+      state.sessions = state.sessions.filter((session) => {
+        if (!session) return false;
+        if (session.id !== sessionId) return true;
+        return !session.pending;
+      });
+      renderSidebarProjects();
+    }
+    if (sessionId) {
+      state.chatSessionId = sessionId;
+      state.preferences.lastChatSessionId = sessionId;
+      savePreferences();
+    }
     state.pendingChatSessionId = "";
     qs("#chat-prompt").value = "";
     autosizeChatPrompt();
+    updateChatComposerState();
+
+    // Show the user prompt in the chat with right-aligned styling, plus the
+    // current overrides footer so the data below the prompt is visible.
+    appendUserPromptToChat(prompt, {
+      cli, model, effort, mode, thinking, sentAt: startedAt,
+    });
+    ensureChatProcessing({
+      provider: cli,
+      sessionId: sessionId || state.chatSessionId,
+    });
   });
+  // Chat-controls row: persist model/mode/effort changes immediately.
+  qs("#chat-model")?.addEventListener("change", () => {
+    state.preferences.chatModel = chatModelValue();
+    savePreferences();
+    // If a session is currently active, persist the override against it.
+    const sid = state.chatSessionId || state.pendingChatSessionId || state.preferences.lastChatSessionId;
+    if (sid) saveSessionOverrides(sid, { model: state.preferences.chatModel, cli: chatCliValue() });
+  });
+  qs("#chat-mode")?.addEventListener("change", () => {
+    state.preferences.chatMode = chatModeValue();
+    savePreferences();
+    const sid = state.chatSessionId || state.pendingChatSessionId || state.preferences.lastChatSessionId;
+    if (sid) saveSessionOverrides(sid, { mode: state.preferences.chatMode });
+  });
+  qs("#chat-effort")?.addEventListener("change", () => {
+    state.preferences.chatEffort = chatEffortValue();
+    savePreferences();
+    const sid = state.chatSessionId || state.pendingChatSessionId || state.preferences.lastChatSessionId;
+    if (sid) saveSessionOverrides(sid, { effort: state.preferences.chatEffort });
+  });
+
+
 
   qs("#abort-session").addEventListener("click", () => {
     if (!state.currentSession || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
@@ -5365,9 +7609,9 @@ function bindForms() {
     updateShellStatus();
     loadProcesses().catch(() => {});
   });
-  qs("#refresh-processes").addEventListener("click", () => {
+  qs("#refresh-processes").addEventListener("click", (event) => {
     state.shellProcessListOpen = !state.shellProcessListOpen;
-    loadProcesses().catch(showError);
+    withButtonLoading(event.currentTarget, loadProcesses).catch(showError);
   });
 }
 
@@ -5377,30 +7621,48 @@ async function bootstrapProtected() {
     setWsStatus("error");
     return;
   }
-  await Promise.all([
-    loadProjects().catch(showError),
+  await loadSidebarState().catch(() => {});
+  await loadProjects().catch(showError);
+  await Promise.allSettled([
     loadSettings().catch(showError),
     loadMetrics().catch(showError),
     loadDbConnections().catch(showError),
   ]);
+  applyPreferences();
+  // Re-apply the most recently persisted chat session overrides so the
+  // chat-controls row reflects what was used for the last conversation.
+  const persistedSessions = readSessionOverrides();
+  const lastSessionId = state.preferences.lastChatSessionId;
+  if (lastSessionId && persistedSessions[lastSessionId]) {
+    loadSessionOverridesIntoState(lastSessionId);
+    renderChatFooter(persistedSessions[lastSessionId]);
+  }
   connectWs();
   const savedView = window.localStorage.getItem("iowb.lastView") || activeView() || "chat";
-  await switchView(qs(`#${savedView}-view`) ? savedView : "chat");
+  const targetView = qs(`#${savedView}-view`) ? savedView : "chat";
+  await switchView(targetView);
+  // If we landed on the chat view and nothing is selected, auto-open the
+  // most recent session for the current project (or the most recent session
+  // across all projects if no project is currently active).
+  if (targetView === "chat" && !state.chatSessionId) {
+    await autoOpenLatestChatSession().catch(showError);
+  }
 }
 
 function showError(error) {
   const message = error?.message || String(error);
   showToast(message, "danger");
-  if (qs("#chat-view").classList.contains("active")) {
+  if (qs("#chat-view")?.classList.contains("active")) {
     appendChatLine(`[error] ${message}`);
-  } else if (qs("#shell-view").classList.contains("active")) {
+  } else if (qs("#shell-view")?.classList.contains("active")) {
     appendShell(`[error] ${message}\n`);
-  } else if (qs("#database-view").classList.contains("active")) {
+  } else if (qs("#database-view")?.classList.contains("active")) {
     setOutput("#db-output", message, "error-output");
-  } else if (qs("#git-view").classList.contains("active")) {
+  } else if (qs("#git-view")?.classList.contains("active")) {
     setOutput("#git-output", message, "error-output");
-  } else if (qs("#files-view").classList.contains("active")) {
-    qs("#file-editor-status").textContent = message;
+  } else if (qs("#files-view")?.classList.contains("active")) {
+    const status = qs("#file-editor-status");
+    if (status) status.textContent = message;
   } else if (qs("#settings-view")?.classList.contains("active")) {
     setOutput("#settings-json", message, "error-output");
   } else {
@@ -5417,11 +7679,89 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+
+// Append the user prompt bubble floated right, with override metadata.
+// Also persists per-session override metadata so refresh reopens the same
+// chat with the same setup.
+function appendUserPromptToChat(prompt, meta) {
+  const output = chatOutputRoot();
+  if (!output) {
+    if (meta) renderChatFooter({ ...meta, role: "user" });
+    return;
+  }
+  clearChatProcessing();
+  // Finalize any pending assistant stream so the user prompt doesn't get
+  // stacked behind an in-progress stream node.
+  if (chatStream.node) {
+    chatStream.node = null;
+    chatStream.text = null;
+    chatStream.role = null;
+    chatStream.buffer = "";
+  }
+  const { node, text, footer } = buildChatLineNode("user");
+  text.textContent = prompt;
+  const sentAt = meta?.sentAt || new Date().toISOString();
+  const inlineMeta = {
+    cli: meta?.cli,
+    model: meta?.model,
+    mode: meta?.mode,
+    effort: meta?.effort,
+    thinking: meta?.thinking,
+    sentAt: formatReceivedDateTime(sentAt),
+  };
+  renderChatLineFooter(footer, inlineMeta);
+  output.appendChild(node);
+  scrollChatToBottom();
+  updateChatEmptyState();
+  if (meta) renderChatFooter({ ...meta, role: "user" });
+}
+
+function pad2(n) { return n < 10 ? `0${n}` : `${n}`; }
+
+function formatReceivedDateTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
+function formatElapsed(fromIso, toIso) {
+  const from = new Date(fromIso).getTime();
+  const to = new Date(toIso).getTime();
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) return "";
+  const ms = to - from;
+  if (ms < 1000) return "<1s";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  if (m < 60) return r ? `${m}m ${r}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const mr = m % 60;
+  return mr ? `${h}h ${mr}m` : `${h}h`;
+}
+
+function rememberSessionMeta(sessionId, patch) {
+  if (!sessionId) return;
+  saveSessionOverrides(sessionId, patch);
+}
+
 function appendChat(value) {
+  const output = chatOutputRoot();
+  if (!output) return;
+  if (typeof value !== "string") value = String(value);
   state.chatBuffer = `${state.chatBuffer}${value}`.slice(-200_000);
-  const output = qs("#chat-output");
-  output.textContent = state.chatBuffer;
-  output.scrollTop = output.scrollHeight;
+  // Lazily spin up the assistant stream node the first time we receive
+  // content after a reset / user prompt.
+  if (!chatStream.node || chatStream.role !== "assistant") {
+    if (!adoptChatProcessingForStream()) {
+      chatStream = { role: "assistant", ...buildChatLineNode("assistant") };
+      output.appendChild(chatStream.node);
+    }
+  }
+  chatStream.text.textContent = state.chatBuffer;
+  scrollChatToBottom();
+  updateChatEmptyState();
 }
 
 function appendChatLine(value) {
@@ -5559,6 +7899,7 @@ bindFloatingNavigationPosition();
 bindCommandPalette();
 bindForms();
 applyPreferences();
+setSettingsTab(state.activeSettingsTab);
 initCodeEditor();
 initXterm();
 registerServiceWorker();
@@ -5571,6 +7912,7 @@ updateShellStatus();
 setGitActiveView("changes", { load: false });
 updateMainHeader();
 loadHealth().catch((error) => {
-  qs("#server-summary").textContent = error.message;
+  const summary = qs("#server-summary");
+  if (summary) summary.textContent = error.message;
 });
 bootstrapProtected();

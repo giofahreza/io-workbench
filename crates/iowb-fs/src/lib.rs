@@ -177,11 +177,27 @@ impl FileService {
         project_root: impl AsRef<Path>,
         requested_path: impl AsRef<Path>,
     ) -> Result<Vec<FileEntry>> {
+        self.list_tree_with_depth(project_root, requested_path, self.max_scan_depth)
+            .await
+    }
+
+    pub async fn list_tree_with_depth(
+        &self,
+        project_root: impl AsRef<Path>,
+        requested_path: impl AsRef<Path>,
+        max_depth: usize,
+    ) -> Result<Vec<FileEntry>> {
         let root = fs::canonicalize(project_root.as_ref()).await?;
         let target = resolve_child_path(&root, requested_path.as_ref()).await?;
         let mut entries = Vec::new();
-        self.read_dir_recursive(&root, &target, 0, &mut entries)
-            .await?;
+        self.read_dir_recursive(
+            &root,
+            &target,
+            0,
+            max_depth.min(self.max_scan_depth),
+            &mut entries,
+        )
+        .await?;
         Ok(entries)
     }
 
@@ -293,6 +309,44 @@ impl FileService {
         ))
     }
 
+    pub async fn copy_path(
+        &self,
+        project_root: impl AsRef<Path>,
+        source_path: impl AsRef<Path>,
+        target_path: impl AsRef<Path>,
+    ) -> Result<FileEntry> {
+        let root = fs::canonicalize(project_root.as_ref()).await?;
+        let source = resolve_child_path(&root, source_path.as_ref()).await?;
+        let target = resolve_child_path_for_create(&root, target_path.as_ref())?;
+        let metadata = fs::metadata(&source).await?;
+
+        if metadata.is_dir() {
+            if target.starts_with(&source) {
+                return Err(FsError::InvalidPath(
+                    "cannot copy a directory into itself".to_string(),
+                ));
+            }
+            let source_clone = source.clone();
+            let target_clone = target.clone();
+            tokio::task::spawn_blocking(move || copy_dir_recursive(&source_clone, &target_clone))
+                .await
+                .map_err(|error| FsError::InvalidPath(error.to_string()))??;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::copy(&source, &target).await?;
+        }
+
+        let copied_metadata = fs::metadata(&target).await?;
+        Ok(file_entry_from_metadata(
+            &root,
+            &target,
+            &copied_metadata,
+            false,
+        ))
+    }
+
     pub async fn delete_path(
         &self,
         project_root: impl AsRef<Path>,
@@ -314,6 +368,7 @@ impl FileService {
         root: &Path,
         path: &Path,
         depth: usize,
+        max_depth: usize,
         output: &mut Vec<FileEntry>,
     ) -> Result<()> {
         let mut reader = fs::read_dir(path).await?;
@@ -330,10 +385,16 @@ impl FileService {
             let entry_path = entry.path();
             let mut file_entry = file_entry_from_metadata(root, &entry_path, &metadata, false);
 
-            if is_dir && depth < self.max_scan_depth {
+            if is_dir && depth < max_depth {
                 let mut children = Vec::new();
-                Box::pin(self.read_dir_recursive(root, &entry_path, depth + 1, &mut children))
-                    .await?;
+                Box::pin(self.read_dir_recursive(
+                    root,
+                    &entry_path,
+                    depth + 1,
+                    max_depth,
+                    &mut children,
+                ))
+                .await?;
                 file_entry.children = children;
             }
 
@@ -350,6 +411,25 @@ impl FileService {
         output.extend(entries);
         Ok(())
     }
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else {
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn file_entry_from_metadata(
@@ -559,5 +639,40 @@ mod tests {
             Path::new("/etc"),
             Path::new("/home/user")
         ));
+    }
+
+    #[tokio::test]
+    async fn limits_file_tree_depth_per_request() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-fs-depth-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        tokio::fs::create_dir_all(root.join("src/nested"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("src/main.rs"), "fn main() {}")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("src/nested/deep.rs"), "fn deep() {}")
+            .await
+            .unwrap();
+
+        let service = FileService::new(6, 1024 * 1024);
+        let shallow = service.list_tree_with_depth(&root, ".", 0).await.unwrap();
+        let src = shallow.iter().find(|entry| entry.name == "src").unwrap();
+        assert!(src.children.is_empty());
+
+        let one_level = service.list_tree_with_depth(&root, ".", 1).await.unwrap();
+        let src = one_level.iter().find(|entry| entry.name == "src").unwrap();
+        assert!(src.children.iter().any(|entry| entry.name == "main.rs"));
+        let nested = src
+            .children
+            .iter()
+            .find(|entry| entry.name == "nested")
+            .unwrap();
+        assert!(nested.children.is_empty());
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

@@ -2,6 +2,7 @@ mod database;
 mod git;
 
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     convert::Infallible,
     env,
@@ -28,17 +29,19 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use iowb_core::{AppConfig, AppState, CoreError, generate_secret_token, hash_secret_token};
+use iowb_core::{
+    AppConfig, AppState, CoreError, DirectAiRuntimeConfig, generate_secret_token, hash_secret_token,
+};
 use iowb_fs::FsError;
 use iowb_process::{ProcessError, ProcessEvent};
 use iowb_protocol::{
-    ApiErrorBody, AuthStatusResponse, BrowseFilesystemResponse, CreateFileRequest,
+    ApiErrorBody, AuthStatusResponse, BrowseFilesystemResponse, CopyFileRequest, CreateFileRequest,
     CreateProjectRequest, CreateWorkspaceRequest, DeleteFileRequest, FileContentResponse,
-    FileEntry, HealthResponse, HealthStatus, LoginRequest, MessagesResponse, PRODUCT_NAME,
-    PlaceholderResponse, ProcessInputRequest, ProcessResizeRequest, ProcessStartRequest,
-    ProcessStartResponse, ProjectListResponse, ProjectSummary, Provider, RenameFileRequest,
-    ServerStatusResponse, SessionRuntimeStatus, SessionSummary, WS_COMMAND_CHANNEL_CAPACITY,
-    WorkspaceType, WsClientCommand, WsServerEvent, new_id,
+    FileEntry, HealthResponse, HealthStatus, LoginRequest, MessageRole, MessagesResponse,
+    PRODUCT_NAME, PlaceholderResponse, ProcessInputRequest, ProcessResizeRequest,
+    ProcessStartRequest, ProcessStartResponse, ProjectListResponse, ProjectSummary, Provider,
+    RenameFileRequest, ServerStatusResponse, SessionRuntimeStatus, SessionSummary,
+    WS_COMMAND_CHANNEL_CAPACITY, WorkspaceType, WsClientCommand, WsServerEvent, new_id,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -63,6 +66,10 @@ const MAX_UPLOAD_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_HISTORY: usize = 50;
 const STATIC_CACHE_CONTROL: &str = "no-cache";
+const RESOURCE_SAMPLE_INTERVAL_MS: u64 = 160;
+const SYS_THERMAL_PATH: &str = "/sys/class/thermal";
+const SYS_HWMON_PATH: &str = "/sys/class/hwmon";
+const SYS_POWER_SUPPLY_PATH: &str = "/sys/class/power_supply";
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let addr = config.socket_addr();
@@ -89,7 +96,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/projects/{project_name}/sessions",
             get(project_sessions),
         )
-        .route("/api/projects/{project_name}", delete(delete_project))
+        .route(
+            "/api/projects/{project_name}",
+            patch(rename_project).delete(delete_project),
+        )
         .route("/api/projects/{project_name}/file", put(write_project_file))
         .route(
             "/api/projects/{project_name}/files",
@@ -108,6 +118,10 @@ pub fn build_router(state: AppState) -> Router {
             put(rename_project_file),
         )
         .route(
+            "/api/projects/{project_name}/files/copy",
+            post(copy_project_file),
+        )
+        .route(
             "/api/projects/{project_name}/files/upload",
             post(files_upload),
         )
@@ -119,6 +133,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/projects/{project_name}/sessions/{session_id}/token-usage",
             get(session_token_usage),
         )
+        .route("/api/sessions/{session_id}", delete(delete_session))
         .route("/api/sessions/{session_id}/messages", get(session_messages))
         .route("/api/sessions/{session_id}/model", get(session_model))
         .route(
@@ -133,6 +148,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(git::router())
         .route("/api/settings/server-status", get(server_status))
         .route("/api/metrics/runtime", get(runtime_metrics))
+        .route(
+            "/api/settings/mobile-overview",
+            get(mobile_settings_overview),
+        )
         .route("/api/settings", get(list_settings))
         .route(
             "/api/settings/value/{key}",
@@ -151,6 +170,7 @@ pub fn build_router(state: AppState) -> Router {
             get(get_direct_ai).put(set_direct_ai),
         )
         .route("/api/settings/direct-ai/models", get(direct_ai_models))
+        .route("/api/chat/models", get(chat_provider_models))
         .route(
             "/api/settings/api-keys",
             get(list_api_keys).post(create_api_key),
@@ -215,8 +235,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/user", get(user_settings_overview))
         .route("/api/codex", any(provider_compat))
         .route("/api/codex/{*path}", any(provider_compat))
-        .route("/api/cursor", any(provider_compat))
-        .route("/api/cursor/{*path}", any(provider_compat))
+        .route("/api/cursor", any(cursor_compat))
+        .route("/api/cursor/{*path}", any(cursor_compat))
         .route("/api/gemini", any(provider_compat))
         .route("/api/gemini/{*path}", any(provider_compat))
         .route("/api/plugins", any(plugins_compat))
@@ -369,32 +389,37 @@ async fn server_status(State(state): State<AppState>) -> Json<ServerStatusRespon
 }
 
 async fn runtime_metrics(State(state): State<AppState>) -> Result<Json<Value>> {
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "metrics": runtime_metrics_payload(&state).await?,
+    })))
+}
+
+async fn runtime_metrics_payload(state: &AppState) -> Result<Value> {
     let projects = state.projects.list(&state.sessions).await?;
     let active_sessions = state.sessions.list_active().await;
     let processes = state.processes.list().await;
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "metrics": {
-            "timestamp": Utc::now(),
-            "memory": process_memory_metrics().await,
-            "projects": {
-                "count": projects.len()
-            },
-            "sessions": {
-                "active": active_sessions.len()
-            },
-            "processes": {
-                "active": processes.len()
-            },
-            "limits": {
-                "maxSessions": state.config.max_sessions,
-                "maxScanDepth": state.config.max_scan_depth,
-                "maxFileReadBytes": state.config.max_file_read_bytes,
-                "maxUploadFileBytes": MAX_UPLOAD_FILE_BYTES,
-                "maxUploadFiles": MAX_UPLOAD_FILES
-            }
+    Ok(serde_json::json!({
+        "timestamp": Utc::now(),
+        "memory": process_memory_metrics().await,
+        "resources": system_resource_metrics(&state.config.workspace_root).await,
+        "projects": {
+            "count": projects.len()
+        },
+        "sessions": {
+            "active": active_sessions.len()
+        },
+        "processes": {
+            "active": processes.len()
+        },
+        "limits": {
+            "maxSessions": state.config.max_sessions,
+            "maxScanDepth": state.config.max_scan_depth,
+            "maxFileReadBytes": state.config.max_file_read_bytes,
+            "maxUploadFileBytes": MAX_UPLOAD_FILE_BYTES,
+            "maxUploadFiles": MAX_UPLOAD_FILES
         }
-    })))
+    }))
 }
 
 async fn process_memory_metrics() -> Value {
@@ -416,7 +441,9 @@ async fn process_memory_metrics() -> Value {
     serde_json::json!({
         "available": true,
         "rssKb": vm_rss_kb,
-        "virtualKb": vm_size_kb
+        "virtualKb": vm_size_kb,
+        "rssBytes": vm_rss_kb.map(|value| value * 1024),
+        "virtualBytes": vm_size_kb.map(|value| value * 1024)
     })
 }
 
@@ -425,6 +452,678 @@ fn parse_proc_status_kb(value: &str) -> Option<u64> {
         .split_whitespace()
         .next()
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuTimes {
+    idle: u64,
+    total: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CpuSnapshot {
+    aggregate: CpuTimes,
+    cores: Vec<CpuTimes>,
+}
+
+#[derive(Debug, Clone)]
+struct NetworkInterfaceSample {
+    name: String,
+    rx_bytes: u64,
+    rx_packets: u64,
+    rx_errors: u64,
+    tx_bytes: u64,
+    tx_packets: u64,
+    tx_errors: u64,
+}
+
+async fn system_resource_metrics(workspace_root: &Path) -> Value {
+    let previous_cpu = read_cpu_snapshot().await;
+    let previous_network = read_network_snapshot().await;
+    tokio::time::sleep(Duration::from_millis(RESOURCE_SAMPLE_INTERVAL_MS)).await;
+
+    let current_cpu = read_cpu_snapshot().await;
+    let current_network = read_network_snapshot().await;
+    let memory = system_memory_metrics().await;
+    let hardware = read_hardware_stats().await;
+    let disk = disk_metrics(workspace_root).await;
+    let load_average = read_load_average().await;
+    let cpu_model = read_cpu_model().await;
+    let system_uptime_seconds = read_system_uptime_seconds().await;
+    let process_uptime_seconds = read_process_uptime_seconds(system_uptime_seconds).await;
+
+    serde_json::json!({
+        "cpu": cpu_metrics(previous_cpu, current_cpu, load_average, cpu_model),
+        "memory": memory,
+        "disk": disk,
+        "network": network_metrics(previous_network, current_network),
+        "hardware": hardware,
+        "systemUptimeSeconds": system_uptime_seconds,
+        "processUptimeSeconds": process_uptime_seconds,
+    })
+}
+
+async fn read_text_path(path: impl AsRef<Path>) -> Option<String> {
+    tokio::fs::read_to_string(path).await.ok()
+}
+
+async fn read_trimmed_path(path: impl AsRef<Path>) -> Option<String> {
+    read_text_path(path)
+        .await
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn read_sysfs_number(path: impl AsRef<Path>) -> Option<f64> {
+    read_trimmed_path(path)
+        .await
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+}
+
+async fn read_directory_paths(directory: &str) -> Vec<PathBuf> {
+    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let is_directory_like = entry
+            .file_type()
+            .await
+            .ok()
+            .is_some_and(|file_type| file_type.is_dir() || file_type.is_symlink());
+        if is_directory_like {
+            paths.push(entry.path());
+        }
+    }
+    paths
+}
+
+async fn read_directory_file_names(directory: &Path) -> Vec<String> {
+    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+fn path_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn json_f64(value: Option<f64>) -> Value {
+    value
+        .filter(|value| value.is_finite())
+        .map(Value::from)
+        .unwrap_or(Value::Null)
+}
+
+fn json_u64(value: Option<u64>) -> Value {
+    value.map(Value::from).unwrap_or(Value::Null)
+}
+
+fn parse_cpu_line(line: &str) -> Option<CpuTimes> {
+    let mut parts = line.split_whitespace();
+    let _name = parts.next()?;
+    let values: Vec<u64> = parts
+        .filter_map(|value| value.parse::<u64>().ok())
+        .collect();
+    if values.len() < 4 {
+        return None;
+    }
+    let idle = values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0);
+    let total = values.iter().copied().sum();
+    Some(CpuTimes { idle, total })
+}
+
+async fn read_cpu_snapshot() -> Option<CpuSnapshot> {
+    let content = read_text_path("/proc/stat").await?;
+    let aggregate = content
+        .lines()
+        .find(|line| line.starts_with("cpu "))
+        .and_then(parse_cpu_line)?;
+    let cores = content
+        .lines()
+        .filter(|line| {
+            line.strip_prefix("cpu")
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|ch| ch.is_ascii_digit())
+        })
+        .filter_map(parse_cpu_line)
+        .collect();
+    Some(CpuSnapshot { aggregate, cores })
+}
+
+fn calculate_cpu_percent(previous: CpuTimes, current: CpuTimes) -> Option<f64> {
+    let total_delta = current.total.checked_sub(previous.total)?;
+    let idle_delta = current.idle.checked_sub(previous.idle)?;
+    if total_delta == 0 {
+        return None;
+    }
+    Some(((total_delta.saturating_sub(idle_delta)) as f64 / total_delta as f64) * 100.0)
+}
+
+fn cpu_metrics(
+    previous: Option<CpuSnapshot>,
+    current: Option<CpuSnapshot>,
+    load_average: Vec<f64>,
+    model: String,
+) -> Value {
+    let usage_percent = previous
+        .as_ref()
+        .zip(current.as_ref())
+        .and_then(|(previous, current)| {
+            calculate_cpu_percent(previous.aggregate, current.aggregate)
+        });
+    let per_core = current
+        .as_ref()
+        .map(|current| {
+            current
+                .cores
+                .iter()
+                .enumerate()
+                .map(|(index, current_core)| {
+                    let usage = previous
+                        .as_ref()
+                        .and_then(|previous| previous.cores.get(index).copied())
+                        .and_then(|previous_core| {
+                            calculate_cpu_percent(previous_core, *current_core)
+                        });
+                    serde_json::json!({
+                        "index": index,
+                        "usagePercent": json_f64(usage),
+                        "temperatureCelsius": Value::Null,
+                        "temperatureLabel": Value::Null,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let cores = current
+        .as_ref()
+        .map(|snapshot| snapshot.cores.len())
+        .unwrap_or(0);
+
+    serde_json::json!({
+        "usagePercent": json_f64(usage_percent),
+        "processUsagePercent": Value::Null,
+        "loadAverage": load_average,
+        "cores": cores,
+        "model": model,
+        "perCore": per_core,
+    })
+}
+
+async fn read_cpu_model() -> String {
+    let Some(content) = read_text_path("/proc/cpuinfo").await else {
+        return "Unknown CPU".to_string();
+    };
+    for key in ["model name", "Hardware", "Processor"] {
+        if let Some(value) = content.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name.trim() == key).then(|| value.trim().to_string())
+        }) {
+            if !value.is_empty() {
+                return value;
+            }
+        }
+    }
+    "Unknown CPU".to_string()
+}
+
+async fn read_load_average() -> Vec<f64> {
+    read_trimmed_path("/proc/loadavg")
+        .await
+        .map(|content| {
+            content
+                .split_whitespace()
+                .take(3)
+                .filter_map(|value| value.parse::<f64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn system_memory_metrics() -> Value {
+    let Some(content) = read_text_path("/proc/meminfo").await else {
+        return serde_json::json!({
+            "total": 0,
+            "used": 0,
+            "free": 0,
+            "available": 0,
+            "usedPercent": Value::Null,
+            "cached": 0,
+            "buffers": 0,
+            "swap": {
+                "total": 0,
+                "used": 0,
+                "free": 0,
+                "usedPercent": 0.0,
+            }
+        });
+    };
+    let mut values = HashMap::<String, u64>::new();
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if let Some(kb) = value
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            values.insert(key.to_string(), kb * 1024);
+        }
+    }
+
+    let total = values.get("MemTotal").copied().unwrap_or(0);
+    let available = values
+        .get("MemAvailable")
+        .copied()
+        .unwrap_or_else(|| values.get("MemFree").copied().unwrap_or(0));
+    let free = values.get("MemFree").copied().unwrap_or(available);
+    let cached = values.get("Cached").copied().unwrap_or(0)
+        + values.get("SReclaimable").copied().unwrap_or(0);
+    let buffers = values.get("Buffers").copied().unwrap_or(0);
+    let swap_total = values.get("SwapTotal").copied().unwrap_or(0);
+    let swap_free = values.get("SwapFree").copied().unwrap_or(0);
+    let used = total.saturating_sub(available);
+    let swap_used = swap_total.saturating_sub(swap_free);
+    let used_percent = (total > 0).then(|| used as f64 / total as f64 * 100.0);
+    let swap_percent = (swap_total > 0)
+        .then(|| swap_used as f64 / swap_total as f64 * 100.0)
+        .unwrap_or(0.0);
+
+    serde_json::json!({
+        "total": total,
+        "used": used,
+        "free": free,
+        "available": available,
+        "usedPercent": json_f64(used_percent),
+        "cached": cached,
+        "buffers": buffers,
+        "swap": {
+            "total": swap_total,
+            "used": swap_used,
+            "free": swap_free,
+            "usedPercent": swap_percent,
+        }
+    })
+}
+
+async fn disk_metrics(path: &Path) -> Value {
+    let output = timeout(
+        Duration::from_secs(2),
+        Command::new("df").arg("-PB1").arg(path).output(),
+    )
+    .await;
+    let Ok(Ok(output)) = output else {
+        return Value::Null;
+    };
+    if !output.status.success() {
+        return Value::Null;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = stdout.lines().nth(1) else {
+        return Value::Null;
+    };
+    let columns: Vec<&str> = line.split_whitespace().collect();
+    if columns.len() < 6 {
+        return Value::Null;
+    }
+    let total = columns.get(1).and_then(|value| value.parse::<u64>().ok());
+    let used = columns.get(2).and_then(|value| value.parse::<u64>().ok());
+    let available = columns.get(3).and_then(|value| value.parse::<u64>().ok());
+    let used_percent = total
+        .zip(used)
+        .and_then(|(total, used)| (total > 0).then(|| used as f64 / total as f64 * 100.0));
+
+    serde_json::json!({
+        "filesystem": columns[0],
+        "mount": columns[5],
+        "total": json_u64(total),
+        "used": json_u64(used),
+        "available": json_u64(available),
+        "free": json_u64(available),
+        "usedPercent": json_f64(used_percent),
+    })
+}
+
+async fn read_network_snapshot() -> Option<Vec<NetworkInterfaceSample>> {
+    let content = read_text_path("/proc/net/dev").await?;
+    let mut interfaces = Vec::new();
+    for line in content.lines().skip(2) {
+        let Some((name, values)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || name == "lo" {
+            continue;
+        }
+        let numbers: Vec<u64> = values
+            .split_whitespace()
+            .filter_map(|value| value.parse::<u64>().ok())
+            .collect();
+        if numbers.len() < 16 {
+            continue;
+        }
+        interfaces.push(NetworkInterfaceSample {
+            name: name.to_string(),
+            rx_bytes: numbers[0],
+            rx_packets: numbers[1],
+            rx_errors: numbers[2],
+            tx_bytes: numbers[8],
+            tx_packets: numbers[9],
+            tx_errors: numbers[10],
+        });
+    }
+    Some(interfaces)
+}
+
+fn network_metrics(
+    previous: Option<Vec<NetworkInterfaceSample>>,
+    current: Option<Vec<NetworkInterfaceSample>>,
+) -> Value {
+    let elapsed_seconds = RESOURCE_SAMPLE_INTERVAL_MS as f64 / 1000.0;
+    let current = current.unwrap_or_default();
+    let previous_by_name: HashMap<String, NetworkInterfaceSample> = previous
+        .unwrap_or_default()
+        .into_iter()
+        .map(|sample| (sample.name.clone(), sample))
+        .collect();
+    let mut rx_bytes = 0_u64;
+    let mut tx_bytes = 0_u64;
+    let mut rx_rate = 0.0;
+    let mut tx_rate = 0.0;
+    let interfaces = current
+        .into_iter()
+        .map(|sample| {
+            let previous = previous_by_name.get(&sample.name);
+            let sample_rx_rate = previous
+                .map(|previous| {
+                    sample.rx_bytes.saturating_sub(previous.rx_bytes) as f64 / elapsed_seconds
+                })
+                .unwrap_or(0.0);
+            let sample_tx_rate = previous
+                .map(|previous| {
+                    sample.tx_bytes.saturating_sub(previous.tx_bytes) as f64 / elapsed_seconds
+                })
+                .unwrap_or(0.0);
+            rx_bytes = rx_bytes.saturating_add(sample.rx_bytes);
+            tx_bytes = tx_bytes.saturating_add(sample.tx_bytes);
+            rx_rate += sample_rx_rate;
+            tx_rate += sample_tx_rate;
+            serde_json::json!({
+                "name": sample.name,
+                "rxBytes": sample.rx_bytes,
+                "txBytes": sample.tx_bytes,
+                "rxRateBytesPerSecond": sample_rx_rate,
+                "txRateBytesPerSecond": sample_tx_rate,
+                "rxPackets": sample.rx_packets,
+                "txPackets": sample.tx_packets,
+                "rxErrors": sample.rx_errors,
+                "txErrors": sample.tx_errors,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "rxBytes": rx_bytes,
+        "txBytes": tx_bytes,
+        "rxRateBytesPerSecond": rx_rate,
+        "txRateBytesPerSecond": tx_rate,
+        "interfaces": interfaces,
+    })
+}
+
+async fn read_system_uptime_seconds() -> Option<u64> {
+    read_trimmed_path("/proc/uptime")
+        .await
+        .and_then(|content| content.split_whitespace().next()?.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| value.floor() as u64)
+}
+
+async fn read_process_uptime_seconds(system_uptime_seconds: Option<u64>) -> Option<u64> {
+    let system_uptime_seconds = system_uptime_seconds?;
+    let stat = read_trimmed_path("/proc/self/stat").await?;
+    let after_command = stat.rsplit_once(')')?.1.trim();
+    let fields: Vec<&str> = after_command.split_whitespace().collect();
+    let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
+    let start_seconds = start_ticks / clock_ticks_per_second().max(1);
+    Some(system_uptime_seconds.saturating_sub(start_seconds))
+}
+
+fn clock_ticks_per_second() -> u64 {
+    env::var("IO_WORKBENCH_CLK_TCK")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100)
+}
+
+fn normalize_temperature_celsius(raw_value: Option<f64>) -> Option<f64> {
+    let raw_value = raw_value?;
+    let celsius = if raw_value.abs() > 1000.0 {
+        raw_value / 1000.0
+    } else {
+        raw_value
+    };
+    (-100.0..=250.0).contains(&celsius).then_some(celsius)
+}
+
+async fn read_thermal_zone_temperatures() -> Vec<Value> {
+    let mut sensors = Vec::new();
+    for zone_path in read_directory_paths(SYS_THERMAL_PATH).await {
+        let name = path_file_name(&zone_path);
+        if !name.starts_with("thermal_zone") {
+            continue;
+        }
+        let raw_temp = read_sysfs_number(zone_path.join("temp")).await;
+        let Some(celsius) = normalize_temperature_celsius(raw_temp) else {
+            continue;
+        };
+        let label = read_trimmed_path(zone_path.join("type"))
+            .await
+            .unwrap_or_else(|| name.clone());
+        sensors.push(serde_json::json!({
+            "id": name,
+            "label": label,
+            "celsius": celsius,
+            "source": "thermal",
+            "path": zone_path.display().to_string(),
+        }));
+    }
+    sensors
+}
+
+async fn read_hwmon_stats() -> (Vec<Value>, Vec<Value>) {
+    let mut temperature_sensors = Vec::new();
+    let mut fans = Vec::new();
+    for hwmon_path in read_directory_paths(SYS_HWMON_PATH).await {
+        let name = path_file_name(&hwmon_path);
+        if !name.starts_with("hwmon") {
+            continue;
+        }
+        let hwmon_name = read_trimmed_path(hwmon_path.join("name")).await;
+        let files = read_directory_file_names(&hwmon_path).await;
+        for file_name in files {
+            if let Some(index) = file_name
+                .strip_prefix("temp")
+                .and_then(|value| value.strip_suffix("_input"))
+            {
+                let raw_temp = read_sysfs_number(hwmon_path.join(&file_name)).await;
+                let Some(celsius) = normalize_temperature_celsius(raw_temp) else {
+                    continue;
+                };
+                let label = read_trimmed_path(hwmon_path.join(format!("temp{index}_label")))
+                    .await
+                    .or_else(|| hwmon_name.clone())
+                    .unwrap_or_else(|| format!("Temperature {index}"));
+                temperature_sensors.push(serde_json::json!({
+                    "id": format!("{name}:temp{index}"),
+                    "label": label,
+                    "celsius": celsius,
+                    "source": "hwmon",
+                    "path": hwmon_path.display().to_string(),
+                }));
+                continue;
+            }
+
+            if let Some(index) = file_name
+                .strip_prefix("fan")
+                .and_then(|value| value.strip_suffix("_input"))
+            {
+                let Some(rpm) = read_sysfs_number(hwmon_path.join(&file_name)).await else {
+                    continue;
+                };
+                let label = read_trimmed_path(hwmon_path.join(format!("fan{index}_label")))
+                    .await
+                    .or_else(|| hwmon_name.clone())
+                    .unwrap_or_else(|| format!("Fan {index}"));
+                let fault = read_sysfs_number(hwmon_path.join(format!("fan{index}_fault")))
+                    .await
+                    .unwrap_or(0.0);
+                let alarm = read_sysfs_number(hwmon_path.join(format!("fan{index}_alarm")))
+                    .await
+                    .unwrap_or(0.0);
+                let status = if fault > 0.0 || alarm > 0.0 {
+                    "fault"
+                } else if rpm > 0.0 {
+                    "ok"
+                } else {
+                    "stopped"
+                };
+                fans.push(serde_json::json!({
+                    "id": format!("{name}:fan{index}"),
+                    "label": label,
+                    "rpm": rpm.max(0.0),
+                    "status": status,
+                    "source": "hwmon",
+                    "path": hwmon_path.display().to_string(),
+                }));
+            }
+        }
+    }
+    (temperature_sensors, fans)
+}
+
+fn temperature_value(sensor: &Value) -> f64 {
+    sensor.get("celsius").and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+fn temperature_sensor_score(sensor: &Value) -> i32 {
+    let label = format!(
+        "{} {}",
+        sensor
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        sensor.get("id").and_then(Value::as_str).unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    let mut score = 0;
+    for token in ["cpu", "processor", "coretemp", "k10temp", "zenpower"] {
+        if label.contains(token) {
+            score += 5;
+        }
+    }
+    for token in ["package", "x86_pkg", "tctl", "tdie"] {
+        if label.contains(token) {
+            score += 4;
+        }
+    }
+    if label.contains("core") {
+        score += 2;
+    }
+    for token in ["nvme", "gpu", "wifi", "pch"] {
+        if label.contains(token) {
+            score -= 4;
+        }
+    }
+    score
+}
+
+fn select_processor_temperature(sensors: &[Value]) -> Value {
+    sensors
+        .iter()
+        .filter_map(|sensor| {
+            let score = temperature_sensor_score(sensor);
+            (score > 0).then_some((score, sensor))
+        })
+        .max_by(|(left_score, left), (right_score, right)| {
+            left_score.cmp(right_score).then_with(|| {
+                temperature_value(left)
+                    .partial_cmp(&temperature_value(right))
+                    .unwrap_or(Ordering::Equal)
+            })
+        })
+        .map(|(_, sensor)| sensor.clone())
+        .unwrap_or(Value::Null)
+}
+
+async fn read_battery_stats() -> Vec<Value> {
+    let mut batteries = Vec::new();
+    for battery_path in read_directory_paths(SYS_POWER_SUPPLY_PATH).await {
+        let type_value = read_trimmed_path(battery_path.join("type")).await;
+        if !type_value
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("battery"))
+        {
+            continue;
+        }
+        let raw_capacity = read_sysfs_number(battery_path.join("capacity")).await;
+        let energy_now = read_sysfs_number(battery_path.join("energy_now")).await;
+        let energy_full = read_sysfs_number(battery_path.join("energy_full")).await;
+        let charge_now = read_sysfs_number(battery_path.join("charge_now")).await;
+        let charge_full = read_sysfs_number(battery_path.join("charge_full")).await;
+        let energy_percent = energy_now
+            .zip(energy_full)
+            .and_then(|(now, full)| (full > 0.0).then(|| now / full * 100.0));
+        let charge_percent = charge_now
+            .zip(charge_full)
+            .and_then(|(now, full)| (full > 0.0).then(|| now / full * 100.0));
+        let level_percent = raw_capacity
+            .or(energy_percent)
+            .or(charge_percent)
+            .map(|value| value.clamp(0.0, 100.0));
+        batteries.push(serde_json::json!({
+            "name": path_file_name(&battery_path),
+            "levelPercent": json_f64(level_percent),
+            "status": read_trimmed_path(battery_path.join("status")).await,
+            "manufacturer": read_trimmed_path(battery_path.join("manufacturer")).await,
+            "model": read_trimmed_path(battery_path.join("model_name")).await,
+            "technology": read_trimmed_path(battery_path.join("technology")).await,
+            "path": battery_path.display().to_string(),
+        }));
+    }
+    batteries
+}
+
+async fn read_hardware_stats() -> Value {
+    let (mut hwmon_temperatures, fans) = read_hwmon_stats().await;
+    hwmon_temperatures.extend(read_thermal_zone_temperatures().await);
+    hwmon_temperatures.sort_by(|left, right| {
+        temperature_value(right)
+            .partial_cmp(&temperature_value(left))
+            .unwrap_or(Ordering::Equal)
+    });
+    let processor_temperature = select_processor_temperature(&hwmon_temperatures);
+    let temperature_sensors = hwmon_temperatures.into_iter().take(16).collect::<Vec<_>>();
+    serde_json::json!({
+        "processorTemperature": processor_temperature,
+        "temperatureSensors": temperature_sensors,
+        "fans": fans,
+        "batteries": read_battery_stats().await,
+    })
 }
 
 #[derive(Clone)]
@@ -486,8 +1185,21 @@ struct UserEnvelope {
     user: iowb_protocol::UserProfile,
 }
 
-async fn list_projects(State(state): State<AppState>) -> Result<Json<ProjectListResponse>> {
-    let projects = state.projects.list(&state.sessions).await?;
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListProjectsQuery {
+    include_sessions: Option<bool>,
+}
+
+async fn list_projects(
+    State(state): State<AppState>,
+    Query(query): Query<ListProjectsQuery>,
+) -> Result<Json<ProjectListResponse>> {
+    let projects = if query.include_sessions.unwrap_or(true) {
+        state.projects.list(&state.sessions).await?
+    } else {
+        state.storage.list_projects()?
+    };
     Ok(Json(ProjectListResponse { projects }))
 }
 
@@ -941,16 +1653,62 @@ async fn delete_project(
 }
 
 #[derive(Debug, Deserialize)]
+struct RenameProjectRequest {
+    name: String,
+}
+
+async fn rename_project(
+    State(state): State<AppState>,
+    AxumPath(project_name): AxumPath<String>,
+    Json(request): Json<RenameProjectRequest>,
+) -> Result<Json<ProjectSummary>> {
+    let mut project = state.projects.find_by_name(&project_name)?;
+    let name = request.name.trim();
+    if name.is_empty() {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "project name is required",
+        ));
+    }
+    if name.len() > 200 || name.chars().any(char::is_control) {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "project name must be 200 printable characters or fewer",
+        ));
+    }
+    if let Some(existing) = state.storage.find_project_by_name(name)?
+        && existing.id != project.id
+    {
+        return Err(ServerError::new(
+            StatusCode::CONFLICT,
+            "another project already uses that name",
+        ));
+    }
+
+    project.name = name.to_string();
+    project.updated_at = Utc::now();
+    state.storage.upsert_project(&project)?;
+    project.sessions = state.sessions.list_for_project(&project.path).await?;
+    publish_projects(&state).await;
+    Ok(Json(project))
+}
+
+#[derive(Debug, Deserialize)]
 struct FileQuery {
     path: Option<String>,
     #[serde(rename = "filePath")]
     file_path: Option<String>,
+    #[serde(rename = "dirPath")]
+    dir_path: Option<String>,
+    #[serde(rename = "maxDepth")]
+    max_depth: Option<usize>,
 }
 
 impl FileQuery {
     fn requested_path(&self) -> &str {
-        self.file_path
+        self.dir_path
             .as_deref()
+            .or(self.file_path.as_deref())
             .or(self.path.as_deref())
             .unwrap_or("")
     }
@@ -965,7 +1723,11 @@ async fn list_project_files(
     Ok(Json(
         state
             .files
-            .list_tree(project.path, query.requested_path())
+            .list_tree_with_depth(
+                project.path,
+                query.requested_path(),
+                query.max_depth.unwrap_or(state.config.max_scan_depth),
+            )
             .await?,
     ))
 }
@@ -1034,6 +1796,20 @@ async fn rename_project_file(
         state
             .files
             .rename_path(project.path, request.old_path, request.new_path)
+            .await?,
+    ))
+}
+
+async fn copy_project_file(
+    State(state): State<AppState>,
+    AxumPath(project_name): AxumPath<String>,
+    Json(request): Json<CopyFileRequest>,
+) -> Result<Json<FileEntry>> {
+    let project = state.projects.find_by_name(&project_name)?;
+    Ok(Json(
+        state
+            .files
+            .copy_path(project.path, request.source_path, request.target_path)
             .await?,
     ))
 }
@@ -1328,6 +2104,290 @@ async fn list_settings(State(state): State<AppState>) -> Result<Json<Value>> {
     })))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct MobileSettingsOverviewQuery {
+    section: Option<String>,
+}
+
+async fn mobile_settings_overview(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Query(query): Query<MobileSettingsOverviewQuery>,
+) -> Result<Json<Value>> {
+    let user_id = &user.0.id;
+    match query.section.as_deref() {
+        Some("agents") => {
+            let (
+                claude_status,
+                codex_status,
+                gemini_status,
+                cursor_status,
+                claude_mcp_config,
+                cursor_mcp_config,
+                codex_mcp_config,
+            ) = tokio::join!(
+                provider_cli_status(Provider::Claude),
+                provider_cli_status(Provider::Codex),
+                provider_cli_status(Provider::Gemini),
+                cursor_cli_status(),
+                claude_mcp_config_overview(&state.config.workspace_root),
+                cursor_mcp_config_overview(),
+                codex_mcp_config_overview(),
+            );
+            let providers = serde_json::json!({
+                "claude": claude_status,
+                "codex": codex_status,
+                "gemini": gemini_status,
+                "cursor": cursor_status,
+            });
+            return Ok(Json(serde_json::json!({
+                "success": true,
+                "agents": {
+                    "providers": providers,
+                    "permissions": {
+                        "claude": state.storage
+                            .get_setting(&user_setting_key(user_id, "claude-settings"))?
+                            .unwrap_or_else(default_claude_agent_settings),
+                        "cursor": state.storage
+                            .get_setting(&user_setting_key(user_id, "cursor-tools-settings"))?
+                            .unwrap_or_else(default_cursor_agent_settings),
+                        "codex": state.storage
+                            .get_setting(&user_setting_key(user_id, "codex-settings"))?
+                            .unwrap_or_else(default_codex_agent_settings),
+                        "gemini": state.storage
+                            .get_setting(&user_setting_key(user_id, "gemini-settings"))?
+                            .unwrap_or_else(default_gemini_agent_settings),
+                    },
+                    "mcp": {
+                        "servers": load_mcp_servers(&state, user_id)?,
+                        "claude": { "config": claude_mcp_config },
+                        "cursor": { "config": cursor_mcp_config },
+                        "codex": { "config": codex_mcp_config },
+                    },
+                    "models": {
+                        "claude": fallback_models(Provider::Claude),
+                        "cursor": ["gpt-5", "gpt-4.1", "claude-sonnet-4-5"],
+                        "codex": fallback_models(Provider::Codex),
+                        "gemini": fallback_models(Provider::Gemini),
+                    }
+                }
+            })));
+        }
+        Some("appearance") => {
+            return Ok(Json(serde_json::json!({
+                "success": true,
+                "appearance": state.storage
+                    .get_setting(&user_setting_key(user_id, "appearance-settings"))?
+                    .unwrap_or_else(default_appearance_settings),
+            })));
+        }
+        Some("tasks") => {
+            return Ok(Json(serde_json::json!({
+                "success": true,
+                "tasks": state.storage
+                    .get_setting(&user_setting_key(user_id, "tasks-settings"))?
+                    .unwrap_or_else(default_tasks_settings),
+            })));
+        }
+        Some("plugins") => {
+            return Ok(Json(serde_json::json!({
+                "success": true,
+                "plugins": compat_value(
+                    &state,
+                    user_id,
+                    "plugins",
+                    "/api/plugins",
+                    serde_json::json!({
+                        "plugins": [],
+                        "namespace": "plugins",
+                        "path": "/api/plugins"
+                    }),
+                )?,
+            })));
+        }
+        _ => {}
+    }
+
+    let direct_ai = resolved_direct_ai_config_for_user(&state, user_id);
+    let (runtime, claude_status, codex_status, gemini_status, cursor_status, direct_ai_models) = tokio::join!(
+        runtime_metrics_payload(&state),
+        provider_cli_status(Provider::Claude),
+        provider_cli_status(Provider::Codex),
+        provider_cli_status(Provider::Gemini),
+        cursor_cli_status(),
+        timeout(Duration::from_secs(2), fetch_direct_ai_models(&direct_ai),),
+    );
+    let runtime = runtime?;
+    let mut providers = serde_json::Map::new();
+    providers.insert(Provider::Claude.as_str().to_string(), claude_status);
+    providers.insert(Provider::Codex.as_str().to_string(), codex_status);
+    providers.insert(Provider::Gemini.as_str().to_string(), gemini_status);
+    providers.insert("cursor".to_string(), cursor_status);
+    let direct_ai_models = match direct_ai_models {
+        Ok(Ok(models)) => models,
+        _ => Vec::new(),
+    };
+    let git = current_git_config_overview(&state, user_id)?;
+    let api_keys = state.storage.list_api_keys(user_id)?;
+    let credentials = state.storage.list_credentials(user_id, None)?;
+    let github_credentials = state
+        .storage
+        .list_credentials(user_id, Some("github_token"))?;
+    let notification_preferences = state
+        .storage
+        .get_setting(&user_setting_key(user_id, "notification-preferences"))?
+        .unwrap_or_else(default_notification_preferences);
+    let plugins = compat_value(
+        &state,
+        user_id,
+        "plugins",
+        "/api/plugins",
+        serde_json::json!({
+            "plugins": [],
+            "namespace": "plugins",
+            "path": "/api/plugins"
+        }),
+    )?;
+    let claude_mcp_config = claude_mcp_config_overview(&state.config.workspace_root).await;
+    let cursor_config = cursor_config_overview().await;
+    let cursor_mcp_config = cursor_mcp_config_overview().await;
+    let codex_config = codex_config_overview().await;
+    let codex_mcp_config = codex_mcp_config_overview().await;
+    let claude_mcp_cli = compat_value(
+        &state,
+        user_id,
+        "mcp",
+        "/api/mcp/cli/list",
+        serde_json::json!({ "success": true, "servers": [] }),
+    )?;
+    let codex_mcp_cli = compat_value(
+        &state,
+        user_id,
+        "provider",
+        "/api/codex/mcp/cli/list",
+        serde_json::json!({ "success": true, "servers": [] }),
+    )?;
+    let mcp_utils_all = compat_value(
+        &state,
+        user_id,
+        "mcp-utils",
+        "/api/mcp-utils/all-servers",
+        serde_json::json!({ "success": true, "servers": {} }),
+    )?;
+    let runtime_resources = runtime.get("resources").cloned().unwrap_or(Value::Null);
+    let process_uptime_seconds = runtime_resources
+        .get("processUptimeSeconds")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "server": {
+            "status": state.config.server_status(VERSION),
+            "runtime": runtime,
+            "webStatus": {
+                "success": true,
+                "server": {
+                    "status": "ok",
+                    "timestamp": Utc::now(),
+                    "appRoot": state.config.workspace_root.display().to_string(),
+                    "installMode": "rust",
+                    "packageName": PRODUCT_NAME,
+                    "version": VERSION,
+                    "uptimeSeconds": process_uptime_seconds,
+                    "platform": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                    "pid": std::process::id(),
+                    "port": state.config.port.to_string(),
+                    "environment": env::var("IO_WORKBENCH_ENV").unwrap_or_else(|_| "local".to_string()),
+                    "resources": runtime_resources,
+                }
+            },
+        },
+        "agents": {
+            "providers": providers,
+            "permissions": {
+                "claude": state.storage
+                    .get_setting(&user_setting_key(user_id, "claude-settings"))?
+                    .unwrap_or_else(default_claude_agent_settings),
+                "cursor": state.storage
+                    .get_setting(&user_setting_key(user_id, "cursor-tools-settings"))?
+                    .unwrap_or_else(default_cursor_agent_settings),
+                "codex": state.storage
+                    .get_setting(&user_setting_key(user_id, "codex-settings"))?
+                    .unwrap_or_else(default_codex_agent_settings),
+                "gemini": state.storage
+                    .get_setting(&user_setting_key(user_id, "gemini-settings"))?
+                    .unwrap_or_else(default_gemini_agent_settings),
+            },
+            "mcp": {
+                "servers": load_mcp_servers(&state, user_id)?,
+                "claude": {
+                    "config": claude_mcp_config,
+                    "cli": claude_mcp_cli,
+                },
+                "cursor": {
+                    "config": cursor_mcp_config,
+                },
+                "codex": {
+                    "config": codex_mcp_config,
+                    "cli": codex_mcp_cli,
+                },
+                "utils": {
+                    "allServers": mcp_utils_all,
+                },
+            },
+            "models": {
+                "claude": fallback_models(Provider::Claude),
+                "cursor": ["gpt-5", "gpt-4.1", "claude-sonnet-4-5"],
+                "codex": fallback_models(Provider::Codex),
+                "gemini": fallback_models(Provider::Gemini),
+            }
+        },
+        "cursor": {
+            "config": cursor_config,
+            "mcp": cursor_mcp_config,
+        },
+        "codex": {
+            "config": codex_config,
+            "mcp": codex_mcp_config,
+        },
+        "appearance": state.storage
+            .get_setting(&user_setting_key(user_id, "appearance-settings"))?
+            .unwrap_or_else(default_appearance_settings),
+        "git": git,
+        "api": {
+            "apiKeys": api_keys,
+            "credentials": credentials,
+            "githubCredentials": github_credentials,
+        },
+        "credentials": {
+            "all": credentials,
+            "github": github_credentials,
+        },
+        "tasks": state.storage
+            .get_setting(&user_setting_key(user_id, "tasks-settings"))?
+            .unwrap_or_else(default_tasks_settings),
+        "notifications": {
+            "preferences": notification_preferences,
+        },
+        "plugins": plugins,
+        "directAi": {
+            "config": direct_ai,
+            "runtimeReady": direct_ai_endpoint_config(&direct_ai).is_some(),
+            "models": direct_ai_models,
+            "modelsEndpoint": "/api/settings/direct-ai/models",
+        },
+        "settings": {
+            "all": state.storage.list_settings()?,
+        },
+        "about": {
+            "product": PRODUCT_NAME,
+            "version": VERSION,
+        }
+    })))
+}
+
 async fn get_setting(
     State(state): State<AppState>,
     AxumPath(key): AxumPath<String>,
@@ -1446,17 +2506,344 @@ async fn set_direct_ai(
     })))
 }
 
-async fn direct_ai_models(
+#[derive(Debug, Default, serde::Deserialize)]
+struct ChatModelsQuery {
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+/// Per-provider model catalog used by the chat UI's model picker. Codex can
+/// query dynamic CLI catalogs; Claude and Gemini use curated provider-specific
+/// lists to avoid slow interactive `models` subcommands. Direct-AI gateway
+/// models are exposed for every UI provider; Codex keeps using its aiproxy
+/// provider override, while Claude/Gemini chat sessions call the Direct-AI
+/// gateway API directly for gateway-prefixed selections.
+async fn chat_provider_models(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-) -> Json<Value> {
-    let key = user_setting_key(&user.0.id, "direct-ai");
-    let config = state
+    Query(query): Query<ChatModelsQuery>,
+) -> Result<Json<Value>> {
+    let provider = match query.provider.as_deref() {
+        Some(name) => parse_provider_param(name)?,
+        None => Provider::Codex,
+    };
+
+    let gateway_models = direct_ai_models_for_user(&state, &user.0.id)
+        .await
+        .unwrap_or_default();
+    let mut models: Vec<String> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    if matches!(provider, Provider::Codex) {
+        for model in &gateway_models {
+            push_chat_model(&mut models, &mut seen, model);
+        }
+        let cli_models = fetch_cli_models(provider_command(provider)).await;
+        let base_models = if cli_models.is_empty() {
+            fallback_models(provider)
+        } else {
+            cli_models
+        };
+        for model in base_models {
+            push_chat_model(&mut models, &mut seen, model);
+        }
+    } else {
+        for model in fallback_models(provider) {
+            push_chat_model(&mut models, &mut seen, model);
+        }
+        for model in &gateway_models {
+            push_chat_model(&mut models, &mut seen, model);
+        }
+    }
+
+    let models: Vec<Value> = models
+        .into_iter()
+        .map(|value| {
+            serde_json::json!({
+                "value": value,
+                "label": value,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "provider": provider.as_str(),
+        "models": models,
+    })))
+}
+
+fn push_chat_model(
+    models: &mut Vec<String>,
+    seen: &mut std::collections::BTreeSet<String>,
+    model: impl AsRef<str>,
+) {
+    let value = model.as_ref().trim();
+    if value.is_empty() {
+        return;
+    }
+    let key = value.to_ascii_lowercase();
+    if seen.insert(key) {
+        models.push(value.to_string());
+    }
+}
+
+/// Fetch the user's Direct-AI proxy model list and return the model ids.
+/// Returns None when the proxy is disabled or the request fails so the
+/// caller can silently fall back to the CLI/curated list. Also probes the
+/// environment for `CODEX_GATEWAY_KEY` so users with the web-ai-cli style
+/// proxy (configured via env, not settings) still see their proxy models.
+async fn direct_ai_models_for_user(state: &AppState, user_id: &str) -> Option<Vec<String>> {
+    let config = resolved_direct_ai_config_for_user(state, user_id);
+    let raw = fetch_direct_ai_models(&config).await.unwrap_or_default();
+    if raw.is_empty() {
+        return None;
+    }
+    let ids: Vec<String> = raw
+        .into_iter()
+        .filter_map(|model| {
+            model
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    model
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .collect();
+    if ids.is_empty() { None } else { Some(ids) }
+}
+
+fn direct_ai_runtime_config_for_user(
+    state: &AppState,
+    user_id: &str,
+) -> Option<DirectAiRuntimeConfig> {
+    let config = resolved_direct_ai_config_for_user(state, user_id);
+    let (base_url, api_key) = direct_ai_endpoint_config(&config)?;
+    let max_tokens = config
+        .get("maxTokens")
+        .or_else(|| config.get("max_tokens"))
+        .and_then(Value::as_u64);
+    Some(DirectAiRuntimeConfig {
+        base_url,
+        api_key,
+        max_tokens,
+    })
+}
+
+fn resolved_direct_ai_config_for_user(state: &AppState, user_id: &str) -> Value {
+    let key = user_setting_key(user_id, "direct-ai");
+    let mut config = state
         .storage
         .get_setting(&key)
         .ok()
         .flatten()
         .unwrap_or_else(default_direct_ai_config);
+    apply_implicit_gateway_env_config(&mut config);
+    config
+}
+
+fn apply_implicit_gateway_env_config(config: &mut Value) {
+    if !config.is_object() {
+        *config = default_direct_ai_config();
+    }
+
+    let has_gateway_key = env::var("CODEX_GATEWAY_KEY")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if !has_gateway_key {
+        return;
+    }
+
+    let mode = config.get("mode").and_then(Value::as_str).unwrap_or("off");
+    if mode != "off" && !mode.is_empty() {
+        return;
+    }
+
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    obj.insert("mode".to_string(), Value::String("aiproxy".to_string()));
+    let has_base_url = obj
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if !has_base_url {
+        obj.insert(
+            "baseUrl".to_string(),
+            Value::String("http://141.144.197.96:8319/claude".to_string()),
+        );
+    }
+    let has_key_env = obj
+        .get("apiKeyEnv")
+        .and_then(Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if !has_key_env {
+        obj.insert(
+            "apiKeyEnv".to_string(),
+            Value::String("CODEX_GATEWAY_KEY".to_string()),
+        );
+    }
+}
+
+/// How long to wait for a provider CLI's `models` subcommand before falling
+/// back to the curated list. Some CLIs (notably `claude`) treat `models`
+/// as an interactive prompt and never return when stdin is not a TTY,
+/// which would otherwise hang the `/api/chat/models` endpoint.
+const CLI_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn fetch_cli_models(command: &str) -> Vec<String> {
+    // Try `cmd models --json` or `cmd models list`; ignore failures and let
+    // the caller fall back to a curated list.
+    for args in [
+        vec!["models", "--json"],
+        vec!["models", "list", "--json"],
+        vec!["models", "list"],
+        vec!["models"],
+    ] {
+        let invocation = async {
+            tokio::process::Command::new(command)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+        };
+        let output = match tokio::time::timeout(CLI_MODEL_TIMEOUT, invocation).await {
+            Ok(result) => result,
+            Err(_) => {
+                // CLI hung past the timeout; try the next invocation and
+                // eventually fall back to the curated list.
+                continue;
+            }
+        };
+        if let Ok(out) = output {
+            if !out.status.success() {
+                continue;
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // Try JSON first.
+            if let Ok(parsed) = serde_json::from_str::<Value>(stdout.trim()) {
+                if let Some(arr) = parsed.get("data").and_then(|v| v.as_array()) {
+                    let names: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| {
+                            v.get("id")
+                                .or_else(|| v.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .filter(|s| looks_like_model_id(s))
+                        .collect();
+                    if !names.is_empty() {
+                        return names;
+                    }
+                } else if let Some(arr) = parsed.as_array() {
+                    let names: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .filter(|s| looks_like_model_id(s))
+                        .collect();
+                    if !names.is_empty() {
+                        return names;
+                    }
+                }
+            }
+            // Otherwise treat each non-empty line as an id, but only keep
+            // tokens that look like model slugs (e.g. `claude-opus-4-1`,
+            // `gpt-5`, `gemini-2.5-pro`). The Claude CLI prints an
+            // interactive clarification prompt on `claude models` that exits
+            // 0 with prose like "1. **List supported models** — ..." which
+            // would otherwise be parsed as a list of model names.
+            let ids: Vec<String> = stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| {
+                    // Drop whitespace-delimited extras after the id.
+                    l.split_whitespace().next().unwrap_or("").to_string()
+                })
+                .filter(|l| looks_like_model_id(l))
+                .collect();
+            if !ids.is_empty() {
+                return ids;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Heuristic check that a token is a plausible model identifier. Model ids
+/// from the supported providers are short slugs (e.g. `gpt-5-codex`,
+/// `claude-opus-4-1`, `gemini-2.5-pro`) that contain letters or digits plus
+/// `-`, `.`, `_`, `:`, or `/`. Real identifiers are at least 3 characters
+/// and always contain either a digit or one of the separator characters
+/// (otherwise prose tokens like `A` or `If` from interactive prompts would
+/// be misclassified as model ids).
+fn looks_like_model_id(token: &str) -> bool {
+    if token.len() < 3 || token.len() > 80 {
+        return false;
+    }
+    if token.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut has_alnum = false;
+    let mut has_separator = false;
+    for ch in token.chars() {
+        if ch.is_alphanumeric() {
+            has_alnum = true;
+            continue;
+        }
+        if matches!(ch, '-' | '.' | '_' | ':' | '/') {
+            has_separator = true;
+            continue;
+        }
+        return false;
+    }
+    has_alnum && (has_separator || token.chars().any(|c| c.is_ascii_digit()))
+}
+
+fn fallback_models(provider: Provider) -> Vec<String> {
+    match provider {
+        Provider::Codex => vec![
+            "gpt-5".to_string(),
+            "gpt-5-codex".to_string(),
+            "gpt-5-mini".to_string(),
+            "gpt-5-nano".to_string(),
+            "gpt-4.1".to_string(),
+            "gpt-4.1-mini".to_string(),
+            "gpt-4o".to_string(),
+            "o4-mini".to_string(),
+        ],
+        Provider::Claude => vec![
+            "claude-sonnet-4-5".to_string(),
+            "claude-sonnet-4".to_string(),
+            "claude-opus-4".to_string(),
+            "claude-3-7-sonnet-latest".to_string(),
+            "claude-3-5-sonnet-latest".to_string(),
+            "claude-3-5-haiku-latest".to_string(),
+        ],
+        Provider::Gemini => vec![
+            "gemini-2.5-pro".to_string(),
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.0-flash".to_string(),
+            "gemini-1.5-pro-latest".to_string(),
+            "gemini-1.5-flash-latest".to_string(),
+        ],
+    }
+}
+
+async fn direct_ai_models(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Json<Value> {
+    let config = resolved_direct_ai_config_for_user(&state, &user.0.id);
     let models = fetch_direct_ai_models(&config).await.unwrap_or_default();
     Json(serde_json::json!({
         "success": true,
@@ -1592,23 +2979,22 @@ async fn user_settings_overview(
 }
 
 async fn cli_provider_status(AxumPath(provider): AxumPath<String>) -> Result<Json<Value>> {
+    if provider == "cursor" {
+        return Ok(Json(cursor_cli_status().await));
+    }
     let provider = parse_provider_param(&provider)?;
     Ok(Json(provider_cli_status(provider).await))
 }
 
 async fn cli_overview() -> Json<Value> {
     let mut providers = serde_json::Map::new();
-    for provider in [
-        Provider::Claude,
-        Provider::Cursor,
-        Provider::Codex,
-        Provider::Gemini,
-    ] {
+    for provider in [Provider::Claude, Provider::Codex, Provider::Gemini] {
         providers.insert(
             provider.as_str().to_string(),
             provider_cli_status(provider).await,
         );
     }
+    providers.insert("cursor".to_string(), cursor_cli_status().await);
     Json(serde_json::json!({
         "success": true,
         "providers": providers,
@@ -1804,14 +3190,63 @@ struct CreateCredentialRequest {
     description: Option<String>,
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct SessionMessagesQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    tail: bool,
+}
+
 async fn session_messages(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
+    Query(query): Query<SessionMessagesQuery>,
 ) -> Result<Json<MessagesResponse>> {
-    let messages = state.sessions.messages(&session_id)?;
+    let offset = query.offset.unwrap_or(0);
+    // When neither limit nor offset is supplied we keep the legacy "all
+    // messages" behaviour for backwards compatibility with the admin views.
+    if query.limit.is_none() && offset == 0 {
+        let messages = state
+            .sessions
+            .messages_including_external(&session_id)
+            .await?;
+        let total_count = messages.len();
+        return Ok(Json(MessagesResponse {
+            session_id,
+            messages,
+            has_more: false,
+            total_count,
+        }));
+    }
+
+    let limit = query.limit.unwrap_or(100);
+    if query.tail {
+        let messages = state
+            .sessions
+            .messages_including_external(&session_id)
+            .await?;
+        let total_count = messages.len();
+        let start = total_count.saturating_sub(limit.max(1).min(500));
+        return Ok(Json(MessagesResponse {
+            session_id,
+            messages: messages[start..].to_vec(),
+            has_more: start > 0,
+            total_count,
+        }));
+    }
+    let (messages, total_count) = state
+        .sessions
+        .messages_page_including_external(&session_id, limit, offset)
+        .await?;
+    let has_more = offset + messages.len() < total_count;
     Ok(Json(MessagesResponse {
         session_id,
         messages,
+        has_more,
+        total_count,
     }))
 }
 
@@ -1888,6 +3323,28 @@ async fn rename_session(
     Ok(Json(serde_json::json!({
         "success": true,
         "session": session,
+    })))
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<Value>> {
+    validate_session_id(&session_id)?;
+    let session = state.sessions.get(&session_id).await?;
+    if session.active {
+        let _ = state
+            .abort_agent_session(session.provider, &session_id)
+            .await;
+    }
+    let deleted = state.sessions.delete(&session_id).await?;
+    state.ws_hub.publish(WsServerEvent::ActiveSessions {
+        sessions: state.sessions.list_active().await,
+    });
+    publish_projects(&state).await;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "session": deleted,
     })))
 }
 
@@ -1970,17 +3427,10 @@ async fn session_token_usage(
         .unwrap_or(Provider::Claude);
 
     let usage = match provider {
-        Provider::Cursor => serde_json::json!({
-            "used": 0,
-            "total": 0,
-            "breakdown": { "input": 0, "cacheCreation": 0, "cacheRead": 0 },
-            "unsupported": true,
-            "message": "Token usage tracking not available for Cursor sessions",
-        }),
         Provider::Gemini => serde_json::json!({
             "used": 0,
             "total": 0,
-            "breakdown": { "input": 0, "cacheCreation": 0, "cacheRead": 0 },
+            "breakdown": { "input": 0, "output": 0, "cacheCreation": 0, "cacheRead": 0 },
             "unsupported": true,
             "message": "Token usage tracking not available for Gemini sessions",
         }),
@@ -1990,6 +3440,39 @@ async fn session_token_usage(
             claude_token_usage(&project.path, &session_id).await?
         }
     };
+
+    // Stamp token usage onto the latest assistant message so the per-turn
+    // footer persists across page refreshes (the UI otherwise has to fetch
+    // it on every load). Skip providers that explicitly report "unsupported".
+    let unsupported = usage
+        .get("unsupported")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !unsupported {
+        let breakdown = usage.get("breakdown").cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "input": 0,
+                "output": 0,
+                "cacheCreation": 0,
+                "cacheRead": 0,
+            })
+        });
+        let token_payload = serde_json::json!({
+            "used": usage.get("used").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "input": breakdown.get("input").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "output": breakdown.get("output").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "cacheCreation": breakdown.get("cacheCreation").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "cacheRead": breakdown.get("cacheRead").cloned().unwrap_or_else(|| serde_json::json!(0)),
+        });
+        let stamp = serde_json::json!({ "tokenUsage": token_payload });
+        if let Err(error) =
+            state
+                .sessions
+                .stamp_latest_message_metadata(&session_id, MessageRole::Assistant, stamp)
+        {
+            warn!(error = %error, session_id = %session_id, "failed to stamp token usage on assistant message");
+        }
+    }
 
     Ok(Json(usage))
 }
@@ -2053,15 +3536,16 @@ async fn ws_handler(
     uri: Uri,
 ) -> Response {
     let token = request_token(&headers, uri.query());
-    if let Err(error) = state.auth.require_user(token.as_deref()) {
-        return ServerError::from(error).into_response();
-    }
+    let user = match state.auth.require_user(token.as_deref()) {
+        Ok(user) => user,
+        Err(error) => return ServerError::from(error).into_response(),
+    };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, user))
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::UserProfile) {
     let connection_id = new_id("conn");
     let (mut sender, mut receiver) = socket.split();
     let (command_tx, mut command_rx) =
@@ -2108,7 +3592,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     loop {
         tokio::select! {
             Some(command) = command_rx.recv() => {
-                handle_ws_command(&state, &direct_tx, command).await;
+                handle_ws_command(&state, &direct_tx, &user, command).await;
             }
             Some(event) = direct_rx.recv() => {
                 if send_ws_event(&mut sender, event).await.is_err() {
@@ -2144,6 +3628,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 async fn handle_ws_command(
     state: &AppState,
     direct_tx: &mpsc::Sender<WsServerEvent>,
+    user: &iowb_protocol::UserProfile,
     command: WsClientCommand,
 ) {
     match command {
@@ -2171,8 +3656,21 @@ async fn handle_ws_command(
             prompt,
             session_id,
             model,
+            effort,
+            mode,
+            thinking,
         } => match state
-            .start_agent_session(provider, project_path, prompt, session_id, model)
+            .start_agent_session(
+                provider,
+                project_path,
+                prompt,
+                session_id,
+                model,
+                effort,
+                mode,
+                thinking,
+                direct_ai_runtime_config_for_user(state, &user.id),
+            )
             .await
         {
             Ok(session) => {
@@ -2418,16 +3916,117 @@ fn user_setting_key(user_id: &str, key: &str) -> String {
     format!("user:{user_id}:{key}")
 }
 
+fn current_git_config_overview(state: &AppState, user_id: &str) -> Result<Value> {
+    let stored = state
+        .storage
+        .get_setting(&user_setting_key(user_id, "git-config"))?;
+    let git_name = stored
+        .as_ref()
+        .and_then(|value| value.get("gitName"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| stored_git_alias(&stored, "git_name"))
+        .or_else(|| blocking_git_config("user.name"));
+    let git_email = stored
+        .as_ref()
+        .and_then(|value| value.get("gitEmail"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| stored_git_alias(&stored, "git_email"))
+        .or_else(|| blocking_git_config("user.email"));
+    let source = if stored.is_some() {
+        "server-setting"
+    } else if git_name.is_some() || git_email.is_some() {
+        "git-global"
+    } else {
+        "unset"
+    };
+
+    Ok(serde_json::json!({
+        "gitName": git_name,
+        "gitEmail": git_email,
+        "source": source,
+    }))
+}
+
+fn default_claude_agent_settings() -> Value {
+    serde_json::json!({
+        "allowedTools": [],
+        "disallowedTools": [],
+        "skipPermissions": false,
+        "providerMode": "anthropic",
+        "aiProxyBaseUrl": "",
+        "aiProxyApiKeyEnv": "CODEX_GATEWAY_KEY",
+        "minimaxBaseUrl": "https://api.minimax.io/anthropic",
+        "minimaxApiKeyEnv": "MINIMAX_API_KEY",
+        "minimaxModel": "MiniMax-M3"
+    })
+}
+
+fn default_cursor_agent_settings() -> Value {
+    serde_json::json!({
+        "allowedCommands": [],
+        "disallowedCommands": [],
+        "skipPermissions": false
+    })
+}
+
+fn default_codex_agent_settings() -> Value {
+    serde_json::json!({
+        "permissionMode": "default"
+    })
+}
+
+fn default_gemini_agent_settings() -> Value {
+    serde_json::json!({
+        "permissionMode": "default"
+    })
+}
+
+fn default_appearance_settings() -> Value {
+    serde_json::json!({
+        "projectSortOrder": "name",
+        "codeEditor": {
+            "theme": "dark",
+            "wordWrap": false,
+            "showMinimap": true,
+            "lineNumbers": true,
+            "fontSize": "14"
+        }
+    })
+}
+
+fn default_tasks_settings() -> Value {
+    serde_json::json!({
+        "enabled": true,
+        "runEndpoint": "/api/taskmaster/run",
+        "commandsEndpoint": "/api/commands/run"
+    })
+}
+
 fn default_notification_preferences() -> Value {
     serde_json::json!({
         "channels": {
-            "browser": true,
-            "webPush": false
+            "inApp": true,
+            "webPush": false,
+            "telegram": false,
+            "googleChat": false
+        },
+        "telegram": {
+            "botToken": "",
+            "chatId": ""
+        },
+        "googleChat": {
+            "webhookUrl": ""
         },
         "events": {
-            "sessionComplete": true,
-            "permissionRequired": true,
-            "processFailed": true
+            "actionRequired": true,
+            "stop": true,
+            "error": true,
+            "agenticRunStarted": true,
+            "agenticTaskUpdated": false,
+            "agenticRunCompleted": true,
+            "agenticRunNeedsAttention": true
         }
     })
 }
@@ -2439,6 +4038,437 @@ fn default_direct_ai_config() -> Value {
         "apiKeyEnv": null,
         "model": null
     })
+}
+
+fn default_cursor_compat() -> Value {
+    serde_json::json!({
+        "success": true,
+        "servers": [],
+        "isDefault": true
+    })
+}
+
+async fn read_json_file(path: &Path) -> Option<Value> {
+    let content = read_text_path(path).await?;
+    serde_json::from_str::<Value>(&content).ok()
+}
+
+async fn cursor_config_overview() -> Value {
+    let Some(home) = home_dir() else {
+        return serde_json::json!({
+            "success": false,
+            "error": "home directory not found",
+            "config": default_cursor_config(),
+            "isDefault": true
+        });
+    };
+    let config_path = home.join(".cursor").join("cli-config.json");
+    if let Some(config) = read_json_file(&config_path).await {
+        return serde_json::json!({
+            "success": true,
+            "config": config,
+            "path": config_path.display().to_string(),
+            "isDefault": false
+        });
+    }
+    serde_json::json!({
+        "success": true,
+        "config": default_cursor_config(),
+        "path": config_path.display().to_string(),
+        "isDefault": true
+    })
+}
+
+fn default_cursor_config() -> Value {
+    serde_json::json!({
+        "version": 1,
+        "model": {
+            "modelId": "gpt-5",
+            "displayName": "GPT-5"
+        },
+        "permissions": {
+            "allow": [],
+            "deny": []
+        }
+    })
+}
+
+async fn cursor_mcp_config_overview() -> Value {
+    let Some(home) = home_dir() else {
+        return serde_json::json!({
+            "success": false,
+            "error": "home directory not found",
+            "servers": []
+        });
+    };
+    let mcp_path = home.join(".cursor").join("mcp.json");
+    let Some(config) = read_json_file(&mcp_path).await else {
+        return serde_json::json!({
+            "success": true,
+            "servers": [],
+            "path": mcp_path.display().to_string(),
+            "isDefault": true
+        });
+    };
+    let servers = config
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .map(|servers| mcp_servers_from_object(servers, "cursor", None))
+        .unwrap_or_default();
+    serde_json::json!({
+        "success": true,
+        "servers": servers,
+        "path": mcp_path.display().to_string(),
+        "raw": config,
+        "isDefault": false
+    })
+}
+
+async fn claude_mcp_config_overview(workspace_root: &Path) -> Value {
+    let Some(home) = home_dir() else {
+        return serde_json::json!({
+            "success": false,
+            "message": "home directory not found",
+            "servers": []
+        });
+    };
+    let config_paths = [
+        home.join(".claude.json"),
+        home.join(".claude").join("settings.json"),
+    ];
+    let mut config_data = None;
+    let mut config_path = None;
+    for path in config_paths {
+        if let Some(value) = read_json_file(&path).await {
+            config_data = Some(value);
+            config_path = Some(path);
+            break;
+        }
+    }
+    let Some(config) = config_data else {
+        return serde_json::json!({
+            "success": false,
+            "message": "No Claude configuration file found",
+            "servers": []
+        });
+    };
+
+    let mut servers = Vec::new();
+    if let Some(root_servers) = config.get("mcpServers").and_then(Value::as_object) {
+        servers.extend(mcp_servers_from_object(root_servers, "user", None));
+    }
+    let workspace_key = workspace_root.display().to_string();
+    if let Some(project_servers) = config
+        .get("projects")
+        .and_then(Value::as_object)
+        .and_then(|projects| projects.get(&workspace_key))
+        .and_then(|project| project.get("mcpServers"))
+        .and_then(Value::as_object)
+    {
+        servers.extend(mcp_servers_from_object(
+            project_servers,
+            "local",
+            Some(workspace_key),
+        ));
+    }
+
+    serde_json::json!({
+        "success": true,
+        "configPath": config_path.map(|path| path.display().to_string()),
+        "servers": servers
+    })
+}
+
+fn mcp_servers_from_object(
+    servers: &serde_json::Map<String, Value>,
+    scope: &str,
+    project_path: Option<String>,
+) -> Vec<Value> {
+    servers
+        .iter()
+        .map(|(name, config)| mcp_server_record(name, config, scope, project_path.clone()))
+        .collect()
+}
+
+fn mcp_server_record(
+    name: &str,
+    config: &Value,
+    scope: &str,
+    project_path: Option<String>,
+) -> Value {
+    let server_type = if config.get("command").is_some() {
+        "stdio".to_string()
+    } else {
+        config
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or("http")
+            .to_string()
+    };
+    let config_details = if server_type == "stdio" {
+        serde_json::json!({
+            "command": config.get("command").and_then(Value::as_str).unwrap_or_default(),
+            "args": config.get("args").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "env": config.get("env").cloned().unwrap_or_else(|| serde_json::json!({})),
+        })
+    } else {
+        serde_json::json!({
+            "url": config.get("url").and_then(Value::as_str).unwrap_or_default(),
+            "headers": config.get("headers").cloned().unwrap_or_else(|| serde_json::json!({})),
+        })
+    };
+    serde_json::json!({
+        "id": if scope == "local" { format!("local:{name}") } else { name.to_string() },
+        "name": name,
+        "type": server_type,
+        "scope": scope,
+        "projectPath": project_path,
+        "config": config_details,
+        "raw": config,
+    })
+}
+
+async fn codex_config_overview() -> Value {
+    let Some(home) = home_dir() else {
+        return default_codex_config_overview(Value::Null);
+    };
+    let config_path = home.join(".codex").join("config.toml");
+    let Some(content) = read_text_path(&config_path).await else {
+        return default_codex_config_overview(Value::String(config_path.display().to_string()));
+    };
+    let top_values = parse_top_level_toml_values(&content);
+    let model = top_values.get("model").cloned().unwrap_or(Value::Null);
+    let reasoning_effort = top_values
+        .get("model_reasoning_effort")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let approval_mode = top_values
+        .get("approval_mode")
+        .cloned()
+        .unwrap_or_else(|| Value::String("suggest".to_string()));
+    let profile_name = env::var("CODEX_PROFILE").unwrap_or_else(|_| "default".to_string());
+
+    serde_json::json!({
+        "success": true,
+        "configPath": config_path.display().to_string(),
+        "config": {
+            "model": model,
+            "profileModel": Value::Null,
+            "resolvedModel": top_values.get("model").cloned().unwrap_or(Value::Null),
+            "activeProfile": profile_name,
+            "profiles": parse_toml_section_names(&content, "profiles"),
+            "mcpServers": codex_mcp_servers_map(&content),
+            "approvalMode": approval_mode,
+            "modelReasoningEffort": reasoning_effort,
+        }
+    })
+}
+
+fn default_codex_config_overview(config_path: Value) -> Value {
+    serde_json::json!({
+        "success": true,
+        "configPath": config_path,
+        "config": {
+            "model": Value::Null,
+            "profileModel": Value::Null,
+            "resolvedModel": Value::Null,
+            "activeProfile": "default",
+            "profiles": [],
+            "mcpServers": {},
+            "approvalMode": "suggest"
+        }
+    })
+}
+
+async fn codex_mcp_config_overview() -> Value {
+    let Some(home) = home_dir() else {
+        return serde_json::json!({
+            "success": false,
+            "error": "home directory not found",
+            "servers": []
+        });
+    };
+    let config_path = home.join(".codex").join("config.toml");
+    let Some(content) = read_text_path(&config_path).await else {
+        return serde_json::json!({
+            "success": true,
+            "configPath": config_path.display().to_string(),
+            "servers": []
+        });
+    };
+    serde_json::json!({
+        "success": true,
+        "configPath": config_path.display().to_string(),
+        "servers": parse_codex_mcp_servers(&content)
+    })
+}
+
+fn parse_top_level_toml_values(content: &str) -> serde_json::Map<String, Value> {
+    let mut values = serde_json::Map::new();
+    for line in content.lines().map(str::trim) {
+        if line.starts_with('[') {
+            break;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if let Some(parsed) = parse_simple_toml_value(value.trim()) {
+            values.insert(key.trim().to_string(), parsed);
+        }
+    }
+    values
+}
+
+fn parse_toml_section_names(content: &str, prefix: &str) -> Vec<Value> {
+    let section_prefix = format!("{prefix}.");
+    content
+        .lines()
+        .filter_map(|line| {
+            let section = line.trim().strip_prefix('[')?.strip_suffix(']')?;
+            let name = section.strip_prefix(&section_prefix)?;
+            (!name.contains('.')).then(|| {
+                serde_json::json!({
+                    "name": unquote_toml_key(name),
+                    "model": Value::Null,
+                    "modelProvider": Value::Null,
+                })
+            })
+        })
+        .collect()
+}
+
+fn codex_mcp_servers_map(content: &str) -> Value {
+    let mut map = serde_json::Map::new();
+    for server in parse_codex_mcp_servers(content) {
+        if let Some(name) = server.get("name").and_then(Value::as_str) {
+            if let Some(raw) = server.get("raw") {
+                map.insert(name.to_string(), raw.clone());
+            }
+        }
+    }
+    Value::Object(map)
+}
+
+fn parse_codex_mcp_servers(content: &str) -> Vec<Value> {
+    let mut servers = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_config = serde_json::Map::new();
+    let mut current_env = false;
+
+    for line in content.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(section) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            if let Some(rest) = section.strip_prefix("mcp_servers.") {
+                if let Some(name) = rest.strip_suffix(".env") {
+                    let name = unquote_toml_key(name);
+                    if current_name.as_deref() != Some(name.as_str()) {
+                        flush_codex_mcp_server(
+                            &mut servers,
+                            &mut current_name,
+                            &mut current_config,
+                        );
+                        current_name = Some(name);
+                    }
+                    current_env = true;
+                } else {
+                    flush_codex_mcp_server(&mut servers, &mut current_name, &mut current_config);
+                    current_name = Some(unquote_toml_key(rest));
+                    current_env = false;
+                }
+            } else {
+                flush_codex_mcp_server(&mut servers, &mut current_name, &mut current_config);
+                current_env = false;
+            }
+            continue;
+        }
+
+        if current_name.is_none() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        let Some(parsed) = parse_simple_toml_value(value.trim()) else {
+            continue;
+        };
+        if current_env {
+            let env = current_config
+                .entry("env".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Value::Object(env) = env {
+                env.insert(key, parsed);
+            }
+        } else {
+            current_config.insert(key, parsed);
+        }
+    }
+    flush_codex_mcp_server(&mut servers, &mut current_name, &mut current_config);
+    servers
+}
+
+fn flush_codex_mcp_server(
+    servers: &mut Vec<Value>,
+    current_name: &mut Option<String>,
+    current_config: &mut serde_json::Map<String, Value>,
+) {
+    let Some(name) = current_name.take() else {
+        return;
+    };
+    let raw = Value::Object(std::mem::take(current_config));
+    servers.push(mcp_server_record(&name, &raw, "user", None));
+}
+
+fn parse_simple_toml_value(value: &str) -> Option<Value> {
+    let value = value.split('#').next().unwrap_or(value).trim();
+    if let Some(string) = parse_toml_string(value) {
+        return Some(Value::String(string));
+    }
+    if value.starts_with('[') && value.ends_with(']') {
+        let inner = &value[1..value.len().saturating_sub(1)];
+        let values = inner
+            .split(',')
+            .filter_map(|item| parse_toml_string(item.trim()).map(Value::String))
+            .collect::<Vec<_>>();
+        return Some(Value::Array(values));
+    }
+    match value {
+        "true" => Some(Value::Bool(true)),
+        "false" => Some(Value::Bool(false)),
+        _ => value.parse::<i64>().ok().map(Value::from),
+    }
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        Some(value[1..value.len() - 1].replace("\\\"", "\""))
+    } else {
+        None
+    }
+}
+
+fn unquote_toml_key(value: &str) -> String {
+    parse_toml_string(value).unwrap_or_else(|| value.trim().to_string())
+}
+
+fn compat_value(
+    state: &AppState,
+    user_id: &str,
+    namespace: &str,
+    path: &str,
+    default_value: Value,
+) -> Result<Value> {
+    let key = user_setting_key(
+        user_id,
+        &format!("compat:{namespace}:{}", compat_path_key(path)),
+    );
+    Ok(state.storage.get_setting(&key)?.unwrap_or(default_value))
 }
 
 async fn fetch_direct_ai_models(config: &Value) -> std::result::Result<Vec<Value>, ServerError> {
@@ -2456,62 +4486,121 @@ async fn fetch_direct_ai_models(config: &Value) -> std::result::Result<Vec<Value
                 error.to_string(),
             )
         })?;
-    let response = client
-        .get(format!("{base_url}/v1/models"))
-        .bearer_auth(&api_key)
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .send()
-        .await
-        .map_err(|error| {
-            ServerError::with_details(
-                StatusCode::BAD_GATEWAY,
-                "Direct AI model request failed",
-                error.to_string(),
-            )
-        })?;
-    if !response.status().is_success() {
-        return Ok(Vec::new());
-    }
-    let body = response.json::<Value>().await.map_err(|error| {
-        ServerError::with_details(
-            StatusCode::BAD_GATEWAY,
-            "Direct AI model response was invalid",
-            error.to_string(),
-        )
-    })?;
 
-    let raw_models = body
-        .get("data")
-        .or_else(|| body.get("models"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Ok(raw_models
-        .into_iter()
-        .filter_map(|model| {
-            let value = model
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| model.get("id").and_then(Value::as_str).map(str::to_string))
-                .or_else(|| {
-                    model
-                        .get("value")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .or_else(|| {
-                    model
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })?;
-            Some(serde_json::json!({
-                "value": value,
-                "label": value,
-            }))
-        })
-        .collect())
+    // Try multiple catalog URLs (path-aware, then origin-based) so we can
+    // match the URL shapes served by both OpenAI-compatible and Claude
+    // /v1/models gateways. Mirrors web-ai-cli/server/utils/codex-models.js
+    // `buildModelCatalogUrls`. The first URL that returns a non-empty model
+    // list wins.
+    let mut urls: Vec<String> = Vec::new();
+    urls.push(format!("{base_url}/models"));
+    urls.push(format!("{base_url}/v1/models"));
+    if let Some(origin) = url_origin(&base_url) {
+        urls.push(format!("{origin}/models"));
+        urls.push(format!("{origin}/v1/models"));
+    }
+
+    for url in urls {
+        let response = match client
+            .get(&url)
+            .bearer_auth(&api_key)
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let body = match response.json::<Value>().await {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        let raw_models = body
+            .get("data")
+            .or_else(|| body.get("models"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if raw_models.is_empty() {
+            continue;
+        }
+        let mapped: Vec<Value> = raw_models
+            .into_iter()
+            .filter_map(|model| {
+                let value = model
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| model.get("id").and_then(Value::as_str).map(str::to_string))
+                    .or_else(|| {
+                        model
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .or_else(|| {
+                        model
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })?;
+                Some(serde_json::json!({
+                    "value": value,
+                    "label": value,
+                }))
+            })
+            .collect();
+        if !mapped.is_empty() {
+            return Ok(mapped);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+/// Extract the origin (scheme + host + port) from a URL string. Returns
+/// None for malformed URLs. Used to build origin-based fallbacks when
+/// the configured base URL has a path prefix the gateway does not echo.
+fn url_origin(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let scheme_end = trimmed.find("://")?;
+    let after_scheme = &trimmed[scheme_end + 3..];
+    let path_start = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let origin = &trimmed[..scheme_end + 3 + path_start];
+    if origin.is_empty() {
+        None
+    } else {
+        Some(origin.trim_end_matches('/').to_string())
+    }
+}
+
+#[cfg(test)]
+mod url_origin_tests {
+    use super::url_origin;
+
+    #[test]
+    fn strips_trailing_path() {
+        assert_eq!(
+            url_origin("http://141.144.197.96:8319/claude"),
+            Some("http://141.144.197.96:8319".to_string())
+        );
+    }
+
+    #[test]
+    fn leaves_origin_only_intact() {
+        assert_eq!(
+            url_origin("https://api.anthropic.com/"),
+            Some("https://api.anthropic.com".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_garbage() {
+        assert_eq!(url_origin("not a url"), None);
+    }
 }
 
 fn direct_ai_endpoint_config(config: &Value) -> Option<(String, String)> {
@@ -2530,6 +4619,7 @@ fn direct_ai_endpoint_config(config: &Value) -> Option<(String, String)> {
         .or_else(|| match mode {
             "direct" | "anthropic" => Some("https://api.anthropic.com".to_string()),
             "minimax" => Some("https://api.minimax.io/anthropic".to_string()),
+            "proxy" | "aiproxy" => Some("http://141.144.197.96:8319/claude".to_string()),
             _ => None,
         })?;
 
@@ -2590,11 +4680,10 @@ fn parse_provider_param(provider: &str) -> Result<Provider> {
     match provider {
         "claude" => Ok(Provider::Claude),
         "codex" => Ok(Provider::Codex),
-        "cursor" => Ok(Provider::Cursor),
         "gemini" => Ok(Provider::Gemini),
         _ => Err(ServerError::new(
             StatusCode::BAD_REQUEST,
-            "Provider must be one of: claude, codex, cursor, gemini",
+            "Provider must be one of: claude, codex, gemini",
         )),
     }
 }
@@ -2660,11 +4749,80 @@ async fn provider_cli_status(provider: Provider) -> Value {
     })
 }
 
+async fn cursor_cli_status() -> Value {
+    let command = "cursor-agent";
+    let installed = command_available(command).await;
+    if !installed {
+        return serde_json::json!({
+            "authenticated": false,
+            "email": Value::Null,
+            "method": Value::Null,
+            "error": "Cursor CLI is not installed",
+            "installed": false,
+            "command": command,
+        });
+    }
+
+    let status = timeout(
+        Duration::from_secs(5),
+        Command::new(command).arg("status").output(),
+    )
+    .await;
+    let Ok(Ok(output)) = status else {
+        return serde_json::json!({
+            "authenticated": false,
+            "email": Value::Null,
+            "method": Value::Null,
+            "error": "Command timeout",
+            "installed": true,
+            "command": command,
+        });
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let authenticated = output.status.success() && stdout.contains("Logged in");
+    let email =
+        authenticated.then(|| extract_email(&stdout).unwrap_or_else(|| "Logged in".to_string()));
+    let error = if authenticated {
+        None
+    } else {
+        let error = stderr.trim();
+        Some(if error.is_empty() {
+            "Not logged in".to_string()
+        } else {
+            error.to_string()
+        })
+    };
+
+    serde_json::json!({
+        "authenticated": authenticated,
+        "email": email,
+        "method": authenticated.then_some("cli_login"),
+        "error": error,
+        "installed": true,
+        "command": command,
+    })
+}
+
+fn extract_email(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|token| {
+        let candidate = token.trim_matches(|ch: char| {
+            ch.is_ascii_punctuation()
+                && ch != '@'
+                && ch != '.'
+                && ch != '_'
+                && ch != '-'
+                && ch != '+'
+        });
+        looks_like_email(candidate).then(|| candidate.to_string())
+    })
+}
+
 fn provider_command(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
-        Provider::Cursor => "cursor-agent",
         Provider::Gemini => "gemini",
     }
 }
@@ -2686,9 +4844,6 @@ fn provider_auth_hint(provider: Provider) -> Option<String> {
         Provider::Codex => ["OPENAI_API_KEY"]
             .into_iter()
             .find(|key| env_has_value(key)),
-        Provider::Cursor => ["CURSOR_API_KEY"]
-            .into_iter()
-            .find(|key| env_has_value(key)),
         Provider::Gemini => ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
             .into_iter()
             .find(|key| env_has_value(key)),
@@ -2701,7 +4856,6 @@ fn provider_auth_hint(provider: Provider) -> Option<String> {
     let configured = match provider {
         Provider::Claude => home.join(".claude").join(".credentials.json").is_file(),
         Provider::Codex => home.join(".codex").join("auth.json").is_file(),
-        Provider::Cursor => home.join(".cursor").exists(),
         Provider::Gemini => home.join(".gemini").join("oauth_creds.json").is_file(),
     };
     configured.then(|| "Configured on disk".to_string())
@@ -2714,7 +4868,6 @@ fn auth_method(provider: Provider, auth: Option<&str>) -> Option<&'static str> {
         } else {
             match provider {
                 Provider::Claude | Provider::Codex | Provider::Gemini => "credentials_file",
-                Provider::Cursor => "cli",
             }
         }
     })
@@ -3575,7 +5728,7 @@ async fn agent_compat(
     request: Request,
 ) -> Result<Json<Value>> {
     let default = serde_json::json!({
-        "providers": ["claude", "codex", "cursor", "gemini"],
+        "providers": ["claude", "codex", "gemini"],
         "transport": "websocket",
         "websocketCommand": "start_session"
     });
@@ -3633,6 +5786,14 @@ async fn provider_compat(
     request: Request,
 ) -> Result<Json<Value>> {
     persisted_compat_endpoint(state, user, request, "provider", serde_json::json!({})).await
+}
+
+async fn cursor_compat(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    request: Request,
+) -> Result<Json<Value>> {
+    persisted_compat_endpoint(state, user, request, "cursor", default_cursor_compat()).await
 }
 
 async fn plugins_compat(

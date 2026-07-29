@@ -51,12 +51,12 @@ pub enum HealthStatus {
     Ok,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
+    #[default]
     Claude,
     Codex,
-    Cursor,
     Gemini,
 }
 
@@ -65,7 +65,6 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Cursor => "cursor",
             Self::Gemini => "gemini",
         }
     }
@@ -121,10 +120,90 @@ pub struct ProjectListResponse {
     pub projects: Vec<ProjectSummary>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionTokenUsage {
+    #[serde(rename = "used")]
+    pub used: u64,
+    #[serde(rename = "input")]
+    pub input: u64,
+    #[serde(rename = "output")]
+    pub output: u64,
+    #[serde(rename = "cacheCreation")]
+    pub cache_creation: u64,
+    #[serde(rename = "cacheRead")]
+    pub cache_read: u64,
+    #[serde(rename = "costUsd")]
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionMode {
+    #[default]
+    #[serde(rename = "default")]
+    Default,
+    #[serde(rename = "accept-edits", alias = "acceptEdits")]
+    AcceptEdits,
+    #[serde(rename = "bypass")]
+    Bypass,
+    #[serde(rename = "plan")]
+    Plan,
+    #[serde(rename = "read-only", alias = "readOnly")]
+    ReadOnly,
+}
+
+impl SessionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionMode::Default => "default",
+            SessionMode::AcceptEdits => "accept-edits",
+            SessionMode::Bypass => "bypass",
+            SessionMode::Plan => "plan",
+            SessionMode::ReadOnly => "read-only",
+        }
+    }
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.unwrap_or("default").to_ascii_lowercase().as_str() {
+            "accept-edits" | "acceptedits" | "accept" => SessionMode::AcceptEdits,
+            "bypass" | "danger" | "no-approvals" | "no_approvals" => SessionMode::Bypass,
+            "plan" | "plan-only" => SessionMode::Plan,
+            "read-only" | "readonly" | "read" => SessionMode::ReadOnly,
+            _ => SessionMode::Default,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionMetadata {
+    #[serde(default)]
+    pub external: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SessionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "lastMessageAt")]
+    pub last_message_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "firstUserAt")]
+    pub first_user_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "receivedAt")]
+    pub received_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<SessionTokenUsage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionSummary {
     pub id: String,
     pub provider: Provider,
+    #[serde(default)]
+    pub external: bool,
     #[serde(rename = "projectPath")]
     pub project_path: String,
     pub title: String,
@@ -135,6 +214,32 @@ pub struct SessionSummary {
     pub active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "lastMessageAt"
+    )]
+    pub last_message_at: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "firstUserAt"
+    )]
+    pub first_user_at: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "receivedAt"
+    )]
+    pub received_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<SessionTokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -160,6 +265,10 @@ pub struct ChatMessage {
 pub struct MessagesResponse {
     pub session_id: String,
     pub messages: Vec<ChatMessage>,
+    /// `true` when older messages still exist beyond the returned window.
+    pub has_more: bool,
+    /// Total number of messages stored for the session.
+    pub total_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -214,6 +323,14 @@ pub struct RenameFileRequest {
     pub old_path: String,
     #[serde(rename = "newPath")]
     pub new_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyFileRequest {
+    #[serde(rename = "sourcePath")]
+    pub source_path: String,
+    #[serde(rename = "targetPath")]
+    pub target_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -992,6 +1109,12 @@ pub enum WsClientCommand {
         session_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<bool>,
     },
     AbortSession {
         provider: Provider,
@@ -1043,6 +1166,27 @@ pub enum WsServerEvent {
         #[serde(rename = "sessionId")]
         session_id: String,
         status: SessionRuntimeStatus,
+    },
+    SessionMetadata {
+        provider: Provider,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<bool>,
+        #[serde(rename = "receivedAt")]
+        received_at: DateTime<Utc>,
+        #[serde(rename = "lastMessageAt", skip_serializing_if = "Option::is_none")]
+        last_message_at: Option<DateTime<Utc>>,
+        #[serde(rename = "firstUserAt", skip_serializing_if = "Option::is_none")]
+        first_user_at: Option<DateTime<Utc>>,
+        #[serde(rename = "tokenUsage", skip_serializing_if = "Option::is_none")]
+        token_usage: Option<SessionTokenUsage>,
     },
     Output {
         provider: Provider,

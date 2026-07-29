@@ -249,6 +249,19 @@ impl Storage {
                 "#,
             )?;
 
+            // Idempotent column additions for older databases created before
+            // the session metadata JSON column existed.
+            let has_metadata: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'metadata'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_metadata == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE sessions ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';",
+                )?;
+            }
+
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '1')",
                 [],
@@ -517,12 +530,13 @@ impl Storage {
 
     pub fn upsert_session(&self, session: &SessionSummary) -> Result<()> {
         self.with_connection(|conn| {
+            let metadata_blob = serialize_session_metadata(session);
             conn.execute(
                 r#"
                 INSERT INTO sessions (
-                    id, provider, project_path, title, message_count, last_activity, active, model
+                    id, provider, project_path, title, message_count, last_activity, active, model, metadata
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ON CONFLICT(id) DO UPDATE SET
                     provider = excluded.provider,
                     project_path = excluded.project_path,
@@ -530,7 +544,8 @@ impl Storage {
                     message_count = excluded.message_count,
                     last_activity = excluded.last_activity,
                     active = excluded.active,
-                    model = excluded.model
+                    model = excluded.model,
+                    metadata = excluded.metadata
                 "#,
                 params![
                     session.id,
@@ -541,6 +556,7 @@ impl Storage {
                     session.last_activity.to_rfc3339(),
                     if session.active { 1 } else { 0 },
                     session.model,
+                    metadata_blob,
                 ],
             )?;
             Ok(())
@@ -551,9 +567,9 @@ impl Storage {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT id, provider, project_path, title, message_count, last_activity, active, model
+                SELECT id, provider, project_path, title, message_count, last_activity, active, model, metadata
                 FROM sessions
-                ORDER BY last_activity DESC
+                ORDER BY last_activity DESC, metadata
                 "#,
             )?;
 
@@ -570,10 +586,10 @@ impl Storage {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT id, provider, project_path, title, message_count, last_activity, active, model
+                SELECT id, provider, project_path, title, message_count, last_activity, active, model, metadata
                 FROM sessions
                 WHERE project_path = ?1
-                ORDER BY last_activity DESC
+                ORDER BY last_activity DESC, metadata
                 "#,
             )?;
 
@@ -590,7 +606,7 @@ impl Storage {
         self.with_connection(|conn| {
             conn.query_row(
                 r#"
-                SELECT id, provider, project_path, title, message_count, last_activity, active, model
+                SELECT id, provider, project_path, title, message_count, last_activity, active, model, metadata
                 FROM sessions
                 WHERE id = ?1
                 "#,
@@ -599,6 +615,14 @@ impl Storage {
             )
             .optional()
             .map_err(StorageError::from)
+        })
+    }
+
+    pub fn delete_session(&self, session_id: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            let changed =
+                conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+            Ok(changed > 0)
         })
     }
 
@@ -622,6 +646,74 @@ impl Storage {
         })
     }
 
+    /// Patch the JSON metadata column for an existing message. Pass `Value::Null`
+    /// to clear the metadata back to its default. Used by the chat session
+    /// manager to stamp per-turn footer info (cli, model, sentAt, tokenUsage…)
+    /// onto the user prompt and assistant reply rows so the UI can re-render
+    /// them after a refresh or session switch.
+    pub fn update_message_metadata(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        metadata: Value,
+    ) -> Result<bool> {
+        self.with_connection(|conn| {
+            let updated = conn.execute(
+                r#"
+                UPDATE messages
+                SET metadata = ?1
+                WHERE session_id = ?2 AND id = ?3
+                "#,
+                params![serde_json::to_string(&metadata)?, session_id, message_id,],
+            )?;
+            Ok(updated > 0)
+        })
+    }
+
+    /// Return the most recent assistant message id for a session so callers can
+    /// patch its metadata once the streaming response is finished without
+    /// having to look up the row themselves.
+    pub fn latest_assistant_message_id(&self, session_id: &str) -> Result<Option<String>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id FROM messages
+                WHERE session_id = ?1 AND role = 'assistant'
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                "#,
+            )?;
+            let mut rows = stmt.query(params![session_id])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row.get(0)?))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// Return the most recent user message id for a session. Used to stamp
+    /// the "sent at" / cli / model footer onto the freshly-persisted prompt
+    /// row after the agent context has been attached.
+    pub fn latest_user_message_id(&self, session_id: &str) -> Result<Option<String>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id FROM messages
+                WHERE session_id = ?1 AND role = 'user'
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                "#,
+            )?;
+            let mut rows = stmt.query(params![session_id])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row.get(0)?))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
     pub fn list_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
@@ -629,7 +721,7 @@ impl Storage {
                 SELECT id, role, content, timestamp, metadata
                 FROM messages
                 WHERE session_id = ?1
-                ORDER BY timestamp ASC
+                ORDER BY timestamp ASC, id ASC
                 "#,
             )?;
 
@@ -655,6 +747,55 @@ impl Storage {
         })
     }
 
+    /// Return messages ordered by oldest-first with a `limit`/`offset` window.
+    /// `total_count` reports the full message count so callers can implement
+    /// "load older" lazy pagination.
+    pub fn list_messages_page(
+        &self,
+        session_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<ChatMessage>, usize)> {
+        let (limit, offset) = (limit as i64, offset as i64);
+        self.with_connection(|conn| {
+            let total: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, role, content, timestamp, metadata
+                FROM messages
+                WHERE session_id = ?1
+                ORDER BY timestamp ASC, id ASC
+                LIMIT ?2 OFFSET ?3
+                "#,
+            )?;
+
+            let rows = stmt.query_map(params![session_id, limit, offset], |row| {
+                let role = parse_role(&row.get::<_, String>(1)?);
+                let timestamp = parse_time_sql(row.get::<_, String>(3)?)?;
+                let metadata_raw: String = row.get(4)?;
+                let metadata = serde_json::from_str::<Value>(&metadata_raw).unwrap_or(Value::Null);
+                Ok(ChatMessage {
+                    id: row.get(0)?,
+                    role,
+                    content: row.get(2)?,
+                    timestamp,
+                    metadata,
+                })
+            })?;
+
+            let mut messages = Vec::new();
+            for row in rows {
+                messages.push(row?);
+            }
+            Ok((messages, total.max(0) as usize))
+        })
+    }
+
     pub fn search_messages(
         &self,
         query: &str,
@@ -665,7 +806,7 @@ impl Storage {
             let mut stmt = conn.prepare(
                 r#"
                 SELECT s.id, s.provider, s.project_path, s.title, s.message_count,
-                       s.last_activity, s.active, s.model,
+                       s.last_activity, s.active, s.model, s.metadata,
                        m.id, m.role, m.content, m.timestamp, m.metadata
                 FROM messages m
                 JOIN sessions s ON s.id = m.session_id
@@ -678,7 +819,7 @@ impl Storage {
             )?;
 
             let rows = stmt.query_map(params![pattern, limit as i64], |row| {
-                let session = SessionSummary {
+                let mut session = SessionSummary {
                     id: row.get(0)?,
                     provider: parse_provider(&row.get::<_, String>(1)?),
                     project_path: row.get(2)?,
@@ -687,14 +828,20 @@ impl Storage {
                     last_activity: parse_time_sql(row.get::<_, String>(5)?)?,
                     active: row.get::<_, i64>(6)? == 1,
                     model: row.get(7)?,
+                    ..Default::default()
                 };
-                let role = parse_role(&row.get::<_, String>(9)?);
-                let metadata_raw: String = row.get(12)?;
+                if let Ok(raw) = row.get::<_, Option<String>>(8) {
+                    if let Some(parsed) = deserialize_session_metadata(&raw.unwrap_or_default()) {
+                        merge_metadata_into(&mut session, parsed);
+                    }
+                }
+                let role = parse_role(&row.get::<_, String>(11)?);
+                let metadata_raw: String = row.get(14)?;
                 let message = ChatMessage {
-                    id: row.get(8)?,
+                    id: row.get(9)?,
                     role,
-                    content: row.get(10)?,
-                    timestamp: parse_time_sql(row.get::<_, String>(11)?)?,
+                    content: row.get(12)?,
+                    timestamp: parse_time_sql(row.get::<_, String>(13)?)?,
                     metadata: serde_json::from_str::<Value>(&metadata_raw).unwrap_or(Value::Null),
                 };
                 Ok((session, message))
@@ -1297,7 +1444,7 @@ fn parse_time_sql(raw: String) -> rusqlite::Result<DateTime<Utc>> {
 }
 
 fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
-    Ok(SessionSummary {
+    let mut session = SessionSummary {
         id: row.get(0)?,
         provider: parse_provider(&row.get::<_, String>(1)?),
         project_path: row.get(2)?,
@@ -1306,7 +1453,94 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> 
         last_activity: parse_time_sql(row.get::<_, String>(5)?)?,
         active: row.get::<_, i64>(6)? == 1,
         model: row.get(7)?,
-    })
+        ..Default::default()
+    };
+    let metadata_blob: Option<String> = row.get(8).ok();
+    if let Some(raw) = metadata_blob {
+        if let Some(parsed) = deserialize_session_metadata(&raw) {
+            merge_metadata_into(&mut session, parsed);
+        }
+    }
+    Ok(session)
+}
+
+fn serialize_session_metadata(session: &SessionSummary) -> String {
+    use serde_json::json;
+    let mut value = serde_json::Map::new();
+    if session.external {
+        value.insert("external".into(), json!(true));
+    }
+    if let Some(model) = session.model.as_ref() {
+        value.insert("model".into(), json!(model));
+    }
+    if let Some(effort) = session.effort.as_ref() {
+        value.insert("effort".into(), json!(effort));
+    }
+    if let Some(mode) = session.mode.as_ref() {
+        value.insert("mode".into(), json!(mode));
+    }
+    if let Some(thinking) = session.thinking {
+        value.insert("thinking".into(), json!(thinking));
+    }
+    if let Some(at) = session.last_message_at {
+        value.insert("lastMessageAt".into(), json!(at));
+    }
+    if let Some(at) = session.first_user_at {
+        value.insert("firstUserAt".into(), json!(at));
+    }
+    if let Some(at) = session.received_at {
+        value.insert("receivedAt".into(), json!(at));
+    }
+    if let Some(usage) = session.token_usage.as_ref() {
+        value.insert(
+            "tokenUsage".into(),
+            serde_json::to_value(usage).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn deserialize_session_metadata(raw: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(raw).ok()
+}
+
+fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
+    use serde_json::Value;
+    if let Some(v) = value.get("external").and_then(Value::as_bool) {
+        session.external = v;
+    }
+    if let Some(v) = value.get("model").and_then(Value::as_str) {
+        session.model = Some(v.to_string());
+    }
+    if let Some(v) = value.get("effort").and_then(Value::as_str) {
+        session.effort = Some(v.to_string());
+    }
+    if let Some(v) = value.get("mode").and_then(Value::as_str) {
+        session.mode = Some(v.to_string());
+    }
+    if let Some(v) = value.get("thinking").and_then(Value::as_bool) {
+        session.thinking = Some(v);
+    }
+    if let Some(v) = value.get("lastMessageAt").and_then(Value::as_str) {
+        if let Ok(ts) = parse_time(v) {
+            session.last_message_at = Some(ts);
+        }
+    }
+    if let Some(v) = value.get("firstUserAt").and_then(Value::as_str) {
+        if let Ok(ts) = parse_time(v) {
+            session.first_user_at = Some(ts);
+        }
+    }
+    if let Some(v) = value.get("receivedAt").and_then(Value::as_str) {
+        if let Ok(ts) = parse_time(v) {
+            session.received_at = Some(ts);
+        }
+    }
+    if let Some(v) = value.get("tokenUsage") {
+        if let Ok(usage) = serde_json::from_value::<iowb_protocol::SessionTokenUsage>(v.clone()) {
+            session.token_usage = Some(usage);
+        }
+    }
 }
 
 fn map_user_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredUser> {
@@ -1386,7 +1620,6 @@ fn mask_secret(prefix: &str) -> String {
 fn parse_provider(raw: &str) -> Provider {
     match raw {
         "codex" => Provider::Codex,
-        "cursor" => Provider::Cursor,
         "gemini" => Provider::Gemini,
         _ => Provider::Claude,
     }

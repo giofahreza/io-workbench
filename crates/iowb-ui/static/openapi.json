@@ -93,6 +93,9 @@
     "/api/projects/{project_name}/upload-images": {
       "post": { "tags": ["Files"], "summary": "Upload chat image attachments" }
     },
+    "/api/sessions/{session_id}": {
+      "delete": { "tags": ["Sessions"], "summary": "Delete a chat session and its messages" }
+    },
     "/api/sessions/{session_id}/messages": {
       "get": { "tags": ["Sessions"], "summary": "Read session messages" }
     },

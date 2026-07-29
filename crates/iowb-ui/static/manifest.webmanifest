@@ -1,7 +1,7 @@
 {
   "name": "io-workbench",
   "short_name": "io-workbench",
-  "description": "Rust workspace server web client",
+  "description": "io-workbench connected workspace",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

@@ -12,27 +12,20 @@
     <link href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;500;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/vendor/codemirror/codemirror.css" />
     <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260727-06" />
+    <link rel="stylesheet" href="/styles.css?v=20260729-03" />
   </head>
-  <body>
+  <body class="auth-pending">
     <aside class="sidebar">
       <div class="brand">
         <span class="brand-mark">io</span>
         <span>
           <strong>io-workbench</strong>
-          <small>Rust workspace server</small>
+          <small class="brand-status status" aria-label="Connection status">
+            <span id="ws-dot" class="dot"></span>
+            <span id="ws-label">Connecting</span>
+          </small>
         </span>
       </div>
-      <section class="sidebar-topnav" aria-label="Workspace controls">
-        <label class="quick-project">
-          <span>Project</span>
-          <select id="active-project"></select>
-        </label>
-        <div class="status">
-          <span id="ws-dot" class="dot"></span>
-          <span id="ws-label">Connecting</span>
-        </div>
-      </section>
       <section class="sidebar-context" aria-label="Projects">
         <div class="sidebar-tools">
           <input id="sidebar-search" type="search" placeholder="Search projects" />
@@ -40,6 +33,13 @@
             <button id="sidebar-new-project" type="button" title="Add project">+</button>
             <button id="sidebar-refresh" class="icon-button" type="button" aria-label="Refresh workspace" title="Refresh workspace" data-symbol="refresh"></button>
           </div>
+        </div>
+        <div id="sidebar-pinned-section" class="sidebar-section sidebar-pinned-section hidden">
+          <div class="sidebar-section-title">
+            <span>Active Sessions</span>
+            <small id="sidebar-pinned-count">0</small>
+          </div>
+          <div id="sidebar-pinned-sessions" class="sidebar-list pinned-session-list"></div>
         </div>
         <div class="sidebar-section">
           <div class="sidebar-section-title">
@@ -103,29 +103,44 @@
 
       <section id="files-view" class="panel view workbench-panel files-panel">
         <div class="files-workbench">
-          <aside class="files-sidebar">
+          <section class="files-sidebar" aria-label="Project files">
+            <input id="files-path" name="path" type="hidden" value="." />
+            <input id="file-upload-input" type="file" multiple hidden />
+            <input id="folder-upload-input" type="file" multiple webkitdirectory directory hidden />
             <div class="files-tree-header">
-              <h3>Files</h3>
-              <div class="row-actions">
-                <button id="refresh-files" class="icon-button" type="button" aria-label="Refresh files" title="Refresh files" data-symbol="refresh"></button>
+              <div class="files-title-row">
+                <h3>Files</h3>
+                <div class="files-header-actions">
+                  <button id="files-select-all" class="icon-button" type="button" aria-label="Select all" title="Select all" data-symbol="square"></button>
+                  <div id="files-selection-chip" class="files-selection-chip hidden">
+                    <span id="files-selection-count">0 selected</span>
+                    <button id="files-clear-selection" type="button" aria-label="Clear selection" title="Clear selection" data-symbol="close"></button>
+                  </div>
+                  <button id="create-file" class="icon-button" type="button" aria-label="New File (Cmd+N)" title="New File (Cmd+N)" data-symbol="file-plus"></button>
+                  <button id="create-directory" class="icon-button" type="button" aria-label="New Folder (Cmd+Shift+N)" title="New Folder (Cmd+Shift+N)" data-symbol="folder-plus"></button>
+                  <button id="refresh-files" class="icon-button" type="button" aria-label="Refresh" title="Refresh" data-symbol="refresh"></button>
+                  <button id="upload-files" class="icon-button" type="button" aria-label="Upload" title="Upload" data-symbol="upload"></button>
+                  <button id="files-collapse-all" class="icon-button" type="button" aria-label="Collapse All" title="Collapse All" data-symbol="chevron-down"></button>
+                  <span class="files-action-divider" aria-hidden="true"></span>
+                  <button class="icon-button" type="button" aria-label="Simple view" title="Simple view" data-file-view-mode="simple" data-symbol="list"></button>
+                  <button class="icon-button" type="button" aria-label="Compact view" title="Compact view" data-file-view-mode="compact" data-symbol="eye"></button>
+                  <button class="icon-button" type="button" aria-label="Detailed view" title="Detailed view" data-file-view-mode="detailed" data-symbol="table"></button>
+                </div>
+              </div>
+              <div class="files-search-field">
+                <span aria-hidden="true"></span>
+                <input id="files-filter" name="filter" placeholder="Search files and folders..." />
+                <button id="files-clear-filter" class="icon-button hidden" type="button" aria-label="Clear search" title="Clear search" data-symbol="close"></button>
               </div>
             </div>
-            <div class="files-toolbar-grid">
-              <label>
-                <span>Path</span>
-                <input id="files-path" name="path" value="." />
-              </label>
+            <div id="files-columns" class="files-columns" aria-hidden="true">
+              <span>Name</span>
+              <span>Size</span>
+              <span>Modified</span>
+              <span>Permissions</span>
             </div>
-            <div class="files-search-row">
-              <label>
-                <span>Filter</span>
-                <input id="files-filter" name="filter" placeholder="Filter visible files" />
-              </label>
-              <button id="files-parent" class="icon-button" type="button" aria-label="Go to parent folder" title="Go to parent folder" data-symbol="up"></button>
-            </div>
-            <div id="files-breadcrumbs" class="breadcrumb-list files-breadcrumbs"></div>
             <div id="files-tree" class="list scroll-pane file-tree-list"></div>
-          </aside>
+          </section>
           <form id="file-editor-form" class="file-editor-pane">
             <div class="editor-topbar">
               <label class="editor-path-field">
@@ -171,8 +186,6 @@
               <textarea id="file-editor-content" rows="18" spellcheck="false"></textarea>
             </div>
             <div class="file-ops-strip">
-              <button id="create-file" class="icon-button" type="button" aria-label="Create file" title="Create file" data-symbol="file-plus"></button>
-              <button id="create-directory" class="icon-button" type="button" aria-label="Create directory" title="Create directory" data-symbol="folder-plus"></button>
               <button id="delete-file" class="icon-button" type="button" aria-label="Delete path" title="Delete path" data-symbol="trash"></button>
               <button id="download-file" class="icon-button" type="button" aria-label="Download file" title="Download file" data-symbol="download"></button>
               <span class="ops-separator"></span>
@@ -182,39 +195,69 @@
               </label>
               <button id="rename-file" class="icon-button" type="button" aria-label="Rename path" title="Rename path" data-symbol="rename"></button>
             </div>
-            <div class="upload-strip">
-              <label>
-                <span>Upload</span>
-                <input id="file-upload-input" type="file" multiple />
-              </label>
-              <button id="upload-files" class="icon-button" type="button" aria-label="Upload files" title="Upload files" data-symbol="upload"></button>
-              <label>
-                <span>Folder Upload</span>
-                <input id="folder-upload-input" type="file" multiple webkitdirectory directory />
-              </label>
-              <button id="upload-folder" class="icon-button" type="button" aria-label="Upload folder" title="Upload folder" data-symbol="folder-up"></button>
-            </div>
           </form>
         </div>
       </section>
 
       <section id="chat-view" class="panel view active workbench-panel chat-panel">
         <div class="chat-workbench">
-          <pre id="chat-output" class="terminal-output chat-transcript"></pre>
+          <div class="chat-body">
+            <div id="chat-output" class="chat-transcript" aria-live="polite"></div>
+            <div id="chat-empty-state" class="chat-empty-state hidden" aria-label="Choose CLI for new chat">
+              <div class="chat-provider-picker" role="group" aria-label="CLI">
+                <button type="button" class="chat-provider-option" data-chat-provider-option="codex" aria-label="Use Codex" title="Codex">
+                  <img src="/icons/codex-white.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                  <span>Codex</span>
+                </button>
+                <button type="button" class="chat-provider-option" data-chat-provider-option="claude" aria-label="Use Claude" title="Claude">
+                  <img src="/icons/claude-white.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                  <span>Claude</span>
+                </button>
+                <button type="button" class="chat-provider-option" data-chat-provider-option="gemini" aria-label="Use Gemini" title="Gemini">
+                  <img src="/icons/gemini-ai-icon.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                  <span>Gemini</span>
+                </button>
+              </div>
+            </div>
+          </div>
           <form id="chat-form" class="chat-composer">
+            <div class="chat-controls" aria-label="Chat overrides">
+              <label>
+                <span>Model</span>
+                <select id="chat-model"></select>
+              </label>
+              <label>
+                <span>Mode</span>
+                <select id="chat-mode">
+                  <option value="default">Default</option>
+                  <option value="accept-edits">Accept edits</option>
+                  <option value="bypass">Bypass</option>
+                  <option value="plan">Plan only</option>
+                  <option value="read-only">Read only</option>
+                </select>
+              </label>
+              <label>
+                <span>Effort</span>
+                <select id="chat-effort">
+                  <option value="low">Low</option>
+                  <option value="medium" selected>Medium</option>
+                  <option value="high">High</option>
+                  <option value="max">Max</option>
+                </select>
+              </label>
+            </div>
             <div class="composer-input-row">
               <button id="chat-upload-images" class="icon-button" type="button" aria-label="Attach images" title="Attach images" data-symbol="image-plus"></button>
-              <textarea id="chat-prompt" rows="1" placeholder="Ask the agent"></textarea>
-              <button id="clear-chat" class="icon-button" type="button" aria-label="Clear chat" title="Clear chat" data-symbol="trash"></button>
+              <textarea id="chat-prompt" class="chat-input-placeholder" rows="1" placeholder="Ask the agent"></textarea>
+              <button id="clear-chat" class="icon-button is-empty" type="button" aria-label="Clear input" title="Clear input" data-symbol="close"></button>
               <button id="abort-session" class="icon-button" type="button" aria-label="Abort session" title="Abort session" data-symbol="stop"></button>
-              <button type="submit" class="primary-action icon-button" aria-label="Start session" title="Start session" data-symbol="send"></button>
+              <button id="chat-submit" type="submit" class="primary-action icon-button" aria-label="Start session" title="Start session" data-symbol="send"></button>
             </div>
             <div class="composer-tools">
               <label class="file-input-field">
                 <span>Images</span>
                 <input id="chat-image-input" type="file" accept="image/*" multiple />
               </label>
-              <button id="chat-clear-images" class="icon-button" type="button" aria-label="Clear images" title="Clear images" data-symbol="image-off"></button>
             </div>
             <div id="chat-image-preview" class="image-preview-list"></div>
           </form>
@@ -332,7 +375,7 @@
       <section id="database-view" class="panel view">
         <div class="panel-header">
           <h2>Database</h2>
-          <button id="refresh-db" type="button">Refresh</button>
+          <button id="refresh-db" type="button" data-symbol="refresh">Refresh</button>
         </div>
         <form id="db-create-form" class="stack-form">
           <div class="form-grid">
@@ -468,255 +511,310 @@
         </div>
       </section>
 
-      <section id="settings-view" class="panel view">
-        <div class="panel-header">
-          <h2>Server Settings</h2>
-          <button id="refresh-settings" class="icon-button" type="button" aria-label="Refresh settings" title="Refresh settings" data-symbol="refresh"></button>
-        </div>
-        <section class="settings-server-status">
-          <div id="settings-server-status" class="summary-grid"></div>
-        </section>
-        <section class="settings-preferences">
-          <label class="toolbar-check">
-            <input id="pref-compact" type="checkbox" />
-            <span>Compact</span>
-          </label>
-          <label class="toolbar-check">
-            <input id="pref-wrap" type="checkbox" />
-            <span>Wrap</span>
-          </label>
-          <label class="terminal-size-field">
-            <span>Terminal Columns</span>
-            <input id="shell-cols" name="cols" type="number" min="20" max="300" value="100" />
-          </label>
-          <label class="terminal-size-field">
-            <span>Terminal Rows</span>
-            <input id="shell-rows" name="rows" type="number" min="8" max="120" value="30" />
-          </label>
-          <label class="terminal-size-field">
-            <span>Chat CLI App</span>
-            <select id="chat-provider-setting">
-              <option value="codex">Codex</option>
-              <option value="claude">Claude</option>
-              <option value="cursor">Cursor</option>
-              <option value="gemini">Gemini</option>
-            </select>
-          </label>
-          <a class="button-link" href="/api-docs.html" target="_blank" rel="noreferrer">AI Docs</a>
-          <a class="button-link" href="/clear-cache.html" target="_blank" rel="noreferrer">Cache Tools</a>
-          <button id="auth-logout" class="hidden">Sign Out</button>
-        </section>
-        <div class="button-row">
-          <button id="load-cli-status" type="button">CLI Status</button>
-          <button id="load-user-settings" type="button">User</button>
-          <button id="load-api-keys" type="button">API Keys</button>
-          <button id="load-credentials" type="button">Credentials</button>
-          <button id="load-notifications" type="button">Notifications</button>
-          <button id="load-direct-ai" type="button">Direct AI</button>
-          <button id="load-direct-ai-models" type="button">AI Models</button>
-          <button id="load-git-config" type="button">Git Config</button>
-        </div>
-        <section class="settings-notifications">
-          <header class="row-title">
-            <h3>Browser Notifications</h3>
-            <span id="notification-status" class="badge warn">Unknown</span>
+      <section id="settings-view" class="panel view settings-view">
+        <div class="settings-shell">
+          <header class="settings-header">
+            <div>
+              <span class="settings-eyebrow">Config</span>
+              <h2>Settings</h2>
+            </div>
+            <div class="settings-header-actions">
+              <button id="refresh-settings" class="icon-button" type="button" aria-label="Refresh settings" title="Refresh settings" data-symbol="refresh"></button>
+              <button id="auth-logout" class="hidden">Sign Out</button>
+            </div>
           </header>
-          <div class="check-grid">
-            <label class="toolbar-check">
-              <input id="notify-browser" type="checkbox" />
-              <span>Browser</span>
-            </label>
-            <label class="toolbar-check">
-              <input id="notify-web-push" type="checkbox" />
-              <span>Web Push</span>
-            </label>
-            <label class="toolbar-check">
-              <input id="notify-session-complete" type="checkbox" />
-              <span>Session Complete</span>
-            </label>
-            <label class="toolbar-check">
-              <input id="notify-permission-required" type="checkbox" />
-              <span>Permission Required</span>
-            </label>
-            <label class="toolbar-check">
-              <input id="notify-process-failed" type="checkbox" />
-              <span>Process Failed</span>
-            </label>
+          <div class="settings-layout">
+            <aside class="settings-nav" aria-label="Settings sections">
+              <button type="button" data-settings-tab="agents" data-symbol="sparkles">Agents</button>
+              <button type="button" data-settings-tab="appearance" data-symbol="nav-settings">Appearance</button>
+              <button type="button" data-settings-tab="git" data-symbol="nav-git">Git</button>
+              <button type="button" data-settings-tab="api" data-symbol="key">API Tokens</button>
+              <button type="button" data-settings-tab="notifications" data-symbol="alert">Notifications</button>
+              <button type="button" data-settings-tab="direct-ai" data-symbol="globe">Direct AI</button>
+              <button type="button" data-settings-tab="server-status" data-symbol="nav-database">Server Status</button>
+              <button type="button" data-settings-tab="tools" data-symbol="nav-command">Tools</button>
+              <button type="button" data-settings-tab="about" data-symbol="info">About</button>
+            </aside>
+            <main class="settings-main">
+              <section class="settings-tab-panel" data-settings-panel="agents">
+                <article class="settings-card">
+                  <header class="settings-card-header">
+                    <h3>Agent Runtime</h3>
+                    <span>CLI availability, user state, and onboarding.</span>
+                  </header>
+                  <div class="settings-action-grid">
+                    <button id="load-cli-status" type="button">CLI Status</button>
+                    <button id="load-user-settings" type="button">User</button>
+                  </div>
+                </article>
+              </section>
+
+              <section class="settings-tab-panel" data-settings-panel="appearance">
+                <article class="settings-card">
+                  <header class="settings-card-header">
+                    <h3>Workspace Display</h3>
+                    <span>Local density, wrapping, and terminal geometry.</span>
+                  </header>
+                  <section class="settings-preferences">
+                    <label class="toolbar-check">
+                      <input id="pref-compact" type="checkbox" />
+                      <span>Compact</span>
+                    </label>
+                    <label class="toolbar-check">
+                      <input id="pref-wrap" type="checkbox" />
+                      <span>Wrap</span>
+                    </label>
+                    <label class="terminal-size-field">
+                      <span>Terminal Columns</span>
+                      <input id="shell-cols" name="cols" type="number" min="20" max="300" value="100" />
+                    </label>
+                    <label class="terminal-size-field">
+                      <span>Terminal Rows</span>
+                      <input id="shell-rows" name="rows" type="number" min="8" max="120" value="30" />
+                    </label>
+                  </section>
+                </article>
+              </section>
+
+              <section class="settings-tab-panel" data-settings-panel="git">
+                <article class="settings-card">
+                  <header class="settings-card-header">
+                    <h3>Git Identity</h3>
+                    <span>Load current config or save name and email through the action console.</span>
+                  </header>
+                  <div class="settings-action-grid">
+                    <button id="load-git-config" type="button">Git Config</button>
+                  </div>
+                </article>
+              </section>
+
+              <section class="settings-tab-panel" data-settings-panel="api">
+                <article class="settings-card">
+                  <header class="settings-card-header">
+                    <h3>API Tokens & Credentials</h3>
+                    <span>Create, toggle, delete, and inspect stored access material.</span>
+                  </header>
+                  <div class="settings-action-grid">
+                    <button id="load-api-keys" type="button">API Keys</button>
+                    <button id="load-credentials" type="button">Credentials</button>
+                  </div>
+                </article>
+              </section>
+
+              <section class="settings-tab-panel" data-settings-panel="notifications">
+                <article class="settings-card settings-notifications">
+                  <header class="row-title">
+                    <h3>Browser Notifications</h3>
+                    <span id="notification-status" class="badge warn">Unknown</span>
+                  </header>
+                  <div class="check-grid">
+                    <label class="toolbar-check">
+                      <input id="notify-browser" type="checkbox" />
+                      <span>Browser</span>
+                    </label>
+                    <label class="toolbar-check">
+                      <input id="notify-web-push" type="checkbox" />
+                      <span>Web Push</span>
+                    </label>
+                    <label class="toolbar-check">
+                      <input id="notify-session-complete" type="checkbox" />
+                      <span>Session Complete</span>
+                    </label>
+                    <label class="toolbar-check">
+                      <input id="notify-permission-required" type="checkbox" />
+                      <span>Permission Required</span>
+                    </label>
+                    <label class="toolbar-check">
+                      <input id="notify-process-failed" type="checkbox" />
+                      <span>Process Failed</span>
+                    </label>
+                  </div>
+                  <div class="settings-action-grid">
+                    <button id="load-notifications" type="button">Load Notifications</button>
+                    <button id="notification-save" type="button">Save Preferences</button>
+                    <button id="notification-permission" type="button">Enable Browser</button>
+                    <button id="notification-preview" type="button">Preview</button>
+                    <button id="notification-test-push" type="button">Test Push Command</button>
+                  </div>
+                </article>
+              </section>
+
+              <section class="settings-tab-panel" data-settings-panel="direct-ai">
+                <article class="settings-card">
+                  <header class="settings-card-header">
+                    <h3>Direct AI</h3>
+                    <span>Gateway configuration and available model metadata.</span>
+                  </header>
+                  <div class="settings-action-grid">
+                    <button id="load-direct-ai" type="button">Direct AI</button>
+                    <button id="load-direct-ai-models" type="button">AI Models</button>
+                  </div>
+                </article>
+              </section>
+
+              <section class="settings-tab-panel" data-settings-panel="server-status">
+                <article class="settings-card">
+                  <header class="settings-card-header">
+                    <h3>Server Status</h3>
+                    <span>Runtime status from the Rust workbench server.</span>
+                  </header>
+                  <section class="settings-server-status">
+                    <div id="settings-server-status" class="summary-grid"></div>
+                  </section>
+                </article>
+                <article class="settings-card settings-metrics">
+                  <div class="panel-header">
+                    <h3>Runtime Metrics</h3>
+                    <button id="refresh-metrics" class="icon-button" type="button" aria-label="Refresh runtime metrics" title="Refresh runtime metrics" data-symbol="refresh"></button>
+                  </div>
+                  <div id="metrics-grid" class="metric-grid"></div>
+                  <pre id="metrics-json"></pre>
+                </article>
+              </section>
+
+              <section class="settings-tab-panel" data-settings-panel="tools">
+                <article class="settings-card settings-tools">
+                  <div class="panel-header">
+                    <h3>Tools</h3>
+                    <button id="refresh-tool-runs" class="icon-button" type="button" aria-label="Refresh tool runs" title="Refresh tool runs" data-symbol="refresh"></button>
+                  </div>
+                  <form id="tool-run-form" class="stack-form">
+                    <div class="form-grid">
+                      <label>
+                        <span>Tool</span>
+                        <select id="tool-kind">
+                          <option value="mcp">MCP</option>
+                          <option value="mcp-utils">MCP Utils</option>
+                          <option value="commands">Commands</option>
+                          <option value="plugins">Plugins</option>
+                          <option value="taskmaster">Taskmaster</option>
+                          <option value="danger">Danger</option>
+                          <option value="notifications">Notifications</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>Command</span>
+                        <input id="tool-command" name="command" placeholder="/bin/echo" />
+                      </label>
+                    </div>
+                    <label>
+                      <span>Args JSON</span>
+                      <input id="tool-args" name="args" value="[&quot;tool-smoke&quot;]" />
+                    </label>
+                    <label>
+                      <span>Payload JSON</span>
+                      <textarea id="tool-payload" rows="6">{}</textarea>
+                    </label>
+                    <button type="submit">Run Tool</button>
+                  </form>
+                  <label class="compact-field">
+                    <span>Filter Runs</span>
+                    <input id="tool-filter" name="filter" placeholder="Filter by command, action, output, or status" />
+                  </label>
+                  <form id="mcp-server-form" class="stack-form">
+                    <div class="form-grid">
+                      <label>
+                        <span>MCP Server Name</span>
+                        <input id="mcp-server-name" name="name" />
+                      </label>
+                      <label>
+                        <span>MCP Server Command</span>
+                        <input id="mcp-server-command" name="command" />
+                      </label>
+                    </div>
+                    <label>
+                      <span>MCP Server Args JSON</span>
+                      <input id="mcp-server-args" name="args" value="[]" />
+                    </label>
+                    <label>
+                      <span>MCP Server ID</span>
+                      <input id="mcp-server-id" name="serverId" />
+                    </label>
+                    <div class="button-row">
+                      <button type="submit">Start MCP Server</button>
+                      <button id="refresh-mcp-servers" type="button" data-symbol="refresh">List MCP Servers</button>
+                      <button id="stop-mcp-server" type="button">Stop MCP Server</button>
+                    </div>
+                  </form>
+                  <form id="audio-transcribe-form" class="stack-form">
+                    <label>
+                      <span>Audio</span>
+                      <input id="audio-file" type="file" accept="audio/*" />
+                    </label>
+                    <button type="submit">Transcribe Audio</button>
+                  </form>
+                  <pre id="tools-output"></pre>
+                </article>
+              </section>
+
+              <section class="settings-tab-panel" data-settings-panel="about">
+                <article class="settings-card">
+                  <header class="settings-card-header">
+                    <h3>io-workbench</h3>
+                    <span>Documentation, cache utilities, and session access.</span>
+                  </header>
+                  <div class="settings-action-grid">
+                    <a class="button-link" href="/api-docs.html" target="_blank" rel="noreferrer">AI Docs</a>
+                    <a class="button-link" href="/clear-cache.html" target="_blank" rel="noreferrer">Cache Tools</a>
+                  </div>
+                </article>
+              </section>
+
+              <section class="settings-card settings-console-card">
+                <header class="settings-card-header">
+                  <h3>Action Console</h3>
+                  <span>Apply server settings and inspect API responses.</span>
+                </header>
+                <form id="settings-action-form" class="stack-form">
+                  <div class="form-grid">
+                    <label>
+                      <span>Action</span>
+                      <select id="settings-action">
+                        <option value="api-key">Create API Key</option>
+                        <option value="api-key-delete">Delete API Key</option>
+                        <option value="api-key-toggle">Toggle API Key</option>
+                        <option value="credential">Create Credential</option>
+                        <option value="credential-delete">Delete Credential</option>
+                        <option value="credential-toggle">Toggle Credential</option>
+                        <option value="git-config">Save Git Config</option>
+                        <option value="notification">Save Notifications JSON</option>
+                        <option value="direct-ai">Save Direct AI JSON</option>
+                        <option value="onboarding">Complete Onboarding</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Name</span>
+                      <input id="settings-name" name="name" />
+                    </label>
+                  </div>
+                  <div class="form-grid">
+                    <label>
+                      <span>Type / Email</span>
+                      <input id="settings-type" name="type" />
+                    </label>
+                    <label>
+                      <span>Value</span>
+                      <input id="settings-value" name="value" />
+                    </label>
+                  </div>
+                  <label>
+                    <span>JSON</span>
+                    <textarea id="settings-json-input" rows="6">{}</textarea>
+                  </label>
+                  <button type="submit">Apply</button>
+                </form>
+                <label class="compact-field">
+                  <span>Filter Settings Rows</span>
+                  <input id="settings-filter" name="filter" placeholder="Filter API keys, credentials, or output rows" />
+                </label>
+                <pre id="settings-json"></pre>
+                <div id="settings-integrations" class="settings-integrations"></div>
+              </section>
+            </main>
           </div>
-          <div class="button-row">
-            <button id="notification-save" type="button">Save Preferences</button>
-            <button id="notification-permission" type="button">Enable Browser</button>
-            <button id="notification-preview" type="button">Preview</button>
-            <button id="notification-test-push" type="button">Test Push Command</button>
-          </div>
-        </section>
-        <form id="settings-action-form" class="stack-form">
-          <div class="form-grid">
-            <label>
-              <span>Action</span>
-              <select id="settings-action">
-                <option value="api-key">Create API Key</option>
-                <option value="api-key-delete">Delete API Key</option>
-                <option value="api-key-toggle">Toggle API Key</option>
-                <option value="credential">Create Credential</option>
-                <option value="credential-delete">Delete Credential</option>
-                <option value="credential-toggle">Toggle Credential</option>
-                <option value="git-config">Save Git Config</option>
-                <option value="notification">Save Notifications JSON</option>
-                <option value="direct-ai">Save Direct AI JSON</option>
-                <option value="onboarding">Complete Onboarding</option>
-              </select>
-            </label>
-            <label>
-              <span>Name</span>
-              <input id="settings-name" name="name" />
-            </label>
-          </div>
-          <div class="form-grid">
-            <label>
-              <span>Type / Email</span>
-              <input id="settings-type" name="type" />
-            </label>
-            <label>
-              <span>Value</span>
-              <input id="settings-value" name="value" />
-            </label>
-          </div>
-          <label>
-            <span>JSON</span>
-            <textarea id="settings-json-input" rows="6">{}</textarea>
-          </label>
-          <button type="submit">Apply</button>
-        </form>
-        <label class="compact-field">
-          <span>Filter Settings Rows</span>
-          <input id="settings-filter" name="filter" placeholder="Filter API keys, credentials, or output rows" />
-        </label>
-        <pre id="settings-json"></pre>
-        <div id="settings-integrations" class="settings-integrations"></div>
-        <section class="settings-tools">
-          <div class="panel-header">
-            <h2>Tools</h2>
-            <button id="refresh-tool-runs" class="icon-button" type="button" aria-label="Refresh tool runs" title="Refresh tool runs" data-symbol="refresh"></button>
-          </div>
-          <form id="tool-run-form" class="stack-form">
-            <div class="form-grid">
-              <label>
-                <span>Tool</span>
-                <select id="tool-kind">
-                  <option value="mcp">MCP</option>
-                  <option value="mcp-utils">MCP Utils</option>
-                  <option value="commands">Commands</option>
-                  <option value="plugins">Plugins</option>
-                  <option value="taskmaster">Taskmaster</option>
-                  <option value="danger">Danger</option>
-                  <option value="notifications">Notifications</option>
-                </select>
-              </label>
-              <label>
-                <span>Command</span>
-                <input id="tool-command" name="command" placeholder="/bin/echo" />
-              </label>
-            </div>
-            <label>
-              <span>Args JSON</span>
-              <input id="tool-args" name="args" value="[&quot;tool-smoke&quot;]" />
-            </label>
-            <label>
-              <span>Payload JSON</span>
-              <textarea id="tool-payload" rows="6">{}</textarea>
-            </label>
-            <button type="submit">Run Tool</button>
-          </form>
-          <label class="compact-field">
-            <span>Filter Runs</span>
-            <input id="tool-filter" name="filter" placeholder="Filter by command, action, output, or status" />
-          </label>
-          <form id="mcp-server-form" class="stack-form">
-            <div class="form-grid">
-              <label>
-                <span>MCP Server Name</span>
-                <input id="mcp-server-name" name="name" />
-              </label>
-              <label>
-                <span>MCP Server Command</span>
-                <input id="mcp-server-command" name="command" />
-              </label>
-            </div>
-            <label>
-              <span>MCP Server Args JSON</span>
-              <input id="mcp-server-args" name="args" value="[]" />
-            </label>
-            <label>
-              <span>MCP Server ID</span>
-              <input id="mcp-server-id" name="serverId" />
-            </label>
-            <div class="button-row">
-              <button type="submit">Start MCP Server</button>
-              <button id="refresh-mcp-servers" type="button">List MCP Servers</button>
-              <button id="stop-mcp-server" type="button">Stop MCP Server</button>
-            </div>
-          </form>
-          <form id="audio-transcribe-form" class="stack-form">
-            <label>
-              <span>Audio</span>
-              <input id="audio-file" type="file" accept="audio/*" />
-            </label>
-            <button type="submit">Transcribe Audio</button>
-          </form>
-          <pre id="tools-output"></pre>
-        </section>
-        <section class="settings-metrics">
-          <div class="panel-header">
-            <h2>Runtime Metrics</h2>
-            <button id="refresh-metrics" class="icon-button" type="button" aria-label="Refresh runtime metrics" title="Refresh runtime metrics" data-symbol="refresh"></button>
-          </div>
-          <div id="metrics-grid" class="metric-grid"></div>
-          <pre id="metrics-json"></pre>
-        </section>
+        </div>
       </section>
     </main>
-
-    <div id="project-modal" class="project-modal hidden" role="dialog" aria-modal="true" aria-label="Manage projects">
-      <div class="project-modal-panel">
-        <div class="project-modal-header">
-          <strong>Projects</strong>
-          <div class="row-actions">
-            <button id="refresh-projects" class="secondary-action icon-button" aria-label="Refresh projects" title="Refresh projects" data-symbol="refresh"></button>
-            <button id="project-modal-close" class="icon-button" type="button" aria-label="Close projects" title="Close" data-symbol="close"></button>
-          </div>
-        </div>
-        <form id="add-project-form" class="inline-form">
-          <input id="project-path" name="path" placeholder="Project path under workspace root" />
-          <button id="browse-project-path" type="button" class="secondary-action icon-button" aria-label="Browse project folder" title="Browse project folder" data-symbol="folder"></button>
-          <button type="submit" class="primary-action icon-button" aria-label="Add project" title="Add project" data-symbol="plus"></button>
-        </form>
-        <form id="workspace-form" class="stack-form">
-          <div class="form-grid">
-            <label>
-              <span>Workspace Type</span>
-              <select id="workspace-type">
-                <option value="existing">Existing</option>
-                <option value="new">New</option>
-              </select>
-            </label>
-            <label>
-              <span>Path</span>
-              <span class="input-action-row">
-                <input id="workspace-path" name="path" />
-                <button id="browse-workspace-path" type="button" class="secondary-action icon-button" aria-label="Browse workspace folder" title="Browse workspace folder" data-symbol="folder"></button>
-              </span>
-            </label>
-          </div>
-          <label>
-            <span>GitHub URL</span>
-            <input id="workspace-github-url" name="githubUrl" />
-          </label>
-          <button type="submit" class="primary-action icon-button" aria-label="Create workspace" title="Create workspace" data-symbol="plus"></button>
-        </form>
-        <div id="projects-list" class="list project-modal-list"></div>
-      </div>
-    </div>
 
     <div id="command-palette" class="command-palette hidden" role="dialog" aria-modal="true" aria-label="Command palette">
       <div class="command-panel">
@@ -728,10 +826,13 @@
       <div class="folder-browser-panel">
         <div class="folder-browser-header">
           <div>
-            <strong>Select Folder</strong>
+            <strong id="folder-browser-title">Select Folder</strong>
             <code id="folder-browser-path">~</code>
           </div>
-          <button id="folder-browser-close" class="icon-button" type="button" aria-label="Close folder picker" title="Close" data-symbol="close"></button>
+          <div class="folder-browser-header-actions">
+            <button id="folder-browser-use" type="button" class="primary-action icon-button" aria-label="Use folder" title="Use folder" data-symbol="check"></button>
+            <button id="folder-browser-close" class="icon-button" type="button" aria-label="Close folder picker" title="Close" data-symbol="close"></button>
+          </div>
         </div>
         <div class="folder-browser-toolbar">
           <button id="folder-browser-home" class="icon-button" type="button" aria-label="Go to home folder" title="Home" data-symbol="home"></button>
@@ -739,24 +840,22 @@
           <button id="folder-browser-hidden" class="icon-button" type="button" aria-label="Show hidden folders" title="Show hidden folders" data-symbol="eye"></button>
           <input id="folder-browser-filter" type="search" placeholder="Filter folders" />
         </div>
-        <div class="folder-create-row">
-          <input id="folder-create-name" placeholder="New folder name" />
-          <button id="folder-create-submit" class="icon-button" type="button" aria-label="Create folder" title="Create folder" data-symbol="plus"></button>
-        </div>
         <div id="folder-browser-status" class="empty"></div>
         <div id="folder-browser-list" class="folder-browser-list"></div>
-        <div class="folder-browser-footer">
-          <button id="folder-browser-use" type="button" class="primary-action icon-button" aria-label="Use for project" title="Use for project" data-symbol="check"></button>
-        </div>
       </div>
     </div>
     <nav class="bottom-nav" aria-label="Mobile workspace views">
       <button id="bottom-sidebar" type="button" data-symbol="nav-menu" aria-label="Toggle sidebar" title="Menu">Menu</button>
-      <button data-view="shell" data-symbol="nav-shell" aria-label="Shell" title="Shell">Shell</button>
-      <button data-view="files" data-symbol="nav-files" aria-label="Files" title="Files">Files</button>
-      <button data-view="chat" data-symbol="nav-chat" aria-label="Chat" title="Chat">Chat</button>
-      <button data-view="git" data-symbol="nav-git" aria-label="Git" title="Git">Git</button>
-      <button data-view="database" data-symbol="nav-database" aria-label="Database" title="Database">Database</button>
+      <div class="bottom-nav-title" aria-live="polite">
+        <strong id="bottom-view-title">Chat</strong>
+        <span id="bottom-view-meta">No project</span>
+      </div>
+      <div class="bottom-nav-tabs" role="tablist" aria-label="Workspace views">
+        <button data-view="shell" data-symbol="nav-shell" aria-label="Shell" title="Shell">Shell</button>
+        <button data-view="files" data-symbol="nav-files" aria-label="Files" title="Files">Files</button>
+        <button data-view="chat" data-symbol="nav-chat" aria-label="Chat" title="Chat">Chat</button>
+        <button data-view="git" data-symbol="nav-git" aria-label="Git" title="Git">Git</button>
+      </div>
     </nav>
     <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
@@ -777,6 +876,6 @@
     <script src="/vendor/codemirror/mode/yaml.js"></script>
     <script src="/vendor/codemirror/mode/toml.js"></script>
     <script src="/vendor/xterm/xterm.js"></script>
-    <script src="/app.js?v=20260727-06" type="module"></script>
+    <script src="/app.js?v=20260729-03" type="module"></script>
   </body>
 </html>
