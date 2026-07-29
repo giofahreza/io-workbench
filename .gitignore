@@ -5,10 +5,3 @@
 *.swp
 *.tmp
 .DS_Store
-
-# Closed-source app clients
-/apps/mobile/
-/apps/desktop/*
-!/apps/desktop/native/
-!/apps/desktop/native/**
-/apps/desktop/native/build/
