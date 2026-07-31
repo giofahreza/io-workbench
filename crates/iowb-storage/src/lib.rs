@@ -476,6 +476,7 @@ impl Storage {
                     id,
                     name,
                     path,
+                    repo_name: None,
                     created_at: parse_time(&created_at)?,
                     updated_at: parse_time(&updated_at)?,
                     sessions: Vec::new(),
@@ -512,6 +513,7 @@ impl Storage {
                     id,
                     name,
                     path,
+                    repo_name: None,
                     created_at: parse_time(&created_at)?,
                     updated_at: parse_time(&updated_at)?,
                     sessions: Vec::new(),
@@ -567,8 +569,14 @@ impl Storage {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT id, provider, project_path, title, message_count, last_activity, active, model, metadata
-                FROM sessions
+                SELECT s.id, s.provider, s.project_path, s.title,
+                       CASE
+                           WHEN EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)
+                           THEN (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                           ELSE s.message_count
+                       END,
+                       s.last_activity, s.active, s.model, s.metadata
+                FROM sessions s
                 ORDER BY last_activity DESC, metadata
                 "#,
             )?;
@@ -586,9 +594,15 @@ impl Storage {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 r#"
-                SELECT id, provider, project_path, title, message_count, last_activity, active, model, metadata
-                FROM sessions
-                WHERE project_path = ?1
+                SELECT s.id, s.provider, s.project_path, s.title,
+                       CASE
+                           WHEN EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)
+                           THEN (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                           ELSE s.message_count
+                       END,
+                       s.last_activity, s.active, s.model, s.metadata
+                FROM sessions s
+                WHERE s.project_path = ?1
                 ORDER BY last_activity DESC, metadata
                 "#,
             )?;
@@ -606,9 +620,15 @@ impl Storage {
         self.with_connection(|conn| {
             conn.query_row(
                 r#"
-                SELECT id, provider, project_path, title, message_count, last_activity, active, model, metadata
-                FROM sessions
-                WHERE id = ?1
+                SELECT s.id, s.provider, s.project_path, s.title,
+                       CASE
+                           WHEN EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)
+                           THEN (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                           ELSE s.message_count
+                       END,
+                       s.last_activity, s.active, s.model, s.metadata
+                FROM sessions s
+                WHERE s.id = ?1
                 "#,
                 params![session_id],
                 map_session_row,
@@ -1470,6 +1490,9 @@ fn serialize_session_metadata(session: &SessionSummary) -> String {
     if session.external {
         value.insert("external".into(), json!(true));
     }
+    if let Some(native_session_id) = session.native_session_id.as_ref() {
+        value.insert("nativeSessionId".into(), json!(native_session_id));
+    }
     if let Some(model) = session.model.as_ref() {
         value.insert("model".into(), json!(model));
     }
@@ -1508,6 +1531,9 @@ fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
     use serde_json::Value;
     if let Some(v) = value.get("external").and_then(Value::as_bool) {
         session.external = v;
+    }
+    if let Some(v) = value.get("nativeSessionId").and_then(Value::as_str) {
+        session.native_session_id = Some(v.to_string());
     }
     if let Some(v) = value.get("model").and_then(Value::as_str) {
         session.model = Some(v.to_string());
@@ -1663,5 +1689,44 @@ fn parse_role(raw: &str) -> MessageRole {
         "assistant" => MessageRole::Assistant,
         "tool" => MessageRole::Tool,
         _ => MessageRole::User,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn native_session_id_round_trips_through_session_metadata() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "iowb-storage-native-thread-{}-{unique}",
+            std::process::id()
+        ));
+        let database = root.join("test.db");
+        let storage = Storage::open(&database).expect("storage");
+        let session = SessionSummary {
+            id: "new-session-test".to_string(),
+            provider: Provider::Codex,
+            project_path: "/tmp/project".to_string(),
+            title: "Test".to_string(),
+            last_activity: Utc::now(),
+            native_session_id: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            ..Default::default()
+        };
+
+        storage.upsert_session(&session).expect("upsert");
+        let restored = storage
+            .get_session(&session.id)
+            .expect("query")
+            .expect("stored session");
+        assert_eq!(restored.native_session_id, session.native_session_id);
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -239,7 +239,8 @@ fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
                 .unwrap_or_default()
                 .to_string();
         }
-        if let Some(record) = finish_builder(builder, Provider::Codex, path, fallback_time) {
+        if let Some(mut record) = finish_builder(builder, Provider::Codex, path, fallback_time) {
+            record.summary.message_count = load_codex_messages(&record).len();
             records.push(record);
         }
     }
@@ -261,7 +262,7 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
         SELECT id, rollout_path, cwd, title, first_user_message,
                updated_at_ms, updated_at, model
         FROM threads
-        WHERE archived = 0
+        WHERE archived = 0 AND first_user_message <> ''
         ORDER BY updated_at_ms DESC
         "#,
     ) else {
@@ -282,7 +283,6 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
         return false;
     };
 
-    let user_message_counts = codex_user_message_counts(&codex_dir.join("history.jsonl"));
     let mut found = false;
     for row in rows.flatten() {
         let (id, rollout_path, project_path, title, first_user, updated_ms, updated, model) = row;
@@ -303,7 +303,6 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
             .find(|value| is_visible_user_text(value))
             .map(|value| summarize(&value))
             .unwrap_or_else(|| "Codex session".to_string());
-        let user_messages = user_message_counts.get(&id).copied().unwrap_or(1);
         records.push(ExternalSessionRecord {
             summary: SessionSummary {
                 id,
@@ -311,10 +310,10 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
                 external: true,
                 project_path,
                 title: visible_title,
-                // This is only a list hint. The messages endpoint returns the
-                // exact total from the selected rollout without scanning all
-                // rollouts during project loading.
-                message_count: user_messages.saturating_mul(2),
+                // The Codex index does not store a message count. Keep discovery
+                // metadata-only; the messages endpoint loads the selected rollout
+                // lazily and returns its authoritative total.
+                message_count: 1,
                 last_activity,
                 active: false,
                 model,
@@ -326,16 +325,6 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
         found = true;
     }
     found
-}
-
-fn codex_user_message_counts(history_path: &Path) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
-    for_each_json_line(history_path, |entry| {
-        if let Some(session_id) = entry.get("session_id").and_then(Value::as_str) {
-            *counts.entry(session_id.to_string()).or_insert(0) += 1;
-        }
-    });
-    counts
 }
 
 fn discover_gemini(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
@@ -501,6 +490,7 @@ fn load_claude_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
 
 fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
+    let mut tool_names = HashMap::<String, String>::new();
     for_each_json_line(&record.file_path, |entry| {
         let timestamp = value_timestamp(entry.get("timestamp"));
         match entry.get("type").and_then(Value::as_str) {
@@ -523,21 +513,142 @@ fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
             }
             Some("response_item") => {
                 let payload = entry.get("payload").unwrap_or(&Value::Null);
-                if payload.get("type").and_then(Value::as_str) != Some("message") {
-                    return;
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("message") => {
+                        let Some(role) = payload
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .and_then(parse_role)
+                        else {
+                            return;
+                        };
+                        let mut content = extract_text(payload.get("content"));
+                        if role == MessageRole::User {
+                            content = visible_user_text(&content);
+                        }
+                        push_message(&mut messages, record, role, content, timestamp);
+                    }
+                    Some("reasoning") => {
+                        let content = extract_text(payload.get("summary"));
+                        if !content.is_empty() {
+                            push_message_with_metadata(
+                                &mut messages,
+                                record,
+                                MessageRole::Assistant,
+                                format!("thinking\n{content}"),
+                                timestamp,
+                                json!({
+                                    "kind": "thinking",
+                                    "thinkingSource": "summary",
+                                }),
+                            );
+                        }
+                    }
+                    Some("function_call") => {
+                        let name = payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool");
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !call_id.is_empty() {
+                            tool_names.insert(call_id.to_string(), name.to_string());
+                        }
+                        let arguments = payload
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        push_message_with_metadata(
+                            &mut messages,
+                            record,
+                            MessageRole::Tool,
+                            format_function_call(name, arguments),
+                            timestamp,
+                            tool_metadata("tool_use", name, call_id, arguments),
+                        );
+                    }
+                    Some("function_call_output") => {
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let name = tool_names
+                            .get(call_id)
+                            .map(String::as_str)
+                            .unwrap_or("tool");
+                        let output = display_json_value(payload.get("output"));
+                        push_message_with_metadata(
+                            &mut messages,
+                            record,
+                            MessageRole::Tool,
+                            format!("tool / Details\n**Tool:** `{name}`\n\n{output}"),
+                            timestamp,
+                            tool_metadata("tool_result", name, call_id, &output),
+                        );
+                    }
+                    Some("custom_tool_call") => {
+                        let name = payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("custom_tool");
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !call_id.is_empty() {
+                            tool_names.insert(call_id.to_string(), name.to_string());
+                        }
+                        let input = payload
+                            .get("input")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let (content, operations) = if name == "apply_patch" {
+                            format_patch_tool(input)
+                        } else {
+                            (
+                                format!(
+                                    "tool / Parameters\n**Tool:** `{name}`\n\n{}",
+                                    fenced_text(input)
+                                ),
+                                Vec::new(),
+                            )
+                        };
+                        let mut metadata = tool_metadata("tool_use", name, call_id, input);
+                        if !operations.is_empty() {
+                            metadata["fileOperations"] = Value::Array(operations);
+                        }
+                        push_message_with_metadata(
+                            &mut messages,
+                            record,
+                            MessageRole::Tool,
+                            content,
+                            timestamp,
+                            metadata,
+                        );
+                    }
+                    Some("custom_tool_call_output") => {
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let name = tool_names
+                            .get(call_id)
+                            .map(String::as_str)
+                            .unwrap_or("custom_tool");
+                        let output = display_json_value(payload.get("output"));
+                        push_message_with_metadata(
+                            &mut messages,
+                            record,
+                            MessageRole::Tool,
+                            format!("tool / Details\n**Tool:** `{name}`\n\n{output}"),
+                            timestamp,
+                            tool_metadata("tool_result", name, call_id, &output),
+                        );
+                    }
+                    _ => {}
                 }
-                let Some(role) = payload
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .and_then(parse_role)
-                else {
-                    return;
-                };
-                let mut content = extract_text(payload.get("content"));
-                if role == MessageRole::User {
-                    content = visible_user_text(&content);
-                }
-                push_message(&mut messages, record, role, content, timestamp);
             }
             _ => {}
         }
@@ -586,8 +697,27 @@ fn push_message(
     content: String,
     timestamp: Option<DateTime<Utc>>,
 ) {
-    if content.trim().is_empty() || !matches!(role, MessageRole::User | MessageRole::Assistant) {
+    push_message_with_metadata(messages, record, role, content, timestamp, Value::Null);
+}
+
+fn push_message_with_metadata(
+    messages: &mut Vec<ChatMessage>,
+    record: &ExternalSessionRecord,
+    role: MessageRole,
+    content: String,
+    timestamp: Option<DateTime<Utc>>,
+    extra_metadata: Value,
+) {
+    if content.trim().is_empty() {
         return;
+    }
+    let mut metadata = json!({
+        "external": true,
+        "cli": record.summary.provider.as_str(),
+        "model": record.summary.model,
+    });
+    if let (Some(base), Some(extra)) = (metadata.as_object_mut(), extra_metadata.as_object()) {
+        base.extend(extra.clone());
     }
     messages.push(ChatMessage {
         id: format!(
@@ -599,12 +729,88 @@ fn push_message(
         role,
         content,
         timestamp: timestamp.unwrap_or(record.summary.last_activity),
-        metadata: json!({
-            "external": true,
-            "cli": record.summary.provider.as_str(),
-            "model": record.summary.model,
-        }),
+        metadata,
     });
+}
+
+fn format_function_call(name: &str, arguments: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(arguments).ok();
+    if matches!(name, "exec_command" | "shell_command") {
+        let command = parsed
+            .as_ref()
+            .and_then(|value| value.get("cmd").or_else(|| value.get("command")))
+            .and_then(Value::as_str)
+            .unwrap_or(arguments);
+        return format!(
+            "tool / Parameters\n**Tool:** `{name}`\n\n### Command\n```sh\n{command}\n```"
+        );
+    }
+    let display = parsed
+        .as_ref()
+        .and_then(|value| serde_json::to_string_pretty(value).ok())
+        .unwrap_or_else(|| arguments.to_string());
+    format!(
+        "tool / Parameters\n**Tool:** `{name}`\n\n{}",
+        fenced_text(&display)
+    )
+}
+
+fn format_patch_tool(input: &str) -> (String, Vec<Value>) {
+    let mut operations = Vec::new();
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let operation = [
+            ("*** Add File: ", "create"),
+            ("*** Update File: ", "update"),
+            ("*** Delete File: ", "delete"),
+            ("*** Move to: ", "move"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, kind)| trimmed.strip_prefix(prefix).map(|path| (kind, path.trim())));
+        if let Some((kind, path)) = operation {
+            operations.push(json!({"operation": kind, "path": path}));
+        }
+    }
+    let summary = operations
+        .iter()
+        .filter_map(|operation| {
+            Some(format!(
+                "- **{}:** `{}`",
+                operation
+                    .get("operation")?
+                    .as_str()?
+                    .replace("create", "created")
+                    .replace("update", "updated")
+                    .replace("delete", "deleted")
+                    .replace("move", "moved"),
+                operation.get("path")?.as_str()?,
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = format!("apply_patch\n{}\n\n```diff\n{}\n```", summary, input.trim());
+    (content, operations)
+}
+
+fn tool_metadata(kind: &str, name: &str, call_id: &str, payload: &str) -> Value {
+    json!({
+        "kind": kind,
+        "toolName": name,
+        "toolCallId": call_id,
+        "payload": serde_json::from_str::<Value>(payload).unwrap_or_else(|_| Value::String(payload.to_string())),
+    })
+}
+
+fn display_json_value(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(value) => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+        None => String::new(),
+    }
+}
+
+fn fenced_text(value: &str) -> String {
+    format!("```json\n{}\n```", value.trim())
 }
 
 fn record_visible_message(
@@ -921,6 +1127,11 @@ mod tests {
             ));
             let messages = load_external_messages(record);
             assert_eq!(messages.len(), 2, "{messages:#?}");
+            assert_eq!(
+                record.summary.message_count,
+                messages.len(),
+                "summary count must match visible messages for {provider:?}",
+            );
             assert_eq!(messages[0].content, expected_question);
             assert_eq!(messages[1].content, expected_answer);
         }
@@ -951,6 +1162,128 @@ mod tests {
         .unwrap();
 
         assert!(discover_external_sessions(&root).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_codex_reasoning_tools_and_patch_file_operations() {
+        let root = std::env::temp_dir().join(format!("iowb-external-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "44444444-4444-4444-8444-444444444444";
+        let file = root
+            .join(".codex/sessions/2026/07/30")
+            .join(format!("rollout-2026-07-30T00-00-00-{session_id}.jsonl"));
+        write_jsonl(
+            &file,
+            &[
+                json!({"timestamp":"2026-07-30T00:00:00Z","type":"session_meta","payload":{"id":session_id,"cwd":project}}),
+                json!({"timestamp":"2026-07-30T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Change files","kind":"plain"}}),
+                json!({"timestamp":"2026-07-30T00:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Inspecting the project"}]}}),
+                json!({"timestamp":"2026-07-30T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-exec","arguments":"{\"cmd\":\"pwd\"}"}}),
+                json!({"timestamp":"2026-07-30T00:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-exec","output":"Chunk ID: one\nProcess exited with code 0"}}),
+                json!({"timestamp":"2026-07-30T00:00:05Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"call-patch","input":"*** Begin Patch\n*** Add File: created.txt\n+created\n*** Update File: updated.txt\n-old\n+new\n*** Delete File: deleted.txt\n*** Move to: moved.txt\n*** End Patch"}}),
+                json!({"timestamp":"2026-07-30T00:00:06Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-patch","output":"Success"}}),
+                json!({"timestamp":"2026-07-30T00:00:07Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Finished"}]}}),
+            ],
+        );
+
+        let record = discover_external_sessions(&root)
+            .into_iter()
+            .find(|record| record.summary.id == session_id)
+            .unwrap();
+        let messages = load_external_messages(&record);
+
+        assert_eq!(7, messages.len(), "{messages:#?}");
+        assert_eq!(7, record.summary.message_count);
+        assert_eq!(MessageRole::Assistant, messages[1].role);
+        assert!(messages[1].content.starts_with("thinking\n"));
+        assert_eq!(MessageRole::Tool, messages[2].role);
+        assert!(messages[2].content.contains("### Command"));
+        assert_eq!(messages[2].metadata["toolName"], "exec_command");
+        assert_eq!(MessageRole::Tool, messages[4].role);
+        assert!(messages[4].content.contains("apply_patch"));
+        assert!(messages[4].content.contains("created.txt"));
+        assert!(messages[4].content.contains("updated.txt"));
+        assert!(messages[4].content.contains("deleted.txt"));
+        assert!(messages[4].content.contains("moved.txt"));
+        assert_eq!(
+            messages[4].metadata["fileOperations"]
+                .as_array()
+                .map(Vec::len),
+            Some(4),
+        );
+        assert_eq!("Finished", messages[6].content);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_index_discovery_defers_rollout_message_loading() {
+        let root = std::env::temp_dir().join(format!("iowb-codex-index-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let codex_dir = root.join(".codex");
+        let session_id = "55555555-5555-4555-8555-555555555555";
+        let rollout = codex_dir
+            .join("sessions/2026/07/31")
+            .join(format!("rollout-{session_id}.jsonl"));
+        fs::create_dir_all(&project).unwrap();
+        write_jsonl(
+            &rollout,
+            &[
+                json!({"timestamp":"2026-07-31T00:00:00Z","type":"session_meta","payload":{"id":session_id,"cwd":project}}),
+                json!({"timestamp":"2026-07-31T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Indexed question","kind":"plain"}}),
+                json!({"timestamp":"2026-07-31T00:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Indexed answer"}]}}),
+            ],
+        );
+
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    first_user_message TEXT NOT NULL,
+                    updated_at_ms INTEGER,
+                    updated_at INTEGER NOT NULL,
+                    model TEXT,
+                    archived INTEGER NOT NULL DEFAULT 0
+                );
+                "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                INSERT INTO threads (
+                    id, rollout_path, cwd, title, first_user_message,
+                    updated_at_ms, updated_at, model, archived
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+                "#,
+                rusqlite::params![
+                    session_id,
+                    rollout.display().to_string(),
+                    project.display().to_string(),
+                    "Indexed session",
+                    "Indexed question",
+                    1_785_459_602_000_i64,
+                    1_785_459_602_i64,
+                    "gpt-test",
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let record = discover_external_sessions(&root)
+            .into_iter()
+            .find(|record| record.summary.id == session_id)
+            .unwrap();
+        assert_eq!(1, record.summary.message_count);
+        assert_eq!(2, load_external_messages(&record).len());
+
         fs::remove_dir_all(root).unwrap();
     }
 

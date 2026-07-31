@@ -75,6 +75,8 @@ pub struct ProjectSummary {
     pub id: String,
     pub name: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -204,6 +206,11 @@ pub struct SessionSummary {
     pub provider: Provider,
     #[serde(default)]
     pub external: bool,
+    /// Native CLI thread/session id associated with an internal workbench
+    /// session. This is persisted by the server but intentionally omitted
+    /// from API payloads.
+    #[serde(skip)]
+    pub native_session_id: Option<String>,
     #[serde(rename = "projectPath")]
     pub project_path: String,
     pub title: String,
@@ -268,6 +275,14 @@ pub struct MessagesResponse {
     /// `true` when older messages still exist beyond the returned window.
     pub has_more: bool,
     /// Total number of messages stored for the session.
+    pub total_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSnapshotResponse {
+    pub session: SessionSummary,
+    pub messages: Vec<ChatMessage>,
+    pub has_more: bool,
     pub total_count: usize,
 }
 
@@ -503,6 +518,35 @@ pub struct GitCommitSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitCommitsResponse {
     pub commits: Vec<GitCommitSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitStashSummary {
+    pub reference: String,
+    pub hash: String,
+    pub author: String,
+    pub date: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitStashesResponse {
+    pub stashes: Vec<GitStashSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitTagSummary {
+    pub name: String,
+    pub hash: String,
+    #[serde(rename = "objectType")]
+    pub object_type: String,
+    pub date: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitTagsResponse {
+    pub tags: Vec<GitTagSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1157,6 +1201,11 @@ pub enum WsServerEvent {
     },
     ProjectsUpdated {
         projects: Vec<ProjectSummary>,
+    },
+    ProjectFilesChanged {
+        #[serde(rename = "projectPath")]
+        project_path: String,
+        paths: Vec<String>,
     },
     ActiveSessions {
         sessions: Vec<SessionSummary>,

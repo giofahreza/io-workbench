@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
+    ffi::OsString,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -222,8 +223,10 @@ impl AppState {
             ));
         }
 
-        let resume_external = if let Some(session_id) = session_id.as_deref() {
-            self.sessions
+        let (external, native_resume_session_id) = if let Some(session_id) = session_id.as_deref() {
+            let stored_session = self.sessions.get_stored(session_id);
+            let external = self
+                .sessions
                 .external_record(
                     session_id,
                     Some(provider),
@@ -231,12 +234,28 @@ impl AppState {
                 )
                 .await
                 .is_some()
-                || self
-                    .sessions
-                    .get_stored(session_id)
-                    .is_some_and(|session| session.external)
+                || stored_session
+                    .as_ref()
+                    .is_some_and(|session| session.external);
+            let native_resume_session_id = if external {
+                Some(session_id.to_string())
+            } else {
+                match stored_session.and_then(|session| session.native_session_id) {
+                    Some(native_session_id) => Some(native_session_id),
+                    None => {
+                        self.sessions
+                            .infer_native_session_id(
+                                session_id,
+                                provider,
+                                &resolved_project_path.display().to_string(),
+                            )
+                            .await?
+                    }
+                }
+            };
+            (external, native_resume_session_id)
         } else {
-            false
+            (false, None)
         };
 
         let session = self
@@ -245,7 +264,7 @@ impl AppState {
                 provider,
                 resolved_project_path.display().to_string(),
                 session_id,
-                resume_external,
+                external,
                 model.clone(),
                 effort.clone(),
                 mode.clone(),
@@ -303,7 +322,7 @@ impl AppState {
                 effort: effort.clone(),
                 mode: mode.clone(),
                 thinking,
-                resume_external,
+                native_resume_session_id,
                 direct_ai_config,
                 sessions: self.sessions.clone(),
                 storage: self.storage.clone(),
@@ -604,6 +623,7 @@ impl SessionManager {
                 first_user_at: None,
                 received_at: None,
                 token_usage: None,
+                native_session_id: None,
             });
 
         session.provider = provider;
@@ -715,6 +735,79 @@ impl SessionManager {
         session.last_activity = Utc::now();
         self.storage.upsert_session(session)?;
         Ok(session.clone())
+    }
+
+    pub async fn set_native_session_id(
+        &self,
+        session_id: &str,
+        native_session_id: impl Into<String>,
+    ) -> Result<SessionSummary> {
+        let native_session_id = native_session_id.into();
+        if native_session_id.trim().is_empty() {
+            return Err(CoreError::InvalidInput(
+                "native session id must not be empty".to_string(),
+            ));
+        }
+
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
+        if session.native_session_id.as_deref() != Some(native_session_id.as_str()) {
+            session.native_session_id = Some(native_session_id);
+            self.storage.upsert_session(session)?;
+        }
+        Ok(session.clone())
+    }
+
+    async fn infer_native_session_id(
+        &self,
+        session_id: &str,
+        provider: Provider,
+        project_path: &str,
+    ) -> Result<Option<String>> {
+        if provider != Provider::Codex {
+            return Ok(None);
+        }
+        let Some(last_user_prompt) = self
+            .storage
+            .list_messages(session_id)?
+            .into_iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User)
+            .map(|message| message.content)
+            .filter(|content| !content.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let candidate = self
+            .external_records()
+            .await
+            .into_iter()
+            .filter(|record| {
+                record.summary.provider == provider
+                    && same_project_path(&record.summary.project_path, project_path)
+            })
+            .filter(|record| {
+                load_external_messages(record).into_iter().any(|message| {
+                    message.role == MessageRole::User && message.content == last_user_prompt
+                })
+            })
+            .max_by_key(|record| record.summary.last_activity);
+
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let native_session_id = candidate.summary.id;
+        self.set_native_session_id(session_id, native_session_id.clone())
+            .await?;
+        info!(
+            session_id,
+            native_session_id = %native_session_id,
+            "reconciled existing workbench session with native Codex thread"
+        );
+        Ok(Some(native_session_id))
     }
 
     pub async fn list_active(&self) -> Vec<SessionSummary> {
@@ -830,22 +923,36 @@ impl SessionManager {
     }
 
     async fn external_records(&self) -> Vec<ExternalSessionRecord> {
-        const CACHE_TTL: Duration = Duration::from_secs(3);
-        {
+        const CACHE_TTL: Duration = Duration::from_secs(30);
+        let records = {
             let cache = self.external_cache.read().await;
             if cache
                 .loaded_at
                 .is_some_and(|loaded_at| loaded_at.elapsed() < CACHE_TTL)
             {
-                return cache.records.clone();
+                cache.records.clone()
+            } else {
+                drop(cache);
+                let records = discover_external_sessions(&self.external_home);
+                let mut cache = self.external_cache.write().await;
+                cache.loaded_at = Some(Instant::now());
+                cache.records = records.clone();
+                records
             }
-        }
+        };
 
-        let records = discover_external_sessions(&self.external_home);
-        let mut cache = self.external_cache.write().await;
-        cache.loaded_at = Some(Instant::now());
-        cache.records = records.clone();
+        let mapped_native_ids = self
+            .sessions
+            .read()
+            .await
+            .values()
+            .filter(|session| !session.external)
+            .filter_map(|session| session.native_session_id.clone())
+            .collect::<HashSet<_>>();
         records
+            .into_iter()
+            .filter(|record| !mapped_native_ids.contains(&record.summary.id))
+            .collect()
     }
 
     async fn external_record(
@@ -953,7 +1060,7 @@ struct AgentStartContext {
     effort: Option<String>,
     mode: Option<String>,
     thinking: Option<bool>,
-    resume_external: bool,
+    native_resume_session_id: Option<String>,
     direct_ai_config: Option<DirectAiRuntimeConfig>,
     sessions: SessionManager,
     storage: iowb_storage::Storage,
@@ -973,9 +1080,25 @@ struct AgentCommandSpec {
     stdin_prompt: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AgentOutputStream {
+    Stdout,
+    Stderr,
+}
+
 enum AgentProcessEvent {
-    Output(String),
+    Output {
+        stream: AgentOutputStream,
+        data: String,
+    },
     Failed(String),
+}
+
+#[derive(Default)]
+struct CodexLiveOutputNormalizer {
+    pending_line: String,
+    pending_agent_message: Option<String>,
+    pending_thread_id: Option<String>,
 }
 
 impl AgentRuntimeManager {
@@ -989,7 +1112,7 @@ impl AgentRuntimeManager {
     }
 
     async fn start(&self, context: AgentStartContext) -> Result<()> {
-        if !context.resume_external
+        if context.native_resume_session_id.is_none()
             && should_use_direct_ai_gateway_runtime(context.provider, context.model.as_deref())
         {
             return self.start_direct_ai(context).await;
@@ -1003,7 +1126,7 @@ impl AgentRuntimeManager {
             context.effort.as_deref(),
             context.mode.as_deref(),
             context.thinking,
-            context.resume_external,
+            context.native_resume_session_id.as_deref(),
         )?;
         let (abort_tx, abort_rx) = oneshot::channel();
         let key = agent_run_key(context.provider, &context.session_id);
@@ -1025,6 +1148,7 @@ impl AgentRuntimeManager {
         child_command
             .args(&command.args)
             .current_dir(&context.project_path)
+            .env("PATH", augmented_user_path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Log the exact spawn so misconfigured flag sets are easy to spot.
@@ -1081,10 +1205,10 @@ impl AgentRuntimeManager {
 
         let (output_tx, mut output_rx) = mpsc::channel::<AgentProcessEvent>(256);
         if let Some(stdout) = child.stdout.take() {
-            spawn_agent_output_reader(output_tx.clone(), stdout);
+            spawn_agent_output_reader(output_tx.clone(), stdout, AgentOutputStream::Stdout);
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_agent_output_reader(output_tx.clone(), stderr);
+            spawn_agent_output_reader(output_tx.clone(), stderr, AgentOutputStream::Stderr);
         }
         drop(output_tx);
 
@@ -1103,28 +1227,38 @@ impl AgentRuntimeManager {
         tokio::spawn(async move {
             let mut abort_rx = abort_rx;
             let mut output = String::new();
+            let mut codex_normalizer =
+                (context.provider == Provider::Codex).then(CodexLiveOutputNormalizer::default);
             loop {
                 tokio::select! {
                     Some(event) = output_rx.recv() => {
-                        match event {
-                            AgentProcessEvent::Output(data) => {
-                                append_bounded(&mut output, &data, manager.max_output_bytes);
-                                manager.publish(&context.hub, &key, WsServerEvent::Output {
-                                    provider: context.provider,
-                                    session_id: context.session_id.clone(),
-                                    content: data,
-                                    done: false,
-                                }).await;
-                            }
-                            AgentProcessEvent::Failed(message) => {
-                                manager.publish(&context.hub, &key, WsServerEvent::Error {
-                                    message: "agent output stream failed".to_string(),
-                                    details: Some(message),
-                                }).await;
-                            }
-                        }
+                        process_agent_event(
+                            &manager,
+                            &context,
+                            &key,
+                            event,
+                            &mut codex_normalizer,
+                            &mut output,
+                        ).await;
                     }
                     status = child.wait() => {
+                        while let Some(event) = output_rx.recv().await {
+                            process_agent_event(
+                                &manager,
+                                &context,
+                                &key,
+                                event,
+                                &mut codex_normalizer,
+                                &mut output,
+                            ).await;
+                        }
+                        flush_codex_live_output(
+                            &manager,
+                            &context,
+                            &key,
+                            &mut codex_normalizer,
+                            &mut output,
+                        ).await;
                         match status {
                             Ok(status) if status.success() => {
                                 manager.finish(
@@ -1164,6 +1298,23 @@ impl AgentRuntimeManager {
                     }
                     _ = &mut abort_rx => {
                         let _ = child.kill().await;
+                        while let Some(event) = output_rx.recv().await {
+                            process_agent_event(
+                                &manager,
+                                &context,
+                                &key,
+                                event,
+                                &mut codex_normalizer,
+                                &mut output,
+                            ).await;
+                        }
+                        flush_codex_live_output(
+                            &manager,
+                            &context,
+                            &key,
+                            &mut codex_normalizer,
+                            &mut output,
+                        ).await;
                         manager.finish(
                             &key,
                             &context,
@@ -1572,6 +1723,7 @@ impl ProjectIndex {
             id: new_id("project"),
             name,
             path: path.display().to_string(),
+            repo_name: None,
             created_at: now,
             updated_at: now,
             sessions: Vec::new(),
@@ -2163,7 +2315,7 @@ fn resolve_agent_command(
     effort: Option<&str>,
     mode: Option<&str>,
     thinking: Option<bool>,
-    resume_external: bool,
+    native_resume_session_id: Option<&str>,
 ) -> Result<AgentCommandSpec> {
     let command_provider = effective_agent_command_provider(provider, model);
     let provider_prefix = format!(
@@ -2178,7 +2330,7 @@ fn resolve_agent_command(
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         })
-        .unwrap_or_else(|| default_agent_command(command_provider).to_string());
+        .unwrap_or_else(|| default_agent_command(command_provider));
 
     let args_template = env::var(format!("{provider_prefix}ARGS_JSON"))
         .ok()
@@ -2199,7 +2351,7 @@ fn resolve_agent_command(
             effort,
             thinking,
             model,
-            resume_external.then_some(session_id),
+            native_resume_session_id,
         )
     };
 
@@ -2232,12 +2384,75 @@ fn uses_codex_aiproxy_cli_runtime(model: &str) -> bool {
     gateway_model_prefix(model).is_some_and(|prefix| prefix == "cod")
 }
 
-fn default_agent_command(provider: Provider) -> &'static str {
-    match provider {
+fn default_agent_command(provider: Provider) -> String {
+    let command = match provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
         Provider::Gemini => "gemini",
+    };
+    preferred_user_command(command).unwrap_or_else(|| command.to_string())
+}
+
+fn preferred_user_command(command: &str) -> Option<String> {
+    let home = env::var_os("HOME").map(PathBuf::from)?;
+    let candidate = home.join(".local").join("bin").join(command);
+    if candidate.is_file() {
+        Some(candidate.display().to_string())
+    } else {
+        None
     }
+}
+
+pub fn augmented_user_path() -> OsString {
+    let original = env::var_os("PATH").unwrap_or_default();
+    let mut paths = Vec::<PathBuf>::new();
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        for candidate in [
+            home.join(".local/bin"),
+            home.join(".volta/bin"),
+            home.join(".fnm/current/bin"),
+            home.join(".asdf/shims"),
+            home.join(".local/share/mise/shims"),
+            home.join(".bun/bin"),
+        ] {
+            push_unique_directory(&mut paths, candidate);
+        }
+
+        let mut nvm_node_bins = std::fs::read_dir(home.join(".nvm/versions/node"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join("bin"))
+            .filter(|path| path.join("node").is_file())
+            .collect::<Vec<_>>();
+        nvm_node_bins.sort_by(|left, right| {
+            node_version_components(right).cmp(&node_version_components(left))
+        });
+        for candidate in nvm_node_bins {
+            push_unique_directory(&mut paths, candidate);
+        }
+    }
+    for path in env::split_paths(&original) {
+        push_unique_directory(&mut paths, path);
+    }
+    env::join_paths(paths).unwrap_or(original)
+}
+
+fn push_unique_directory(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if candidate.is_dir() && !paths.contains(&candidate) {
+        paths.push(candidate);
+    }
+}
+
+fn node_version_components(path: &Path) -> Vec<u64> {
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|part| part.parse().unwrap_or_default())
+        .collect()
 }
 
 #[cfg(test)]
@@ -2273,7 +2488,7 @@ fn default_agent_args_with_resume(
         }
         // Codex exec options must precede the `resume` subcommand. The prompt
         // and resume arguments are appended after all shared options below.
-        Provider::Codex => vec!["exec".to_string()],
+        Provider::Codex => vec!["exec".to_string(), "--json".to_string()],
         Provider::Gemini => {
             let mut args = vec!["--prompt".to_string(), prompt.to_string()];
             if let Some(session_id) = resume_session_id {
@@ -2339,21 +2554,22 @@ fn default_agent_args_with_resume(
             _ => {}
         }
     }
-    // The user-selected model takes priority over effort-derived model hints
-    // so the dropdown value the user actually picked is what gets sent.
+    // The user-selected model is independent from reasoning effort so the
+    // dropdown value the user actually picked is what gets sent.
     if let Some(model) = model {
         let trimmed = model.trim();
         if !trimmed.is_empty() {
-            // Strip any leading flag characters (some CLIs display model ids
-            // with namespace prefixes like "agw:" or "cod:"). We forward the
-            // raw id but detect proxy prefixes to switch codex to the user's
-            // configured `aiproxy` provider so those models resolve.
-            if matches!(provider, Provider::Codex) && looks_like_proxy_model(trimmed) {
-                push_codex_provider_override(&mut args, "aiproxy");
+            // Gateway catalog prefixes select the Codex model provider. MiniMax
+            // is configured as its own provider and expects the bare model id;
+            // the remaining routed aliases are resolved by aiproxy as-is.
+            if matches!(provider, Provider::Codex) {
+                if let Some(provider) = codex_model_provider_override(trimmed) {
+                    push_codex_provider_override(&mut args, provider);
+                }
             }
             if !args.iter().any(|a| a == "--model") {
                 args.push("--model".to_string());
-                args.push(trimmed.to_string());
+                args.push(codex_launch_model(trimmed).to_string());
             }
         }
     }
@@ -2364,21 +2580,17 @@ fn default_agent_args_with_resume(
                 args.push(effort.to_string());
             }
             Provider::Codex => {
-                // Codex has no global --effort; map low/medium/high/max onto
-                // known MODEL_ID strings (--model) only when the user hasn't
-                // already picked an explicit model.
-                if !args.iter().any(|a| a == "--model") {
-                    let effort_model = match effort {
-                        "low" => "gpt-5-mini",
-                        "medium" => "gpt-5",
-                        "high" => "gpt-5-codex",
-                        "max" => "gpt-5-codex",
-                        _ => "",
-                    };
-                    if !effort_model.is_empty() {
-                        args.push("--model".to_string());
-                        args.push(effort_model.to_string());
-                    }
+                let reasoning_effort = match effort {
+                    "minimal" | "low" | "medium" | "high" | "xhigh" => effort,
+                    "max" => "xhigh",
+                    _ => "",
+                };
+                if !reasoning_effort.is_empty() {
+                    push_codex_config_override(
+                        &mut args,
+                        "model_reasoning_effort",
+                        &format!("\"{reasoning_effort}\""),
+                    );
                 }
             }
             Provider::Gemini => {}
@@ -2386,8 +2598,7 @@ fn default_agent_args_with_resume(
     }
     if thinking.unwrap_or(false) {
         if matches!(provider, Provider::Codex) {
-            args.push("--reasoning-effort".to_string());
-            args.push("high".to_string());
+            push_codex_config_override(&mut args, "model_reasoning_effort", "\"xhigh\"");
         } else if matches!(provider, Provider::Gemini) {
             args.push("--thinking".to_string());
         }
@@ -2431,22 +2642,46 @@ fn gateway_model_prefix(model: &str) -> Option<String> {
     })
 }
 
+fn codex_model_provider_override(model: &str) -> Option<&'static str> {
+    gateway_model_prefix(model).map(|prefix| {
+        if prefix == "min" {
+            "minimax"
+        } else {
+            "aiproxy"
+        }
+    })
+}
+
+fn codex_launch_model(model: &str) -> &str {
+    if gateway_model_prefix(model).as_deref() == Some("min") {
+        model
+            .split_once(':')
+            .map(|(_, value)| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(model)
+    } else {
+        model
+    }
+}
+
 /// Insert the `-c key=value` override before the `exec` positional so
 /// codex applies the override to its subcommand invocation. Existing
 /// overrides for the same key are skipped so we don't double up.
 fn push_codex_provider_override(args: &mut Vec<String>, provider: &str) {
-    let key = "model_provider";
+    push_codex_config_override(args, "model_provider", provider);
+}
+
+fn push_codex_config_override(args: &mut Vec<String>, key: &str, value: &str) {
     let needle = format!("{key}=");
-    if args.iter().any(|a| {
-        a.starts_with("-c ")
-            && a.splitn(2, ' ')
-                .nth(1)
-                .is_some_and(|v| v.starts_with(&needle))
-    }) {
-        return;
+    if let Some(index) = args
+        .windows(2)
+        .position(|pair| pair[0] == "-c" && pair[1].starts_with(&needle))
+    {
+        args[index + 1] = format!("{key}={value}");
+    } else {
+        args.push("-c".to_string());
+        args.push(format!("{key}={value}"));
     }
-    args.push("-c".to_string());
-    args.push(format!("{key}={provider}"));
 }
 
 fn expand_agent_template(
@@ -2478,8 +2713,466 @@ fn append_bounded(output: &mut String, chunk: &str, max_bytes: usize) {
     }
 }
 
-fn spawn_agent_output_reader<R>(tx: mpsc::Sender<AgentProcessEvent>, reader: R)
-where
+async fn process_agent_event(
+    manager: &AgentRuntimeManager,
+    context: &AgentStartContext,
+    key: &str,
+    event: AgentProcessEvent,
+    codex_normalizer: &mut Option<CodexLiveOutputNormalizer>,
+    output: &mut String,
+) {
+    match event {
+        AgentProcessEvent::Output { stream, data } => {
+            let (visible, native_session_id) = if stream == AgentOutputStream::Stdout {
+                if let Some(normalizer) = codex_normalizer.as_mut() {
+                    let visible = normalizer.push(&data);
+                    (visible, normalizer.take_thread_id())
+                } else {
+                    (data, None)
+                }
+            } else {
+                (data, None)
+            };
+            persist_native_session_id(context, native_session_id).await;
+            publish_agent_output(manager, context, key, output, visible).await;
+        }
+        AgentProcessEvent::Failed(message) => {
+            manager
+                .publish(
+                    &context.hub,
+                    key,
+                    WsServerEvent::Error {
+                        message: "agent output stream failed".to_string(),
+                        details: Some(message),
+                    },
+                )
+                .await;
+        }
+    }
+}
+
+async fn flush_codex_live_output(
+    manager: &AgentRuntimeManager,
+    context: &AgentStartContext,
+    key: &str,
+    codex_normalizer: &mut Option<CodexLiveOutputNormalizer>,
+    output: &mut String,
+) {
+    let Some(normalizer) = codex_normalizer.as_mut() else {
+        return;
+    };
+    let visible = normalizer.finish();
+    let native_session_id = normalizer.take_thread_id();
+    persist_native_session_id(context, native_session_id).await;
+    publish_agent_output(manager, context, key, output, visible).await;
+}
+
+async fn persist_native_session_id(context: &AgentStartContext, native_session_id: Option<String>) {
+    let Some(native_session_id) = native_session_id else {
+        return;
+    };
+    match context
+        .sessions
+        .set_native_session_id(&context.session_id, native_session_id.clone())
+        .await
+    {
+        Ok(_) => info!(
+            session_id = %context.session_id,
+            native_session_id = %native_session_id,
+            "associated workbench session with native Codex thread"
+        ),
+        Err(error) => warn!(
+            error = %error,
+            session_id = %context.session_id,
+            native_session_id = %native_session_id,
+            "failed to persist native Codex thread id"
+        ),
+    }
+}
+
+async fn publish_agent_output(
+    manager: &AgentRuntimeManager,
+    context: &AgentStartContext,
+    key: &str,
+    output: &mut String,
+    content: String,
+) {
+    if content.is_empty() {
+        return;
+    }
+    append_bounded(output, &content, manager.max_output_bytes);
+    manager
+        .publish(
+            &context.hub,
+            key,
+            WsServerEvent::Output {
+                provider: context.provider,
+                session_id: context.session_id.clone(),
+                content,
+                done: false,
+            },
+        )
+        .await;
+}
+
+impl CodexLiveOutputNormalizer {
+    fn push(&mut self, chunk: &str) -> String {
+        self.pending_line.push_str(chunk);
+        let mut output = String::new();
+        while let Some(newline) = self.pending_line.find('\n') {
+            let line = self.pending_line[..newline]
+                .trim_end_matches('\r')
+                .to_string();
+            self.pending_line.drain(..=newline);
+            append_live_section(&mut output, &self.normalize_line(&line));
+        }
+        output
+    }
+
+    fn finish(&mut self) -> String {
+        let mut output = String::new();
+        if !self.pending_line.is_empty() {
+            let line = std::mem::take(&mut self.pending_line);
+            append_live_section(
+                &mut output,
+                &self.normalize_line(line.trim_end_matches('\r')),
+            );
+        }
+        append_live_section(&mut output, &self.take_pending_agent_message(false));
+        output
+    }
+
+    fn normalize_line(&mut self, line: &str) -> String {
+        if line.trim().is_empty() {
+            return String::new();
+        }
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            return line.to_string();
+        };
+        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+            return line.to_string();
+        };
+        match event_type {
+            "thread.started" => {
+                if let Some(thread_id) = event
+                    .get("thread_id")
+                    .or_else(|| event.get("threadId"))
+                    .and_then(Value::as_str)
+                    .filter(|thread_id| !thread_id.trim().is_empty())
+                {
+                    self.pending_thread_id = Some(thread_id.to_string());
+                }
+                String::new()
+            }
+            "item.started" | "item.updated" | "turn.started" => String::new(),
+            "item.completed" => self.normalize_completed_item(&event),
+            "turn.completed" => {
+                let mut output = self.take_pending_agent_message(false);
+                if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
+                    append_live_section(
+                        &mut output,
+                        &format!(
+                            "tokens used\n{}",
+                            serde_json::to_string_pretty(usage)
+                                .unwrap_or_else(|_| usage.to_string())
+                        ),
+                    );
+                }
+                output
+            }
+            "turn.failed" => {
+                let mut output = self.take_pending_agent_message(true);
+                let message = event
+                    .pointer("/error/message")
+                    .or_else(|| event.get("error"))
+                    .map(display_codex_live_value)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "Codex turn failed".to_string());
+                append_live_section(&mut output, &format!("ERROR: {message}"));
+                output
+            }
+            "error" => {
+                let mut output = self.take_pending_agent_message(true);
+                let message = event
+                    .get("message")
+                    .or_else(|| event.get("error"))
+                    .map(display_codex_live_value)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "Codex reported an error".to_string());
+                append_live_section(&mut output, &format!("ERROR: {message}"));
+                output
+            }
+            _ => line.to_string(),
+        }
+    }
+
+    fn normalize_completed_item(&mut self, event: &Value) -> String {
+        let item = event.get("item").unwrap_or(&Value::Null);
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if item_type == "agent_message" {
+            let content = item
+                .get("text")
+                .or_else(|| item.pointer("/message/content"))
+                .map(display_codex_live_value)
+                .unwrap_or_default();
+            if content.trim().is_empty() {
+                return String::new();
+            }
+            return match item.get("phase").and_then(Value::as_str) {
+                Some("commentary") => format!("thinking\n{}", content.trim()),
+                Some("final_answer") => {
+                    let mut output = self.take_pending_agent_message(true);
+                    append_live_section(&mut output, &format!("codex\n{}", content.trim()));
+                    output
+                }
+                _ => {
+                    let previous = self.take_pending_agent_message(true);
+                    self.pending_agent_message = Some(content.trim().to_string());
+                    previous
+                }
+            };
+        }
+
+        let mut output = self.take_pending_agent_message(true);
+        let item_output = match item_type {
+            "reasoning" => item
+                .get("text")
+                .map(display_codex_live_value)
+                .filter(|value| !value.is_empty())
+                .map(|text| format!("thinking\n{text}"))
+                .unwrap_or_default(),
+            "command_execution" => format_codex_live_command(item),
+            "file_change" => format_codex_live_file_change(item),
+            "function_call" => format_codex_live_function_call(item),
+            "function_call_output" => format_codex_live_tool_result(item, "function_call"),
+            "custom_tool_call" => format_codex_live_custom_tool(item),
+            "custom_tool_call_output" => format_codex_live_tool_result(item, "custom_tool_call"),
+            "mcp_tool_call" => format_codex_live_named_tool(
+                item.get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("mcp_tool_call"),
+                item.get("arguments"),
+                item.get("result").or_else(|| item.get("error")),
+            ),
+            "web_search" => {
+                format_codex_live_named_tool("web_search", item.get("query"), item.get("result"))
+            }
+            "todo_list" => format_codex_live_named_tool("todo_list", item.get("items"), None),
+            "error" => format!(
+                "ERROR: {}",
+                item.get("message")
+                    .map(display_codex_live_value)
+                    .unwrap_or_else(|| "Codex item failed".to_string())
+            ),
+            "" => return output,
+            _ => format_codex_live_named_tool(item_type, Some(item), None),
+        };
+        append_live_section(&mut output, &item_output);
+        output
+    }
+
+    fn take_pending_agent_message(&mut self, thinking: bool) -> String {
+        self.pending_agent_message
+            .take()
+            .map(|content| {
+                if thinking {
+                    format!("thinking\n{content}")
+                } else {
+                    format!("codex\n{content}")
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    fn take_thread_id(&mut self) -> Option<String> {
+        self.pending_thread_id.take()
+    }
+}
+
+fn append_live_section(output: &mut String, section: &str) {
+    let section = section.trim();
+    if section.is_empty() {
+        return;
+    }
+    if !output.is_empty() {
+        output.push_str("\n\n");
+    }
+    output.push_str(section);
+    output.push('\n');
+}
+
+fn format_codex_live_command(item: &Value) -> String {
+    let command = item
+        .get("command")
+        .map(display_codex_live_value)
+        .unwrap_or_default();
+    let result = item
+        .get("aggregated_output")
+        .or_else(|| item.get("output"))
+        .map(display_codex_live_value)
+        .unwrap_or_default();
+    let exit_code = item.get("exit_code").and_then(Value::as_i64);
+    let mut content = format!(
+        "exec / Parameters\n**Tool:** `command_execution`\n\n### Command\n```sh\n{}\n```",
+        command.trim()
+    );
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    append_live_section(
+        &mut content,
+        &format!(
+            "exec / Details\n- **Status:** `{status}`\n- **Exit code:** `{}`\n\n```text\n{}\n```",
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            result.trim()
+        ),
+    );
+    content
+}
+
+fn format_codex_live_file_change(item: &Value) -> String {
+    let changes = item
+        .get("changes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut content = String::new();
+    for change in &changes {
+        let path = change
+            .get("path")
+            .or_else(|| change.get("file_path"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let kind = change
+            .get("kind")
+            .or_else(|| change.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("update");
+        let operation = match kind.to_ascii_lowercase().as_str() {
+            "add" | "create" | "created" => "create",
+            "delete" | "deleted" | "remove" => "delete",
+            "move" | "moved" | "rename" | "renamed" => "move",
+            _ => "edit",
+        };
+        append_live_section(&mut content, &format!("{operation} / {path}"));
+    }
+    if content.is_empty() {
+        content.push_str("file_change / Details\n");
+    }
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    append_live_section(&mut content, &format!("- **Status:** `{status}`"));
+    content
+}
+
+fn format_codex_live_function_call(item: &Value) -> String {
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("function_call");
+    if matches!(name, "exec_command" | "shell_command") {
+        let arguments = item
+            .get("arguments")
+            .map(display_codex_live_value)
+            .unwrap_or_default();
+        let parsed = serde_json::from_str::<Value>(&arguments).ok();
+        let command = parsed
+            .as_ref()
+            .and_then(|value| value.get("cmd").or_else(|| value.get("command")))
+            .and_then(Value::as_str)
+            .unwrap_or(&arguments);
+        return format!(
+            "exec / Parameters\n**Tool:** `{name}`\n\n### Command\n```sh\n{command}\n```"
+        );
+    }
+    format_codex_live_named_tool(name, item.get("arguments"), None)
+}
+
+fn format_codex_live_custom_tool(item: &Value) -> String {
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("custom_tool_call");
+    let input = item
+        .get("input")
+        .map(display_codex_live_value)
+        .unwrap_or_default();
+    if name != "apply_patch" {
+        return format_codex_live_named_tool(name, Some(&Value::String(input)), None);
+    }
+
+    let mut content = String::from("apply_patch");
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let operation = [
+            ("*** Add File: ", "create"),
+            ("*** Update File: ", "edit"),
+            ("*** Delete File: ", "delete"),
+            ("*** Move to: ", "move"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, kind)| trimmed.strip_prefix(prefix).map(|path| (kind, path)));
+        if let Some((kind, path)) = operation {
+            append_live_section(&mut content, &format!("{kind} / {}", path.trim()));
+        }
+    }
+    append_live_section(&mut content, &format!("```diff\n{}\n```", input.trim()));
+    content
+}
+
+fn format_codex_live_tool_result(item: &Value, fallback_name: &str) -> String {
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_name);
+    format_codex_live_named_tool(
+        name,
+        None,
+        item.get("output").or_else(|| item.get("result")),
+    )
+}
+
+fn format_codex_live_named_tool(
+    name: &str,
+    input: Option<&Value>,
+    result: Option<&Value>,
+) -> String {
+    let mut content = format!("tool / Parameters\n**Tool:** `{name}`");
+    if let Some(input) = input {
+        append_live_section(
+            &mut content,
+            &format!("```json\n{}\n```", display_codex_live_value(input).trim()),
+        );
+    }
+    if let Some(result) = result {
+        append_live_section(
+            &mut content,
+            &format!(
+                "tool / Details\n```text\n{}\n```",
+                display_codex_live_value(result).trim()
+            ),
+        );
+    }
+    content
+}
+
+fn display_codex_live_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        value => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+    }
+}
+
+fn spawn_agent_output_reader<R>(
+    tx: mpsc::Sender<AgentProcessEvent>,
+    reader: R,
+    stream: AgentOutputStream,
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -2490,9 +3183,10 @@ where
                 Ok(0) => break,
                 Ok(read) => {
                     if tx
-                        .send(AgentProcessEvent::Output(
-                            String::from_utf8_lossy(&buffer[..read]).into_owned(),
-                        ))
+                        .send(AgentProcessEvent::Output {
+                            stream,
+                            data: String::from_utf8_lossy(&buffer[..read]).into_owned(),
+                        })
                         .await
                         .is_err()
                     {
@@ -2681,6 +3375,225 @@ mod tests {
     fn summary_truncates_long_prompts() {
         let prompt = "a".repeat(80);
         assert_eq!(summarize(&prompt), format!("{}...", "a".repeat(50)));
+    }
+
+    #[test]
+    fn normalizes_split_codex_live_tool_and_file_events() {
+        let mut normalizer = CodexLiveOutputNormalizer::default();
+        let first = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"22222222-2222-4222-8222-222222222222\"}\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"reason-1\",\"type\":\"reasoning\",",
+            "\"text\":\"Inspecting files\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"command-1\",\"type\":\"command_execution\",",
+            "\"command\":\"pwd\",\"aggregated_output\":\"/tmp/project\\n\",\"exit_code\":0,",
+            "\"status\":\"completed\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"change-1\",\"type\":\"file_change\",",
+            "\"changes\":[{\"path\":\"created.txt\",\"kind\":\"add\"},",
+            "{\"path\":\"updated.txt\",\"kind\":\"update\"},",
+            "{\"path\":\"deleted.txt\",\"kind\":\"delete\"},",
+            "{\"path\":\"moved.txt\",\"kind\":\"move\"}],\"status\":\"completed\"}}\n"
+        );
+        let split = first.len() / 2;
+        let mut output = normalizer.push(&first[..split]);
+        output.push_str(&normalizer.push(&first[split..]));
+        output.push_str(&normalizer.finish());
+
+        assert!(output.contains("thinking\nInspecting files"), "{output}");
+        assert!(output.contains("exec / Parameters"), "{output}");
+        assert!(output.contains("### Command\n```sh\npwd"), "{output}");
+        assert!(output.contains("exec / Details"), "{output}");
+        assert!(output.contains("create / created.txt"), "{output}");
+        assert!(output.contains("edit / updated.txt"), "{output}");
+        assert!(output.contains("delete / deleted.txt"), "{output}");
+        assert!(output.contains("move / moved.txt"), "{output}");
+        assert!(!output.contains("turn.started"), "{output}");
+        assert_eq!(
+            normalizer.take_thread_id().as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+        assert!(normalizer.take_thread_id().is_none());
+    }
+
+    #[test]
+    fn normalizes_codex_agent_messages_and_apply_patch_without_duplicates() {
+        let mut normalizer = CodexLiveOutputNormalizer::default();
+        let output = normalizer.push(concat!(
+            "{\"type\":\"item.started\",\"item\":{\"id\":\"patch-1\",\"type\":\"custom_tool_call\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"message-1\",\"type\":\"agent_message\",",
+            "\"text\":\"I will update the file.\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"patch-1\",\"type\":\"custom_tool_call\",",
+            "\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** Add File: new.txt\\n+new\\n",
+            "*** Update File: old.txt\\n-old\\n+updated\\n*** End Patch\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"message-2\",\"type\":\"agent_message\",",
+            "\"text\":\"Both files are ready.\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":8}}\n"
+        ));
+
+        assert!(
+            output.contains("thinking\nI will update the file."),
+            "{output}"
+        );
+        assert!(output.contains("apply_patch"), "{output}");
+        assert!(output.contains("create / new.txt"), "{output}");
+        assert!(output.contains("edit / old.txt"), "{output}");
+        assert!(output.contains("```diff"), "{output}");
+        assert!(output.contains("codex\nBoth files are ready."), "{output}");
+        assert!(output.contains("tokens used"), "{output}");
+        assert_eq!(output.matches("apply_patch").count(), 1, "{output}");
+    }
+
+    #[test]
+    fn codex_live_normalizer_preserves_plain_output_and_partial_last_line() {
+        let mut normalizer = CodexLiveOutputNormalizer::default();
+        assert_eq!(normalizer.push("plain out"), "");
+        assert_eq!(normalizer.push("put\n"), "plain output\n");
+        assert_eq!(normalizer.push("last line"), "");
+        assert_eq!(normalizer.finish(), "last line\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_codex_thread_mapping_persists_resumes_and_hides_rollout() {
+        let root = std::env::temp_dir().join(format!("iowb-native-thread-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project dir");
+
+        let native_id = "22222222-2222-4222-8222-222222222222";
+        let historical_native_id = "33333333-3333-4333-8333-333333333333";
+        let now = Utc::now();
+        let rollout = root
+            .join(".codex/sessions/2026/07/31")
+            .join(format!("rollout-2026-07-31T00-00-00-{native_id}.jsonl"));
+        std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("rollout dir");
+        std::fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "session_meta",
+                    "payload": {"id": native_id, "cwd": project}
+                }),
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "first prompt",
+                        "kind": "plain"
+                    }
+                })
+            ),
+        )
+        .expect("rollout");
+        let historical_rollout = rollout.parent().expect("rollout parent").join(format!(
+            "rollout-2026-07-30T23-59-00-{historical_native_id}.jsonl"
+        ));
+        std::fs::write(
+            historical_rollout,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": now - chrono::Duration::seconds(60),
+                    "type": "session_meta",
+                    "payload": {"id": historical_native_id, "cwd": project}
+                }),
+                serde_json::json!({
+                    "timestamp": now - chrono::Duration::seconds(60),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "older prompt",
+                        "kind": "plain"
+                    }
+                })
+            ),
+        )
+        .expect("historical rollout");
+
+        let storage = Storage::open(config_dir.join("test.db")).expect("storage");
+        let mut sessions = SessionManager::load(storage.clone(), 10).expect("sessions");
+        sessions.external_home = Arc::new(root.clone());
+        let internal = sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("new-session-test".to_string()),
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("internal session");
+        sessions
+            .append_message(&internal.id, MessageRole::User, "older prompt")
+            .await
+            .expect("older stored prompt");
+        sessions
+            .append_message(&internal.id, MessageRole::User, "first prompt")
+            .await
+            .expect("stored prompt");
+        let inferred = sessions
+            .infer_native_session_id(
+                &internal.id,
+                Provider::Codex,
+                project.to_str().expect("project path"),
+            )
+            .await
+            .expect("native mapping");
+        assert_eq!(inferred.as_deref(), Some(native_id));
+
+        let stored = storage
+            .get_session(&internal.id)
+            .expect("storage query")
+            .expect("stored session");
+        assert_eq!(stored.native_session_id.as_deref(), Some(native_id));
+        let api_json = serde_json::to_value(&stored).expect("session JSON");
+        assert!(api_json.get("nativeSessionId").is_none());
+
+        let listed = sessions
+            .list_for_project(project.to_str().expect("project path"))
+            .await
+            .expect("project sessions");
+        assert!(
+            listed.iter().all(|session| session.id != native_id),
+            "mapped native rollout must not appear as an extra chat: {listed:#?}"
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|session| session.id == historical_native_id),
+            "unmapped historical rollout must remain discoverable: {listed:#?}"
+        );
+        assert!(
+            listed.iter().any(|session| session.id == internal.id),
+            "internal chat must remain visible: {listed:#?}"
+        );
+
+        let args = default_agent_args_with_resume(
+            Provider::Codex,
+            "second prompt",
+            None,
+            None,
+            None,
+            None,
+            stored.native_session_id.as_deref(),
+        );
+        assert!(
+            args.contains(&"--json".to_string()),
+            "Codex must emit thread.started JSON: {args:?}"
+        );
+        assert_eq!(
+            &args[args.iter().position(|arg| arg == "resume").unwrap()..],
+            ["resume", native_id, "second prompt"]
+        );
+
+        drop(sessions);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -3088,8 +4001,6 @@ mod tests {
 
     #[test]
     fn codex_user_model_overrides_effort_default() {
-        // The user-selected model must win over the effort-derived default
-        // so the dropdown value is what actually reaches codex.
         let args = default_agent_args_with(
             Provider::Codex,
             "hi",
@@ -3104,8 +4015,57 @@ mod tests {
         // Proxy models also reroute codex to the user's `aiproxy` provider.
         assert!(args.iter().any(|a| a == "-c"));
         assert!(args.iter().any(|a| a == "model_provider=aiproxy"));
-        // And it must NOT contain the effort-derived default model id.
+        // Reasoning effort must not silently replace the selected model.
         assert!(!args.contains(&"gpt-5".to_string()));
+    }
+
+    #[test]
+    fn codex_minimax_model_uses_minimax_provider_and_bare_model_id() {
+        let args = default_agent_args_with(
+            Provider::Codex,
+            "hi",
+            None,
+            Some("medium"),
+            None,
+            Some("min:MiniMax-M3"),
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-c", "model_provider=minimax"]),
+            "args: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "MiniMax-M3"]),
+            "args: {args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == "model_provider=aiproxy"));
+        assert!(!args.iter().any(|arg| arg == "min:MiniMax-M3"));
+    }
+
+    #[test]
+    fn codex_effort_uses_reasoning_config_without_forcing_an_old_model() {
+        let args = default_agent_args_with(Provider::Codex, "hi", None, Some("medium"), None, None);
+        assert!(!args.iter().any(|arg| arg == "--model"));
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["-c", "model_reasoning_effort=\"medium\""] })
+        );
+
+        let thinking_args = default_agent_args_with(
+            Provider::Codex,
+            "hi",
+            None,
+            Some("medium"),
+            Some(true),
+            None,
+        );
+        assert!(
+            thinking_args
+                .windows(2)
+                .any(|pair| { pair == ["-c", "model_reasoning_effort=\"xhigh\""] })
+        );
+        assert!(!thinking_args.iter().any(|arg| arg == "--reasoning-effort"));
     }
 
     #[test]

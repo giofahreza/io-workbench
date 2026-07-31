@@ -30,7 +30,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use iowb_core::{
-    AppConfig, AppState, CoreError, DirectAiRuntimeConfig, generate_secret_token, hash_secret_token,
+    AppConfig, AppState, CoreError, DirectAiRuntimeConfig, augmented_user_path,
+    generate_secret_token, hash_secret_token,
 };
 use iowb_fs::FsError;
 use iowb_process::{ProcessError, ProcessEvent};
@@ -40,8 +41,9 @@ use iowb_protocol::{
     FileEntry, HealthResponse, HealthStatus, LoginRequest, MessageRole, MessagesResponse,
     PRODUCT_NAME, PlaceholderResponse, ProcessInputRequest, ProcessResizeRequest,
     ProcessStartRequest, ProcessStartResponse, ProjectListResponse, ProjectSummary, Provider,
-    RenameFileRequest, ServerStatusResponse, SessionRuntimeStatus, SessionSummary,
-    WS_COMMAND_CHANNEL_CAPACITY, WorkspaceType, WsClientCommand, WsServerEvent, new_id,
+    RenameFileRequest, ServerStatusResponse, SessionRuntimeStatus, SessionSnapshotResponse,
+    SessionSummary, WS_COMMAND_CHANNEL_CAPACITY, WorkspaceType, WsClientCommand, WsServerEvent,
+    new_id,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -135,6 +137,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/sessions/{session_id}", delete(delete_session))
         .route("/api/sessions/{session_id}/messages", get(session_messages))
+        .route("/api/sessions/{session_id}/snapshot", get(session_snapshot))
         .route("/api/sessions/{session_id}/model", get(session_model))
         .route(
             "/api/sessions/{session_id}/model",
@@ -161,6 +164,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/settings/notification-preferences",
             get(get_notification_preferences).put(set_notification_preferences),
         )
+        .route("/api/settings/agent/{provider}", put(set_agent_preferences))
         .route(
             "/api/settings/sidebar-active-sessions",
             get(get_sidebar_active_sessions).put(set_sidebar_active_sessions),
@@ -399,10 +403,28 @@ async fn runtime_metrics_payload(state: &AppState) -> Result<Value> {
     let projects = state.projects.list(&state.sessions).await?;
     let active_sessions = state.sessions.list_active().await;
     let processes = state.processes.list().await;
+    let resources = system_resource_metrics(&state.config.workspace_root).await;
+    let process_uptime_seconds = resources
+        .get("processUptimeSeconds")
+        .cloned()
+        .unwrap_or(Value::Null);
     Ok(serde_json::json!({
         "timestamp": Utc::now(),
         "memory": process_memory_metrics().await,
-        "resources": system_resource_metrics(&state.config.workspace_root).await,
+        "resources": resources,
+        "server": {
+            "status": "ok",
+            "appRoot": state.config.workspace_root.display().to_string(),
+            "installMode": "rust",
+            "packageName": PRODUCT_NAME,
+            "version": VERSION,
+            "uptimeSeconds": process_uptime_seconds,
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "pid": std::process::id(),
+            "port": state.config.port.to_string(),
+            "environment": env::var("IO_WORKBENCH_ENV").unwrap_or_else(|_| "local".to_string()),
+        },
         "projects": {
             "count": projects.len()
         },
@@ -1195,11 +1217,12 @@ async fn list_projects(
     State(state): State<AppState>,
     Query(query): Query<ListProjectsQuery>,
 ) -> Result<Json<ProjectListResponse>> {
-    let projects = if query.include_sessions.unwrap_or(true) {
+    let mut projects = if query.include_sessions.unwrap_or(true) {
         state.projects.list(&state.sessions).await?
     } else {
         state.storage.list_projects()?
     };
+    populate_repository_names(&mut projects).await;
     Ok(Json(ProjectListResponse { projects }))
 }
 
@@ -1219,9 +1242,51 @@ async fn create_project(
         ));
     }
 
-    let project = state.projects.add_project(&path)?;
+    let mut project = state.projects.add_project(&path)?;
+    project.repo_name = project_repository_name(&project.path).await;
     publish_projects(&state).await;
     Ok(Json(project))
+}
+
+async fn populate_repository_names(projects: &mut [ProjectSummary]) {
+    for project in projects {
+        project.repo_name = project_repository_name(&project.path).await;
+    }
+}
+
+async fn project_repository_name(project_path: &str) -> Option<String> {
+    let config = tokio::fs::read_to_string(Path::new(project_path).join(".git/config"))
+        .await
+        .ok()?;
+    let mut in_origin = false;
+    for line in config.lines() {
+        let value = line.trim();
+        if value.starts_with('[') {
+            in_origin = value == r#"[remote "origin"]"#;
+            continue;
+        }
+        if !in_origin {
+            continue;
+        }
+        let Some((key, remote)) = value.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "url" {
+            continue;
+        }
+        return repository_name_from_remote(remote.trim());
+    }
+    None
+}
+
+fn repository_name_from_remote(remote: &str) -> Option<String> {
+    remote
+        .trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .next()
+        .map(|name| name.trim_end_matches(".git").trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 async fn create_workspace(
@@ -2445,6 +2510,39 @@ async fn set_notification_preferences(
     })))
 }
 
+async fn set_agent_preferences(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(provider): AxumPath<String>,
+    Json(settings): Json<Value>,
+) -> Result<Json<Value>> {
+    if !settings.is_object() {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "agent settings must be a JSON object",
+        ));
+    }
+    let setting_name = match provider.as_str() {
+        "claude" => "claude-settings",
+        "cursor" => "cursor-tools-settings",
+        "codex" => "codex-settings",
+        "gemini" => "gemini-settings",
+        _ => {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "provider must be claude, cursor, codex, or gemini",
+            ));
+        }
+    };
+    let key = user_setting_key(&user.0.id, setting_name);
+    state.storage.set_setting(&key, &settings)?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "provider": provider,
+        "settings": settings,
+    })))
+}
+
 async fn get_sidebar_active_sessions(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -2538,11 +2636,20 @@ async fn chat_provider_models(
         for model in &gateway_models {
             push_chat_model(&mut models, &mut seen, model);
         }
-        let cli_models = fetch_cli_models(provider_command(provider)).await;
-        let base_models = if cli_models.is_empty() {
-            fallback_models(provider)
+        let cached_models = cached_codex_models().await;
+        let base_models = if !cached_models.is_empty() {
+            cached_models
         } else {
-            cli_models
+            let command = provider_command(provider);
+            let cli_models = fetch_cli_models(&command).await;
+            if cli_models.is_empty() {
+                configured_codex_model()
+                    .await
+                    .map(|model| vec![model])
+                    .unwrap_or_else(|| fallback_models(provider))
+            } else {
+                cli_models
+            }
         };
         for model in base_models {
             push_chat_model(&mut models, &mut seen, model);
@@ -2586,6 +2693,38 @@ fn push_chat_model(
     if seen.insert(key) {
         models.push(value.to_string());
     }
+}
+
+async fn cached_codex_models() -> Vec<String> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let path = home.join(".codex").join("models_cache.json");
+    let Some(content) = read_text_path(&path).await else {
+        return Vec::new();
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&content) else {
+        return Vec::new();
+    };
+    root.get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|model| model.get("visibility").and_then(Value::as_str) != Some("hide"))
+        .filter_map(|model| model.get("slug").and_then(Value::as_str))
+        .filter(|model| looks_like_model_id(model))
+        .map(str::to_string)
+        .collect()
+}
+
+async fn configured_codex_model() -> Option<String> {
+    let path = home_dir()?.join(".codex").join("config.toml");
+    let content = read_text_path(&path).await?;
+    parse_top_level_toml_values(&content)
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| looks_like_model_id(model))
+        .map(str::to_string)
 }
 
 /// Fetch the user's Direct-AI proxy model list and return the model ids.
@@ -2710,6 +2849,7 @@ async fn fetch_cli_models(command: &str) -> Vec<String> {
         let invocation = async {
             tokio::process::Command::new(command)
                 .args(args)
+                .env("PATH", augmented_user_path())
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true)
                 .output()
@@ -3250,6 +3390,38 @@ async fn session_messages(
     }))
 }
 
+async fn session_snapshot(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+    Query(query): Query<SessionMessagesQuery>,
+) -> Result<Json<SessionSnapshotResponse>> {
+    let limit = query.limit.unwrap_or(100).max(1).min(500);
+    let session_before = state.sessions.get(&session_id).await?;
+    let mut messages = state
+        .sessions
+        .messages_including_external(&session_id)
+        .await?;
+    let session = state.sessions.get(&session_id).await?;
+    // Finishing a run persists the assistant reply before marking the
+    // session inactive. If that transition happened between the two reads,
+    // fetch the messages once more so an inactive snapshot can never omit
+    // the final reply.
+    if session_before.active && !session.active {
+        messages = state
+            .sessions
+            .messages_including_external(&session_id)
+            .await?;
+    }
+    let total_count = messages.len();
+    let start = total_count.saturating_sub(limit);
+    Ok(Json(SessionSnapshotResponse {
+        session,
+        messages: messages[start..].to_vec(),
+        has_more: start > 0,
+        total_count,
+    }))
+}
+
 async fn session_model(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
@@ -3588,6 +3760,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
             server_time: Utc::now(),
         })
         .await;
+    let _ = direct_tx
+        .send(WsServerEvent::ActiveSessions {
+            sessions: state.sessions.list_active().await,
+        })
+        .await;
 
     loop {
         tokio::select! {
@@ -3790,33 +3967,43 @@ fn spawn_process_event_bridge(state: AppState) {
 }
 
 fn spawn_project_watch_bridge(state: AppState) {
-    let (tx, mut rx) = mpsc::channel::<notify::Result<notify::Event>>(256);
+    let (tx, mut rx) = mpsc::channel::<(String, notify::Result<notify::Event>)>(256);
     let debounce = Duration::from_millis(state.watch.debounce_ms());
 
     tokio::spawn(async move {
         let mut watchers: HashMap<String, RecommendedWatcher> = HashMap::new();
         let mut discovery = tokio::time::interval(Duration::from_secs(5));
         discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut pending_update = false;
+        let mut pending_updates = HashMap::<String, HashSet<String>>::new();
 
         loop {
             tokio::select! {
                 _ = discovery.tick() => {
                     refresh_project_watchers(&state, &tx, &mut watchers).await;
                 }
-                Some(event) = rx.recv() => {
+                Some((project_path, event)) = rx.recv() => {
                     match event {
                         Ok(event) => {
-                            if is_interesting_watch_event(&event) {
-                                pending_update = true;
+                            let paths = interesting_project_watch_paths(&project_path, &event);
+                            if !paths.is_empty() {
+                                pending_updates
+                                    .entry(project_path)
+                                    .or_default()
+                                    .extend(paths);
                             }
                         }
                         Err(error) => warn!(error = %error, "project watcher error"),
                     }
                 }
-                _ = tokio::time::sleep(debounce), if pending_update => {
-                    pending_update = false;
-                    publish_projects(&state).await;
+                _ = tokio::time::sleep(debounce), if !pending_updates.is_empty() => {
+                    for (project_path, changed_paths) in std::mem::take(&mut pending_updates) {
+                        let mut paths = changed_paths.into_iter().collect::<Vec<_>>();
+                        paths.sort();
+                        state.ws_hub.publish(WsServerEvent::ProjectFilesChanged {
+                            project_path,
+                            paths,
+                        });
+                    }
                 }
                 else => break,
             }
@@ -3826,7 +4013,7 @@ fn spawn_project_watch_bridge(state: AppState) {
 
 async fn refresh_project_watchers(
     state: &AppState,
-    tx: &mpsc::Sender<notify::Result<notify::Event>>,
+    tx: &mpsc::Sender<(String, notify::Result<notify::Event>)>,
     watchers: &mut HashMap<String, RecommendedWatcher>,
 ) {
     let projects = match state.storage.list_projects() {
@@ -3853,8 +4040,9 @@ async fn refresh_project_watchers(
         }
 
         let event_tx = tx.clone();
+        let event_project_path = project.path.clone();
         match notify::recommended_watcher(move |event| {
-            let _ = event_tx.blocking_send(event);
+            let _ = event_tx.blocking_send((event_project_path.clone(), event));
         }) {
             Ok(mut watcher) => {
                 if let Err(error) = watcher.watch(&project_path, RecursiveMode::Recursive) {
@@ -3884,11 +4072,42 @@ fn is_interesting_watch_event(event: &notify::Event) -> bool {
     )
 }
 
+fn interesting_project_watch_paths(project_path: &str, event: &notify::Event) -> Vec<String> {
+    if !is_interesting_watch_event(event) {
+        return Vec::new();
+    }
+    event
+        .paths
+        .iter()
+        .filter_map(|path| project_relative_watch_path(project_path, path))
+        .collect()
+}
+
+fn project_relative_watch_path(project_path: &str, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(project_path).ok()?;
+    if relative
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str() == ".git")
+    {
+        return None;
+    }
+    let normalized = relative.to_string_lossy().replace('\\', "/");
+    Some(if normalized.is_empty() {
+        ".".to_string()
+    } else {
+        normalized
+    })
+}
+
 async fn publish_projects(state: &AppState) {
     match state.projects.list(&state.sessions).await {
-        Ok(projects) => state
-            .ws_hub
-            .publish(WsServerEvent::ProjectsUpdated { projects }),
+        Ok(mut projects) => {
+            populate_repository_names(&mut projects).await;
+            state
+                .ws_hub
+                .publish(WsServerEvent::ProjectsUpdated { projects });
+        }
         Err(error) => warn!(error = %error, "failed to publish project list"),
     }
 }
@@ -4730,7 +4949,8 @@ fn looks_like_email(value: &str) -> bool {
 
 async fn provider_cli_status(provider: Provider) -> Value {
     let command = provider_command(provider);
-    let installed = command_available(command).await;
+    let version = command_version(&command).await;
+    let installed = version.is_some();
     let auth = provider_auth_hint(provider);
     let authenticated = auth.is_some();
     let error = if installed {
@@ -4746,6 +4966,7 @@ async fn provider_cli_status(provider: Provider) -> Value {
         "error": error,
         "installed": installed,
         "command": command,
+        "version": version,
     })
 }
 
@@ -4765,7 +4986,10 @@ async fn cursor_cli_status() -> Value {
 
     let status = timeout(
         Duration::from_secs(5),
-        Command::new(command).arg("status").output(),
+        Command::new(command)
+            .arg("status")
+            .env("PATH", augmented_user_path())
+            .output(),
     )
     .await;
     let Ok(Ok(output)) = status else {
@@ -4819,21 +5043,45 @@ fn extract_email(text: &str) -> Option<String> {
     })
 }
 
-fn provider_command(provider: Provider) -> &'static str {
-    match provider {
+fn provider_command(provider: Provider) -> String {
+    let command = match provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
         Provider::Gemini => "gemini",
+    };
+    preferred_user_command(command).unwrap_or_else(|| command.to_string())
+}
+
+fn preferred_user_command(command: &str) -> Option<String> {
+    let home = home_dir()?;
+    let candidate = home.join(".local").join("bin").join(command);
+    if candidate.is_file() {
+        Some(candidate.display().to_string())
+    } else {
+        None
     }
 }
 
 async fn command_available(command: &str) -> bool {
+    command_version(command).await.is_some()
+}
+
+async fn command_version(command: &str) -> Option<String> {
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        Command::new(command).arg("--version").status(),
+        Command::new(command)
+            .arg("--version")
+            .env("PATH", augmented_user_path())
+            .output(),
     )
     .await;
-    matches!(result, Ok(Ok(_)))
+    let output = match result {
+        Ok(Ok(output)) if output.status.success() => output,
+        _ => return None,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    [stdout, stderr].into_iter().find(|value| !value.is_empty())
 }
 
 fn provider_auth_hint(provider: Provider) -> Option<String> {
@@ -5940,6 +6188,31 @@ mod tests {
         assert_eq!(
             repository_name("https://example.com/a bad repo.git"),
             "abadrepo"
+        );
+        assert_eq!(
+            repository_name_from_remote("git@github.com:example/mobile-app.git").as_deref(),
+            Some("mobile-app")
+        );
+    }
+
+    #[test]
+    fn normalizes_project_watch_paths_and_ignores_git_metadata() {
+        let root = "/tmp/project";
+        assert_eq!(
+            project_relative_watch_path(root, Path::new("/tmp/project/src/main.rs")).as_deref(),
+            Some("src/main.rs"),
+        );
+        assert_eq!(
+            project_relative_watch_path(root, Path::new("/tmp/project")).as_deref(),
+            Some("."),
+        );
+        assert_eq!(
+            project_relative_watch_path(root, Path::new("/tmp/project/.git/index")),
+            None,
+        );
+        assert_eq!(
+            project_relative_watch_path(root, Path::new("/tmp/another/file.txt")),
+            None,
         );
     }
 }

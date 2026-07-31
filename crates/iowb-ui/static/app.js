@@ -883,6 +883,8 @@ function sidebarSessionCardHtml(session, options = {}) {
   const lastActivity = session.lastActivity || session.updatedAt || session.createdAt;
   const relative = formatRelativeTime(lastActivity);
   const messageCount = Number(session.messageCount || 0);
+  const messageCountLabel = session.external ? "history" : String(messageCount);
+  const messageCountTitle = session.external ? "External CLI history" : `${messageCount} messages`;
   const pending = session.pending ? "true" : "false";
   const projectLabel = showProject
     ? (options.projectName || session.projectName || projectPath || "")
@@ -894,7 +896,7 @@ function sidebarSessionCardHtml(session, options = {}) {
       <div class="session-bottom">
         <span class="meta-time">${escapeHtml(relative || "never")}</span>
         <span class="meta-right">
-          <span class="meta-count" title="${messageCount} messages">${messageCount}</span>
+          <span class="meta-count" title="${escapeHtml(messageCountTitle)}">${escapeHtml(messageCountLabel)}</span>
           <span class="cli-badge ${escapeHtml(cli)}" aria-label="${escapeHtml(cliLabel)}" title="${escapeHtml(cliLabel)}">
             <img src="${escapeHtml(cliIcon)}" alt="" aria-hidden="true" loading="lazy" decoding="async" />
           </span>
@@ -1883,7 +1885,7 @@ function renderSessions() {
     render: (session) => `<article class="row">
       <strong>${escapeHtml(session.title || session.id)}</strong>
       <span>${escapeHtml(session.provider)} · ${escapeHtml(session.projectPath)}</span>
-      <span class="meta">${session.messageCount} messages</span>
+      <span class="meta">${session.external ? "External CLI history" : `${session.messageCount} messages`}</span>
       <div class="row-actions">
         <button type="button" data-session-use="${escapeHtml(session.id)}">Use</button>
         <button type="button" data-session-open="${escapeHtml(session.id)}">Messages</button>

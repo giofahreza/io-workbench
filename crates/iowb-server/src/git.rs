@@ -16,7 +16,8 @@ use iowb_protocol::{
     GitBranchesResponse, GitCommitSummary, GitCommitsResponse, GitConflictFileResponse,
     GitConflictRegion, GitConflictSummary, GitConflictsResponse, GitDiffResponse, GitFileStatus,
     GitFileWithDiffResponse, GitGenerateMessageResponse, GitOperationResponse,
-    GitRemoteStatusResponse, GitStatusResponse,
+    GitRemoteStatusResponse, GitStashSummary, GitStashesResponse, GitStatusResponse, GitTagSummary,
+    GitTagsResponse,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -43,6 +44,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/git/delete-branch", post(delete_branch))
         .route("/api/git/commits", get(commits))
         .route("/api/git/commit-diff", get(commit_diff))
+        .route("/api/git/stashes", get(stashes))
+        .route("/api/git/tags", get(tags))
         .route(
             "/api/git/generate-commit-message",
             post(generate_commit_message),
@@ -860,6 +863,71 @@ async fn commit_diff(
     };
 
     Ok(Json(GitDiffResponse { diff, is_truncated }))
+}
+
+async fn stashes(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<GitStashesResponse>> {
+    let project_path = resolve_project_path(&state, query.project_ref()?).await?;
+    validate_git_repository(&project_path).await?;
+    let output = git(
+        &project_path,
+        ["stash", "list", "--format=%gd%x1f%H%x1f%an%x1f%aI%x1f%s"],
+    )
+    .await?
+    .stdout;
+    let stashes = output
+        .lines()
+        .filter_map(parse_stash_summary)
+        .collect::<Vec<_>>();
+    Ok(Json(GitStashesResponse { stashes }))
+}
+
+async fn tags(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<GitTagsResponse>> {
+    let project_path = resolve_project_path(&state, query.project_ref()?).await?;
+    validate_git_repository(&project_path).await?;
+    let output = git(
+        &project_path,
+        [
+            "for-each-ref",
+            "refs/tags",
+            "--sort=-creatordate",
+            "--format=%(refname:short)%1f%(objectname)%1f%(objecttype)%1f%(creatordate:iso-strict)%1f%(subject)",
+        ],
+    )
+    .await?
+    .stdout;
+    let tags = output
+        .lines()
+        .filter_map(parse_tag_summary)
+        .collect::<Vec<_>>();
+    Ok(Json(GitTagsResponse { tags }))
+}
+
+fn parse_stash_summary(line: &str) -> Option<GitStashSummary> {
+    let mut parts = line.splitn(5, '\u{1f}');
+    Some(GitStashSummary {
+        reference: parts.next()?.to_string(),
+        hash: parts.next()?.to_string(),
+        author: parts.next()?.to_string(),
+        date: parts.next()?.to_string(),
+        message: parts.next()?.to_string(),
+    })
+}
+
+fn parse_tag_summary(line: &str) -> Option<GitTagSummary> {
+    let mut parts = line.splitn(5, '\u{1f}');
+    Some(GitTagSummary {
+        name: parts.next()?.to_string(),
+        hash: parts.next()?.to_string(),
+        object_type: parts.next()?.to_string(),
+        date: parts.next()?.to_string(),
+        message: parts.next()?.to_string(),
+    })
 }
 
 async fn generate_commit_message(
@@ -2605,5 +2673,21 @@ mod tests {
         assert_eq!(regions[0].ours, "ours");
         assert_eq!(regions[0].base.as_deref(), Some("base"));
         assert_eq!(regions[0].theirs, "theirs");
+    }
+
+    #[test]
+    fn parses_stash_and_tag_rows_without_losing_message_text() {
+        let stash =
+            parse_stash_summary("stash@{0}\u{1f}abc123\u{1f}Gio\u{1f}2026-07-30T12:00:00+07:00\u{1f}WIP: keep | separators")
+                .expect("stash row");
+        assert_eq!(stash.reference, "stash@{0}");
+        assert_eq!(stash.message, "WIP: keep | separators");
+
+        let tag = parse_tag_summary(
+            "v1.0.0\u{1f}def456\u{1f}tag\u{1f}2026-07-30T12:00:00+07:00\u{1f}Release 1.0",
+        )
+        .expect("tag row");
+        assert_eq!(tag.name, "v1.0.0");
+        assert_eq!(tag.object_type, "tag");
     }
 }
