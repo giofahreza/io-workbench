@@ -7,7 +7,7 @@ use std::{
     convert::Infallible,
     env,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -30,21 +30,25 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use iowb_core::{
-    AppConfig, AppState, CoreError, DirectAiRuntimeConfig, augmented_user_path,
-    generate_secret_token, hash_secret_token,
+    AppConfig, AppState, CoreError, DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS, DirectAiRuntimeConfig,
+    augmented_user_path, generate_secret_token, hash_secret_token,
+    terminate_orphaned_agent_run_processes,
 };
 use iowb_fs::FsError;
 use iowb_process::{ProcessError, ProcessEvent};
 use iowb_protocol::{
-    ApiErrorBody, AuthStatusResponse, BrowseFilesystemResponse, CopyFileRequest, CreateFileRequest,
-    CreateProjectRequest, CreateWorkspaceRequest, DeleteFileRequest, FileContentResponse,
-    FileEntry, HealthResponse, HealthStatus, LoginRequest, MessageRole, MessagesResponse,
-    PRODUCT_NAME, PlaceholderResponse, ProcessInputRequest, ProcessResizeRequest,
-    ProcessStartRequest, ProcessStartResponse, ProjectListResponse, ProjectSummary, Provider,
-    RenameFileRequest, ServerStatusResponse, SessionRuntimeStatus, SessionSnapshotResponse,
-    SessionSummary, WS_COMMAND_CHANNEL_CAPACITY, WorkspaceType, WsClientCommand, WsServerEvent,
-    new_id,
+    ApiErrorBody, AuthStatusResponse, BatchCopyFileRequest, BatchDeleteFileRequest,
+    BatchRenameFileRequest, BrowseFilesystemResponse, ChatMessage, CopyFileRequest,
+    CreateFileRequest, CreateProjectRequest, CreateWorkspaceRequest, DeleteFcmTokenRequest,
+    DeleteFileRequest, FcmTokenResponse, FileContentResponse, FileEntry, HealthResponse,
+    HealthStatus, LoginRequest, MessageRole, MessagesResponse, PRODUCT_NAME, PlaceholderResponse,
+    ProcessInputRequest, ProcessResizeRequest, ProcessStartRequest, ProcessStartResponse,
+    ProjectListResponse, ProjectSummary, Provider, RegisterFcmTokenRequest, RenameFileRequest,
+    ServerStatusResponse, SessionDraftResponse, SessionSnapshotResponse, SessionSummary,
+    UpdateSessionDraftRequest, WS_COMMAND_CHANNEL_CAPACITY, WorkspaceType, WsClientCommand,
+    WsServerEvent, new_id,
 };
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,22 +71,206 @@ const MAX_UPLOAD_IMAGES: usize = 5;
 const MAX_UPLOAD_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_HISTORY: usize = 50;
+const SESSION_HISTORY_DEFAULT_MESSAGES: usize = 30;
+const SESSION_HISTORY_MAX_MESSAGES: usize = 100;
+const SESSION_RESPONSE_MAX_CONTENT_BYTES: usize = 512 * 1024;
+const SESSION_RESPONSE_ASSISTANT_MAX_BYTES: usize = 256 * 1024;
+const SESSION_RESPONSE_TOOL_MAX_BYTES: usize = 64 * 1024;
+const SESSION_RESPONSE_USER_MAX_BYTES: usize = 128 * 1024;
+const SESSION_RESPONSE_SYSTEM_MAX_BYTES: usize = 32 * 1024;
+const SESSION_RESPONSE_METADATA_MAX_BYTES: usize = 16 * 1024;
+const SESSION_RESPONSE_MAX_LINE_CHARS: usize = 8 * 1024;
+const SESSION_DRAFT_MAX_BYTES: usize = 256 * 1024;
 const STATIC_CACHE_CONTROL: &str = "no-cache";
 const RESOURCE_SAMPLE_INTERVAL_MS: u64 = 160;
 const SYS_THERMAL_PATH: &str = "/sys/class/thermal";
 const SYS_HWMON_PATH: &str = "/sys/class/hwmon";
 const SYS_POWER_SUPPLY_PATH: &str = "/sys/class/power_supply";
+const DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL: &str = "http://141.144.197.96:8319/claude";
+const IO_GATEWAY_API_KEY_ENV: &str = "CODEX_GATEWAY_KEY";
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let addr = config.socket_addr();
     let state = AppState::initialize(config).await?;
+    recover_interrupted_chat_runs(&state).await?;
     spawn_process_event_bridge(state.clone());
     spawn_project_watch_bridge(state.clone());
+    spawn_fcm_notification_bridge(state.clone());
 
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "starting io-workbench server");
 
     axum::serve(listener, build_router(state)).await?;
+    Ok(())
+}
+
+async fn recover_interrupted_chat_runs(state: &AppState) -> anyhow::Result<()> {
+    synthesize_legacy_durable_runs(state).await?;
+    let mut active_runs = state.storage.list_active_durable_chat_runs()?;
+    if active_runs.is_empty() {
+        state
+            .sessions
+            .mark_unrecovered_active_sessions_interrupted(&HashSet::new())
+            .await?;
+        return Ok(());
+    }
+
+    // A session can only have one provider invocation attached. Older active
+    // rows can exist if a process was killed between superseding one turn and
+    // committing the next; keep the newest row and terminalize the rest.
+    let mut newest_run_by_session = HashMap::<String, String>::new();
+    for run in &active_runs {
+        let replace = newest_run_by_session
+            .get(&run.session_id)
+            .and_then(|id| active_runs.iter().find(|candidate| &candidate.id == id))
+            .is_none_or(|current| {
+                (run.created_at, run.id.as_str()) > (current.created_at, current.id.as_str())
+            });
+        if replace {
+            newest_run_by_session.insert(run.session_id.clone(), run.id.clone());
+        }
+    }
+    active_runs.sort_by_key(|run| (run.created_at, run.id.clone()));
+
+    let mut recovered_session_ids = HashSet::new();
+    for run in active_runs {
+        if newest_run_by_session.get(&run.session_id) != Some(&run.id) {
+            state.storage.mark_durable_chat_run_interrupted(
+                &run.id,
+                Some("superseded by a newer interrupted turn in the same session"),
+            )?;
+            continue;
+        }
+        if !run.auto_resume || run.resume_attempts >= DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS {
+            state.storage.mark_durable_chat_run_interrupted(
+                &run.id,
+                Some(if run.auto_resume {
+                    "automatic recovery attempt limit reached"
+                } else {
+                    "automatic recovery is disabled"
+                }),
+            )?;
+            continue;
+        }
+
+        let Some(claimed) = state
+            .storage
+            .mark_durable_chat_run_recovering(&run.id, DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS)?
+        else {
+            continue;
+        };
+        terminate_orphaned_agent_run_processes(&claimed.id);
+        let direct_ai_config = parse_provider_param(&claimed.provider)
+            .ok()
+            .and_then(|provider| {
+                claimed
+                    .user_id
+                    .as_deref()
+                    .and_then(|user_id| direct_ai_runtime_config_for_user(state, user_id, provider))
+            });
+        match state
+            .recover_agent_run(claimed.clone(), direct_ai_config)
+            .await
+        {
+            Ok(session) => {
+                if session.active {
+                    recovered_session_ids.insert(session.id);
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                state
+                    .storage
+                    .mark_durable_chat_run_failed(&claimed.id, &message)?;
+                let _ = state.sessions.set_active(&claimed.session_id, false).await;
+                warn!(
+                    error = %error,
+                    run_id = %claimed.id,
+                    session_id = %claimed.session_id,
+                    "failed to recover interrupted chat run"
+                );
+            }
+        }
+    }
+
+    let interrupted = state
+        .sessions
+        .mark_unrecovered_active_sessions_interrupted(&recovered_session_ids)
+        .await?;
+    info!(
+        recovered = recovered_session_ids.len(),
+        interrupted = interrupted.len(),
+        "reconciled chat runs after server restart"
+    );
+    Ok(())
+}
+
+async fn synthesize_legacy_durable_runs(state: &AppState) -> anyhow::Result<()> {
+    let durable_session_ids = state
+        .storage
+        .list_active_durable_chat_runs()?
+        .into_iter()
+        .map(|run| run.session_id)
+        .collect::<HashSet<_>>();
+    let fallback_user_id = state
+        .storage
+        .get_first_user()?
+        .map(|user| user.id)
+        .or_else(|| Some("local".to_string()));
+
+    for session in state
+        .storage
+        .list_sessions()?
+        .into_iter()
+        .filter(|session| session.active && !durable_session_ids.contains(&session.id))
+    {
+        // Workbench-local rows are authoritative here. Native CLI history can
+        // already contain partial assistant output from the interrupted turn,
+        // which must not be mistaken for a completed response.
+        let messages = state.storage.list_messages(&session.id)?;
+        let last_conversation_message = messages.iter().rev().find(|message| {
+            matches!(message.role, MessageRole::User | MessageRole::Assistant)
+                && !message.content.trim().is_empty()
+        });
+        let Some(last_user_prompt) = last_conversation_message
+            .filter(|message| message.role == MessageRole::User)
+            .map(|message| message.content.clone())
+        else {
+            // A final assistant row means the old process most likely died
+            // after persistence but before clearing the active bit. There is
+            // nothing left for the provider to continue.
+            if last_conversation_message
+                .is_some_and(|message| message.role == MessageRole::Assistant)
+            {
+                let _ = state.sessions.set_active(&session.id, false).await;
+            }
+            continue;
+        };
+
+        let mut run = iowb_storage::StoredDurableChatRun::new(
+            new_id("run"),
+            fallback_user_id.clone(),
+            session.id.clone(),
+            session.provider.as_str(),
+            last_user_prompt,
+            session.project_path.clone(),
+        );
+        run.native_session_id = session
+            .native_session_id
+            .clone()
+            .or_else(|| session.external.then(|| session.id.clone()));
+        run.model = session.model.clone();
+        run.effort = session.effort.clone();
+        run.mode = session.mode.clone();
+        run.thinking = session.thinking;
+        state.storage.create_durable_chat_run(&run)?;
+        info!(
+            run_id = %run.id,
+            session_id = %session.id,
+            provider = session.provider.as_str(),
+            "created durable recovery record for legacy active chat session"
+        );
+    }
     Ok(())
 }
 
@@ -120,8 +308,20 @@ pub fn build_router(state: AppState) -> Router {
             put(rename_project_file),
         )
         .route(
+            "/api/projects/{project_name}/files/rename-batch",
+            put(rename_project_files_batch),
+        )
+        .route(
             "/api/projects/{project_name}/files/copy",
             post(copy_project_file),
+        )
+        .route(
+            "/api/projects/{project_name}/files/copy-batch",
+            post(copy_project_files_batch),
+        )
+        .route(
+            "/api/projects/{project_name}/files/delete-batch",
+            post(delete_project_files_batch),
         )
         .route(
             "/api/projects/{project_name}/files/upload",
@@ -138,6 +338,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/sessions/{session_id}", delete(delete_session))
         .route("/api/sessions/{session_id}/messages", get(session_messages))
         .route("/api/sessions/{session_id}/snapshot", get(session_snapshot))
+        .route(
+            "/api/sessions/{session_id}/draft",
+            get(get_session_draft)
+                .put(update_session_draft)
+                .delete(delete_session_draft),
+        )
         .route("/api/sessions/{session_id}/model", get(session_model))
         .route(
             "/api/sessions/{session_id}/model",
@@ -217,6 +423,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/plugins/run", post(run_plugin_command))
         .route("/api/danger/run", post(run_danger))
         .route("/api/danger/runs", get(list_danger_runs))
+        .route(
+            "/api/devices/fcm-token",
+            post(register_fcm_token).delete(delete_fcm_token),
+        )
         .route("/api/notifications/push", post(send_push_notification))
         .route("/api/notifications/test", post(test_push_notification))
         .route("/api/tool-runs/{namespace}", get(list_tool_runs))
@@ -1865,6 +2075,24 @@ async fn rename_project_file(
     ))
 }
 
+async fn rename_project_files_batch(
+    State(state): State<AppState>,
+    AxumPath(project_name): AxumPath<String>,
+    Json(request): Json<BatchRenameFileRequest>,
+) -> Result<Json<Vec<FileEntry>>> {
+    let project = state.projects.find_by_name(&project_name)?;
+    let mut renamed = Vec::with_capacity(request.entries.len());
+    for entry in request.entries {
+        renamed.push(
+            state
+                .files
+                .rename_path(project.path.clone(), entry.old_path, entry.new_path)
+                .await?,
+        );
+    }
+    Ok(Json(renamed))
+}
+
 async fn copy_project_file(
     State(state): State<AppState>,
     AxumPath(project_name): AxumPath<String>,
@@ -1877,6 +2105,24 @@ async fn copy_project_file(
             .copy_path(project.path, request.source_path, request.target_path)
             .await?,
     ))
+}
+
+async fn copy_project_files_batch(
+    State(state): State<AppState>,
+    AxumPath(project_name): AxumPath<String>,
+    Json(request): Json<BatchCopyFileRequest>,
+) -> Result<Json<Vec<FileEntry>>> {
+    let project = state.projects.find_by_name(&project_name)?;
+    let mut copied = Vec::with_capacity(request.entries.len());
+    for entry in request.entries {
+        copied.push(
+            state
+                .files
+                .copy_path(project.path.clone(), entry.source_path, entry.target_path)
+                .await?,
+        );
+    }
+    Ok(Json(copied))
 }
 
 async fn delete_project_file(
@@ -1892,6 +2138,22 @@ async fn delete_project_file(
     Ok(Json(PlaceholderResponse {
         implemented: true,
         message: "file deleted".to_string(),
+    }))
+}
+
+async fn delete_project_files_batch(
+    State(state): State<AppState>,
+    AxumPath(project_name): AxumPath<String>,
+    Json(request): Json<BatchDeleteFileRequest>,
+) -> Result<Json<PlaceholderResponse>> {
+    let project = state.projects.find_by_name(&project_name)?;
+    let count = request.paths.len();
+    for path in request.paths {
+        state.files.delete_path(project.path.clone(), path).await?;
+    }
+    Ok(Json(PlaceholderResponse {
+        implemented: true,
+        message: format!("deleted: {count} item(s)"),
     }))
 }
 
@@ -2435,6 +2697,10 @@ async fn mobile_settings_overview(
             .unwrap_or_else(default_tasks_settings),
         "notifications": {
             "preferences": notification_preferences,
+            "fcm": {
+                "enabled": env_bool_local("IO_WORKBENCH_FCM_ENABLED", false),
+                "configured": fcm_config_from_env().is_some()
+            },
         },
         "plugins": plugins,
         "directAi": {
@@ -2610,12 +2876,10 @@ struct ChatModelsQuery {
     provider: Option<String>,
 }
 
-/// Per-provider model catalog used by the chat UI's model picker. Codex can
-/// query dynamic CLI catalogs; Claude and Gemini use curated provider-specific
-/// lists to avoid slow interactive `models` subcommands. Direct-AI gateway
-/// models are exposed for every UI provider; Codex keeps using its aiproxy
-/// provider override, while Claude/Gemini chat sessions call the Direct-AI
-/// gateway API directly for gateway-prefixed selections.
+/// Per-provider model catalog used by the chat UI's model picker. IO gateway
+/// models are exposed alongside familiar unprefixed aliases, but the backend
+/// routing policy—not the spelling shown here—forces Codex and Claude traffic
+/// through the IO gateway.
 async fn chat_provider_models(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -2626,7 +2890,7 @@ async fn chat_provider_models(
         None => Provider::Codex,
     };
 
-    let gateway_models = direct_ai_models_for_user(&state, &user.0.id)
+    let gateway_models = direct_ai_models_for_user(&state, &user.0.id, provider)
         .await
         .unwrap_or_default();
     let mut models: Vec<String> = Vec::new();
@@ -2659,7 +2923,11 @@ async fn chat_provider_models(
             push_chat_model(&mut models, &mut seen, model);
         }
         for model in &gateway_models {
-            push_chat_model(&mut models, &mut seen, model);
+            push_chat_model(
+                &mut models,
+                &mut seen,
+                chat_gateway_model_alias(provider, model),
+            );
         }
     }
 
@@ -2695,6 +2963,18 @@ fn push_chat_model(
     }
 }
 
+fn chat_gateway_model_alias(provider: Provider, model: &str) -> String {
+    if provider == Provider::Claude {
+        if let Some((prefix, rest)) = model.trim().split_once(':')
+            && prefix.eq_ignore_ascii_case("cld")
+            && !rest.trim().is_empty()
+        {
+            return format!("gateway:{}", rest.trim());
+        }
+    }
+    model.to_string()
+}
+
 async fn cached_codex_models() -> Vec<String> {
     let Some(home) = home_dir() else {
         return Vec::new();
@@ -2727,13 +3007,17 @@ async fn configured_codex_model() -> Option<String> {
         .map(str::to_string)
 }
 
-/// Fetch the user's Direct-AI proxy model list and return the model ids.
-/// Returns None when the proxy is disabled or the request fails so the
-/// caller can silently fall back to the CLI/curated list. Also probes the
-/// environment for `CODEX_GATEWAY_KEY` so users with the web-ai-cli style
-/// proxy (configured via env, not settings) still see their proxy models.
-async fn direct_ai_models_for_user(state: &AppState, user_id: &str) -> Option<Vec<String>> {
-    let config = resolved_direct_ai_config_for_user(state, user_id);
+/// Fetch the chat runtime's model list and return the model ids. Codex and
+/// Claude use the forced IO gateway config; other providers retain their
+/// resolved Direct-AI setting. A missing key or failed catalog request returns
+/// None so the picker can still show its familiar aliases, which are routed by
+/// the same backend policy when selected.
+async fn direct_ai_models_for_user(
+    state: &AppState,
+    user_id: &str,
+    provider: Provider,
+) -> Option<Vec<String>> {
+    let config = chat_ai_config_for_user(state, user_id, provider);
     let raw = fetch_direct_ai_models(&config).await.unwrap_or_default();
     if raw.is_empty() {
         return None;
@@ -2759,8 +3043,9 @@ async fn direct_ai_models_for_user(state: &AppState, user_id: &str) -> Option<Ve
 fn direct_ai_runtime_config_for_user(
     state: &AppState,
     user_id: &str,
+    provider: Provider,
 ) -> Option<DirectAiRuntimeConfig> {
-    let config = resolved_direct_ai_config_for_user(state, user_id);
+    let config = chat_ai_config_for_user(state, user_id, provider);
     let (base_url, api_key) = direct_ai_endpoint_config(&config)?;
     let max_tokens = config
         .get("maxTokens")
@@ -2771,6 +3056,52 @@ fn direct_ai_runtime_config_for_user(
         api_key,
         max_tokens,
     })
+}
+
+/// Resolve the credential/config used by an actual chat turn. Codex and
+/// Claude are pinned to the IO gateway even if the persisted Direct-AI setting
+/// points at Anthropic, MiniMax, or is disabled. Missing gateway credentials
+/// therefore fail closed instead of falling back to a locally authenticated
+/// provider CLI.
+fn chat_ai_config_for_user(state: &AppState, user_id: &str, provider: Provider) -> Value {
+    let mut config = resolved_direct_ai_config_for_user(state, user_id);
+    if matches!(provider, Provider::Codex | Provider::Claude) {
+        force_io_gateway_config(&mut config);
+    }
+    config
+}
+
+fn force_io_gateway_config(config: &mut Value) {
+    if !config.is_object() {
+        *config = default_direct_ai_config();
+    }
+
+    let preserve_proxy_base = config
+        .get("mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| matches!(mode, "proxy" | "aiproxy"))
+        && config
+            .get("baseUrl")
+            .or_else(|| config.get("base_url"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    obj.insert("mode".to_string(), Value::String("aiproxy".to_string()));
+    if !preserve_proxy_base {
+        obj.remove("base_url");
+        obj.insert(
+            "baseUrl".to_string(),
+            Value::String(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string()),
+        );
+    }
+    obj.remove("api_key_env");
+    obj.insert(
+        "apiKeyEnv".to_string(),
+        Value::String(IO_GATEWAY_API_KEY_ENV.to_string()),
+    );
 }
 
 fn resolved_direct_ai_config_for_user(state: &AppState, user_id: &str) -> Value {
@@ -2790,7 +3121,7 @@ fn apply_implicit_gateway_env_config(config: &mut Value) {
         *config = default_direct_ai_config();
     }
 
-    let has_gateway_key = env::var("CODEX_GATEWAY_KEY")
+    let has_gateway_key = env::var(IO_GATEWAY_API_KEY_ENV)
         .ok()
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
@@ -2815,7 +3146,7 @@ fn apply_implicit_gateway_env_config(config: &mut Value) {
     if !has_base_url {
         obj.insert(
             "baseUrl".to_string(),
-            Value::String("http://141.144.197.96:8319/claude".to_string()),
+            Value::String(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string()),
         );
     }
     let has_key_env = obj
@@ -2826,7 +3157,7 @@ fn apply_implicit_gateway_env_config(config: &mut Value) {
     if !has_key_env {
         obj.insert(
             "apiKeyEnv".to_string(),
-            Value::String("CODEX_GATEWAY_KEY".to_string()),
+            Value::String(IO_GATEWAY_API_KEY_ENV.to_string()),
         );
     }
 }
@@ -3340,40 +3671,186 @@ struct SessionMessagesQuery {
     tail: bool,
 }
 
+fn sanitize_session_response_text(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len().min(SESSION_RESPONSE_MAX_CONTENT_BYTES));
+    let mut line_chars = 0;
+    for character in value.chars() {
+        if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+            continue;
+        }
+        if character == '\n' || character == '\r' {
+            line_chars = 0;
+        } else {
+            line_chars += 1;
+            if line_chars > SESSION_RESPONSE_MAX_LINE_CHARS {
+                sanitized.push_str("\n[long line wrapped for display]\n");
+                line_chars = 1;
+            }
+        }
+        sanitized.push(character);
+    }
+    sanitized
+}
+
+fn response_utf8_prefix_boundary(value: &str, max_bytes: usize) -> usize {
+    if value.len() <= max_bytes {
+        return value.len();
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+fn response_utf8_suffix_boundary(value: &str, max_bytes: usize) -> usize {
+    if value.len() <= max_bytes {
+        return 0;
+    }
+    let mut boundary = value.len().saturating_sub(max_bytes);
+    while boundary < value.len() && !value.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    boundary
+}
+
+fn bound_session_response_text(value: &str, max_bytes: usize, label: &str) -> String {
+    let sanitized = sanitize_session_response_text(value);
+    if sanitized.len() <= max_bytes {
+        return sanitized;
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let marker = format!(
+        "\n\n[truncated {label}: original {} bytes; showing beginning and end]\n\n",
+        sanitized.len()
+    );
+    if marker.len() >= max_bytes {
+        let end = response_utf8_prefix_boundary(&marker, max_bytes);
+        return marker[..end].to_string();
+    }
+    let available = max_bytes - marker.len();
+    let head_budget = available.saturating_mul(3) / 4;
+    let tail_budget = available - head_budget;
+    let head_end = response_utf8_prefix_boundary(&sanitized, head_budget);
+    let tail_start = response_utf8_suffix_boundary(&sanitized, tail_budget);
+    format!(
+        "{}{}{}",
+        &sanitized[..head_end],
+        marker,
+        &sanitized[tail_start..]
+    )
+}
+
+fn bounded_session_response_metadata(metadata: &Value) -> Value {
+    if serde_json::to_vec(metadata)
+        .is_ok_and(|encoded| encoded.len() <= SESSION_RESPONSE_METADATA_MAX_BYTES)
+    {
+        return metadata.clone();
+    }
+    let mut bounded = serde_json::Map::new();
+    if let Some(source) = metadata.as_object() {
+        for key in [
+            "kind",
+            "type",
+            "toolName",
+            "toolCallId",
+            "provider",
+            "model",
+            "mode",
+            "effort",
+            "thinking",
+            "status",
+            "exitCode",
+            "responseId",
+            "sequence",
+            "receivedAt",
+            "sentAt",
+            "elapsedMs",
+            "tokenUsage",
+        ] {
+            let Some(value) = source.get(key) else {
+                continue;
+            };
+            let value = match value {
+                Value::String(text) => Value::String(bound_session_response_text(
+                    text,
+                    4 * 1024,
+                    "metadata value",
+                )),
+                value
+                    if serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() <= 4 * 1024) =>
+                {
+                    value.clone()
+                }
+                _ => continue,
+            };
+            bounded.insert(key.to_string(), value);
+        }
+    }
+    bounded.insert("metadataTruncated".to_string(), Value::Bool(true));
+    Value::Object(bounded)
+}
+
+fn bound_session_messages_for_response(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut remaining = SESSION_RESPONSE_MAX_CONTENT_BYTES;
+    for message in messages.iter_mut().rev() {
+        let original_bytes = message.content.len();
+        let per_message_limit = match message.role {
+            MessageRole::Assistant => SESSION_RESPONSE_ASSISTANT_MAX_BYTES,
+            MessageRole::Tool => SESSION_RESPONSE_TOOL_MAX_BYTES,
+            MessageRole::User => SESSION_RESPONSE_USER_MAX_BYTES,
+            MessageRole::System => SESSION_RESPONSE_SYSTEM_MAX_BYTES,
+        };
+        let allowed = per_message_limit.min(remaining);
+        message.content = bound_session_response_text(
+            &message.content,
+            allowed,
+            match message.role {
+                MessageRole::Tool => "tool output",
+                _ => "chat message",
+            },
+        );
+        remaining = remaining.saturating_sub(message.content.len());
+        message.metadata = bounded_session_response_metadata(&message.metadata);
+        if message.content.len() < original_bytes {
+            if !message.metadata.is_object() {
+                message.metadata = Value::Object(serde_json::Map::new());
+            }
+            let metadata = message.metadata.as_object_mut().expect("metadata object");
+            metadata.insert("contentTruncated".to_string(), Value::Bool(true));
+            metadata.insert(
+                "originalContentBytes".to_string(),
+                Value::from(original_bytes as u64),
+            );
+        }
+    }
+    messages
+}
+
 async fn session_messages(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
     Query(query): Query<SessionMessagesQuery>,
 ) -> Result<Json<MessagesResponse>> {
     let offset = query.offset.unwrap_or(0);
-    // When neither limit nor offset is supplied we keep the legacy "all
-    // messages" behaviour for backwards compatibility with the admin views.
-    if query.limit.is_none() && offset == 0 {
-        let messages = state
+    let limit = query
+        .limit
+        .unwrap_or(SESSION_HISTORY_DEFAULT_MESSAGES)
+        .max(1)
+        .min(SESSION_HISTORY_MAX_MESSAGES);
+    let use_tail = query.tail || (query.limit.is_none() && query.offset.is_none());
+    if use_tail {
+        let (messages, total_count) = state
             .sessions
-            .messages_including_external(&session_id)
+            .messages_tail_including_external(&session_id, limit)
             .await?;
-        let total_count = messages.len();
+        let has_more = messages.len() < total_count;
         return Ok(Json(MessagesResponse {
             session_id,
-            messages,
-            has_more: false,
-            total_count,
-        }));
-    }
-
-    let limit = query.limit.unwrap_or(100);
-    if query.tail {
-        let messages = state
-            .sessions
-            .messages_including_external(&session_id)
-            .await?;
-        let total_count = messages.len();
-        let start = total_count.saturating_sub(limit.max(1).min(500));
-        return Ok(Json(MessagesResponse {
-            session_id,
-            messages: messages[start..].to_vec(),
-            has_more: start > 0,
+            messages: bound_session_messages_for_response(messages),
+            has_more,
             total_count,
         }));
     }
@@ -3384,7 +3861,7 @@ async fn session_messages(
     let has_more = offset + messages.len() < total_count;
     Ok(Json(MessagesResponse {
         session_id,
-        messages,
+        messages: bound_session_messages_for_response(messages),
         has_more,
         total_count,
     }))
@@ -3395,11 +3872,15 @@ async fn session_snapshot(
     AxumPath(session_id): AxumPath<String>,
     Query(query): Query<SessionMessagesQuery>,
 ) -> Result<Json<SessionSnapshotResponse>> {
-    let limit = query.limit.unwrap_or(100).max(1).min(500);
+    let limit = query
+        .limit
+        .unwrap_or(SESSION_HISTORY_DEFAULT_MESSAGES)
+        .max(1)
+        .min(SESSION_HISTORY_MAX_MESSAGES);
     let session_before = state.sessions.get(&session_id).await?;
-    let mut messages = state
+    let (mut messages, mut total_count) = state
         .sessions
-        .messages_including_external(&session_id)
+        .messages_tail_including_external(&session_id, limit)
         .await?;
     let session = state.sessions.get(&session_id).await?;
     // Finishing a run persists the assistant reply before marking the
@@ -3407,18 +3888,66 @@ async fn session_snapshot(
     // fetch the messages once more so an inactive snapshot can never omit
     // the final reply.
     if session_before.active && !session.active {
-        messages = state
+        let refreshed = state
             .sessions
-            .messages_including_external(&session_id)
+            .messages_tail_including_external(&session_id, limit)
             .await?;
+        messages = refreshed.0;
+        total_count = refreshed.1;
     }
-    let total_count = messages.len();
-    let start = total_count.saturating_sub(limit);
     Ok(Json(SessionSnapshotResponse {
         session,
-        messages: messages[start..].to_vec(),
-        has_more: start > 0,
+        has_more: messages.len() < total_count,
+        messages: bound_session_messages_for_response(messages),
         total_count,
+    }))
+}
+
+async fn get_session_draft(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<SessionDraftResponse>> {
+    validate_session_id(&session_id)?;
+    let _ = state.sessions.get(&session_id).await?;
+    Ok(Json(
+        state.storage.get_session_draft(&user.0.id, &session_id)?,
+    ))
+}
+
+async fn update_session_draft(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<UpdateSessionDraftRequest>,
+) -> Result<Json<SessionDraftResponse>> {
+    validate_session_id(&session_id)?;
+    let _ = state.sessions.get(&session_id).await?;
+    if request.content.len() > SESSION_DRAFT_MAX_BYTES {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            format!("session draft exceeds {} bytes", SESSION_DRAFT_MAX_BYTES),
+        ));
+    }
+    Ok(Json(state.storage.set_session_draft(
+        &user.0.id,
+        &session_id,
+        &request.content,
+    )?))
+}
+
+async fn delete_session_draft(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Result<Json<PlaceholderResponse>> {
+    validate_session_id(&session_id)?;
+    state
+        .storage
+        .delete_session_draft(&user.0.id, &session_id)?;
+    Ok(Json(PlaceholderResponse {
+        implemented: true,
+        message: "session draft cleared".to_string(),
     }))
 }
 
@@ -3836,30 +4365,22 @@ async fn handle_ws_command(
             effort,
             mode,
             thinking,
-        } => match state
-            .start_agent_session(
-                provider,
-                project_path,
-                prompt,
-                session_id,
-                model,
-                effort,
-                mode,
-                thinking,
-                direct_ai_runtime_config_for_user(state, &user.id),
-            )
-            .await
-        {
-            Ok(session) => {
-                let _ = direct_tx
-                    .send(WsServerEvent::SessionStatus {
-                        provider,
-                        session_id: session.id,
-                        status: SessionRuntimeStatus::Starting,
-                    })
-                    .await;
-            }
-            Err(error) => {
+        } => {
+            if let Err(error) = state
+                .start_agent_session(
+                    provider,
+                    project_path,
+                    prompt,
+                    session_id,
+                    model,
+                    effort,
+                    mode,
+                    thinking,
+                    direct_ai_runtime_config_for_user(state, &user.id, provider),
+                    Some(user.id.clone()),
+                )
+                .await
+            {
                 let _ = direct_tx
                     .send(WsServerEvent::Error {
                         message: "failed to start session".to_string(),
@@ -3867,7 +4388,7 @@ async fn handle_ws_command(
                     })
                     .await;
             }
-        },
+        }
         WsClientCommand::AbortSession {
             provider,
             session_id,
@@ -3932,6 +4453,292 @@ async fn send_ws_event(
     sender.send(Message::Text(payload.into())).await
 }
 
+#[derive(Debug, Clone)]
+struct FcmConfig {
+    project_id: String,
+    service_account_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FirebaseServiceAccount {
+    #[serde(default)]
+    project_id: String,
+    client_email: String,
+    private_key: String,
+    #[serde(default)]
+    token_uri: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FcmJwtClaims<'a> {
+    iss: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    iat: i64,
+    exp: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FcmAccessTokenResponse {
+    access_token: String,
+}
+
+fn fcm_config_from_env() -> Option<FcmConfig> {
+    if !env_bool_local("IO_WORKBENCH_FCM_ENABLED", false) {
+        return None;
+    }
+    let service_account_json = env::var("IO_WORKBENCH_FCM_SERVICE_ACCOUNT_JSON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("IO_WORKBENCH_FCM_SERVICE_ACCOUNT_PATH")
+                .ok()
+                .or_else(|| env::var("GOOGLE_APPLICATION_CREDENTIALS").ok())
+                .and_then(|path| std::fs::read_to_string(path).ok())
+        })?;
+    let service_account =
+        serde_json::from_str::<FirebaseServiceAccount>(&service_account_json).ok()?;
+    let project_id = env::var("IO_WORKBENCH_FCM_PROJECT_ID")
+        .ok()
+        .or_else(|| env::var("FIREBASE_PROJECT_ID").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(service_account.project_id)
+        .trim()
+        .to_string();
+    if project_id.is_empty() {
+        return None;
+    }
+    Some(FcmConfig {
+        project_id,
+        service_account_json,
+    })
+}
+
+fn env_bool_local(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+async fn fcm_access_token(
+    client: &reqwest::Client,
+    service_account: &FirebaseServiceAccount,
+) -> anyhow::Result<String> {
+    let token_uri = service_account
+        .token_uri
+        .as_deref()
+        .unwrap_or("https://oauth2.googleapis.com/token");
+    let now = Utc::now().timestamp();
+    let claims = FcmJwtClaims {
+        iss: &service_account.client_email,
+        scope: "https://www.googleapis.com/auth/firebase.messaging",
+        aud: token_uri,
+        iat: now,
+        exp: now + 3600,
+    };
+    let assertion = jsonwebtoken::encode(
+        &Header::new(Algorithm::RS256),
+        &claims,
+        &EncodingKey::from_rsa_pem(service_account.private_key.as_bytes())?,
+    )?;
+    let response = client
+        .post(token_uri)
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", assertion.as_str()),
+        ])
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("FCM OAuth token request failed: {status} {text}");
+    }
+    let token = serde_json::from_str::<FcmAccessTokenResponse>(&text)?;
+    Ok(token.access_token)
+}
+
+async fn send_fcm_notification_to_token(
+    client: &reqwest::Client,
+    config: &FcmConfig,
+    access_token: &str,
+    token: &str,
+    title: &str,
+    body: &str,
+    data: Value,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "https://fcm.googleapis.com/v1/projects/{}/messages:send",
+        config.project_id
+    );
+    let response = client
+        .post(url)
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({
+            "message": {
+                "token": token,
+                "notification": {
+                    "title": title,
+                    "body": body,
+                },
+                "data": data,
+                "android": {
+                    "priority": "HIGH",
+                    "notification": {
+                        "channel_id": "io_workbench_activity",
+                        "default_sound": true,
+                        "default_vibrate_timings": true,
+                    }
+                }
+            }
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("FCM send failed: {status} {text}");
+    }
+    Ok(())
+}
+
+fn spawn_fcm_notification_bridge(state: AppState) {
+    let Some(config) = fcm_config_from_env() else {
+        info!("FCM push notifications are disabled");
+        return;
+    };
+    let mut hub_rx = state.ws_hub.subscribe();
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(error = %error, "failed to create FCM HTTP client");
+                return;
+            }
+        };
+        loop {
+            match hub_rx.recv().await {
+                Ok(WsServerEvent::SessionStatus {
+                    provider,
+                    session_id,
+                    status: iowb_protocol::SessionRuntimeStatus::Completed,
+                    latest_user_prompt,
+                    ..
+                }) => {
+                    if let Err(error) = send_fcm_chat_completed(
+                        &state,
+                        &client,
+                        &config,
+                        provider,
+                        &session_id,
+                        latest_user_prompt.as_deref(),
+                    )
+                    .await
+                    {
+                        warn!(error = %error, session_id = %session_id, "failed to send FCM chat completion notification");
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "FCM notification bridge lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+async fn send_fcm_chat_completed(
+    state: &AppState,
+    client: &reqwest::Client,
+    config: &FcmConfig,
+    provider: Provider,
+    session_id: &str,
+    latest_user_prompt: Option<&str>,
+) -> anyhow::Result<()> {
+    let session = state.sessions.get(session_id).await.ok();
+    let run = state
+        .storage
+        .latest_durable_chat_run_for_session(session_id)?;
+    let user_id = run.as_ref().and_then(|run| run.user_id.as_deref());
+    let tokens = if let Some(user_id) = user_id {
+        state.storage.list_fcm_tokens_for_user(user_id)?
+    } else {
+        state.storage.list_all_fcm_tokens()?
+    };
+    if tokens.is_empty() {
+        return Ok(());
+    }
+
+    let service_account =
+        serde_json::from_str::<FirebaseServiceAccount>(&config.service_account_json)?;
+    let access_token = fcm_access_token(client, &service_account).await?;
+    let project_folder = session
+        .as_ref()
+        .and_then(|session| Path::new(&session.project_path).file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("io-workbench");
+    let prompt = latest_user_prompt
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map(str::trim)
+        .or_else(|| {
+            run.as_ref()
+                .map(|run| run.prompt.trim())
+                .filter(|prompt| !prompt.is_empty())
+        })
+        .unwrap_or("latest prompt");
+    let title = format!("{project_folder} | {}", provider.as_str());
+    let body = format!("finished: {}", truncate_notification_text(prompt, 180));
+    let data = serde_json::json!({
+        "event": "chat_completed",
+        "sessionId": session_id,
+        "provider": provider.as_str(),
+    });
+    for stored in tokens {
+        if let Err(error) = send_fcm_notification_to_token(
+            client,
+            config,
+            &access_token,
+            &stored.token,
+            &title,
+            &body,
+            data.clone(),
+        )
+        .await
+        {
+            warn!(
+                error = %error,
+                user_id = %stored.user_id,
+                platform = ?stored.platform,
+                "failed to send FCM notification to token"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn truncate_notification_text(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            output.push('…');
+            return output;
+        }
+        output.push(ch);
+    }
+    output
+}
+
 fn spawn_process_event_bridge(state: AppState) {
     let mut rx = state.processes.subscribe();
     let hub = state.ws_hub.clone();
@@ -3972,6 +4779,7 @@ fn spawn_project_watch_bridge(state: AppState) {
 
     tokio::spawn(async move {
         let mut watchers: HashMap<String, RecommendedWatcher> = HashMap::new();
+        let mut failed_watchers = HashMap::<String, Instant>::new();
         let mut discovery = tokio::time::interval(Duration::from_secs(5));
         discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut pending_updates = HashMap::<String, HashSet<String>>::new();
@@ -3979,7 +4787,12 @@ fn spawn_project_watch_bridge(state: AppState) {
         loop {
             tokio::select! {
                 _ = discovery.tick() => {
-                    refresh_project_watchers(&state, &tx, &mut watchers).await;
+                    refresh_project_watchers(
+                        &state,
+                        &tx,
+                        &mut watchers,
+                        &mut failed_watchers,
+                    ).await;
                 }
                 Some((project_path, event)) = rx.recv() => {
                     match event {
@@ -4015,6 +4828,7 @@ async fn refresh_project_watchers(
     state: &AppState,
     tx: &mpsc::Sender<(String, notify::Result<notify::Event>)>,
     watchers: &mut HashMap<String, RecommendedWatcher>,
+    failed_watchers: &mut HashMap<String, Instant>,
 ) {
     let projects = match state.storage.list_projects() {
         Ok(projects) => projects,
@@ -4029,37 +4843,80 @@ async fn refresh_project_watchers(
         .collect::<HashSet<_>>();
 
     watchers.retain(|path, _| desired.contains(path));
+    failed_watchers.retain(|path, _| desired.contains(path));
 
     for project in projects {
         if watchers.contains_key(&project.path) {
+            continue;
+        }
+        if failed_watchers
+            .get(&project.path)
+            .is_some_and(|retry_at| *retry_at > Instant::now())
+        {
             continue;
         }
         let project_path = PathBuf::from(&project.path);
         if !project_path.is_dir() {
             continue;
         }
+        let broad_ancestor = state.config.workspace_root.starts_with(&project_path)
+            && state.config.workspace_root != project_path;
+        let requested_mode = if broad_ancestor {
+            RecursiveMode::NonRecursive
+        } else {
+            RecursiveMode::Recursive
+        };
 
         let event_tx = tx.clone();
         let event_project_path = project.path.clone();
         match notify::recommended_watcher(move |event| {
-            let _ = event_tx.blocking_send((event_project_path.clone(), event));
+            // Watch registration can synchronously emit hundreds of events.
+            // Never block the notify thread waiting for this task to finish
+            // registering the watcher, otherwise a broad project can deadlock
+            // the entire server runtime.
+            let _ = event_tx.try_send((event_project_path.clone(), event));
         }) {
             Ok(mut watcher) => {
-                if let Err(error) = watcher.watch(&project_path, RecursiveMode::Recursive) {
+                if broad_ancestor {
                     warn!(
                         project_path = %project_path.display(),
-                        error = %error,
-                        "failed to watch project"
+                        workspace_root = %state.config.workspace_root.display(),
+                        "project is an ancestor of the workspace root; using root-only watch"
                     );
-                    continue;
                 }
+                if let Err(recursive_error) = watcher.watch(&project_path, requested_mode) {
+                    match watcher.watch(&project_path, RecursiveMode::NonRecursive) {
+                        Ok(()) => {
+                            warn!(
+                                project_path = %project_path.display(),
+                                error = %recursive_error,
+                                "recursive project watch unavailable; using root-only watch"
+                            );
+                        }
+                        Err(fallback_error) => {
+                            warn!(
+                                project_path = %project_path.display(),
+                                recursive_error = %recursive_error,
+                                fallback_error = %fallback_error,
+                                "failed to watch project"
+                            );
+                            failed_watchers
+                                .insert(project.path, Instant::now() + Duration::from_secs(5 * 60));
+                            continue;
+                        }
+                    }
+                }
+                failed_watchers.remove(&project.path);
                 watchers.insert(project.path, watcher);
             }
-            Err(error) => warn!(
-                project_path = %project_path.display(),
-                error = %error,
-                "failed to create project watcher"
-            ),
+            Err(error) => {
+                warn!(
+                    project_path = %project_path.display(),
+                    error = %error,
+                    "failed to create project watcher"
+                );
+                failed_watchers.insert(project.path, Instant::now() + Duration::from_secs(5 * 60));
+            }
         }
     }
 }
@@ -4227,6 +5084,7 @@ fn default_notification_preferences() -> Value {
     serde_json::json!({
         "channels": {
             "inApp": true,
+            "fcm": true,
             "webPush": false,
             "telegram": false,
             "googleChat": false
@@ -4838,7 +5696,7 @@ fn direct_ai_endpoint_config(config: &Value) -> Option<(String, String)> {
         .or_else(|| match mode {
             "direct" | "anthropic" => Some("https://api.anthropic.com".to_string()),
             "minimax" => Some("https://api.minimax.io/anthropic".to_string()),
-            "proxy" | "aiproxy" => Some("http://141.144.197.96:8319/claude".to_string()),
+            "proxy" | "aiproxy" => Some(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string()),
             _ => None,
         })?;
 
@@ -4857,7 +5715,7 @@ fn direct_ai_endpoint_config(config: &Value) -> Option<(String, String)> {
             "minimax" => env::var("MINIMAX_API_KEY")
                 .or_else(|_| env::var("ANTHROPIC_API_KEY"))
                 .ok(),
-            _ => env::var("CODEX_GATEWAY_KEY").ok(),
+            _ => env::var(IO_GATEWAY_API_KEY_ENV).ok(),
         })
         .filter(|value| !value.trim().is_empty())?;
 
@@ -5645,6 +6503,62 @@ async fn list_danger_runs(
     })))
 }
 
+async fn register_fcm_token(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(request): Json<RegisterFcmTokenRequest>,
+) -> Result<Json<FcmTokenResponse>> {
+    let token = request.token.trim();
+    if token.is_empty() {
+        return Err(CoreError::InvalidInput("FCM token is required".to_string()).into());
+    }
+    if token.len() > 8192 {
+        return Err(CoreError::InvalidInput("FCM token is too large".to_string()).into());
+    }
+    let token_count = state.storage.upsert_fcm_token(
+        &user.0.id,
+        token,
+        request
+            .platform
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+        request
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+        request
+            .app_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )?;
+    Ok(Json(FcmTokenResponse {
+        success: true,
+        token_count,
+    }))
+}
+
+async fn delete_fcm_token(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(request): Json<DeleteFcmTokenRequest>,
+) -> Result<Json<FcmTokenResponse>> {
+    let token = request.token.trim();
+    if token.is_empty() {
+        return Ok(Json(FcmTokenResponse {
+            success: true,
+            token_count: state.storage.list_fcm_tokens_for_user(&user.0.id)?.len(),
+        }));
+    }
+    let token_count = state.storage.delete_fcm_token(&user.0.id, token)?;
+    Ok(Json(FcmTokenResponse {
+        success: true,
+        token_count,
+    }))
+}
+
 async fn send_push_notification(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -6159,6 +7073,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounds_pathological_history_for_clients_and_prioritizes_newest_messages() {
+        let now = Utc::now();
+        let messages = vec![
+            ChatMessage {
+                id: "older-tool".to_string(),
+                role: MessageRole::Tool,
+                content: format!("<style>bad</style>\0{}", "a".repeat(900_000)),
+                timestamp: now,
+                metadata: serde_json::json!({"huge": "m".repeat(100_000)}),
+            },
+            ChatMessage {
+                id: "latest-assistant".to_string(),
+                role: MessageRole::Assistant,
+                content: format!("{}FINAL-TAIL", "b".repeat(600_000)),
+                timestamp: now,
+                metadata: Value::Null,
+            },
+        ];
+
+        let bounded = bound_session_messages_for_response(messages);
+        assert_eq!(bounded.len(), 2);
+        assert!(
+            bounded
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>()
+                <= SESSION_RESPONSE_MAX_CONTENT_BYTES
+        );
+        assert!(bounded[0].content.len() <= SESSION_RESPONSE_TOOL_MAX_BYTES);
+        assert!(bounded[1].content.len() <= SESSION_RESPONSE_ASSISTANT_MAX_BYTES);
+        assert!(bounded[1].content.contains("FINAL-TAIL"));
+        assert!(!bounded[0].content.contains('\0'));
+        assert!(bounded.iter().all(|message| {
+            message
+                .content
+                .lines()
+                .all(|line| line.chars().count() <= SESSION_RESPONSE_MAX_LINE_CHARS + 80)
+        }));
+        assert_eq!(
+            bounded[0]
+                .metadata
+                .get("contentTruncated")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            bounded[0]
+                .metadata
+                .get("metadataTruncated")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn forced_io_gateway_config_replaces_non_gateway_provider_settings() {
+        let mut config = serde_json::json!({
+            "mode": "anthropic",
+            "baseUrl": "https://api.anthropic.com",
+            "apiKeyEnv": "ANTHROPIC_API_KEY",
+            "maxTokens": 1234,
+        });
+
+        force_io_gateway_config(&mut config);
+
+        assert_eq!(config.get("mode").and_then(Value::as_str), Some("aiproxy"));
+        assert_eq!(
+            config.get("baseUrl").and_then(Value::as_str),
+            Some(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL)
+        );
+        assert_eq!(
+            config.get("apiKeyEnv").and_then(Value::as_str),
+            Some(IO_GATEWAY_API_KEY_ENV)
+        );
+        assert_eq!(config.get("maxTokens").and_then(Value::as_u64), Some(1234));
+    }
+
+    #[test]
+    fn claude_gateway_catalog_models_use_non_cli_alias() {
+        assert_eq!(
+            chat_gateway_model_alias(Provider::Claude, "cld:claude-sonnet-5"),
+            "gateway:claude-sonnet-5"
+        );
+        assert_eq!(
+            chat_gateway_model_alias(Provider::Claude, "claude-sonnet-5"),
+            "claude-sonnet-5"
+        );
+        assert_eq!(
+            chat_gateway_model_alias(Provider::Gemini, "cld:claude-sonnet-5"),
+            "cld:claude-sonnet-5"
+        );
+    }
+
+    #[test]
+    fn forced_io_gateway_config_preserves_explicit_proxy_endpoint() {
+        let mut config = serde_json::json!({
+            "mode": "aiproxy",
+            "baseUrl": "http://127.0.0.1:8319/claude",
+            "apiKeyEnv": "WRONG_KEY",
+        });
+
+        force_io_gateway_config(&mut config);
+
+        assert_eq!(
+            config.get("baseUrl").and_then(Value::as_str),
+            Some("http://127.0.0.1:8319/claude")
+        );
+        assert_eq!(
+            config.get("apiKeyEnv").and_then(Value::as_str),
+            Some(IO_GATEWAY_API_KEY_ENV)
+        );
+    }
+
+    #[test]
     fn parses_latest_claude_usage() {
         let content = r#"
 {"type":"assistant","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}
@@ -6214,5 +7242,204 @@ mod tests {
             project_relative_watch_path(root, Path::new("/tmp/another/file.txt")),
             None,
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_terminalizes_recovery_after_retry_limit() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-server-recovery-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("project directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+        let session = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .append_message(&session.id, MessageRole::User, "keep working")
+            .await
+            .expect("user message");
+        let mut run = iowb_storage::StoredDurableChatRun::new(
+            "retry-limit-run",
+            Some("retry-user".to_string()),
+            session.id.clone(),
+            "codex",
+            "keep working",
+            project.display().to_string(),
+        );
+        run.resume_attempts = DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS;
+        state
+            .storage
+            .create_durable_chat_run(&run)
+            .expect("durable run");
+
+        recover_interrupted_chat_runs(&state)
+            .await
+            .expect("startup reconciliation");
+
+        let stored_run = state
+            .storage
+            .get_durable_chat_run(&run.id)
+            .expect("read run")
+            .expect("run exists");
+        assert_eq!(stored_run.status, "interrupted");
+        assert_eq!(
+            stored_run.last_error.as_deref(),
+            Some("automatic recovery attempt limit reached")
+        );
+        assert!(
+            !state
+                .storage
+                .get_session(&session.id)
+                .expect("read session")
+                .expect("session exists")
+                .active
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_automatically_recovers_legacy_active_chat() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-server-legacy-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("project directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+        let session = state
+            .sessions
+            .create_or_update(
+                Provider::Gemini,
+                project.display().to_string(),
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .set_native_session_id(&session.id, "legacy-native-session")
+            .await
+            .expect("native session");
+        state
+            .sessions
+            .append_message(&session.id, MessageRole::User, "finish legacy work")
+            .await
+            .expect("user message");
+        assert!(
+            state
+                .storage
+                .list_active_durable_chat_runs()
+                .expect("list durable runs")
+                .is_empty()
+        );
+
+        unsafe {
+            std::env::set_var("IO_WORKBENCH_GEMINI_COMMAND", "/bin/sh");
+            std::env::set_var(
+                "IO_WORKBENCH_GEMINI_ARGS_JSON",
+                r#"["-c","printf 'startup-resumed:%s\\n' \"$1\"","iowb-recovery","{native_session_id}"]"#,
+            );
+        }
+        recover_interrupted_chat_runs(&state)
+            .await
+            .expect("startup recovery");
+        unsafe {
+            std::env::remove_var("IO_WORKBENCH_GEMINI_COMMAND");
+            std::env::remove_var("IO_WORKBENCH_GEMINI_ARGS_JSON");
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let runs = state
+                    .storage
+                    .list_active_durable_chat_runs()
+                    .expect("active durable runs");
+                if runs.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("automatic recovery completes");
+
+        let messages = state.storage.list_messages(&session.id).expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == MessageRole::User)
+                .count(),
+            1
+        );
+        assert!(messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message
+                    .content
+                    .contains("startup-resumed:legacy-native-session")
+        }));
+        let durable_runs = state
+            .storage
+            .list_recoverable_durable_chat_runs(DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS, 10)
+            .expect("recoverable runs");
+        assert!(durable_runs.is_empty());
+        assert!(
+            !state
+                .storage
+                .get_session(&session.id)
+                .expect("read session")
+                .expect("session exists")
+                .active
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

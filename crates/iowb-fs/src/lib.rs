@@ -3,6 +3,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use iowb_protocol::{FileContentResponse, FileEntry, FileKind, WorkspaceValidation};
 use thiserror::Error;
@@ -220,15 +221,36 @@ impl FileService {
         }
 
         let bytes = fs::read(&target).await?;
-        if bytes.contains(&0) {
-            return Err(FsError::BinaryFile);
-        }
-        let content = String::from_utf8(bytes).map_err(|_| FsError::BinaryFile)?;
+        let mime_type = mime_guess::from_path(&target)
+            .first_raw()
+            .map(str::to_string);
+        let is_image = mime_type
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("image/"));
+        let binary = bytes.contains(&0);
+        let (content, content_encoding, response_mime_type) = if binary || is_image {
+            if !is_image {
+                return Err(FsError::BinaryFile);
+            }
+            (
+                BASE64_STANDARD.encode(&bytes),
+                Some("base64".to_string()),
+                mime_type,
+            )
+        } else {
+            (
+                String::from_utf8(bytes).map_err(|_| FsError::BinaryFile)?,
+                None,
+                mime_type,
+            )
+        };
 
         Ok(FileContentResponse {
             path: display_path(&root, &target),
             content,
             size: metadata.len(),
+            content_encoding,
+            mime_type: response_mime_type,
             modified: metadata.modified().ok().map(DateTime::<Utc>::from),
         })
     }

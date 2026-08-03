@@ -11,6 +11,9 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+const MAX_EXTERNAL_TOOL_CONTENT_BYTES: usize = 128 * 1024;
+const EXTERNAL_TOOL_CONTENT_TAIL_BYTES: usize = 32 * 1024;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ExternalSessionRecord {
     pub summary: SessionSummary,
@@ -566,7 +569,7 @@ fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
                             MessageRole::Tool,
                             format_function_call(name, arguments),
                             timestamp,
-                            tool_metadata("tool_use", name, call_id, arguments),
+                            tool_metadata("tool_use", name, call_id),
                         );
                     }
                     Some("function_call_output") => {
@@ -585,7 +588,7 @@ fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
                             MessageRole::Tool,
                             format!("tool / Details\n**Tool:** `{name}`\n\n{output}"),
                             timestamp,
-                            tool_metadata("tool_result", name, call_id, &output),
+                            tool_metadata("tool_result", name, call_id),
                         );
                     }
                     Some("custom_tool_call") => {
@@ -615,7 +618,7 @@ fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
                                 Vec::new(),
                             )
                         };
-                        let mut metadata = tool_metadata("tool_use", name, call_id, input);
+                        let mut metadata = tool_metadata("tool_use", name, call_id);
                         if !operations.is_empty() {
                             metadata["fileOperations"] = Value::Array(operations);
                         }
@@ -644,7 +647,7 @@ fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
                             MessageRole::Tool,
                             format!("tool / Details\n**Tool:** `{name}`\n\n{output}"),
                             timestamp,
-                            tool_metadata("tool_result", name, call_id, &output),
+                            tool_metadata("tool_result", name, call_id),
                         );
                     }
                     _ => {}
@@ -741,18 +744,18 @@ fn format_function_call(name: &str, arguments: &str) -> String {
             .and_then(|value| value.get("cmd").or_else(|| value.get("command")))
             .and_then(Value::as_str)
             .unwrap_or(arguments);
-        return format!(
+        return bounded_tool_text(&format!(
             "tool / Parameters\n**Tool:** `{name}`\n\n### Command\n```sh\n{command}\n```"
-        );
+        ));
     }
     let display = parsed
         .as_ref()
         .and_then(|value| serde_json::to_string_pretty(value).ok())
         .unwrap_or_else(|| arguments.to_string());
-    format!(
+    bounded_tool_text(&format!(
         "tool / Parameters\n**Tool:** `{name}`\n\n{}",
         fenced_text(&display)
-    )
+    ))
 }
 
 fn format_patch_tool(input: &str) -> (String, Vec<Value>) {
@@ -788,29 +791,135 @@ fn format_patch_tool(input: &str) -> (String, Vec<Value>) {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let content = format!("apply_patch\n{}\n\n```diff\n{}\n```", summary, input.trim());
+    let content = bounded_tool_text(&format!(
+        "apply_patch\n{}\n\n```diff\n{}\n```",
+        summary,
+        input.trim()
+    ));
     (content, operations)
 }
 
-fn tool_metadata(kind: &str, name: &str, call_id: &str, payload: &str) -> Value {
+fn tool_metadata(kind: &str, name: &str, call_id: &str) -> Value {
     json!({
         "kind": kind,
         "toolName": name,
         "toolCallId": call_id,
-        "payload": serde_json::from_str::<Value>(payload).unwrap_or_else(|_| Value::String(payload.to_string())),
     })
 }
 
 fn display_json_value(value: Option<&Value>) -> String {
     match value {
-        Some(Value::String(text)) => text.clone(),
-        Some(value) => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+        Some(Value::String(text)) => bounded_tool_text(text),
+        Some(value) => {
+            let sanitized = sanitize_inline_data_value(value);
+            bounded_tool_text(
+                &serde_json::to_string_pretty(&sanitized).unwrap_or_else(|_| sanitized.to_string()),
+            )
+        }
         None => String::new(),
     }
 }
 
 fn fenced_text(value: &str) -> String {
-    format!("```json\n{}\n```", value.trim())
+    bounded_tool_text(&format!("```json\n{}\n```", value.trim()))
+}
+
+fn sanitize_inline_data_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(sanitize_inline_data_value).collect())
+        }
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), sanitize_inline_data_value(value)))
+                .collect(),
+        ),
+        Value::String(value) => Value::String(omit_inline_data_urls(value)),
+        value => value.clone(),
+    }
+}
+
+fn bounded_tool_text(value: &str) -> String {
+    let sanitized = omit_inline_data_urls(value);
+    if sanitized.len() <= MAX_EXTERNAL_TOOL_CONTENT_BYTES {
+        return sanitized;
+    }
+
+    let tail_start = floor_char_boundary(
+        &sanitized,
+        sanitized
+            .len()
+            .saturating_sub(EXTERNAL_TOOL_CONTENT_TAIL_BYTES),
+    );
+    let marker = format!(
+        "\n\n[tool output truncated: {} bytes omitted]\n\n",
+        tail_start
+            .saturating_sub(MAX_EXTERNAL_TOOL_CONTENT_BYTES - EXTERNAL_TOOL_CONTENT_TAIL_BYTES,)
+    );
+    let head_budget = MAX_EXTERNAL_TOOL_CONTENT_BYTES
+        .saturating_sub(EXTERNAL_TOOL_CONTENT_TAIL_BYTES)
+        .saturating_sub(marker.len());
+    let head_end = floor_char_boundary(&sanitized, head_budget);
+    format!(
+        "{}{}{}",
+        &sanitized[..head_end],
+        marker,
+        &sanitized[tail_start..]
+    )
+}
+
+fn omit_inline_data_urls(value: &str) -> String {
+    let mut cursor = 0;
+    let mut output: Option<String> = None;
+    while let Some(relative_start) = value[cursor..].find("data:") {
+        let start = cursor + relative_start;
+        let header_end_limit = (start + 160).min(value.len());
+        let header = &value[start..header_end_limit];
+        let Some(marker_offset) = header.find(";base64,") else {
+            cursor = start + "data:".len();
+            continue;
+        };
+        let payload_start = start + marker_offset + ";base64,".len();
+        let mut payload_end = payload_start;
+        for byte in value.as_bytes()[payload_start..].iter().copied() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'\r' | b'\n') {
+                payload_end += 1;
+            } else {
+                break;
+            }
+        }
+        if payload_end == payload_start {
+            cursor = payload_start;
+            continue;
+        }
+
+        let output = output.get_or_insert_with(|| String::with_capacity(value.len().min(4096)));
+        output.push_str(&value[cursor..start]);
+        let mime = value[start + "data:".len()..start + marker_offset].trim();
+        output.push_str(&format!(
+            "[inline {} omitted: {} encoded bytes]",
+            if mime.is_empty() { "data" } else { mime },
+            payload_end - payload_start,
+        ));
+        cursor = payload_end;
+    }
+
+    match output {
+        Some(mut output) => {
+            output.push_str(&value[cursor..]);
+            output
+        }
+        None => value.to_string(),
+    }
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn record_visible_message(
@@ -1214,6 +1323,46 @@ mod tests {
             Some(4),
         );
         assert_eq!("Finished", messages[6].content);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn omits_inline_tool_data_and_bounds_external_tool_output() {
+        let root = std::env::temp_dir().join(format!("iowb-external-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "77777777-7777-4777-8777-777777777777";
+        let file = root
+            .join(".codex/sessions/2026/08/01")
+            .join(format!("rollout-2026-08-01T00-00-00-{session_id}.jsonl"));
+        let image = format!("data:image/png;base64,{}", "A".repeat(300_000));
+        let long_text = format!("{}TAIL", "B".repeat(180_000));
+        write_jsonl(
+            &file,
+            &[
+                json!({"timestamp":"2026-08-01T00:00:00Z","type":"session_meta","payload":{"id":session_id,"cwd":project}}),
+                json!({"timestamp":"2026-08-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Inspect images","kind":"plain"}}),
+                json!({"timestamp":"2026-08-01T00:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call-image","input":"view image"}}),
+                json!({"timestamp":"2026-08-01T00:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-image","output":[{"type":"input_image","image_url":image},{"type":"input_text","text":long_text}]}}),
+            ],
+        );
+
+        let record = discover_external_sessions(&root)
+            .into_iter()
+            .find(|record| record.summary.id == session_id)
+            .unwrap();
+        let messages = load_external_messages(&record);
+        let tool_use = &messages[1];
+        let tool_output = &messages[2];
+
+        assert!(tool_use.metadata.get("payload").is_none());
+        assert!(tool_output.metadata.get("payload").is_none());
+        assert!(!tool_output.content.contains("data:image/png;base64"));
+        assert!(tool_output.content.contains("inline image/png omitted"));
+        assert!(tool_output.content.contains("tool output truncated"));
+        assert!(tool_output.content.contains("TAIL"));
+        assert!(tool_output.content.len() <= MAX_EXTERNAL_TOOL_CONTENT_BYTES + 128);
 
         fs::remove_dir_all(root).unwrap();
     }

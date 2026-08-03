@@ -3725,6 +3725,125 @@ body.xterm-active .shell-terminal {
   background: var(--panel);
 }
 
+.first-chat-cli-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1340;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgb(0 0 0 / 55%);
+}
+
+.first-chat-cli-modal.hidden {
+  display: none;
+}
+
+.first-chat-cli-dialog {
+  display: grid;
+  width: min(440px, 100%);
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+  background: var(--panel);
+  box-shadow: 0 22px 60px rgb(0 0 0 / 32%);
+}
+
+.first-chat-cli-dialog header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.first-chat-cli-dialog h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.first-chat-cli-dialog p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.first-chat-cli-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.first-chat-cli-option {
+  display: grid;
+  gap: 8px;
+  place-items: center;
+  padding: 14px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+}
+
+.first-chat-cli-option:hover,
+.first-chat-cli-option:focus-visible {
+  border-color: var(--accent, #6366f1);
+  outline: none;
+  transform: translateY(-1px);
+}
+
+.first-chat-cli-option img {
+  width: 28px;
+  height: 28px;
+}
+
+.chat-cli-picker {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 4px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.chat-cli-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.chat-cli-option:hover,
+.chat-cli-option:focus-visible {
+  color: var(--ink);
+  outline: none;
+}
+
+.chat-cli-option.active {
+  background: var(--panel);
+  border-color: var(--accent, #6366f1);
+  color: var(--ink);
+}
+
+.chat-cli-option img {
+  width: 16px;
+  height: 16px;
+}
+
 .git-commit-modal {
   position: fixed;
   inset: 0;
@@ -4212,7 +4331,7 @@ body:not(.wrap-output) .side-by-side pre {
 
 .folder-browser-panel {
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   width: min(720px, 100%);
   max-height: min(760px, calc(100vh - 32px));
   overflow: hidden;
@@ -4275,6 +4394,16 @@ body:not(.wrap-output) .side-by-side pre {
   min-height: 0;
   overflow: auto;
   padding: 10px 12px 12px;
+}
+
+.folder-browser-footer {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding: 10px 12px;
+  background: var(--panel);
 }
 
 .folder-row {
@@ -5377,6 +5506,48 @@ th {
   font-size: 11px;
   font-style: italic;
   white-space: pre-wrap;
+}
+
+#chat-output .chat-line-tool {
+  align-self: stretch;
+  width: 100%;
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+  color: var(--muted);
+}
+
+#chat-output .chat-line-tool summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+  user-select: none;
+}
+
+#chat-output .chat-line-tool .chat-line-text {
+  max-height: 320px;
+  margin: 7px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font: inherit;
+}
+
+#chat-output .chat-history-load-older {
+  align-self: center;
+  padding: 6px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  color: var(--text);
+  cursor: pointer;
+}
+
+#chat-output .chat-history-load-older:disabled {
+  cursor: wait;
+  opacity: 0.65;
 }
 
 /* ----------------------------------------------------------------------

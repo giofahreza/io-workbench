@@ -157,3 +157,21 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_history_treats_agent_content_as_text_and_pages_from_the_tail() {
+        let app = get_asset("app.js").expect("app.js");
+        let source = std::str::from_utf8(app.bytes).expect("utf-8 JavaScript");
+        assert!(source.contains("text.textContent = String(content)"));
+        assert!(source.contains("text.textContent = String(prompt)"));
+        assert!(!source.contains("text.innerHTML = content"));
+        assert!(!source.contains("text.innerHTML = prompt"));
+        assert!(source.contains("tail=true"));
+        assert!(source.contains("chat-history-load-older"));
+        assert!(source.contains("replayToolLine"));
+    }
+}

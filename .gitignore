@@ -5,3 +5,6 @@
 *.swp
 *.tmp
 .DS_Store
+apps/mobile/androidApp/google-services.json
+*service-account*.json
+.playwright-mcp/

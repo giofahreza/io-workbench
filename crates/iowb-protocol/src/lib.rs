@@ -286,6 +286,44 @@ pub struct SessionSnapshotResponse {
     pub total_count: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionDraftResponse {
+    pub session_id: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateSessionDraftRequest {
+    #[serde(default)]
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterFcmTokenRequest {
+    pub token: String,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(rename = "deviceId", default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(rename = "appId", default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteFcmTokenRequest {
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FcmTokenResponse {
+    pub success: bool,
+    #[serde(rename = "tokenCount", default)]
+    pub token_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileKind {
@@ -311,6 +349,14 @@ pub struct FileContentResponse {
     pub path: String,
     pub content: String,
     pub size: u64,
+    #[serde(
+        rename = "contentEncoding",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub content_encoding: Option<String>,
+    #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modified: Option<DateTime<Utc>>,
 }
@@ -341,6 +387,11 @@ pub struct RenameFileRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRenameFileRequest {
+    pub entries: Vec<RenameFileRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopyFileRequest {
     #[serde(rename = "sourcePath")]
     pub source_path: String,
@@ -349,9 +400,19 @@ pub struct CopyFileRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchCopyFileRequest {
+    pub entries: Vec<CopyFileRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteFileRequest {
     #[serde(rename = "filePath")]
     pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchDeleteFileRequest {
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1215,6 +1276,20 @@ pub enum WsServerEvent {
         #[serde(rename = "sessionId")]
         session_id: String,
         status: SessionRuntimeStatus,
+        #[serde(
+            rename = "responseId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+        #[serde(
+            rename = "latestUserPrompt",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        latest_user_prompt: Option<String>,
     },
     SessionMetadata {
         provider: Provider,
@@ -1236,6 +1311,14 @@ pub enum WsServerEvent {
         first_user_at: Option<DateTime<Utc>>,
         #[serde(rename = "tokenUsage", skip_serializing_if = "Option::is_none")]
         token_usage: Option<SessionTokenUsage>,
+        #[serde(
+            rename = "responseId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
     },
     Output {
         provider: Provider,
@@ -1244,6 +1327,14 @@ pub enum WsServerEvent {
         content: String,
         #[serde(default)]
         done: bool,
+        #[serde(
+            rename = "responseId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
     },
     ProcessOutput {
         #[serde(rename = "processId")]

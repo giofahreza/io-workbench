@@ -17,6 +17,7 @@ iowb-process.workspace = true
 iowb-protocol.workspace = true
 iowb-storage.workspace = true
 iowb-ui.workspace = true
+jsonwebtoken.workspace = true
 notify.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true

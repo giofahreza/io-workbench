@@ -75,7 +75,11 @@ const state = {
   },
   currentFileDirty: false,
   chatBuffer: "",
+  chatPromptDraftSessionId: "",
+  chatPromptDraftSaveTimer: null,
+  chatPromptDraftLoadingSessionId: "",
   chatProcessing: null,
+  cliPickerVisible: true,
   lastSessionMessages: [],
   shellBuffer: "",
   virtualLists: {},
@@ -937,6 +941,7 @@ function clearSelectedChatSession(sessionId) {
   if (state.chatSessionId !== sessionId && state.pendingChatSessionId !== sessionId) return;
   state.chatSessionId = "";
   state.pendingChatSessionId = "";
+  state.chatPromptDraftSessionId = "";
   state.currentSession = null;
   if (state.preferences.lastChatSessionId === sessionId) {
     state.preferences.lastChatSessionId = "";
@@ -1002,10 +1007,14 @@ function updatePendingChatProvider(provider) {
 
 function renderChatProviderPicker() {
   const selected = chatCliValue();
-  document.querySelectorAll("[data-chat-provider-option]").forEach((button) => {
-    const active = button.dataset.chatProviderOption === selected;
+  document.querySelectorAll("[data-chat-provider-option], [data-chat-cli-option]").forEach((button) => {
+    const value = button.dataset.chatProviderOption || button.dataset.chatCliOption;
+    const active = value === selected;
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  document.querySelectorAll(".chat-cli-picker").forEach((picker) => {
+    picker.classList.toggle("hidden", !state.cliPickerVisible);
   });
 }
 
@@ -1026,6 +1035,89 @@ function chatSessionIdForSubmit() {
   const pending = pendingId ? findChatSession(pendingId) : null;
   if (pending?.pending) return pendingId;
   return state.chatSessionId || "";
+}
+
+function currentChatDraftSessionId() {
+  const id = state.chatSessionId || "";
+  if (!id || state.pendingChatSessionId === id) return "";
+  const session = findChatSession(id);
+  if (session?.pending) return "";
+  return id;
+}
+
+function setChatPromptValue(value) {
+  const prompt = qs("#chat-prompt");
+  if (!prompt) return;
+  prompt.value = value || "";
+  autosizeChatPrompt();
+  updateChatComposerState();
+}
+
+async function loadChatPromptDraft(sessionId) {
+  const id = (sessionId || "").trim();
+  if (!id) {
+    state.chatPromptDraftSessionId = "";
+    setChatPromptValue("");
+    return;
+  }
+  state.chatPromptDraftLoadingSessionId = id;
+  try {
+    const body = await api(`/api/sessions/${encodeURIComponent(id)}/draft`);
+    if (state.chatPromptDraftLoadingSessionId !== id || currentChatDraftSessionId() !== id) return;
+    state.chatPromptDraftSessionId = id;
+    setChatPromptValue(body?.content || "");
+  } catch (error) {
+    if (state.chatPromptDraftLoadingSessionId === id && currentChatDraftSessionId() === id) {
+      showError(new Error(`Could not load prompt draft: ${error.message}`));
+    }
+  } finally {
+    if (state.chatPromptDraftLoadingSessionId === id) {
+      state.chatPromptDraftLoadingSessionId = "";
+    }
+  }
+}
+
+async function saveChatPromptDraftNow() {
+  if (state.chatPromptDraftSaveTimer) {
+    window.clearTimeout(state.chatPromptDraftSaveTimer);
+    state.chatPromptDraftSaveTimer = null;
+  }
+  const sessionId = currentChatDraftSessionId();
+  const prompt = qs("#chat-prompt");
+  if (!sessionId || !prompt) return;
+  const content = prompt.value || "";
+  state.chatPromptDraftSessionId = sessionId;
+  if (!content.trim()) {
+    await api(`/api/sessions/${encodeURIComponent(sessionId)}/draft`, { method: "DELETE" });
+    return;
+  }
+  await api(`/api/sessions/${encodeURIComponent(sessionId)}/draft`, {
+    method: "PUT",
+    body: JSON.stringify({ content }),
+  });
+}
+
+function scheduleChatPromptDraftSave() {
+  if (state.chatPromptDraftSaveTimer) {
+    window.clearTimeout(state.chatPromptDraftSaveTimer);
+  }
+  state.chatPromptDraftSaveTimer = window.setTimeout(() => {
+    saveChatPromptDraftNow().catch((error) => {
+      console.warn("Unable to sync prompt draft", error);
+    });
+  }, 1000);
+}
+
+function clearRemoteChatPromptDraft(sessionId) {
+  const id = (sessionId || "").trim();
+  if (!id) return;
+  if (state.chatPromptDraftSaveTimer) {
+    window.clearTimeout(state.chatPromptDraftSaveTimer);
+    state.chatPromptDraftSaveTimer = null;
+  }
+  api(`/api/sessions/${encodeURIComponent(id)}/draft`, { method: "DELETE" }).catch((error) => {
+    console.warn("Unable to clear prompt draft", error);
+  });
 }
 
 function updateChatEmptyState() {
@@ -1355,6 +1447,9 @@ function resetChatOutputDom() {
 // references so each new chunk renders into the right text node without
 // tearing down the existing struct.
 let chatStream = { role: null, node: null, text: null, buffer: "" };
+const CHAT_HISTORY_PAGE_SIZE = 30;
+const CHAT_LIVE_RENDER_MAX_CHARS = 128 * 1024;
+let chatHistoryWindow = { sessionId: "", offset: 0, totalCount: 0, messages: [] };
 
 function chatOutputRoot() {
   return qs("#chat-output");
@@ -1408,9 +1503,17 @@ function sessionMetaForStatus(payload = {}) {
   };
 }
 
-function setProcessingText(textNode, label = "Processing") {
+function setProcessingText(textNode, label = "Sending") {
   if (!textNode) return;
   textNode.innerHTML = `<span class="chat-processing-label">${escapeHtml(label)}</span><span class="chat-processing-dots" aria-hidden="true"></span>`;
+}
+
+function updateProcessingLabel(label) {
+  const processing = state.chatProcessing;
+  if (!processing?.node?.isConnected || !processing.text) return;
+  const existing = processing.text.querySelector(".chat-processing-label");
+  if (existing && existing.textContent === label) return;
+  setProcessingText(processing.text, label);
 }
 
 function ensureChatProcessing(payload = {}) {
@@ -1514,10 +1617,8 @@ function renderChatLineFooter(footer, meta) {
 function replayUserPromptLine(prompt, meta) {
   const output = chatOutputRoot();
   if (!output) return;
-  const isHtml = typeof prompt === "string" && /<[a-z][^>]*>/i.test(prompt);
   const { node, text, footer } = buildChatLineNode("user");
-  if (isHtml) text.innerHTML = prompt;
-  else text.textContent = String(prompt);
+  text.textContent = String(prompt);
   renderChatLineFooter(footer, meta);
   output.appendChild(node);
 }
@@ -1525,11 +1626,27 @@ function replayUserPromptLine(prompt, meta) {
 function replayAssistantLine(content, meta) {
   const output = chatOutputRoot();
   if (!output) return;
-  const isHtml = typeof content === "string" && /<[a-z][^>]*>/i.test(content);
   const { node, text, footer } = buildChatLineNode("assistant");
-  if (isHtml) text.innerHTML = content;
-  else text.textContent = String(content);
+  // Agent output is untrusted. HTML/CSS/script text must never become
+  // application DOM, even when a tool has returned an entire web page.
+  text.textContent = String(content);
   renderChatLineFooter(footer, meta);
+  output.appendChild(node);
+}
+
+function replayToolLine(content, meta) {
+  const output = chatOutputRoot();
+  if (!output) return;
+  const node = document.createElement("details");
+  node.className = "chat-line-tool";
+  const summary = document.createElement("summary");
+  summary.textContent = meta.toolName ? `Tool · ${meta.toolName}` : "Tool output";
+  const text = document.createElement("pre");
+  text.className = "chat-line-text";
+  // Keep tool output collapsed and plain until the user explicitly opens it.
+  text.textContent = String(content);
+  node.appendChild(summary);
+  node.appendChild(text);
   output.appendChild(node);
 }
 
@@ -1547,6 +1664,7 @@ function replayChatMessages(messages) {
     const meta = normalizeMessageMeta(persistedMeta);
     if (role === "user") replayUserPromptLine(content, meta);
     else if (role === "assistant") replayAssistantLine(content, meta);
+    else if (role === "tool") replayToolLine(content, meta);
     else if (role === "system") {
       const output = chatOutputRoot();
       if (!output) return;
@@ -1607,13 +1725,33 @@ function normalizeMessageMeta(raw) {
 async function loadChatHistoryForSession(sessionId, opts = {}) {
   if (!sessionId) return false;
   try {
-    const url = `/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=200&offset=0`;
+    const loadingOlder = opts.older === true && chatHistoryWindow.sessionId === sessionId;
+    const previousOutput = chatOutputRoot();
+    const previousHeight = previousOutput?.scrollHeight || 0;
+    const previousTop = previousOutput?.scrollTop || 0;
+    const requestedOffset = loadingOlder
+      ? Math.max(0, chatHistoryWindow.offset - CHAT_HISTORY_PAGE_SIZE)
+      : 0;
+    const requestedLimit = loadingOlder
+      ? chatHistoryWindow.offset - requestedOffset
+      : CHAT_HISTORY_PAGE_SIZE;
+    if (loadingOlder && requestedLimit <= 0) return true;
+    const query = loadingOlder
+      ? `limit=${requestedLimit}&offset=${requestedOffset}`
+      : `limit=${CHAT_HISTORY_PAGE_SIZE}&tail=true`;
+    const url = `/api/sessions/${encodeURIComponent(sessionId)}/messages?${query}`;
     const body = await api(url);
-    const messages = Array.isArray(body) ? body : (body.messages || []);
+    const page = Array.isArray(body) ? body : (body.messages || []);
+    const totalCount = Number(body?.total_count ?? body?.totalCount ?? page.length) || page.length;
+    const messages = loadingOlder
+      ? page.concat(chatHistoryWindow.messages)
+      : page;
+    const offset = loadingOlder
+      ? requestedOffset
+      : Math.max(0, totalCount - page.length);
+    chatHistoryWindow = { sessionId, offset, totalCount, messages };
     resetChatOutputDom();
     const persisted = getSessionOverridesFor(sessionId) || {};
-    const all = readSessionOverrides();
-    const overrides = all[sessionId] || {};
     const replayMeta = (msg, role) => {
       // Prefer the per-message metadata persisted on the message row by the
       // server. Fall back to the legacy per-session override so older turns
@@ -1645,6 +1783,21 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
         elapsed: isLatest ? persisted.elapsed : "",
       };
     };
+    if (offset > 0) {
+      const output = chatOutputRoot();
+      if (output) {
+        const loadOlder = document.createElement("button");
+        loadOlder.type = "button";
+        loadOlder.className = "chat-history-load-older";
+        loadOlder.textContent = `Load older messages (${offset} remaining)`;
+        loadOlder.addEventListener("click", async () => {
+          loadOlder.disabled = true;
+          loadOlder.textContent = "Loading older messages…";
+          await loadChatHistoryForSession(sessionId, { older: true });
+        });
+        output.appendChild(loadOlder);
+      }
+    }
     for (const raw of messages) {
       if (!raw) continue;
       const role = String(raw.role || "").toLowerCase();
@@ -1652,6 +1805,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       const meta = replayMeta(raw, role);
       if (role === "user") replayUserPromptLine(content, meta);
       else if (role === "assistant") replayAssistantLine(content, meta);
+      else if (role === "tool") replayToolLine(content, meta);
       else if (role === "system") {
         const output = chatOutputRoot();
         if (!output) continue;
@@ -1661,7 +1815,12 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
         output.appendChild(node);
       }
     }
-    scrollChatToBottom();
+    const output = chatOutputRoot();
+    if (loadingOlder && output) {
+      output.scrollTop = Math.max(0, output.scrollHeight - previousHeight + previousTop);
+    } else {
+      scrollChatToBottom();
+    }
     // Restore the per-session overrides + footer (legacy slot).
     loadSessionOverridesIntoState(sessionId);
     renderChatFooter(getSessionOverridesFor(sessionId));
@@ -1676,6 +1835,9 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
 async function pickChatSession(sessionId, projectPath) {
   const id = (sessionId || "").trim();
   if (!id) return;
+  await saveChatPromptDraftNow().catch((error) => {
+    console.warn("Unable to sync prompt draft before switching session", error);
+  });
   const session = findChatSession(id);
   state.pendingChatSessionId = id;
   state.chatSessionId = id;
@@ -1685,11 +1847,13 @@ async function pickChatSession(sessionId, projectPath) {
   await switchView("chat");
   if (session?.pending) {
     resetChatOutputDom();
+    setChatPromptValue("");
     updateChatEmptyState();
     return;
   }
   state.pendingChatSessionId = "";
   await loadChatHistoryForSession(id);
+  await loadChatPromptDraft(id);
 }
 
 // Start a fresh chat session for a given project. Wipes any active session
@@ -1701,6 +1865,9 @@ async function pickChatSession(sessionId, projectPath) {
 // transitions seamlessly from placeholder to real session.
 async function startNewChatForProject(projectPath) {
   if (!projectPath) return;
+  await saveChatPromptDraftNow().catch((error) => {
+    console.warn("Unable to sync prompt draft before starting new chat", error);
+  });
   setActiveProject(projectPath);
   const project = (state.projects || []).find((p) => p.path === projectPath);
   const cli = chatCliValue();
@@ -1727,6 +1894,7 @@ async function startNewChatForProject(projectPath) {
   state.pendingChatSessionId = placeholderId;
   state.preferences.lastChatSessionId = placeholderId;
   state.chatBuffer = "";
+  state.cliPickerVisible = true;
   if (!state.expandedProjectPaths.has(projectPath)) {
     state.expandedProjectPaths.add(projectPath);
     saveExpandedProjectPaths();
@@ -1740,6 +1908,7 @@ async function startNewChatForProject(projectPath) {
   const prompt = qs("#chat-prompt");
   if (prompt) {
     prompt.value = "";
+    state.chatPromptDraftSessionId = "";
     prompt.focus();
     autosizeChatPrompt();
   }
@@ -6291,6 +6460,9 @@ function connectWs() {
       }
       if (status === "starting" || status === "running" || status === "waiting-for-input") {
         ensureChatProcessing(payload);
+        if (status === "running" || status === "waiting-for-input") {
+          updateProcessingLabel("Processing");
+        }
       } else if (status === "completed") {
         if (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer) {
           finishChatProcessing(payload);
@@ -7248,6 +7420,9 @@ function bindForms() {
   document.querySelectorAll("[data-chat-provider-option]").forEach((button) => {
     button.addEventListener("click", () => chooseNewChatProvider(button.dataset.chatProviderOption));
   });
+  document.querySelectorAll("[data-chat-cli-option]").forEach((button) => {
+    button.addEventListener("click", () => chooseNewChatProvider(button.dataset.chatCliOption));
+  });
   qs("#folder-browser-close").addEventListener("click", closeFolderBrowser);
   qs("#folder-browser").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) closeFolderBrowser();
@@ -7343,6 +7518,8 @@ function bindForms() {
   qs("#file-editor-form").addEventListener("submit", (event) => saveFile(event).catch(showError));
   qs("#create-file").addEventListener("click", () => startCreateFileTreePath(false, qs("#files-path")?.value || "."));
   qs("#create-directory").addEventListener("click", () => startCreateFileTreePath(true, qs("#files-path")?.value || "."));
+  qs("#editor-create-file")?.addEventListener("click", () => startCreateFileTreePath(false, qs("#files-path")?.value || "."));
+  qs("#editor-create-directory")?.addEventListener("click", () => startCreateFileTreePath(true, qs("#files-path")?.value || "."));
   qs("#delete-file").addEventListener("click", () => deletePath().catch(showError));
   qs("#download-file").addEventListener("click", downloadCurrentFile);
   qs("#reload-file").addEventListener("click", (event) => withButtonLoading(event.currentTarget, reloadCurrentFile).catch(showError));
@@ -7423,12 +7600,17 @@ function bindForms() {
   qs("#load-git-config").addEventListener("click", () => loadSettingsView("/api/user/git-config").catch(showError));
   qs("#chat-upload-images").addEventListener("click", () => qs("#chat-image-input").click());
   qs("#chat-image-input").addEventListener("change", () => uploadChatImages().catch(showError));
-  qs("#chat-prompt").addEventListener("input", autosizeChatPrompt);
+  qs("#chat-prompt").addEventListener("input", () => {
+    autosizeChatPrompt();
+    scheduleChatPromptDraftSave();
+  });
   qs("#chat-prompt").addEventListener("focus", autosizeChatPrompt);
   qs("#clear-chat").addEventListener("click", () => {
     const prompt = qs("#chat-prompt");
     prompt.value = "";
     autosizeChatPrompt();
+    const sessionId = currentChatDraftSessionId();
+    if (sessionId) clearRemoteChatPromptDraft(sessionId);
     prompt.focus();
   });
   qs("#clear-shell").addEventListener("click", () => {
@@ -7500,6 +7682,12 @@ function bindForms() {
       return;
     }
     const cli = chatCliValue();
+    if (!cli) {
+      showError(new Error("Pick a CLI (Codex, Claude, or Gemini) before sending a prompt."));
+      const picker = qs(".chat-cli-picker");
+      if (picker) picker.scrollIntoView({ block: "center", behavior: "smooth" });
+      return;
+    }
     const prompt = chatPromptWithImages(qs("#chat-prompt").value.trim());
     if (!prompt) return;
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
@@ -7539,6 +7727,8 @@ function bindForms() {
     };
     if (sessionId) message.sessionId = sessionId;
     state.ws.send(JSON.stringify(message));
+    state.cliPickerVisible = false;
+    renderChatProviderPicker();
     // Drop the placeholder entry for this session; the server will adopt the
     // id and the next `projects_updated` broadcast will surface the real
     // session row in its place.
@@ -7554,6 +7744,7 @@ function bindForms() {
       state.chatSessionId = sessionId;
       state.preferences.lastChatSessionId = sessionId;
       savePreferences();
+      if (currentChatDraftSessionId() === sessionId) clearRemoteChatPromptDraft(sessionId);
     }
     state.pendingChatSessionId = "";
     qs("#chat-prompt").value = "";
@@ -7752,7 +7943,7 @@ function appendChat(value) {
   const output = chatOutputRoot();
   if (!output) return;
   if (typeof value !== "string") value = String(value);
-  state.chatBuffer = `${state.chatBuffer}${value}`.slice(-200_000);
+  state.chatBuffer = `${state.chatBuffer}${value}`.slice(-CHAT_LIVE_RENDER_MAX_CHARS);
   // Lazily spin up the assistant stream node the first time we receive
   // content after a reset / user prompt.
   if (!chatStream.node || chatStream.role !== "assistant") {

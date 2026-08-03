@@ -3,11 +3,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use iowb_protocol::{
     ChatMessage, DatabaseConnectionInput, DatabaseConnectionProfile, DatabaseTestStatus,
-    DatabaseTransferJob, MessageRole, ProjectSummary, Provider, SessionSummary, SettingEntry,
-    SupportedDatabaseType,
+    DatabaseTransferJob, MessageRole, ProjectSummary, Provider, SessionDraftResponse,
+    SessionSummary, SettingEntry, SupportedDatabaseType,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -83,6 +83,81 @@ pub struct CredentialRecord {
 pub struct StoredDatabaseConnection {
     pub profile: DatabaseConnectionProfile,
     pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredFcmToken {
+    pub token: String,
+    pub user_id: String,
+    pub platform: Option<String>,
+    pub device_id: Option<String>,
+    pub app_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+}
+
+/// A persisted agent invocation that can be continued after the server process
+/// exits unexpectedly.
+///
+/// Status values are intentionally stored as strings so the runtime can add a
+/// terminal status without requiring a storage schema migration. Storage uses
+/// `running` and `recovering` to identify work eligible for restart recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDurableChatRun {
+    pub id: String,
+    pub user_id: Option<String>,
+    pub session_id: String,
+    pub native_session_id: Option<String>,
+    pub provider: String,
+    pub prompt: String,
+    pub project_path: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub mode: Option<String>,
+    pub thinking: Option<bool>,
+    pub status: String,
+    pub auto_resume: bool,
+    pub resume_attempts: u32,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub recovered_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl StoredDurableChatRun {
+    pub fn new(
+        id: impl Into<String>,
+        user_id: Option<String>,
+        session_id: impl Into<String>,
+        provider: impl Into<String>,
+        prompt: impl Into<String>,
+        project_path: impl Into<String>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: id.into(),
+            user_id,
+            session_id: session_id.into(),
+            native_session_id: None,
+            provider: provider.into(),
+            prompt: prompt.into(),
+            project_path: project_path.into(),
+            model: None,
+            effort: None,
+            mode: None,
+            thinking: None,
+            status: "running".to_string(),
+            auto_resume: true,
+            resume_attempts: 0,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            recovered_at: None,
+            completed_at: None,
+        }
+    }
 }
 
 impl Storage {
@@ -171,6 +246,13 @@ impl Storage {
                     model TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS deleted_sessions (
+                    session_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    deleted_at TEXT NOT NULL,
+                    PRIMARY KEY(session_id, provider)
+                );
+
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
@@ -246,6 +328,65 @@ impl Storage {
 
                 CREATE INDEX IF NOT EXISTS idx_database_transfer_jobs_user_id
                     ON database_transfer_jobs(user_id, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS durable_chat_runs (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    session_id TEXT NOT NULL,
+                    native_session_id TEXT,
+                    provider TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    project_path TEXT NOT NULL,
+                    model TEXT,
+                    effort TEXT,
+                    mode TEXT,
+                    thinking INTEGER,
+                    status TEXT NOT NULL,
+                    auto_resume INTEGER NOT NULL DEFAULT 1,
+                    resume_attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    recovered_at TEXT,
+                    completed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_durable_chat_runs_recoverable
+                    ON durable_chat_runs(status, auto_resume, resume_attempts, updated_at);
+
+                CREATE INDEX IF NOT EXISTS idx_durable_chat_runs_session
+                    ON durable_chat_runs(session_id, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS session_drafts (
+                    user_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id, session_id),
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_drafts_session
+                    ON session_drafts(session_id, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS fcm_device_tokens (
+                    token TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    platform TEXT,
+                    device_id TEXT,
+                    app_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_fcm_device_tokens_user_id
+                    ON fcm_device_tokens(user_id, updated_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_fcm_device_tokens_device
+                    ON fcm_device_tokens(user_id, device_id);
                 "#,
             )?;
 
@@ -646,6 +787,261 @@ impl Storage {
         })
     }
 
+    pub fn tombstone_session(&self, session_id: &str, provider: Provider) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            conn.execute(
+                r#"
+                INSERT INTO deleted_sessions (session_id, provider, deleted_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(session_id, provider) DO UPDATE SET
+                    deleted_at = excluded.deleted_at
+                "#,
+                params![session_id, provider.as_str(), now],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_deleted_sessions(&self) -> Result<Vec<(Provider, String)>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT provider, session_id
+                FROM deleted_sessions
+                "#,
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let provider_raw: String = row.get(0)?;
+                let session_id: String = row.get(1)?;
+                Ok((parse_provider(&provider_raw), session_id))
+            })?;
+            let mut sessions = Vec::new();
+            for row in rows {
+                sessions.push(row?);
+            }
+            Ok(sessions)
+        })
+    }
+
+    /// Persist a run before its agent process is launched. Callers normally
+    /// construct the value with [`StoredDurableChatRun::new`], which starts it
+    /// in the `running` state with recovery enabled.
+    pub fn create_durable_chat_run(&self, run: &StoredDurableChatRun) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                r#"
+                INSERT INTO durable_chat_runs (
+                    id, user_id, session_id, native_session_id, provider, prompt,
+                    project_path, model, effort, mode, thinking, status, auto_resume,
+                    resume_attempts, last_error, created_at, updated_at, recovered_at,
+                    completed_at
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16, ?17, ?18, ?19
+                )
+                "#,
+                params![
+                    run.id,
+                    run.user_id,
+                    run.session_id,
+                    run.native_session_id,
+                    run.provider,
+                    run.prompt,
+                    run.project_path,
+                    run.model,
+                    run.effort,
+                    run.mode,
+                    run.thinking.map(i64::from),
+                    run.status,
+                    i64::from(run.auto_resume),
+                    i64::from(run.resume_attempts),
+                    run.last_error,
+                    run.created_at.to_rfc3339(),
+                    run.updated_at.to_rfc3339(),
+                    run.recovered_at.map(|time| time.to_rfc3339()),
+                    run.completed_at.map(|time| time.to_rfc3339()),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_durable_chat_run(&self, run_id: &str) -> Result<Option<StoredDurableChatRun>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT id, user_id, session_id, native_session_id, provider, prompt,
+                       project_path, model, effort, mode, thinking, status, auto_resume,
+                       resume_attempts, last_error, created_at, updated_at, recovered_at,
+                       completed_at
+                FROM durable_chat_runs
+                WHERE id = ?1
+                "#,
+                params![run_id],
+                map_durable_chat_run_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    pub fn update_durable_chat_run_native_session_id(
+        &self,
+        run_id: &str,
+        native_session_id: Option<&str>,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                r#"
+                UPDATE durable_chat_runs
+                SET native_session_id = ?1, updated_at = ?2
+                WHERE id = ?3
+                "#,
+                params![native_session_id, now, run_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Return resumable runs in oldest-first order. Runs which disabled
+    /// automatic recovery, exhausted their retry allowance, or reached a
+    /// terminal status are omitted.
+    pub fn list_recoverable_durable_chat_runs(
+        &self,
+        max_resume_attempts: u32,
+        limit: usize,
+    ) -> Result<Vec<StoredDurableChatRun>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, user_id, session_id, native_session_id, provider, prompt,
+                       project_path, model, effort, mode, thinking, status, auto_resume,
+                       resume_attempts, last_error, created_at, updated_at, recovered_at,
+                       completed_at
+                FROM durable_chat_runs
+                WHERE status IN ('running', 'recovering')
+                  AND auto_resume = 1
+                  AND resume_attempts < ?1
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?2
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![i64::from(max_resume_attempts), limit],
+                map_durable_chat_run_row,
+            )?;
+            let mut runs = Vec::new();
+            for row in rows {
+                runs.push(row?);
+            }
+            Ok(runs)
+        })
+    }
+
+    /// Return every non-terminal run, including runs which opted out of
+    /// recovery or exhausted their retry budget. Startup reconciliation can
+    /// use this to explicitly mark those rows interrupted.
+    pub fn list_active_durable_chat_runs(&self) -> Result<Vec<StoredDurableChatRun>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, user_id, session_id, native_session_id, provider, prompt,
+                       project_path, model, effort, mode, thinking, status, auto_resume,
+                       resume_attempts, last_error, created_at, updated_at, recovered_at,
+                       completed_at
+                FROM durable_chat_runs
+                WHERE status IN ('running', 'recovering')
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )?;
+            let rows = stmt.query_map([], map_durable_chat_run_row)?;
+            let mut runs = Vec::new();
+            for row in rows {
+                runs.push(row?);
+            }
+            Ok(runs)
+        })
+    }
+
+    /// Atomically claim a run for recovery and increment its attempt count.
+    /// Returns `None` if another server already made the run terminal, recovery
+    /// is disabled, or the configured attempt limit has been reached.
+    pub fn mark_durable_chat_run_recovering(
+        &self,
+        run_id: &str,
+        max_resume_attempts: u32,
+    ) -> Result<Option<StoredDurableChatRun>> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                UPDATE durable_chat_runs
+                SET status = 'recovering',
+                    resume_attempts = resume_attempts + 1,
+                    last_error = NULL,
+                    recovered_at = ?1,
+                    updated_at = ?1
+                WHERE id = ?2
+                  AND status IN ('running', 'recovering')
+                  AND auto_resume = 1
+                  AND resume_attempts < ?3
+                RETURNING id, user_id, session_id, native_session_id, provider, prompt,
+                          project_path, model, effort, mode, thinking, status, auto_resume,
+                          resume_attempts, last_error, created_at, updated_at, recovered_at,
+                          completed_at
+                "#,
+                params![now, run_id, i64::from(max_resume_attempts)],
+                map_durable_chat_run_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    /// Mark any run terminal. `status` is kept open-ended for provider-specific
+    /// outcomes such as `completed`, `aborted`, `failed`, or `interrupted`.
+    pub fn mark_durable_chat_run_terminal(
+        &self,
+        run_id: &str,
+        status: &str,
+        last_error: Option<&str>,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                r#"
+                UPDATE durable_chat_runs
+                SET status = ?1,
+                    last_error = ?2,
+                    updated_at = ?3,
+                    completed_at = ?3
+                WHERE id = ?4
+                "#,
+                params![status, last_error, now, run_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    pub fn mark_durable_chat_run_completed(&self, run_id: &str) -> Result<bool> {
+        self.mark_durable_chat_run_terminal(run_id, "completed", None)
+    }
+
+    pub fn mark_durable_chat_run_interrupted(
+        &self,
+        run_id: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        self.mark_durable_chat_run_terminal(run_id, "interrupted", error)
+    }
+
+    pub fn mark_durable_chat_run_failed(&self, run_id: &str, error: &str) -> Result<bool> {
+        self.mark_durable_chat_run_terminal(run_id, "failed", Some(error))
+    }
+
     pub fn append_message(&self, session_id: &str, message: &ChatMessage) -> Result<()> {
         self.with_connection(|conn| {
             conn.execute(
@@ -732,6 +1128,207 @@ impl Storage {
                 Ok(None)
             }
         })
+    }
+
+    pub fn latest_user_message_content(&self, session_id: &str) -> Result<Option<String>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT content FROM messages
+                WHERE session_id = ?1 AND role = 'user'
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                "#,
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    pub fn get_session_draft(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<SessionDraftResponse> {
+        self.with_connection(|conn| {
+            let row = conn
+                .query_row(
+                    r#"
+                    SELECT content, updated_at
+                    FROM session_drafts
+                    WHERE user_id = ?1 AND session_id = ?2
+                    "#,
+                    params![user_id, session_id],
+                    |row| {
+                        let updated_at = parse_time_sql(row.get::<_, String>(1)?)?;
+                        Ok((row.get::<_, String>(0)?, updated_at))
+                    },
+                )
+                .optional()?;
+            Ok(match row {
+                Some((content, updated_at)) => SessionDraftResponse {
+                    session_id: session_id.to_string(),
+                    content,
+                    updated_at: Some(updated_at),
+                },
+                None => SessionDraftResponse {
+                    session_id: session_id.to_string(),
+                    content: String::new(),
+                    updated_at: None,
+                },
+            })
+        })
+    }
+
+    pub fn set_session_draft(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        content: &str,
+    ) -> Result<SessionDraftResponse> {
+        let now = Utc::now();
+        self.with_connection(|conn| {
+            conn.execute(
+                r#"
+                INSERT INTO session_drafts (user_id, session_id, content, updated_at)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(user_id, session_id) DO UPDATE SET
+                    content = excluded.content,
+                    updated_at = excluded.updated_at
+                "#,
+                params![user_id, session_id, content, now.to_rfc3339()],
+            )?;
+            Ok(SessionDraftResponse {
+                session_id: session_id.to_string(),
+                content: content.to_string(),
+                updated_at: Some(now),
+            })
+        })
+    }
+
+    pub fn delete_session_draft(&self, user_id: &str, session_id: &str) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM session_drafts WHERE user_id = ?1 AND session_id = ?2",
+                params![user_id, session_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn upsert_fcm_token(
+        &self,
+        user_id: &str,
+        token: &str,
+        platform: Option<&str>,
+        device_id: Option<&str>,
+        app_id: Option<&str>,
+    ) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            conn.execute(
+                r#"
+                INSERT INTO fcm_device_tokens (
+                    token, user_id, platform, device_id, app_id,
+                    created_at, updated_at, last_seen_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)
+                ON CONFLICT(token) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    platform = excluded.platform,
+                    device_id = excluded.device_id,
+                    app_id = excluded.app_id,
+                    updated_at = excluded.updated_at,
+                    last_seen_at = excluded.last_seen_at
+                "#,
+                params![token, user_id, platform, device_id, app_id, now],
+            )?;
+            self.count_fcm_tokens_for_user_conn(conn, user_id)
+        })
+    }
+
+    pub fn delete_fcm_token(&self, user_id: &str, token: &str) -> Result<usize> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM fcm_device_tokens WHERE user_id = ?1 AND token = ?2",
+                params![user_id, token],
+            )?;
+            self.count_fcm_tokens_for_user_conn(conn, user_id)
+        })
+    }
+
+    pub fn list_fcm_tokens_for_user(&self, user_id: &str) -> Result<Vec<StoredFcmToken>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT token, user_id, platform, device_id, app_id,
+                       created_at, updated_at, last_seen_at
+                FROM fcm_device_tokens
+                WHERE user_id = ?1
+                ORDER BY updated_at DESC
+                "#,
+            )?;
+            let rows = stmt.query_map(params![user_id], map_fcm_token_row)?;
+            let mut tokens = Vec::new();
+            for row in rows {
+                tokens.push(row?);
+            }
+            Ok(tokens)
+        })
+    }
+
+    pub fn list_all_fcm_tokens(&self) -> Result<Vec<StoredFcmToken>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT token, user_id, platform, device_id, app_id,
+                       created_at, updated_at, last_seen_at
+                FROM fcm_device_tokens
+                ORDER BY updated_at DESC
+                "#,
+            )?;
+            let rows = stmt.query_map([], map_fcm_token_row)?;
+            let mut tokens = Vec::new();
+            for row in rows {
+                tokens.push(row?);
+            }
+            Ok(tokens)
+        })
+    }
+
+    pub fn latest_durable_chat_run_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredDurableChatRun>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT id, user_id, session_id, native_session_id, provider, prompt,
+                       project_path, model, effort, mode, thinking, status, auto_resume,
+                       resume_attempts, last_error, created_at, updated_at, recovered_at,
+                       completed_at
+                FROM durable_chat_runs
+                WHERE session_id = ?1
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                "#,
+                params![session_id],
+                map_durable_chat_run_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    fn count_fcm_tokens_for_user_conn(&self, conn: &Connection, user_id: &str) -> Result<usize> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM fcm_device_tokens WHERE user_id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 
     pub fn list_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
@@ -1458,9 +2055,68 @@ fn parse_time(raw: &str) -> Result<DateTime<Utc>> {
 }
 
 fn parse_time_sql(raw: String) -> rusqlite::Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(&raw)
-        .map(|time| time.with_timezone(&Utc))
+    if let Ok(time) = DateTime::parse_from_rfc3339(&raw) {
+        return Ok(time.with_timezone(&Utc));
+    }
+
+    NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S")
+        .map(|time| time.and_utc())
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+}
+
+fn map_durable_chat_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDurableChatRun> {
+    let thinking = row.get::<_, Option<i64>>(10)?.map(|value| value != 0);
+    let resume_attempts_raw = row.get::<_, i64>(13)?;
+    let resume_attempts = u32::try_from(resume_attempts_raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            13,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    let recovered_at = row
+        .get::<_, Option<String>>(17)?
+        .map(parse_time_sql)
+        .transpose()?;
+    let completed_at = row
+        .get::<_, Option<String>>(18)?
+        .map(parse_time_sql)
+        .transpose()?;
+
+    Ok(StoredDurableChatRun {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        session_id: row.get(2)?,
+        native_session_id: row.get(3)?,
+        provider: row.get(4)?,
+        prompt: row.get(5)?,
+        project_path: row.get(6)?,
+        model: row.get(7)?,
+        effort: row.get(8)?,
+        mode: row.get(9)?,
+        thinking,
+        status: row.get(11)?,
+        auto_resume: row.get::<_, i64>(12)? != 0,
+        resume_attempts,
+        last_error: row.get(14)?,
+        created_at: parse_time_sql(row.get::<_, String>(15)?)?,
+        updated_at: parse_time_sql(row.get::<_, String>(16)?)?,
+        recovered_at,
+        completed_at,
+    })
+}
+
+fn map_fcm_token_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredFcmToken> {
+    Ok(StoredFcmToken {
+        token: row.get(0)?,
+        user_id: row.get(1)?,
+        platform: row.get(2)?,
+        device_id: row.get(3)?,
+        app_id: row.get(4)?,
+        created_at: parse_time_sql(row.get::<_, String>(5)?)?,
+        updated_at: parse_time_sql(row.get::<_, String>(6)?)?,
+        last_seen_at: parse_time_sql(row.get::<_, String>(7)?)?,
+    })
 }
 
 fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
@@ -1697,6 +2353,19 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn temporary_storage(label: &str) -> (Storage, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "iowb-storage-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        let storage = Storage::open(root.join("test.db")).expect("storage");
+        (storage, root)
+    }
+
     #[test]
     fn native_session_id_round_trips_through_session_metadata() {
         let unique = SystemTime::now()
@@ -1725,6 +2394,252 @@ mod tests {
             .expect("query")
             .expect("stored session");
         assert_eq!(restored.native_session_id, session.native_session_id);
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn durable_chat_run_round_trips_and_updates_native_session_id() {
+        let (storage, root) = temporary_storage("durable-round-trip");
+        let mut run = StoredDurableChatRun::new(
+            "run-1",
+            Some("user-1".to_string()),
+            "ui-session-1",
+            "codex",
+            "finish the interrupted task",
+            "/tmp/project",
+        );
+        run.native_session_id = Some("native-1".to_string());
+        run.model = Some("gpt-5.4".to_string());
+        run.effort = Some("high".to_string());
+        run.mode = Some("agent".to_string());
+        run.thinking = Some(true);
+
+        storage
+            .create_durable_chat_run(&run)
+            .expect("create durable run");
+        let restored = storage
+            .get_durable_chat_run(&run.id)
+            .expect("get durable run")
+            .expect("stored durable run");
+        assert_eq!(restored, run);
+
+        assert!(
+            storage
+                .update_durable_chat_run_native_session_id(&run.id, Some("native-2"))
+                .expect("update native id")
+        );
+        assert_eq!(
+            storage
+                .get_durable_chat_run(&run.id)
+                .expect("get updated run")
+                .expect("updated run")
+                .native_session_id
+                .as_deref(),
+            Some("native-2")
+        );
+        assert!(
+            storage
+                .update_durable_chat_run_native_session_id(&run.id, None)
+                .expect("clear native id")
+        );
+        assert_eq!(
+            storage
+                .get_durable_chat_run(&run.id)
+                .expect("get cleared run")
+                .expect("cleared run")
+                .native_session_id,
+            None
+        );
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn durable_chat_run_recovery_respects_status_flags_attempts_and_limit() {
+        let (storage, root) = temporary_storage("durable-recovery");
+        let base_time = Utc::now();
+
+        let mut eligible = StoredDurableChatRun::new(
+            "eligible",
+            None,
+            "session-1",
+            "codex",
+            "prompt 1",
+            "/tmp/project",
+        );
+        eligible.created_at = base_time;
+        eligible.updated_at = base_time;
+        eligible.last_error = Some("server stopped".to_string());
+
+        let mut recovering = StoredDurableChatRun::new(
+            "recovering",
+            None,
+            "session-2",
+            "claude",
+            "prompt 2",
+            "/tmp/project",
+        );
+        recovering.status = "recovering".to_string();
+        recovering.resume_attempts = 1;
+        recovering.created_at = base_time + chrono::Duration::seconds(1);
+        recovering.updated_at = recovering.created_at;
+
+        let mut disabled = StoredDurableChatRun::new(
+            "disabled",
+            None,
+            "session-3",
+            "gemini",
+            "prompt 3",
+            "/tmp/project",
+        );
+        disabled.auto_resume = false;
+        disabled.created_at = base_time + chrono::Duration::seconds(2);
+        disabled.updated_at = disabled.created_at;
+
+        let mut exhausted = StoredDurableChatRun::new(
+            "exhausted",
+            None,
+            "session-4",
+            "codex",
+            "prompt 4",
+            "/tmp/project",
+        );
+        exhausted.resume_attempts = 2;
+        exhausted.created_at = base_time + chrono::Duration::seconds(3);
+        exhausted.updated_at = exhausted.created_at;
+
+        let mut terminal = StoredDurableChatRun::new(
+            "terminal",
+            None,
+            "session-5",
+            "codex",
+            "prompt 5",
+            "/tmp/project",
+        );
+        terminal.status = "completed".to_string();
+        terminal.created_at = base_time + chrono::Duration::seconds(4);
+        terminal.updated_at = terminal.created_at;
+
+        for run in [&eligible, &recovering, &disabled, &exhausted, &terminal] {
+            storage
+                .create_durable_chat_run(run)
+                .expect("create durable run");
+        }
+
+        let recoverable = storage
+            .list_recoverable_durable_chat_runs(2, 10)
+            .expect("list recoverable");
+        assert_eq!(
+            recoverable
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eligible", "recovering"]
+        );
+        assert_eq!(
+            storage
+                .list_recoverable_durable_chat_runs(2, 1)
+                .expect("limited list")[0]
+                .id,
+            "eligible"
+        );
+
+        let active = storage
+            .list_active_durable_chat_runs()
+            .expect("list active");
+        assert_eq!(
+            active.iter().map(|run| run.id.as_str()).collect::<Vec<_>>(),
+            vec!["eligible", "recovering", "disabled", "exhausted"]
+        );
+
+        let claimed = storage
+            .mark_durable_chat_run_recovering("eligible", 2)
+            .expect("claim recovery")
+            .expect("eligible claim");
+        assert_eq!(claimed.status, "recovering");
+        assert_eq!(claimed.resume_attempts, 1);
+        assert_eq!(claimed.last_error, None);
+        assert!(claimed.recovered_at.is_some());
+
+        let claimed_again = storage
+            .mark_durable_chat_run_recovering("eligible", 2)
+            .expect("claim second recovery")
+            .expect("eligible second claim");
+        assert_eq!(claimed_again.resume_attempts, 2);
+        assert!(
+            storage
+                .mark_durable_chat_run_recovering("eligible", 2)
+                .expect("attempt exhausted claim")
+                .is_none()
+        );
+        assert!(
+            storage
+                .mark_durable_chat_run_recovering("terminal", 2)
+                .expect("terminal claim")
+                .is_none()
+        );
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn durable_chat_run_terminal_helpers_persist_outcomes() {
+        let (storage, root) = temporary_storage("durable-terminal");
+        let failed = StoredDurableChatRun::new(
+            "failed",
+            None,
+            "session-1",
+            "codex",
+            "prompt",
+            "/tmp/project",
+        );
+        let interrupted = StoredDurableChatRun::new(
+            "interrupted",
+            None,
+            "session-2",
+            "codex",
+            "prompt",
+            "/tmp/project",
+        );
+        storage
+            .create_durable_chat_run(&failed)
+            .expect("create failed run");
+        storage
+            .create_durable_chat_run(&interrupted)
+            .expect("create interrupted run");
+
+        assert!(
+            storage
+                .mark_durable_chat_run_failed("failed", "provider exited")
+                .expect("mark failed")
+        );
+        let failed = storage
+            .get_durable_chat_run("failed")
+            .expect("get failed")
+            .expect("failed run");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.last_error.as_deref(), Some("provider exited"));
+        assert!(failed.completed_at.is_some());
+
+        assert!(
+            storage
+                .mark_durable_chat_run_interrupted("interrupted", Some("retry limit reached"))
+                .expect("mark interrupted")
+        );
+        let interrupted = storage
+            .get_durable_chat_run("interrupted")
+            .expect("get interrupted")
+            .expect("interrupted run");
+        assert_eq!(interrupted.status, "interrupted");
+        assert_eq!(
+            interrupted.last_error.as_deref(),
+            Some("retry limit reached")
+        );
+        assert!(interrupted.completed_at.is_some());
 
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");

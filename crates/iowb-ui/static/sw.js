@@ -1,10 +1,10 @@
-const APP_VERSION = "20260729-03";
-const CACHE_NAME = "io-workbench-web-v120";
+const APP_VERSION = "20260731-01";
+const CACHE_NAME = "io-workbench-web-v121";
 const CORE_ASSETS = [
   "/",
   "/index.html",
-  "/styles.css?v=20260729-03",
-  "/app.js?v=20260729-03",
+  "/styles.css?v=20260731-01",
+  "/app.js?v=20260731-01",
   "/manifest.webmanifest",
   "/openapi.json",
   "/icon.svg",

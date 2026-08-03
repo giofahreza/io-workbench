@@ -7,8 +7,10 @@ authors.workspace = true
 
 [dependencies]
 chrono.workspace = true
+base64.workspace = true
 dirs.workspace = true
 iowb-protocol.workspace = true
+mime_guess.workspace = true
 notify.workspace = true
 serde.workspace = true
 thiserror.workspace = true

@@ -148,6 +148,9 @@
                 <input id="file-editor-path" name="filePath" />
               </label>
               <div class="editor-primary-actions">
+                <button id="editor-create-file" class="icon-button" type="button" aria-label="New File (Cmd+N)" title="New File (Cmd+N)" data-symbol="file-plus"></button>
+                <button id="editor-create-directory" class="icon-button" type="button" aria-label="New Folder (Cmd+Shift+N)" title="New Folder (Cmd+Shift+N)" data-symbol="folder-plus"></button>
+                <span class="ops-separator" aria-hidden="true"></span>
                 <button type="submit" class="primary-action icon-button" aria-label="Save file" title="Save file" data-symbol="save"></button>
                 <button id="reload-file" class="icon-button" type="button" aria-label="Reload file" title="Reload file" data-symbol="refresh"></button>
                 <button id="copy-file-path" class="icon-button" type="button" aria-label="Copy file path" title="Copy file path" data-symbol="copy"></button>
@@ -222,6 +225,20 @@
           </div>
           <form id="chat-form" class="chat-composer">
             <div class="chat-controls" aria-label="Chat overrides">
+              <div class="chat-cli-picker" role="group" aria-label="CLI">
+                <button type="button" class="chat-cli-option" data-chat-cli-option="codex" aria-label="Use Codex" title="Codex">
+                  <img src="/icons/codex-white.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                  <span>Codex</span>
+                </button>
+                <button type="button" class="chat-cli-option" data-chat-cli-option="claude" aria-label="Use Claude" title="Claude">
+                  <img src="/icons/claude-white.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                  <span>Claude</span>
+                </button>
+                <button type="button" class="chat-cli-option" data-chat-cli-option="gemini" aria-label="Use Gemini" title="Gemini">
+                  <img src="/icons/gemini-ai-icon.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                  <span>Gemini</span>
+                </button>
+              </div>
               <label>
                 <span>Model</span>
                 <select id="chat-model"></select>
@@ -830,7 +847,6 @@
             <code id="folder-browser-path">~</code>
           </div>
           <div class="folder-browser-header-actions">
-            <button id="folder-browser-use" type="button" class="primary-action icon-button" aria-label="Use folder" title="Use folder" data-symbol="check"></button>
             <button id="folder-browser-close" class="icon-button" type="button" aria-label="Close folder picker" title="Close" data-symbol="close"></button>
           </div>
         </div>
@@ -842,6 +858,9 @@
         </div>
         <div id="folder-browser-status" class="empty"></div>
         <div id="folder-browser-list" class="folder-browser-list"></div>
+        <div class="folder-browser-footer">
+          <button id="folder-browser-use" type="button" class="primary-action icon-button" aria-label="Use folder" title="Use folder" data-symbol="check"></button>
+        </div>
       </div>
     </div>
     <nav class="bottom-nav" aria-label="Mobile workspace views">
