@@ -1128,6 +1128,7 @@ nav button.active::before,
 }
 
 .workspace {
+  position: relative;
   min-width: 0;
   min-height: 0;
   height: 100vh;
@@ -1136,6 +1137,10 @@ nav button.active::before,
   overflow: hidden;
   padding: 0;
   background: var(--panel);
+}
+
+#mobile-sidebar-fab {
+  display: none;
 }
 
 .main-content-header {
@@ -2645,7 +2650,9 @@ pre {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   background: var(--panel);
+  height: 100%;
   min-height: 0;
+  overflow: hidden;
 }
 
 .chat-body {
@@ -2673,8 +2680,12 @@ pre {
 }
 
 .chat-composer {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
   display: block;
   flex-shrink: 0;
+  min-height: max-content;
   border-top: 0;
   padding: 8px 8px calc(8px + env(safe-area-inset-bottom));
   background: transparent;
@@ -4823,6 +4834,7 @@ th {
   }
 
   .workspace {
+    position: relative;
     grid-row: 1;
     height: auto;
     min-height: 0;
@@ -4842,6 +4854,28 @@ th {
 
   #main-sidebar-toggle {
     display: inline-grid;
+  }
+
+  #mobile-sidebar-fab {
+    position: fixed;
+    top: calc(10px + env(safe-area-inset-top));
+    left: 10px;
+    z-index: 820;
+    display: inline-grid;
+    width: 38px;
+    min-width: 38px;
+    height: 38px;
+    min-height: 38px;
+    border-color: var(--line);
+    background: color-mix(in srgb, var(--panel) 92%, transparent);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+    backdrop-filter: blur(10px);
+  }
+
+  body.sidebar-open #mobile-sidebar-fab,
+  body.auth-active #mobile-sidebar-fab,
+  body.auth-pending #mobile-sidebar-fab {
+    display: none;
   }
 
   .main-title-text h1 {

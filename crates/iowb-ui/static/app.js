@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260729-03";
+const APP_VERSION = "20260804-01";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -103,6 +103,8 @@ const state = {
   projectOrder: readJsonStorage("iowb.projectOrder", []),
   projectMeta: readJsonStorage("iowb.projectMeta", {}),
   pinnedChatSessions: readJsonStorage(PINNED_CHAT_SESSIONS_KEY, []),
+  legacySidebarPinnedChatSessions: [],
+  pinnedChatSessionsPersistTimer: null,
   activeProjectPath: window.localStorage.getItem("iowb.activeProjectPath") || "",
   expandedProjectPaths: new Set(readJsonStorage("iowb.expandedProjects", [])),
   limits: {
@@ -372,7 +374,6 @@ function sidebarStatePayload() {
     projectOrder: state.projectOrder,
     projectMeta: state.projectMeta,
     expandedProjectPaths: [...state.expandedProjectPaths],
-    pinnedChatSessions: state.pinnedChatSessions,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -381,7 +382,9 @@ function saveSidebarStateLocal(payload = sidebarStatePayload()) {
   window.localStorage.setItem("iowb.projectOrder", JSON.stringify(payload.projectOrder || []));
   window.localStorage.setItem("iowb.projectMeta", JSON.stringify(payload.projectMeta || {}));
   window.localStorage.setItem("iowb.expandedProjects", JSON.stringify(payload.expandedProjectPaths || []));
-  window.localStorage.setItem(PINNED_CHAT_SESSIONS_KEY, JSON.stringify(payload.pinnedChatSessions || []));
+  if (Object.prototype.hasOwnProperty.call(payload, "pinnedChatSessions")) {
+    window.localStorage.setItem(PINNED_CHAT_SESSIONS_KEY, JSON.stringify(payload.pinnedChatSessions || []));
+  }
   if (payload.updatedAt) window.localStorage.setItem(SIDEBAR_STATE_UPDATED_KEY, payload.updatedAt);
 }
 
@@ -397,7 +400,7 @@ function applySidebarStatePayload(payload) {
     state.expandedProjectPaths = new Set(payload.expandedProjectPaths.filter((path) => typeof path === "string"));
   }
   if (Array.isArray(payload.pinnedChatSessions)) {
-    state.pinnedChatSessions = normalizePinnedChatSessions(payload.pinnedChatSessions);
+    state.legacySidebarPinnedChatSessions = normalizePinnedChatSessions(payload.pinnedChatSessions);
   }
   saveSidebarStateLocal(payload);
   return true;
@@ -682,6 +685,9 @@ function normalizePinnedChatSessions(entries) {
   return (Array.isArray(entries) ? entries : [])
     .map((entry) => {
       if (typeof entry === "string") {
+        if (!entry.includes("::")) {
+          return { sessionId: entry.trim(), projectPath: "", provider: "" };
+        }
         const [projectPath = "", sessionId = "", provider = ""] = entry.split("::");
         return { projectPath, sessionId, provider };
       }
@@ -690,7 +696,10 @@ function normalizePinnedChatSessions(entries) {
         key: entry.key || pinnedChatKey(entry.projectPath, entry.sessionId, entry.provider),
         projectPath: entry.projectPath || "",
         projectName: entry.projectName || "",
+        projectDisplayName: entry.projectDisplayName || entry.projectName || "",
         sessionId: entry.sessionId || "",
+        title: entry.title || entry.sessionName || "",
+        sessionName: entry.sessionName || entry.title || "",
         provider: entry.provider || "",
         pinnedAt: entry.pinnedAt || new Date().toISOString(),
       };
@@ -704,9 +713,67 @@ function normalizePinnedChatSessions(entries) {
     });
 }
 
+function savePinnedChatSessionsLocal(entries = state.pinnedChatSessions) {
+  window.localStorage.setItem(PINNED_CHAT_SESSIONS_KEY, JSON.stringify(normalizePinnedChatSessions(entries)));
+}
+
+function sharedPinnedChatSessionsPayload(entries = state.pinnedChatSessions) {
+  return normalizePinnedChatSessions(entries).map((entry) => ({
+    key: entry.key || pinnedChatKey(entry.projectPath, entry.sessionId, entry.provider),
+    sessionId: entry.sessionId,
+    projectName: entry.projectName || "",
+    projectDisplayName: entry.projectDisplayName || entry.projectName || "",
+    projectPath: entry.projectPath || "",
+    provider: entry.provider || "",
+    sessionName: entry.sessionName || entry.title || "",
+    pinnedAt: entry.pinnedAt || new Date().toISOString(),
+  }));
+}
+
+async function saveSharedPinnedChatSessions(entries = state.pinnedChatSessions) {
+  state.pinnedChatSessions = sharedPinnedChatSessionsPayload(entries);
+  savePinnedChatSessionsLocal(state.pinnedChatSessions);
+  return api("/api/settings/sidebar-active-sessions", {
+    method: "PUT",
+    body: JSON.stringify({ pinnedSessions: state.pinnedChatSessions }),
+  });
+}
+
+async function loadSharedPinnedChatSessions() {
+  const localPinned = normalizePinnedChatSessions([
+    ...readJsonStorage(PINNED_CHAT_SESSIONS_KEY, []),
+    ...state.legacySidebarPinnedChatSessions,
+  ]);
+  try {
+    const response = await api("/api/settings/sidebar-active-sessions");
+    const remotePinned = normalizePinnedChatSessions(response?.pinnedSessions || []);
+    if (remotePinned.length || !localPinned.length) {
+      state.pinnedChatSessions = remotePinned;
+      savePinnedChatSessionsLocal(remotePinned);
+      return true;
+    }
+    state.pinnedChatSessions = localPinned;
+    await saveSharedPinnedChatSessions(localPinned);
+    return true;
+  } catch (error) {
+    console.debug("shared pinned chat load skipped", error);
+    if (localPinned.length) {
+      state.pinnedChatSessions = localPinned;
+      savePinnedChatSessionsLocal(localPinned);
+    }
+    return false;
+  }
+}
+
 function persistPinnedChatSessions() {
   state.pinnedChatSessions = normalizePinnedChatSessions(state.pinnedChatSessions);
-  persistSidebarState();
+  savePinnedChatSessionsLocal(state.pinnedChatSessions);
+  window.clearTimeout(state.pinnedChatSessionsPersistTimer);
+  state.pinnedChatSessionsPersistTimer = window.setTimeout(() => {
+    saveSharedPinnedChatSessions(state.pinnedChatSessions).catch((error) => {
+      console.warn("Unable to sync pinned chat sessions", error);
+    });
+  }, 300);
 }
 
 function sessionProjectPath(session, fallback = "") {
@@ -739,8 +806,19 @@ function pinnedChatEntries() {
   for (const pin of pinned) {
     const project = (state.projects || []).find((item) => item.path === pin.projectPath || item.name === pin.projectName);
     const session = findChatSession(pin.sessionId);
-    if (!session) continue;
     const projectPath = pin.projectPath || sessionProjectPath(session, project?.path || "");
+    if (!session) {
+      entries.push({
+        id: pin.sessionId,
+        title: pin.title || pin.sessionName || pin.sessionId,
+        provider: pin.provider || "",
+        projectPath,
+        projectName: pin.projectDisplayName || pin.projectName || project?.name || "",
+        pinKey: pin.key || pinnedChatKey(projectPath, pin.sessionId, pin.provider || ""),
+        messageCount: 0,
+      });
+      continue;
+    }
     entries.push({
       ...session,
       provider: pin.provider || sessionProvider(session),
@@ -2539,7 +2617,7 @@ async function loadHealth() {
 }
 
 async function loadProjects() {
-  const body = await api("/api/projects");
+  const body = await api("/api/projects?includeSessions=true");
   state.projects = body.projects || [];
   syncProjectOrder();
   const activeExists = state.projects.some((project) => project.path === state.activeProjectPath);
@@ -7366,6 +7444,7 @@ function bindForms() {
   qs("#sidebar-refresh")?.addEventListener("click", (event) => {
     withButtonLoading(event.currentTarget, async () => {
       await Promise.all([
+        loadSharedPinnedChatSessions().catch(showError),
         loadProjects().catch(showError),
         loadView(activeView()).catch(showError),
       ]);
@@ -7374,10 +7453,11 @@ function bindForms() {
   });
   qs("#bottom-sidebar")?.addEventListener("click", toggleSidebar);
   qs("#main-sidebar-toggle")?.addEventListener("click", toggleSidebar);
+  qs("#mobile-sidebar-fab")?.addEventListener("click", toggleSidebar);
   document.addEventListener("pointerdown", (event) => {
     if (!document.body.classList.contains("sidebar-open")) return;
     if (!window.matchMedia("(max-width: 760px)").matches) return;
-    if (event.target.closest(".sidebar") || event.target.closest("#bottom-sidebar")) return;
+    if (event.target.closest(".sidebar") || event.target.closest("#bottom-sidebar") || event.target.closest("#mobile-sidebar-fab")) return;
     closeSidebar();
   }, true);
   document.addEventListener("click", (event) => {
@@ -7815,6 +7895,7 @@ async function bootstrapProtected() {
     return;
   }
   await loadSidebarState().catch(() => {});
+  await loadSharedPinnedChatSessions().catch(() => {});
   await loadProjects().catch(showError);
   await Promise.allSettled([
     loadSettings().catch(showError),

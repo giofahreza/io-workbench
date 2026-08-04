@@ -168,7 +168,8 @@ impl SessionMode {
     pub fn parse(value: Option<&str>) -> Self {
         match value.unwrap_or("default").to_ascii_lowercase().as_str() {
             "accept-edits" | "acceptedits" | "accept" => SessionMode::AcceptEdits,
-            "bypass" | "danger" | "no-approvals" | "no_approvals" => SessionMode::Bypass,
+            "bypass" | "bypass-permissions" | "bypasspermissions" | "danger" | "no-approvals"
+            | "no_approvals" => SessionMode::Bypass,
             "plan" | "plan-only" => SessionMode::Plan,
             "read-only" | "readonly" | "read" => SessionMode::ReadOnly,
             _ => SessionMode::Default,
@@ -1395,4 +1396,21 @@ fn default_terminal_cols() -> u16 {
 
 fn default_terminal_rows() -> u16 {
     24
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionMode;
+
+    #[test]
+    fn session_mode_parse_accepts_bypass_permissions_alias() {
+        assert_eq!(
+            SessionMode::parse(Some("bypass-permissions")),
+            SessionMode::Bypass
+        );
+        assert_eq!(
+            SessionMode::parse(Some("bypassPermissions")),
+            SessionMode::Bypass
+        );
+    }
 }

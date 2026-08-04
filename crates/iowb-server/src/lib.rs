@@ -2813,11 +2813,7 @@ async fn get_sidebar_active_sessions(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<Value>> {
-    let key = user_setting_key(&user.0.id, "sidebar-active-sessions");
-    let pinned_sessions = state
-        .storage
-        .get_setting(&key)?
-        .unwrap_or_else(|| serde_json::json!([]));
+    let pinned_sessions = load_sidebar_active_sessions(&state, &user.0.id)?;
     Ok(Json(serde_json::json!({
         "success": true,
         "pinnedSessions": pinned_sessions,
@@ -2833,12 +2829,112 @@ async fn set_sidebar_active_sessions(
         .get("pinnedSessions")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
-    let key = user_setting_key(&user.0.id, "sidebar-active-sessions");
-    state.storage.set_setting(&key, &pinned_sessions)?;
+    state
+        .storage
+        .set_setting(SIDEBAR_ACTIVE_SESSIONS_KEY, &pinned_sessions)?;
+    state.storage.set_setting(
+        &user_setting_key(&user.0.id, SIDEBAR_ACTIVE_SESSIONS_KEY),
+        &pinned_sessions,
+    )?;
     Ok(Json(serde_json::json!({
         "success": true,
         "pinnedSessions": pinned_sessions,
     })))
+}
+
+const SIDEBAR_ACTIVE_SESSIONS_KEY: &str = "sidebar-active-sessions";
+
+fn load_sidebar_active_sessions(state: &AppState, user_id: &str) -> Result<Value> {
+    let user_key = user_setting_key(user_id, SIDEBAR_ACTIVE_SESSIONS_KEY);
+    let user_key_suffix = format!(":{SIDEBAR_ACTIVE_SESSIONS_KEY}");
+
+    let mut candidates: Vec<_> = state
+        .storage
+        .list_settings()?
+        .into_iter()
+        .filter(|setting| {
+            setting.key == SIDEBAR_ACTIVE_SESSIONS_KEY
+                || setting.key == user_key
+                || (setting.key.starts_with("user:") && setting.key.ends_with(&user_key_suffix))
+        })
+        .filter(|setting| !sidebar_active_sessions_empty(&setting.value))
+        .collect();
+    candidates.sort_by(|a, b| {
+        (b.key == user_key)
+            .cmp(&(a.key == user_key))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+
+    let pinned_sessions =
+        merge_sidebar_active_sessions(candidates.into_iter().map(|setting| setting.value));
+    if !sidebar_active_sessions_empty(&pinned_sessions) {
+        state
+            .storage
+            .set_setting(SIDEBAR_ACTIVE_SESSIONS_KEY, &pinned_sessions)?;
+        return Ok(pinned_sessions);
+    }
+
+    Ok(serde_json::json!([]))
+}
+
+fn merge_sidebar_active_sessions(sources: impl IntoIterator<Item = Value>) -> Value {
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    let mut fallback = None;
+
+    for source in sources {
+        match source {
+            Value::Array(items) => {
+                for item in items {
+                    if seen.insert(sidebar_active_session_key(&item)) {
+                        merged.push(item);
+                    }
+                }
+            }
+            value if fallback.is_none() => fallback = Some(value),
+            _ => {}
+        }
+    }
+
+    if merged.is_empty() {
+        fallback.unwrap_or_else(|| serde_json::json!([]))
+    } else {
+        Value::Array(merged)
+    }
+}
+
+fn sidebar_active_session_key(value: &Value) -> String {
+    let provider = value
+        .get("provider")
+        .or_else(|| value.get("cli"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let project_path = value
+        .get("projectPath")
+        .or_else(|| value.get("project_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let session_id = value
+        .get("sessionId")
+        .or_else(|| value.get("session_id"))
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    if !session_id.is_empty() {
+        format!("{provider}\u{1f}{project_path}\u{1f}{session_id}")
+    } else {
+        value.to_string()
+    }
+}
+
+fn sidebar_active_sessions_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
 }
 
 async fn get_direct_ai(
@@ -2923,11 +3019,7 @@ async fn chat_provider_models(
             push_chat_model(&mut models, &mut seen, model);
         }
         for model in &gateway_models {
-            push_chat_model(
-                &mut models,
-                &mut seen,
-                chat_gateway_model_alias(provider, model),
-            );
+            push_chat_model(&mut models, &mut seen, model);
         }
     }
 
@@ -2961,18 +3053,6 @@ fn push_chat_model(
     if seen.insert(key) {
         models.push(value.to_string());
     }
-}
-
-fn chat_gateway_model_alias(provider: Provider, model: &str) -> String {
-    if provider == Provider::Claude {
-        if let Some((prefix, rest)) = model.trim().split_once(':')
-            && prefix.eq_ignore_ascii_case("cld")
-            && !rest.trim().is_empty()
-        {
-            return format!("gateway:{}", rest.trim());
-        }
-    }
-    model.to_string()
 }
 
 async fn cached_codex_models() -> Vec<String> {
@@ -3076,27 +3156,15 @@ fn force_io_gateway_config(config: &mut Value) {
         *config = default_direct_ai_config();
     }
 
-    let preserve_proxy_base = config
-        .get("mode")
-        .and_then(Value::as_str)
-        .is_some_and(|mode| matches!(mode, "proxy" | "aiproxy"))
-        && config
-            .get("baseUrl")
-            .or_else(|| config.get("base_url"))
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty());
-
     let Some(obj) = config.as_object_mut() else {
         return;
     };
     obj.insert("mode".to_string(), Value::String("aiproxy".to_string()));
-    if !preserve_proxy_base {
-        obj.remove("base_url");
-        obj.insert(
-            "baseUrl".to_string(),
-            Value::String(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string()),
-        );
-    }
+    obj.remove("base_url");
+    obj.insert(
+        "baseUrl".to_string(),
+        Value::String(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string()),
+    );
     obj.remove("api_key_env");
     obj.insert(
         "apiKeyEnv".to_string(),
@@ -3293,6 +3361,10 @@ fn fallback_models(provider: Provider) -> Vec<String> {
             "o4-mini".to_string(),
         ],
         Provider::Claude => vec![
+            "sonnet".to_string(),
+            "opus".to_string(),
+            "haiku".to_string(),
+            "fable".to_string(),
             "claude-sonnet-4-5".to_string(),
             "claude-sonnet-4".to_string(),
             "claude-opus-4".to_string(),
@@ -7151,23 +7223,19 @@ mod tests {
     }
 
     #[test]
-    fn claude_gateway_catalog_models_use_non_cli_alias() {
-        assert_eq!(
-            chat_gateway_model_alias(Provider::Claude, "cld:claude-sonnet-5"),
-            "gateway:claude-sonnet-5"
-        );
-        assert_eq!(
-            chat_gateway_model_alias(Provider::Claude, "claude-sonnet-5"),
-            "claude-sonnet-5"
-        );
-        assert_eq!(
-            chat_gateway_model_alias(Provider::Gemini, "cld:claude-sonnet-5"),
-            "cld:claude-sonnet-5"
-        );
+    fn claude_fallback_models_include_local_cli_aliases() {
+        let models = fallback_models(Provider::Claude);
+
+        for alias in ["sonnet", "opus", "haiku", "fable"] {
+            assert!(
+                models.iter().any(|model| model == alias),
+                "models: {models:?}"
+            );
+        }
     }
 
     #[test]
-    fn forced_io_gateway_config_preserves_explicit_proxy_endpoint() {
+    fn forced_io_gateway_config_replaces_explicit_proxy_endpoint() {
         let mut config = serde_json::json!({
             "mode": "aiproxy",
             "baseUrl": "http://127.0.0.1:8319/claude",
@@ -7178,7 +7246,7 @@ mod tests {
 
         assert_eq!(
             config.get("baseUrl").and_then(Value::as_str),
-            Some("http://127.0.0.1:8319/claude")
+            Some(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL)
         );
         assert_eq!(
             config.get("apiKeyEnv").and_then(Value::as_str),

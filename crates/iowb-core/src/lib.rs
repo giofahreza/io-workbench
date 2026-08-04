@@ -1167,11 +1167,8 @@ impl SessionManager {
     }
 
     pub async fn messages_including_external(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
-        if let Some(record) = self.external_record(session_id, None, None).await {
-            let messages = self.external_messages(&record).await;
-            if !messages.is_empty() {
-                return Ok(messages.as_ref().clone());
-            }
+        if let Some(messages) = self.external_messages_for_session(session_id).await? {
+            return Ok(messages);
         }
         self.messages(session_id)
     }
@@ -1195,14 +1192,11 @@ impl SessionManager {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ChatMessage>, usize)> {
-        if let Some(record) = self.external_record(session_id, None, None).await {
-            let messages = self.external_messages(&record).await;
-            if !messages.is_empty() {
-                let total = messages.len();
-                let start = offset.min(total);
-                let end = start.saturating_add(limit.max(1).min(500)).min(total);
-                return Ok((messages[start..end].to_vec(), total));
-            }
+        if let Some(messages) = self.external_messages_for_session(session_id).await? {
+            let total = messages.len();
+            let start = offset.min(total);
+            let end = start.saturating_add(limit.max(1).min(500)).min(total);
+            return Ok((messages[start..end].to_vec(), total));
         }
         self.messages_page(session_id, limit, offset)
     }
@@ -1213,13 +1207,10 @@ impl SessionManager {
         limit: usize,
     ) -> Result<(Vec<ChatMessage>, usize)> {
         let limit = limit.max(1).min(500);
-        if let Some(record) = self.external_record(session_id, None, None).await {
-            let messages = self.external_messages(&record).await;
-            if !messages.is_empty() {
-                let total = messages.len();
-                let start = total.saturating_sub(limit);
-                return Ok((messages[start..].to_vec(), total));
-            }
+        if let Some(messages) = self.external_messages_for_session(session_id).await? {
+            let total = messages.len();
+            let start = total.saturating_sub(limit);
+            return Ok((messages[start..].to_vec(), total));
         }
         let (_, total) = self.messages_page(session_id, 1, 0)?;
         let start = total.saturating_sub(limit);
@@ -1329,6 +1320,76 @@ impl SessionManager {
                     same_project_path(&record.summary.project_path, project_path)
                 })
         })
+    }
+
+    async fn external_record_for_messages(
+        &self,
+        session_id: &str,
+    ) -> Option<ExternalSessionRecord> {
+        if let Some(record) = self.external_record(session_id, None, None).await {
+            return Some(record);
+        }
+
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .or_else(|| self.storage.get_session(session_id).ok().flatten())?;
+        if session.provider != Provider::Codex {
+            return None;
+        }
+        let native_session_id = session.native_session_id.as_deref()?;
+
+        // Populate the discovery cache even though normal listing hides native
+        // rollouts already mapped to a Workbench session.
+        let _ = self.external_records().await;
+        let find_record = || async {
+            self.external_cache
+                .read()
+                .await
+                .records
+                .iter()
+                .find(|record| {
+                    record.summary.id == native_session_id
+                        && record.summary.provider == session.provider
+                        && same_project_path(&record.summary.project_path, &session.project_path)
+                })
+                .cloned()
+        };
+        if let Some(record) = find_record().await {
+            return Some(record);
+        }
+
+        // The native rollout may have been created after the last discovery.
+        // Force one refresh so a just-finished external continuation appears
+        // immediately instead of waiting for the normal cache TTL.
+        self.external_cache.write().await.loaded_at = None;
+        let _ = self.external_records().await;
+        find_record().await
+    }
+
+    async fn external_messages_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Vec<ChatMessage>>> {
+        let Some(record) = self.external_record_for_messages(session_id).await else {
+            return Ok(None);
+        };
+        let external = self.external_messages(&record).await;
+        if external.is_empty() {
+            return Ok(None);
+        }
+        if record.summary.id == session_id {
+            return Ok(Some(external.as_ref().clone()));
+        }
+
+        let stored = self.messages(session_id)?;
+        Ok(Some(merge_mapped_external_messages(
+            stored,
+            external.as_ref().clone(),
+        )))
     }
 
     async fn external_messages(&self, record: &ExternalSessionRecord) -> Arc<Vec<ChatMessage>> {
@@ -1449,6 +1510,42 @@ impl SessionManager {
         }
         Ok(())
     }
+}
+
+fn merge_mapped_external_messages(
+    stored: Vec<ChatMessage>,
+    mut external: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    let mut matched_stored = vec![false; stored.len()];
+    for external_message in &mut external {
+        let Some((index, stored_message)) = stored.iter().enumerate().find(|(index, message)| {
+            !matched_stored[*index]
+                && message.role == external_message.role
+                && message.content.trim() == external_message.content.trim()
+        }) else {
+            continue;
+        };
+        matched_stored[index] = true;
+        if let (Some(external_metadata), Some(stored_metadata)) = (
+            external_message.metadata.as_object_mut(),
+            stored_message.metadata.as_object(),
+        ) {
+            external_metadata.extend(stored_metadata.clone());
+            external_metadata.insert("external".to_string(), Value::Bool(true));
+        }
+    }
+
+    external.extend(
+        stored
+            .into_iter()
+            .enumerate()
+            .filter(|(index, message)| {
+                !matched_stored[*index] && message.role == MessageRole::System
+            })
+            .map(|(_, message)| message),
+    );
+    external.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    external
 }
 
 #[derive(Clone)]
@@ -1594,6 +1691,31 @@ impl AgentRuntimeManager {
             .env("PATH", augmented_user_path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if should_force_claude_cli_io_gateway(context.provider, context.model.as_deref()) {
+            let Some(config) = context.direct_ai_config.as_ref() else {
+                self.publish(
+                    &context.hub,
+                    &key,
+                    WsServerEvent::Error {
+                        message: "Claude IO gateway is not configured".to_string(),
+                        details: Some(
+                            "Set CODEX_GATEWAY_KEY before using prefixed Claude gateway models."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .await;
+                self.finish(
+                    &key,
+                    &context,
+                    iowb_protocol::SessionRuntimeStatus::Failed,
+                    None,
+                )
+                .await;
+                return Ok(());
+            };
+            apply_claude_cli_io_gateway_env(&mut child_command, config);
+        }
         if let Some(run_id) = context.durable_run_id.as_deref() {
             // Descendants inherit this marker. If the Rust server is SIGKILLed
             // and a CLI wrapper leaves grandchildren behind, the next server
@@ -3171,14 +3293,10 @@ fn effective_agent_command_provider(provider: Provider, model: Option<&str>) -> 
 
 fn should_use_direct_ai_gateway_runtime(provider: Provider, model: Option<&str>) -> bool {
     match provider {
-        // Claude provider selections must use Claude Code CLI for Claude-family
-        // models so the run has workspace tools. Other gateway-prefixed model
-        // families still use the Direct AI API path.
-        Provider::Claude => model.is_some_and(|model| {
-            looks_like_proxy_model(model)
-                && !uses_codex_aiproxy_cli_runtime(model)
-                && !uses_claude_cli_runtime(model)
-        }),
+        // Claude provider runs gateway-prefixed models through Claude Code CLI
+        // so the session keeps workspace tools. Use unprefixed aliases such as
+        // `sonnet`, `opus`, `haiku`, or `fable` for the local Claude config.
+        Provider::Claude => false,
         Provider::Gemini => model.is_some_and(|model| {
             looks_like_proxy_model(model) && !uses_codex_aiproxy_cli_runtime(model)
         }),
@@ -3190,8 +3308,15 @@ fn uses_codex_aiproxy_cli_runtime(model: &str) -> bool {
     gateway_model_prefix(model).is_some_and(|prefix| prefix == "cod")
 }
 
-fn uses_claude_cli_runtime(model: &str) -> bool {
-    gateway_model_prefix(model).is_some_and(|prefix| prefix == "cld")
+fn uses_claude_aiproxy_cli_runtime(model: &str) -> bool {
+    let Some(prefix) = gateway_model_prefix(model) else {
+        return false;
+    };
+    prefix != "cod"
+}
+
+fn should_force_claude_cli_io_gateway(provider: Provider, model: Option<&str>) -> bool {
+    provider == Provider::Claude && model.is_some_and(uses_claude_aiproxy_cli_runtime)
 }
 
 fn default_agent_command(provider: Provider) -> String {
@@ -3293,13 +3418,17 @@ fn default_agent_args_with_resume(
             // way it does for Codex. Claude requires `--print` for
             // `--output-format stream-json`, and partial assistant deltas only
             // show up when `--include-partial-messages` is enabled.
-            let args = vec![
+            let mut args = vec![
                 "--print".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
                 "--verbose".to_string(),
                 "--include-partial-messages".to_string(),
             ];
+            if should_force_claude_cli_io_gateway(provider, model) {
+                args.push("--setting-sources".to_string());
+                args.push("project,local".to_string());
+            }
             args
         }
         // Codex exec options must precede the `resume` subcommand. The prompt
@@ -3331,10 +3460,14 @@ fn default_agent_args_with_resume(
     // Per-mode flags (Claude supports --permission-mode; Codex exec uses
     // --sandbox / --dangerously-bypass-approvals-and-sandbox). Provider-specific.
     if let Some(mode) = mode {
-        match mode {
-            "bypass" => match provider {
+        match normalize_agent_mode(mode).as_deref() {
+            Some("bypass") => match provider {
                 Provider::Claude => {
+                    args.push("--permission-mode".to_string());
+                    args.push("bypassPermissions".to_string());
                     args.push("--dangerously-skip-permissions".to_string());
+                    args.push("--tools".to_string());
+                    args.push("default".to_string());
                 }
                 Provider::Codex => {
                     args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
@@ -3343,7 +3476,7 @@ fn default_agent_args_with_resume(
                     args.push("--yolo".to_string());
                 }
             },
-            "accept-edits" => match provider {
+            Some("accept-edits") => match provider {
                 Provider::Claude => {
                     args.push("--permission-mode".to_string());
                     args.push("acceptEdits".to_string());
@@ -3354,7 +3487,7 @@ fn default_agent_args_with_resume(
                 }
                 Provider::Gemini => {}
             },
-            "plan" => match provider {
+            Some("plan") => match provider {
                 Provider::Claude => {
                     args.push("--permission-mode".to_string());
                     args.push("plan".to_string());
@@ -3365,7 +3498,7 @@ fn default_agent_args_with_resume(
                 }
                 Provider::Gemini => {}
             },
-            "read-only" => match provider {
+            Some("read-only") => match provider {
                 Provider::Claude => {
                     args.push("--permission-mode".to_string());
                     args.push("readonly".to_string());
@@ -3461,23 +3594,28 @@ fn gateway_model_prefix(model: &str) -> Option<String> {
     })
 }
 
-fn agent_cli_model_arg(provider: Provider, model: &str) -> String {
-    match provider {
-        Provider::Claude => strip_gateway_model_prefix(model, "cld")
-            .unwrap_or(model)
-            .to_string(),
-        _ => model.to_string(),
+fn agent_cli_model_arg(_provider: Provider, model: &str) -> String {
+    model.to_string()
+}
+
+fn normalize_agent_mode(mode: &str) -> Option<&'static str> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "bypass" | "bypass-permissions" | "bypasspermissions" | "danger" | "no-approvals"
+        | "no_approvals" => Some("bypass"),
+        "accept-edits" | "acceptedits" | "accept" => Some("accept-edits"),
+        "plan" | "plan-only" => Some("plan"),
+        "read-only" | "readonly" | "read" => Some("read-only"),
+        "default" | "" => Some("default"),
+        _ => None,
     }
 }
 
-fn strip_gateway_model_prefix<'a>(model: &'a str, expected_prefix: &str) -> Option<&'a str> {
-    let trimmed = model.trim();
-    let (prefix, rest) = trimmed.split_once(':')?;
-    if prefix.eq_ignore_ascii_case(expected_prefix) && !rest.trim().is_empty() {
-        Some(rest.trim())
-    } else {
-        None
-    }
+fn apply_claude_cli_io_gateway_env(command: &mut Command, config: &DirectAiRuntimeConfig) {
+    command
+        .env("ANTHROPIC_BASE_URL", config.base_url.trim_end_matches('/'))
+        .env("ANTHROPIC_API_KEY", &config.api_key)
+        .env("ANTHROPIC_AUTH_TOKEN", &config.api_key)
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
 }
 
 /// Insert the `-c key=value` override before the `exec` positional so
@@ -3668,13 +3806,21 @@ async fn process_agent_event(
 ) {
     match event {
         AgentProcessEvent::Output { stream, data } => {
+            if stream == AgentOutputStream::Stdout
+                && let Some(normalizer) = claude_normalizer.as_mut()
+            {
+                let visible_chunks = normalizer.push_chunks(&data);
+                let native_session_id = normalizer.take_session_id();
+                persist_native_session_id(context, native_session_id).await;
+                for visible in visible_chunks {
+                    publish_agent_output(manager, context, key, output, visible).await;
+                }
+                return;
+            }
             let (visible, native_session_id) = if stream == AgentOutputStream::Stdout {
                 if let Some(normalizer) = codex_normalizer.as_mut() {
                     let visible = normalizer.push(&data);
                     (visible, normalizer.take_thread_id())
-                } else if let Some(normalizer) = claude_normalizer.as_mut() {
-                    let visible = normalizer.push(&data);
-                    (visible, normalizer.take_session_id())
                 } else if let Some(normalizer) = gemini_normalizer.as_mut() {
                     let visible = normalizer.push(&data);
                     (visible, normalizer.take_session_id())
@@ -4101,12 +4247,28 @@ fn is_codex_tool_item_type(item_type: &str) -> bool {
 struct ClaudeLiveOutputNormalizer {
     pending_line: String,
     pending_session_id: Option<String>,
+    observed_session_id: Option<String>,
+    streamed_text: String,
+    streamed_thinking: bool,
+    streamed_text_started: bool,
+    saw_stream_event: bool,
+    emitted_content: bool,
+    active_tool: Option<ClaudeStreamingTool>,
+    tool_names: HashMap<String, String>,
+    emitted_tool_results: HashSet<String>,
+}
+
+#[derive(Default)]
+struct ClaudeStreamingTool {
+    id: Option<String>,
+    name: String,
+    input_json: String,
 }
 
 impl ClaudeLiveOutputNormalizer {
-    fn push(&mut self, chunk: &str) -> String {
+    fn push_chunks(&mut self, chunk: &str) -> Vec<String> {
         self.pending_line.push_str(chunk);
-        let mut output = String::new();
+        let mut output = Vec::new();
         while let Some(newline) = self.pending_line.find('\n') {
             let line = self.pending_line[..newline]
                 .trim_end_matches('\r')
@@ -4114,7 +4276,7 @@ impl ClaudeLiveOutputNormalizer {
             self.pending_line.drain(..=newline);
             let chunk = self.normalize_line(&line);
             if !chunk.is_empty() {
-                output.push_str(&chunk);
+                output.push(chunk);
             }
         }
         output
@@ -4144,9 +4306,25 @@ impl ClaudeLiveOutputNormalizer {
             .or_else(|| event.get("sessionId"))
             .and_then(Value::as_str)
             .filter(|session_id| !session_id.trim().is_empty())
+            .filter(|session_id| self.observed_session_id.as_deref() != Some(*session_id))
         {
+            self.observed_session_id = Some(session_id.to_string());
             self.pending_session_id = Some(session_id.to_string());
         }
+        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+            return String::new();
+        };
+        if event_type == "stream_event" {
+            self.saw_stream_event = true;
+            return event
+                .get("event")
+                .map(|stream_event| self.normalize_event(stream_event))
+                .unwrap_or_default();
+        }
+        self.normalize_event(&event)
+    }
+
+    fn normalize_event(&mut self, event: &Value) -> String {
         let Some(event_type) = event.get("type").and_then(Value::as_str) else {
             return String::new();
         };
@@ -4158,27 +4336,122 @@ impl ClaudeLiveOutputNormalizer {
                     .and_then(|delta| delta.get("type"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if delta_type == "text_delta" {
-                    event
-                        .get("delta")
-                        .and_then(|delta| delta.get("text"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string()
-                } else {
-                    String::new()
+                match delta_type {
+                    "thinking_delta" => {
+                        let thinking = event
+                            .get("delta")
+                            .and_then(|delta| delta.get("thinking"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if thinking.is_empty() {
+                            return String::new();
+                        }
+                        let prefix = if self.streamed_thinking {
+                            ""
+                        } else {
+                            self.streamed_thinking = true;
+                            self.emitted_content = true;
+                            "thinking\n"
+                        };
+                        format!("{prefix}{thinking}")
+                    }
+                    "text_delta" => {
+                        let text = event
+                            .get("delta")
+                            .and_then(|delta| delta.get("text"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if text.is_empty() {
+                            return String::new();
+                        }
+                        self.streamed_text.push_str(&text);
+                        let prefix = if !self.streamed_text_started && self.streamed_thinking {
+                            "\n\n"
+                        } else {
+                            ""
+                        };
+                        self.streamed_text_started = true;
+                        self.emitted_content = true;
+                        format!("{prefix}{text}")
+                    }
+                    "input_json_delta" => {
+                        let partial_json = event
+                            .get("delta")
+                            .and_then(|delta| delta.get("partial_json"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if partial_json.is_empty() {
+                            return String::new();
+                        }
+                        if let Some(tool) = self.active_tool.as_mut() {
+                            tool.input_json.push_str(partial_json);
+                        }
+                        String::new()
+                    }
+                    _ => String::new(),
                 }
             }
+            "content_block_start" => event
+                .get("content_block")
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                .map(|block| {
+                    let id = block.get("id").and_then(Value::as_str).map(str::to_string);
+                    let name = claude_tool_name(block);
+                    if let Some(id) = id.as_deref() {
+                        self.tool_names.insert(id.to_string(), name.clone());
+                    }
+                    self.active_tool = Some(ClaudeStreamingTool {
+                        id,
+                        name,
+                        input_json: block
+                            .get("input")
+                            .filter(|input| !input.is_null() && !is_empty_json_container(input))
+                            .map(display_codex_live_value)
+                            .unwrap_or_default(),
+                    });
+                    String::new()
+                })
+                .unwrap_or_default(),
+            "content_block_stop" => self
+                .active_tool
+                .take()
+                .filter(|tool| !tool.name.trim().is_empty())
+                .map(format_claude_streaming_tool)
+                .map(|section| self.format_activity_section(section))
+                .unwrap_or_default(),
+            "assistant" if !self.saw_stream_event => {
+                let section = format_claude_message_content(
+                    event.get("message").unwrap_or(event),
+                    false,
+                    &mut self.tool_names,
+                );
+                self.format_activity_section(section)
+            }
+            "user" if self.saw_stream_event => {
+                let section = format_claude_message_tool_results(
+                    event.get("message").unwrap_or(event),
+                    &mut self.tool_names,
+                    &mut self.emitted_tool_results,
+                );
+                self.format_activity_section(section)
+            }
+            "user" => {
+                let section = format_claude_message_content(
+                    event.get("message").unwrap_or(event),
+                    true,
+                    &mut self.tool_names,
+                );
+                self.format_activity_section(section)
+            }
+            "tool_use" => {
+                let section = format_claude_tool_use(event, &mut self.tool_names);
+                self.format_activity_section(section)
+            }
+            "tool_result" | "tool_use_result" => self.format_tool_result_once(event),
             // Lifecycle events we currently ignore but want to swallow
             // silently when the user has not asked for verbose noise.
-            "message_start"
-            | "content_block_start"
-            | "content_block_stop"
-            | "message_delta"
-            | "message_stop"
-            | "ping"
-            | "tool_use"
-            | "tool_result" => String::new(),
+            "message_start" | "message_delta" | "message_stop" | "ping" => String::new(),
             // Final result event with optional usage info.
             "result" => {
                 let mut parts = Vec::new();
@@ -4188,13 +4461,16 @@ impl ClaudeLiveOutputNormalizer {
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                 {
-                    parts.push(text.to_string());
+                    let remaining = text.strip_prefix(&self.streamed_text).unwrap_or(text);
+                    if self.streamed_text.is_empty() || !remaining.is_empty() {
+                        parts.push(remaining.to_string());
+                    }
                 }
                 if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
-                    parts.push(format!(
+                    parts.push(self.format_activity_section(format!(
                         "tokens used\n{}",
                         serde_json::to_string_pretty(usage).unwrap_or_else(|_| usage.to_string())
-                    ));
+                    )));
                 }
                 parts.join("\n\n")
             }
@@ -4203,7 +4479,6 @@ impl ClaudeLiveOutputNormalizer {
             | "stream_request_end"
             | "tool_use_request_start"
             | "tool_use_request_end"
-            | "tool_use_result"
             | "progress"
             | "error" => String::new(),
             _ => String::new(),
@@ -4213,6 +4488,208 @@ impl ClaudeLiveOutputNormalizer {
     fn take_session_id(&mut self) -> Option<String> {
         self.pending_session_id.take()
     }
+
+    fn format_activity_section(&mut self, section: String) -> String {
+        let section = section.trim();
+        if section.is_empty() {
+            return String::new();
+        }
+        let prefix = if self.emitted_content { "\n\n" } else { "" };
+        self.emitted_content = true;
+        format!("{prefix}{section}")
+    }
+
+    fn format_tool_result_once(&mut self, event: &Value) -> String {
+        if let Some(key) = claude_tool_result_key(event)
+            && !self.emitted_tool_results.insert(key)
+        {
+            return String::new();
+        }
+        self.format_activity_section(format_claude_tool_result(event, &self.tool_names))
+    }
+}
+
+fn is_empty_json_container(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| object.is_empty())
+        || value.as_array().is_some_and(|array| array.is_empty())
+}
+
+fn claude_tool_name(event: &Value) -> String {
+    event
+        .get("name")
+        .or_else(|| event.get("tool_name"))
+        .or_else(|| event.get("toolName"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("tool")
+        .to_string()
+}
+
+fn format_claude_streaming_tool(tool: ClaudeStreamingTool) -> String {
+    let input = if tool.input_json.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        serde_json::from_str::<Value>(&tool.input_json)
+            .map(|value| display_codex_live_value(&value))
+            .unwrap_or(tool.input_json)
+    };
+    format_claude_tool_sections(&tool.name, tool.id.as_deref(), Some(&input), None)
+}
+
+fn format_claude_tool_use(event: &Value, tool_names: &mut HashMap<String, String>) -> String {
+    let name = claude_tool_name(event);
+    let id = event
+        .get("id")
+        .or_else(|| event.get("tool_use_id"))
+        .or_else(|| event.get("toolUseId"))
+        .and_then(Value::as_str);
+    if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+        tool_names.insert(id.to_string(), name.clone());
+    }
+    let input = event
+        .get("input")
+        .or_else(|| event.get("arguments"))
+        .or_else(|| event.get("args"))
+        .filter(|value| !value.is_null())
+        .map(display_codex_live_value);
+    format_claude_tool_sections(&name, id, input.as_deref(), None)
+}
+
+fn format_claude_tool_result(event: &Value, tool_names: &HashMap<String, String>) -> String {
+    let id = event
+        .get("tool_use_id")
+        .or_else(|| event.get("toolUseId"))
+        .or_else(|| event.get("id"))
+        .and_then(Value::as_str);
+    let name = id
+        .and_then(|id| tool_names.get(id))
+        .cloned()
+        .unwrap_or_else(|| claude_tool_name(event));
+    let result = event
+        .get("content")
+        .or_else(|| event.get("result"))
+        .or_else(|| event.get("output"))
+        .or_else(|| event.get("error"))
+        .map(display_codex_live_value);
+    format_claude_tool_sections(&name, id, None, result.as_deref())
+}
+
+fn claude_tool_result_key(event: &Value) -> Option<String> {
+    event
+        .get("tool_use_id")
+        .or_else(|| event.get("toolUseId"))
+        .or_else(|| event.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| id.trim().to_string())
+}
+
+fn format_claude_message_content(
+    message: &Value,
+    user_message: bool,
+    tool_names: &mut HashMap<String, String>,
+) -> String {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
+    let mut output = String::new();
+    let blocks: Vec<&Value> = content
+        .as_array()
+        .map(|items| items.iter().collect())
+        .unwrap_or_else(|| vec![content]);
+    for block in blocks {
+        match block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "text" if !user_message => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    append_live_section(&mut output, text);
+                }
+            }
+            "thinking" | "thinking_delta" if !user_message => {
+                let thinking = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !thinking.trim().is_empty() {
+                    append_live_section(&mut output, &format!("thinking\n{thinking}"));
+                }
+            }
+            "tool_use" if !user_message => {
+                append_live_section(&mut output, &format_claude_tool_use(block, tool_names));
+            }
+            "tool_result" => {
+                append_live_section(&mut output, &format_claude_tool_result(block, tool_names));
+            }
+            _ => {}
+        }
+    }
+    output.trim().to_string()
+}
+
+fn format_claude_message_tool_results(
+    message: &Value,
+    tool_names: &mut HashMap<String, String>,
+    emitted_tool_results: &mut HashSet<String>,
+) -> String {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
+    let mut output = String::new();
+    let blocks: Vec<&Value> = content
+        .as_array()
+        .map(|items| items.iter().collect())
+        .unwrap_or_else(|| vec![content]);
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        if let Some(key) = claude_tool_result_key(block)
+            && !emitted_tool_results.insert(key)
+        {
+            continue;
+        }
+        append_live_section(&mut output, &format_claude_tool_result(block, tool_names));
+    }
+    output.trim().to_string()
+}
+
+fn format_claude_tool_sections(
+    name: &str,
+    id: Option<&str>,
+    input: Option<&str>,
+    result: Option<&str>,
+) -> String {
+    let mut content = String::new();
+    if input.is_some() || result.is_none() {
+        content.push_str("tool / Parameters\n");
+        content.push_str(&format!("**Tool:** `{}`", name.trim()));
+        if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+            content.push_str(&format!("\n- **ID:** `{}`", id.trim()));
+        }
+        if let Some(input) = input.filter(|input| !input.trim().is_empty()) {
+            content.push_str("\n\n### Input\n```json\n");
+            content.push_str(input.trim());
+            content.push_str("\n```");
+        }
+    }
+    if let Some(result) = result.filter(|result| !result.trim().is_empty()) {
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str("tool / Details\n");
+        content.push_str(&format!("**Tool:** `{}`", name.trim()));
+        if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+            content.push_str(&format!("\n- **ID:** `{}`", id.trim()));
+        }
+        content.push_str("\n\n```text\n");
+        content.push_str(result.trim());
+        content.push_str("\n```");
+    }
+    bound_agent_text(&content, AGENT_TOOL_MESSAGE_MAX_BYTES, "tool output")
 }
 
 impl GeminiLiveOutputNormalizer {
@@ -5030,12 +5507,20 @@ mod tests {
     #[test]
     fn claude_and_gemini_normalizers_capture_native_session_ids() {
         let mut claude = ClaudeLiveOutputNormalizer::default();
-        let claude_output = claude.push(concat!(
+        let claude_output = claude.push_chunks(concat!(
             "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-native\"}\n",
-            "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"continued\"}}\n"
+            "{\"type\":\"stream_event\",\"session_id\":\"claude-native\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"continued\"}}}\n"
         ));
-        assert_eq!(claude_output, "continued");
+        assert_eq!(claude_output, ["continued"]);
         assert_eq!(claude.take_session_id().as_deref(), Some("claude-native"));
+        assert!(
+            claude
+                .push_chunks(
+                    "{\"type\":\"stream_event\",\"session_id\":\"claude-native\",\"event\":{\"type\":\"ping\"}}\n"
+                )
+                .is_empty()
+        );
+        assert_eq!(claude.take_session_id(), None);
 
         let mut gemini = GeminiLiveOutputNormalizer::default();
         let gemini_output = gemini.push(concat!(
@@ -5044,6 +5529,164 @@ mod tests {
         ));
         assert_eq!(gemini_output, "continued");
         assert_eq!(gemini.take_session_id().as_deref(), Some("gemini-native"));
+    }
+
+    #[test]
+    fn claude_normalizer_streams_wrapped_deltas_without_repeating_final_result() {
+        let mut claude = ClaudeLiveOutputNormalizer::default();
+
+        assert_eq!(
+            claude.push_chunks(
+                "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}}\n"
+            ),
+            ["Hello "]
+        );
+        assert_eq!(
+            claude.push_chunks(
+                "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"mobile\"}}}\n"
+            ),
+            ["mobile"]
+        );
+        assert_eq!(
+            claude.push_chunks(
+                "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Hello mobile\"}\n"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(claude.finish(), "");
+    }
+
+    #[test]
+    fn claude_normalizer_streams_thinking_before_final_text() {
+        let mut claude = ClaudeLiveOutputNormalizer::default();
+
+        assert_eq!(
+            claude.push_chunks(
+                "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Inspecting files\"}}}\n"
+            ),
+            ["thinking\nInspecting files"]
+        );
+        assert_eq!(
+            claude.push_chunks(
+                "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" now\"}}}\n"
+            ),
+            [" now"]
+        );
+        assert_eq!(
+            claude.push_chunks(
+                "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Finished.\"}}}\n"
+            ),
+            ["\n\nFinished."]
+        );
+        assert_eq!(
+            claude.push_chunks(
+                "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Finished.\"}\n"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn claude_normalizer_formats_tool_use_sections() {
+        let mut claude = ClaudeLiveOutputNormalizer::default();
+
+        let output = claude.push_chunks(concat!(
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"pwd\\\"}\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_stop\"}}\n",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"name\":\"Bash\",\"content\":\"/tmp/project\\n\"}\n"
+        ));
+
+        assert_eq!(output.len(), 2);
+        assert!(output[0].contains("tool / Parameters"), "{output:?}");
+        assert!(output[0].contains("**Tool:** `Bash`"), "{output:?}");
+        assert!(output[0].contains("\"command\": \"pwd\""), "{output:?}");
+        assert!(output[1].contains("tool / Details"), "{output:?}");
+        assert!(output[1].contains("/tmp/project"), "{output:?}");
+    }
+
+    #[test]
+    fn claude_normalizer_formats_message_enveloped_thinking_and_tools() {
+        let mut claude = ClaudeLiveOutputNormalizer::default();
+
+        let output = claude.push_chunks(concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[",
+            "{\"type\":\"thinking\",\"thinking\":\"Checking files\"},",
+            "{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"Read\",\"input\":{\"file_path\":\"Cargo.toml\"}},",
+            "{\"type\":\"text\",\"text\":\"Done.\"}",
+            "]}}\n"
+        ));
+
+        assert_eq!(output.len(), 1);
+        assert!(output[0].contains("thinking\nChecking files"), "{output:?}");
+        assert!(output[0].contains("tool / Parameters"), "{output:?}");
+        assert!(output[0].contains("**Tool:** `Read`"), "{output:?}");
+        assert!(
+            output[0].contains("\"file_path\": \"Cargo.toml\""),
+            "{output:?}"
+        );
+        assert!(output[0].contains("Done."), "{output:?}");
+    }
+
+    #[test]
+    fn claude_normalizer_prefers_stream_events_over_duplicate_message_envelopes() {
+        let mut claude = ClaudeLiveOutputNormalizer::default();
+
+        let output = claude.push_chunks(concat!(
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Checking Cargo.toml presence\"}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[",
+            "{\"type\":\"thinking\",\"thinking\":\"Checking Cargo.toml presence\"},",
+            "{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"Bash\",\"input\":{\"command\":\"pwd && ls Cargo.toml\"}},",
+            "{\"type\":\"text\",\"text\":\"Cargo.toml exists.\"}",
+            "]}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"Bash\",\"input\":{}}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"pwd && ls Cargo.toml\\\"}\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_stop\"}}\n",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"/tmp/project\\nCargo.toml\\n\"}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Cargo.toml exists.\"}}}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"Cargo.toml exists.\"}\n"
+        ));
+        let visible = output.concat();
+
+        assert_eq!(
+            visible.matches("Checking Cargo.toml presence").count(),
+            1,
+            "{visible}"
+        );
+        assert_eq!(visible.matches("tool / Parameters").count(), 1, "{visible}");
+        assert_eq!(
+            visible.matches("Cargo.toml exists.").count(),
+            1,
+            "{visible}"
+        );
+        assert!(visible.contains("\n\ntool / Parameters"), "{visible}");
+        assert!(visible.contains("\n\ntool / Details"), "{visible}");
+        assert!(visible.contains("**Tool:** `Bash`"), "{visible}");
+        assert!(!visible.contains("{}{"), "{visible}");
+    }
+
+    #[test]
+    fn claude_normalizer_formats_user_enveloped_tool_result_after_stream_events() {
+        let mut claude = ClaudeLiveOutputNormalizer::default();
+
+        let output = claude.push_chunks(concat!(
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Checking\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_2\",\"name\":\"Bash\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_stop\"}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"call_2\",\"content\":\"/tmp/project\\n\"}",
+            "]}}\n",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"call_2\",\"content\":\"/tmp/project\\n\"}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Done.\"}}}\n"
+        ));
+        let visible = output.concat();
+
+        assert_eq!(visible.matches("tool / Parameters").count(), 1, "{visible}");
+        assert_eq!(visible.matches("tool / Details").count(), 1, "{visible}");
+        assert_eq!(visible.matches("/tmp/project").count(), 1, "{visible}");
+        assert!(visible.contains("**Tool:** `Bash`"), "{visible}");
     }
 
     #[test]
@@ -5225,6 +5868,57 @@ mod tests {
         assert_eq!(stored.native_session_id.as_deref(), Some(native_id));
         let api_json = serde_json::to_value(&stored).expect("session JSON");
         assert!(api_json.get("nativeSessionId").is_none());
+
+        let existing_rollout = std::fs::read_to_string(&rollout).expect("read rollout");
+        std::fs::write(
+            &rollout,
+            format!(
+                "{existing_rollout}{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": now + chrono::Duration::seconds(1),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "continued outside Workbench",
+                        "kind": "plain"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": now + chrono::Duration::seconds(2),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "external answer"}]
+                    }
+                })
+            ),
+        )
+        .expect("append external continuation");
+
+        let mapped_messages = sessions
+            .messages_including_external(&internal.id)
+            .await
+            .expect("mapped external messages");
+        assert_eq!(
+            mapped_messages
+                .iter()
+                .filter(|message| message.content == "first prompt")
+                .count(),
+            1,
+            "mapped history must not duplicate the first Workbench prompt: {mapped_messages:#?}"
+        );
+        assert_eq!(
+            mapped_messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "first prompt",
+                "continued outside Workbench",
+                "external answer"
+            ]
+        );
 
         let listed = sessions
             .list_for_project(project.to_str().expect("project path"))
@@ -5579,14 +6273,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn claude_non_claude_gateway_model_calls_direct_ai_api() {
-        assert_gateway_model_calls_direct_ai_api(
+    #[test]
+    fn claude_prefixed_minimax_model_uses_cli_runtime_with_gateway_env() {
+        assert_eq!(
+            effective_agent_command_provider(Provider::Claude, Some("min:MiniMax-M3")),
+            Provider::Claude
+        );
+        assert!(!should_use_direct_ai_gateway_runtime(
             Provider::Claude,
-            "min:MiniMax-M3",
-            "/v1/chat/completions",
-        )
-        .await;
+            Some("min:MiniMax-M3")
+        ));
+        assert!(should_force_claude_cli_io_gateway(
+            Provider::Claude,
+            Some("min:MiniMax-M3")
+        ));
+
+        let args = default_agent_args_with(
+            Provider::Claude,
+            "pwd",
+            Some("bypass"),
+            None,
+            None,
+            Some("min:MiniMax-M3"),
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "min:MiniMax-M3"]),
+            "args: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--setting-sources", "project,local"]),
+            "args: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"]),
+            "args: {args:?}"
+        );
     }
 
     #[test]
@@ -5623,12 +6347,16 @@ mod tests {
     }
 
     #[test]
-    fn claude_prefixed_model_uses_local_cli_runtime_with_stripped_model() {
+    fn claude_prefixed_model_uses_cli_runtime_with_prefixed_gateway_model_arg() {
         assert_eq!(
             effective_agent_command_provider(Provider::Claude, Some("cld:claude-sonnet-5")),
             Provider::Claude
         );
         assert!(!should_use_direct_ai_gateway_runtime(
+            Provider::Claude,
+            Some("cld:claude-sonnet-5")
+        ));
+        assert!(should_force_claude_cli_io_gateway(
             Provider::Claude,
             Some("cld:claude-sonnet-5")
         ));
@@ -5643,11 +6371,74 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|pair| pair == ["--model", "claude-sonnet-5"]),
+                .any(|pair| pair == ["--model", "cld:claude-sonnet-5"]),
             "args: {args:?}"
         );
         assert!(
-            !args.iter().any(|arg| arg == "cld:claude-sonnet-5"),
+            args.windows(2)
+                .any(|pair| pair == ["--setting-sources", "project,local"]),
+            "args: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"]),
+            "args: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|pair| pair == ["--tools", "default"]),
+            "args: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "cld:claude-sonnet-5"),
+            "args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn claude_bypass_permissions_alias_enables_bypass_mode() {
+        let args = default_agent_args_with(
+            Provider::Claude,
+            "pwd",
+            Some("bypass-permissions"),
+            None,
+            None,
+            Some("cld:claude-sonnet-5"),
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"]),
+            "args: {args:?}"
+        );
+        assert!(
+            args.contains(&"--dangerously-skip-permissions".to_string()),
+            "args: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|pair| pair == ["--tools", "default"]),
+            "args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn claude_unprefixed_alias_uses_local_cli_runtime() {
+        let args = default_agent_args_with(
+            Provider::Claude,
+            "pwd",
+            Some("bypass"),
+            None,
+            None,
+            Some("sonnet"),
+        );
+        assert!(
+            args.windows(2).any(|pair| pair == ["--model", "sonnet"]),
+            "args: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--setting-sources"),
+            "args: {args:?}"
+        );
+        assert!(
+            !should_use_direct_ai_gateway_runtime(Provider::Claude, Some("sonnet")),
             "args: {args:?}"
         );
         assert_eq!(args.last().map(String::as_str), Some("pwd"));
@@ -6057,6 +6848,18 @@ mod tests {
         assert!(!should_use_direct_ai_gateway_runtime(
             Provider::Claude,
             Some("cld:claude-haiku-4-5-20251001")
+        ));
+        assert!(!should_use_direct_ai_gateway_runtime(
+            Provider::Claude,
+            Some("min:MiniMax-M3")
+        ));
+        assert!(should_force_claude_cli_io_gateway(
+            Provider::Claude,
+            Some("gateway:claude-haiku-4-5-20251001")
+        ));
+        assert!(should_force_claude_cli_io_gateway(
+            Provider::Claude,
+            Some("min:MiniMax-M3")
         ));
         assert!(!should_use_direct_ai_gateway_runtime(
             Provider::Claude,
