@@ -1859,8 +1859,13 @@ impl AgentRuntimeManager {
                         let codex_final_assistant = codex_normalizer
                             .as_mut()
                             .and_then(CodexLiveOutputNormalizer::take_final_assistant_message);
+                        let claude_final_assistant = claude_normalizer
+                            .as_mut()
+                            .and_then(ClaudeLiveOutputNormalizer::take_final_assistant_message);
                         persist_codex_tool_messages(&context, &mut codex_normalizer).await;
-                        let persisted_output = codex_final_assistant
+                        let provider_specific_final = codex_final_assistant
+                            .or(claude_final_assistant);
+                        let persisted_output = provider_specific_final
                             .unwrap_or_else(|| output.clone());
                         match status {
                             Ok(status) if status.success() => {
@@ -1905,12 +1910,18 @@ impl AgentRuntimeManager {
                         let codex_final_assistant = codex_normalizer
                             .as_mut()
                             .and_then(CodexLiveOutputNormalizer::take_final_assistant_message);
+                        let claude_final_assistant = claude_normalizer
+                            .as_mut()
+                            .and_then(ClaudeLiveOutputNormalizer::take_final_assistant_message);
                         persist_codex_tool_messages(&context, &mut codex_normalizer).await;
+                        let final_assistant = codex_final_assistant
+                            .or(claude_final_assistant)
+                            .unwrap_or_else(|| output.clone());
                         manager.finish(
                             &key,
                             &context,
                             iowb_protocol::SessionRuntimeStatus::Aborted,
-                            Some(codex_final_assistant.unwrap_or_else(|| output.clone())),
+                            Some(final_assistant),
                         ).await;
                         break;
                     }
@@ -4256,6 +4267,7 @@ struct ClaudeLiveOutputNormalizer {
     active_tool: Option<ClaudeStreamingTool>,
     tool_names: HashMap<String, String>,
     emitted_tool_results: HashSet<String>,
+    final_assistant_message: Option<String>,
 }
 
 #[derive(Default)]
@@ -4366,13 +4378,24 @@ impl ClaudeLiveOutputNormalizer {
                             return String::new();
                         }
                         self.streamed_text.push_str(&text);
-                        let prefix = if !self.streamed_text_started && self.streamed_thinking {
-                            "\n\n"
+                        let prefix = if !self.streamed_text_started {
+                            if self.streamed_thinking {
+                                "\n\nclaude\n"
+                            } else {
+                                "claude\n"
+                            }
                         } else {
                             ""
                         };
                         self.streamed_text_started = true;
                         self.emitted_content = true;
+                        if self.final_assistant_message.is_none() {
+                            self.final_assistant_message = Some(bound_agent_text(
+                                self.streamed_text.trim(),
+                                AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
+                                "assistant response",
+                            ));
+                        }
                         format!("{prefix}{text}")
                     }
                     "input_json_delta" => {
@@ -4421,11 +4444,20 @@ impl ClaudeLiveOutputNormalizer {
                 .map(|section| self.format_activity_section(section))
                 .unwrap_or_default(),
             "assistant" if !self.saw_stream_event => {
-                let section = format_claude_message_content(
-                    event.get("message").unwrap_or(event),
-                    false,
-                    &mut self.tool_names,
-                );
+                let message = event.get("message").unwrap_or(event);
+                if self.final_assistant_message.is_none() {
+                    if let Some(text) = extract_claude_assistant_text(message) {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            self.final_assistant_message = Some(bound_agent_text(
+                                trimmed,
+                                AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
+                                "assistant response",
+                            ));
+                        }
+                    }
+                }
+                let section = format_claude_message_content(message, false, &mut self.tool_names);
                 self.format_activity_section(section)
             }
             "user" if self.saw_stream_event => {
@@ -4462,8 +4494,18 @@ impl ClaudeLiveOutputNormalizer {
                     .filter(|value| !value.is_empty())
                 {
                     let remaining = text.strip_prefix(&self.streamed_text).unwrap_or(text);
-                    if self.streamed_text.is_empty() || !remaining.is_empty() {
-                        parts.push(remaining.to_string());
+                    let trimmed = remaining.trim();
+                    if !trimmed.is_empty()
+                        && (self.streamed_text.is_empty() || !remaining.is_empty())
+                    {
+                        if self.final_assistant_message.is_none() {
+                            self.final_assistant_message = Some(bound_agent_text(
+                                trimmed,
+                                AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
+                                "assistant response",
+                            ));
+                        }
+                        parts.push(format!("claude\n{trimmed}"));
                     }
                 }
                 if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
@@ -4487,6 +4529,10 @@ impl ClaudeLiveOutputNormalizer {
 
     fn take_session_id(&mut self) -> Option<String> {
         self.pending_session_id.take()
+    }
+
+    fn take_final_assistant_message(&mut self) -> Option<String> {
+        self.final_assistant_message.take()
     }
 
     fn format_activity_section(&mut self, section: String) -> String {
@@ -4605,7 +4651,10 @@ fn format_claude_message_content(
         {
             "text" if !user_message => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    append_live_section(&mut output, text);
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        append_live_section(&mut output, &format!("claude\n{trimmed}"));
+                    }
                 }
             }
             "thinking" | "thinking_delta" if !user_message => {
@@ -4628,6 +4677,34 @@ fn format_claude_message_content(
         }
     }
     output.trim().to_string()
+}
+
+fn extract_claude_assistant_text(message: &Value) -> Option<String> {
+    let content = message.get("content")?;
+    let blocks: Vec<&Value> = content
+        .as_array()
+        .map(|items| items.iter().collect())
+        .unwrap_or_else(|| vec![content]);
+    let mut combined = String::new();
+    for block in blocks {
+        let block_type = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if block_type == "text" {
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(text);
+            }
+        }
+    }
+    if combined.trim().is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
 }
 
 fn format_claude_message_tool_results(
@@ -4663,6 +4740,9 @@ fn format_claude_tool_sections(
     input: Option<&str>,
     result: Option<&str>,
 ) -> String {
+    if is_claude_command_tool(name) {
+        return format_claude_command_sections(name, id, input, result);
+    }
     let mut content = String::new();
     if input.is_some() || result.is_none() {
         content.push_str("tool / Parameters\n");
@@ -4690,6 +4770,70 @@ fn format_claude_tool_sections(
         content.push_str("\n```");
     }
     bound_agent_text(&content, AGENT_TOOL_MESSAGE_MAX_BYTES, "tool output")
+}
+
+fn is_claude_command_tool(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "bash" | "shell" | "sh" | "exec" | "command" | "shell_command" | "exec_command"
+    )
+}
+
+fn format_claude_command_sections(
+    name: &str,
+    id: Option<&str>,
+    input: Option<&str>,
+    result: Option<&str>,
+) -> String {
+    let mut content = String::new();
+    if input.is_some() || result.is_none() {
+        content.push_str("exec / Parameters\n");
+        content.push_str(&format!("**Tool:** `{}`", name.trim()));
+        if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+            content.push_str(&format!("\n- **ID:** `{}`", id.trim()));
+        }
+        if let Some(command) = input.and_then(claude_command_input_shell) {
+            content.push_str("\n\n### Command\n```sh\n");
+            content.push_str(command.trim());
+            content.push_str("\n```");
+        } else if let Some(input) = input.filter(|input| !input.trim().is_empty()) {
+            content.push_str("\n\n```json\n");
+            content.push_str(input.trim());
+            content.push_str("\n```");
+        }
+    }
+    if let Some(result) = result.filter(|result| !result.trim().is_empty()) {
+        if !content.is_empty() {
+            content.push_str("\n\n");
+        }
+        content.push_str("exec / Details\n");
+        content.push_str(&format!("**Tool:** `{}`", name.trim()));
+        if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+            content.push_str(&format!("\n- **ID:** `{}`", id.trim()));
+        }
+        content.push_str("\n\n```text\n");
+        content.push_str(result.trim());
+        content.push_str("\n```");
+    }
+    bound_agent_text(&content, AGENT_TOOL_MESSAGE_MAX_BYTES, "tool output")
+}
+
+fn claude_command_input_shell(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("command")
+                .or_else(|| value.get("cmd"))
+                .or_else(|| value.get("script"))
+                .and_then(Value::as_str)
+                .filter(|command| !command.trim().is_empty())
+                .map(str::to_string)
+        })
 }
 
 impl GeminiLiveOutputNormalizer {
@@ -5511,7 +5655,7 @@ mod tests {
             "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-native\"}\n",
             "{\"type\":\"stream_event\",\"session_id\":\"claude-native\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"continued\"}}}\n"
         ));
-        assert_eq!(claude_output, ["continued"]);
+        assert_eq!(claude_output, ["claude\ncontinued"]);
         assert_eq!(claude.take_session_id().as_deref(), Some("claude-native"));
         assert!(
             claude
@@ -5539,7 +5683,7 @@ mod tests {
             claude.push_chunks(
                 "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}}\n"
             ),
-            ["Hello "]
+            ["claude\nHello "]
         );
         assert_eq!(
             claude.push_chunks(
@@ -5576,7 +5720,7 @@ mod tests {
             claude.push_chunks(
                 "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Finished.\"}}}\n"
             ),
-            ["\n\nFinished."]
+            ["\n\nclaude\nFinished."]
         );
         assert_eq!(
             claude.push_chunks(
@@ -5599,10 +5743,11 @@ mod tests {
         ));
 
         assert_eq!(output.len(), 2);
-        assert!(output[0].contains("tool / Parameters"), "{output:?}");
+        assert!(output[0].contains("exec / Parameters"), "{output:?}");
         assert!(output[0].contains("**Tool:** `Bash`"), "{output:?}");
-        assert!(output[0].contains("\"command\": \"pwd\""), "{output:?}");
-        assert!(output[1].contains("tool / Details"), "{output:?}");
+        assert!(output[0].contains("### Command"), "{output:?}");
+        assert!(output[0].contains("pwd"), "{output:?}");
+        assert!(output[1].contains("exec / Details"), "{output:?}");
         assert!(output[1].contains("/tmp/project"), "{output:?}");
     }
 
@@ -5654,14 +5799,15 @@ mod tests {
             1,
             "{visible}"
         );
-        assert_eq!(visible.matches("tool / Parameters").count(), 1, "{visible}");
+        assert_eq!(visible.matches("exec / Parameters").count(), 1, "{visible}");
         assert_eq!(
             visible.matches("Cargo.toml exists.").count(),
             1,
             "{visible}"
         );
-        assert!(visible.contains("\n\ntool / Parameters"), "{visible}");
-        assert!(visible.contains("\n\ntool / Details"), "{visible}");
+        assert!(visible.contains("\n\nexec / Parameters"), "{visible}");
+        assert!(visible.contains("\n\nexec / Details"), "{visible}");
+        assert!(visible.contains("### Command"), "{visible}");
         assert!(visible.contains("**Tool:** `Bash`"), "{visible}");
         assert!(!visible.contains("{}{"), "{visible}");
     }
@@ -5683,9 +5829,10 @@ mod tests {
         ));
         let visible = output.concat();
 
-        assert_eq!(visible.matches("tool / Parameters").count(), 1, "{visible}");
-        assert_eq!(visible.matches("tool / Details").count(), 1, "{visible}");
+        assert_eq!(visible.matches("exec / Parameters").count(), 1, "{visible}");
+        assert_eq!(visible.matches("exec / Details").count(), 1, "{visible}");
         assert_eq!(visible.matches("/tmp/project").count(), 1, "{visible}");
+        assert!(visible.contains("### Command"), "{visible}");
         assert!(visible.contains("**Tool:** `Bash`"), "{visible}");
     }
 

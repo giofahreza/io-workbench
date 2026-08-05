@@ -12,7 +12,7 @@
     <link href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;500;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/vendor/codemirror/codemirror.css" />
     <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260804-01" />
+    <link rel="stylesheet" href="/styles.css?v=20260805-05" />
   </head>
   <body class="auth-pending">
     <aside class="sidebar">
@@ -55,7 +55,6 @@
     </aside>
 
     <main class="workspace">
-      <button id="mobile-sidebar-fab" class="icon-button" type="button" aria-label="Open sidebar" title="Menu" data-symbol="nav-menu"></button>
       <section id="auth-panel" class="panel auth-panel hidden">
         <div class="auth-card">
           <div class="auth-logo">io</div>
@@ -225,51 +224,48 @@
             </div>
           </div>
           <form id="chat-form" class="chat-composer">
-            <div class="chat-controls" aria-label="Chat overrides">
-              <div class="chat-cli-picker" role="group" aria-label="CLI">
-                <button type="button" class="chat-cli-option" data-chat-cli-option="codex" aria-label="Use Codex" title="Codex">
-                  <img src="/icons/codex-white.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
-                  <span>Codex</span>
-                </button>
-                <button type="button" class="chat-cli-option" data-chat-cli-option="claude" aria-label="Use Claude" title="Claude">
-                  <img src="/icons/claude-white.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
-                  <span>Claude</span>
-                </button>
-                <button type="button" class="chat-cli-option" data-chat-cli-option="gemini" aria-label="Use Gemini" title="Gemini">
-                  <img src="/icons/gemini-ai-icon.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
-                  <span>Gemini</span>
-                </button>
+            <div id="prompt-config-panel" class="prompt-config-panel hidden" aria-label="Prompt config">
+              <div class="chat-controls" aria-label="Chat overrides">
+                <label>
+                  <span>Model</span>
+                  <select id="chat-model"></select>
+                </label>
+                <label>
+                  <span>Mode</span>
+                  <select id="chat-mode">
+                    <option value="default">Default</option>
+                    <option value="accept-edits">Accept edits</option>
+                    <option value="bypass">Bypass</option>
+                    <option value="plan">Plan only</option>
+                    <option value="read-only">Read only</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Effort</span>
+                  <select id="chat-effort">
+                    <option value="low">Low</option>
+                    <option value="medium" selected>Medium</option>
+                    <option value="high">High</option>
+                    <option value="max">Max</option>
+                  </select>
+                </label>
               </div>
-              <label>
-                <span>Model</span>
-                <select id="chat-model"></select>
-              </label>
-              <label>
-                <span>Mode</span>
-                <select id="chat-mode">
-                  <option value="default">Default</option>
-                  <option value="accept-edits">Accept edits</option>
-                  <option value="bypass">Bypass</option>
-                  <option value="plan">Plan only</option>
-                  <option value="read-only">Read only</option>
-                </select>
-              </label>
-              <label>
-                <span>Effort</span>
-                <select id="chat-effort">
-                  <option value="low">Low</option>
-                  <option value="medium" selected>Medium</option>
-                  <option value="high">High</option>
-                  <option value="max">Max</option>
-                </select>
-              </label>
+              <div class="prompt-config-actions" aria-label="Prompt tools">
+                <button id="chat-upload-images" class="icon-button" type="button" aria-label="Attach images" title="Attach images" data-symbol="image-plus"></button>
+                <span id="chat-image-count" class="prompt-image-count" aria-live="polite">0</span>
+                <button id="clear-chat-images" class="icon-button" type="button" aria-label="Clear images" title="Clear images" data-symbol="trash"></button>
+                <button id="prompt-history-prev" class="icon-button" type="button" aria-label="Previous prompt" title="Previous prompt" data-symbol="chevron-up"></button>
+                <button id="prompt-history-next" class="icon-button" type="button" aria-label="Next prompt" title="Next prompt" data-symbol="chevron-down"></button>
+                <button id="clear-chat" class="icon-button is-empty" type="button" aria-label="Clear input" title="Clear input" data-symbol="close"></button>
+                <button id="chat-thinking-toggle" class="icon-button" type="button" aria-label="Enable thinking" title="Enable thinking" data-symbol="thinking-off"></button>
+                <button id="reload-chat-session" class="icon-button" type="button" aria-label="Reload chat" title="Reload chat" data-symbol="refresh"></button>
+                <button id="chat-session-config" class="icon-button" type="button" aria-label="Chat config" title="Chat config" data-symbol="settings-2"></button>
+              </div>
             </div>
             <div class="composer-input-row">
-              <button id="chat-upload-images" class="icon-button" type="button" aria-label="Attach images" title="Attach images" data-symbol="image-plus"></button>
               <textarea id="chat-prompt" class="chat-input-placeholder" rows="1" placeholder="Ask the agent"></textarea>
-              <button id="clear-chat" class="icon-button is-empty" type="button" aria-label="Clear input" title="Clear input" data-symbol="close"></button>
-              <button id="abort-session" class="icon-button" type="button" aria-label="Abort session" title="Abort session" data-symbol="stop"></button>
-              <button id="chat-submit" type="submit" class="primary-action icon-button" aria-label="Start session" title="Start session" data-symbol="send"></button>
+              <button id="prompt-config-toggle" class="icon-button" type="button" aria-label="Prompt config" title="Prompt config" data-symbol="flask-conical" aria-expanded="false" aria-controls="prompt-config-panel"></button>
+              <button id="chat-submit" type="submit" class="primary-action icon-button" aria-label="Send" title="Send" data-symbol="send"></button>
             </div>
             <div class="composer-tools">
               <label class="file-input-field">
@@ -896,6 +892,6 @@
     <script src="/vendor/codemirror/mode/yaml.js"></script>
     <script src="/vendor/codemirror/mode/toml.js"></script>
     <script src="/vendor/xterm/xterm.js"></script>
-    <script src="/app.js?v=20260804-01" type="module"></script>
+    <script src="/app.js?v=20260805-05" type="module"></script>
   </body>
 </html>

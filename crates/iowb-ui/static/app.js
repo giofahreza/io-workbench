@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260804-01";
+const APP_VERSION = "20260805-05";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -78,8 +78,10 @@ const state = {
   chatPromptDraftSessionId: "",
   chatPromptDraftSaveTimer: null,
   chatPromptDraftLoadingSessionId: "",
+  chatPromptHistory: readJsonStorage("iowb.chatPromptHistory", []),
+  chatPromptHistoryIndex: -1,
+  chatPromptHistoryScratch: "",
   chatProcessing: null,
-  cliPickerVisible: true,
   lastSessionMessages: [],
   shellBuffer: "",
   virtualLists: {},
@@ -1085,14 +1087,93 @@ function updatePendingChatProvider(provider) {
 
 function renderChatProviderPicker() {
   const selected = chatCliValue();
-  document.querySelectorAll("[data-chat-provider-option], [data-chat-cli-option]").forEach((button) => {
-    const value = button.dataset.chatProviderOption || button.dataset.chatCliOption;
+  document.querySelectorAll("[data-chat-provider-option]").forEach((button) => {
+    const value = button.dataset.chatProviderOption;
     const active = value === selected;
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", active ? "true" : "false");
   });
-  document.querySelectorAll(".chat-cli-picker").forEach((picker) => {
-    picker.classList.toggle("hidden", !state.cliPickerVisible);
+}
+
+function persistChatPromptHistory() {
+  state.chatPromptHistory = (state.chatPromptHistory || [])
+    .filter((item) => typeof item === "string" && item.trim())
+    .slice(-80);
+  window.localStorage.setItem("iowb.chatPromptHistory", JSON.stringify(state.chatPromptHistory));
+}
+
+function rememberChatPrompt(prompt) {
+  const value = String(prompt || "").trim();
+  if (!value) return;
+  state.chatPromptHistory = (state.chatPromptHistory || []).filter((item) => item !== value);
+  state.chatPromptHistory.push(value);
+  persistChatPromptHistory();
+  state.chatPromptHistoryIndex = state.chatPromptHistory.length;
+  state.chatPromptHistoryScratch = "";
+}
+
+function navigateChatPromptHistory(direction) {
+  const history = state.chatPromptHistory || [];
+  if (!history.length) return;
+  const prompt = qs("#chat-prompt");
+  if (!prompt) return;
+  if (state.chatPromptHistoryIndex < 0 || state.chatPromptHistoryIndex > history.length) {
+    state.chatPromptHistoryIndex = history.length;
+  }
+  if (state.chatPromptHistoryIndex === history.length) {
+    state.chatPromptHistoryScratch = prompt.value || "";
+  }
+  const next = Math.max(0, Math.min(history.length, state.chatPromptHistoryIndex + direction));
+  state.chatPromptHistoryIndex = next;
+  setChatPromptValue(next === history.length ? state.chatPromptHistoryScratch : history[next]);
+  scheduleChatPromptDraftSave();
+}
+
+function togglePromptConfigPanel(force) {
+  const panel = qs("#prompt-config-panel");
+  const toggle = qs("#prompt-config-toggle");
+  if (!panel || !toggle) return;
+  const open = force === undefined ? panel.classList.contains("hidden") : Boolean(force);
+  panel.classList.toggle("hidden", !open);
+  toggle.classList.toggle("active", open);
+  toggle.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+function closeChatSessionConfigModal() {
+  qs("#chat-session-config-modal")?.remove();
+}
+
+function showChatSessionConfigModal() {
+  closeChatSessionConfigModal();
+  const settings = chatDisplaySettings();
+  document.body.insertAdjacentHTML("beforeend", `<div id="chat-session-config-modal" class="chat-session-config-modal">
+    <section class="chat-session-config-dialog" role="dialog" aria-modal="true" aria-labelledby="chat-session-config-title">
+      <header>
+        <h3 id="chat-session-config-title">Chat config</h3>
+        <button type="button" class="icon-button" data-chat-session-config-close aria-label="Close" title="Close" data-symbol="close"></button>
+      </header>
+      <div class="chat-session-config-body">
+        <label><input type="checkbox" data-chat-display-setting="expandThinking"${settings.expandThinking ? " checked" : ""} /> Auto expand thinking</label>
+        <label><input type="checkbox" data-chat-display-setting="expandParameters"${settings.expandParameters ? " checked" : ""} /> Auto expand parameters</label>
+        <label><input type="checkbox" data-chat-display-setting="autoScrollToBottom"${settings.autoScrollToBottom ? " checked" : ""} /> Auto scroll to bottom</label>
+      </div>
+    </section>
+  </div>`);
+  const modal = qs("#chat-session-config-modal");
+  modal?.addEventListener("click", (event) => {
+    if (event.target === modal) closeChatSessionConfigModal();
+  });
+  modal?.querySelectorAll("[data-chat-session-config-close]").forEach((button) => {
+    button.addEventListener("click", closeChatSessionConfigModal);
+  });
+  modal?.querySelectorAll("[data-chat-display-setting]").forEach((input) => {
+    input.addEventListener("change", () => {
+      state.preferences.chatExpandThinking = modal.querySelector('[data-chat-display-setting="expandThinking"]')?.checked !== false;
+      state.preferences.chatExpandParameters = modal.querySelector('[data-chat-display-setting="expandParameters"]')?.checked !== false;
+      state.preferences.chatAutoScrollToBottom = modal.querySelector('[data-chat-display-setting="autoScrollToBottom"]')?.checked !== false;
+      savePreferences();
+      if (state.chatSessionId) loadChatHistoryForSession(state.chatSessionId).catch(showError);
+    });
   });
 }
 
@@ -1128,6 +1209,12 @@ function setChatPromptValue(value) {
   if (!prompt) return;
   prompt.value = value || "";
   autosizeChatPrompt();
+  const length = prompt.value.length;
+  try {
+    prompt.setSelectionRange(length, length);
+  } catch {
+    // Some browsers do not expose selection APIs on detached inputs.
+  }
   updateChatComposerState();
 }
 
@@ -1533,7 +1620,16 @@ function chatOutputRoot() {
   return qs("#chat-output");
 }
 
+function chatDisplaySettings() {
+  return {
+    expandThinking: state.preferences.chatExpandThinking !== false,
+    expandParameters: state.preferences.chatExpandParameters !== false,
+    autoScrollToBottom: state.preferences.chatAutoScrollToBottom !== false,
+  };
+}
+
 function scrollChatToBottom() {
+  if (!chatDisplaySettings().autoScrollToBottom) return;
   const output = chatOutputRoot();
   if (!output) return;
   output.scrollTop = output.scrollHeight;
@@ -1602,7 +1698,7 @@ function ensureChatProcessing(payload = {}) {
     return null;
   }
   if (state.chatProcessing?.node?.isConnected) {
-    renderChatLineFooter(state.chatProcessing.footer, sessionMetaForStatus(payload));
+    renderChatLineFooter(state.chatProcessing.footer, null);
     scrollChatToBottom();
     updateChatEmptyState();
     return state.chatProcessing;
@@ -1611,7 +1707,7 @@ function ensureChatProcessing(payload = {}) {
   line.node.classList.add("chat-line-processing");
   line.node.dataset.processingSessionId = payload.sessionId || "";
   setProcessingText(line.text);
-  renderChatLineFooter(line.footer, sessionMetaForStatus(payload));
+  renderChatLineFooter(line.footer, null);
   output.appendChild(line.node);
   state.chatProcessing = {
     provider: payload.provider || "",
@@ -1659,7 +1755,7 @@ function finishChatProcessing(payload = {}, label = "") {
   state.chatProcessing.node.classList.remove("chat-line-processing");
   state.chatProcessing.node.classList.add("chat-line-system");
   state.chatProcessing.text.textContent = label;
-  renderChatLineFooter(state.chatProcessing.footer, sessionMetaForStatus(payload));
+  renderChatLineFooter(state.chatProcessing.footer, null);
   state.chatProcessing = null;
   scrollChatToBottom();
   updateChatEmptyState();
@@ -1685,19 +1781,39 @@ function renderChatLineFooter(footer, meta) {
     items.push(`<span>Effort: <strong>${escapeHtml(meta.effort)}</strong></span>`);
   }
   if (meta.thinking) items.push(`<span>Thinking on</span>`);
-  if (meta.tokenUsage) items.push(`<span>Tokens: <strong>${escapeHtml(meta.tokenUsage)}</strong></span>`);
+  // Token usage is intentionally hidden from the per-turn footer; the mobile
+  // app and web UI both keep the chat transcript focused on the actual
+  // response, not on internal accounting metrics.
   if (meta.receivedAt) items.push(`<span>Received: <strong>${escapeHtml(meta.receivedAt)}</strong></span>`);
   if (meta.elapsed) items.push(`<span>Elapsed: <strong>${escapeHtml(meta.elapsed)}</strong></span>`);
   if (meta.sentAt) items.push(`<span>Sent: <strong>${escapeHtml(meta.sentAt)}</strong></span>`);
-  footer.innerHTML = items.join("");
+  // Wrap the metadata in a collapsible so the chat transcript stays compact
+  // when re-opening a session. Users can click the toggle to inspect the
+  // exact CLI, model, mode, effort, token, and timestamp fields for any
+  // individual turn without having those fields crowd every reply.
+  footer.innerHTML = items.length
+    ? `<details class="chat-line-footer-details">` +
+      `<summary class="chat-line-footer-summary" aria-label="Show message metadata">` +
+      `<span class="chat-line-footer-summary-label">details</span>` +
+      `</summary>` +
+      `<div class="chat-line-footer-items">${items.join("")}</div>` +
+      `</details>`
+    : "";
 }
 
-function replayUserPromptLine(prompt, meta) {
+function clearChatLineMetadata() {
+  chatOutputRoot()?.querySelectorAll(".chat-line-footer").forEach((footer) => {
+    footer.innerHTML = "";
+  });
+  renderChatFooter(null);
+}
+
+function replayUserPromptLine(prompt) {
   const output = chatOutputRoot();
   if (!output) return;
   const { node, text, footer } = buildChatLineNode("user");
   text.textContent = String(prompt);
-  renderChatLineFooter(footer, meta);
+  renderChatLineFooter(footer, null);
   output.appendChild(node);
 }
 
@@ -1707,30 +1823,36 @@ function replayAssistantLine(content, meta) {
   const { node, text, footer } = buildChatLineNode("assistant");
   // Agent output is untrusted. HTML/CSS/script text must never become
   // application DOM, even when a tool has returned an entire web page.
-  text.textContent = String(content);
+  // renderChatBubbleHtml escapes every line and only emits a whitelist
+  // of block tags, so this stays safe while exec / Parameters /
+  // exec / Details become collapsible blocks.
+  text.innerHTML = renderChatBubbleHtml(String(content));
   renderChatLineFooter(footer, meta);
   output.appendChild(node);
 }
 
-function replayToolLine(content, meta) {
+function replayToolLine(content) {
   const output = chatOutputRoot();
   if (!output) return;
-  const node = document.createElement("details");
-  node.className = "chat-line-tool";
-  const summary = document.createElement("summary");
-  summary.textContent = meta.toolName ? `Tool · ${meta.toolName}` : "Tool output";
-  const text = document.createElement("pre");
-  text.className = "chat-line-text";
-  // Keep tool output collapsed and plain until the user explicitly opens it.
-  text.textContent = String(content);
-  node.appendChild(summary);
-  node.appendChild(text);
+  const { node, text, footer } = buildChatLineNode("assistant");
+  node.classList.add("chat-line-tool-message");
+  // Tool rows already contain structured `exec/tool / Parameters|Details`
+  // sections. Render those directly so the UI does not create a second
+  // outer "Tool output" collapsible around the real collapsibles.
+  text.innerHTML = renderChatBubbleHtml(String(content || ""));
+  renderChatLineFooter(footer, null);
   output.appendChild(node);
 }
 
 function replayChatMessages(messages) {
-  for (const raw of messages) {
-    if (!raw) continue;
+  const latestAssistantIndex = (() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (String(messages[index]?.role || "").toLowerCase() === "assistant") return index;
+    }
+    return -1;
+  })();
+  messages.forEach((raw, index) => {
+    if (!raw) return;
     const role = String(raw.role || "").toLowerCase();
     const content = raw.content == null ? "" : String(raw.content);
     // Per-turn metadata (cli / model / sentAt / receivedAt / tokenUsage /
@@ -1739,10 +1861,12 @@ function replayChatMessages(messages) {
     const persistedMeta = raw.metadata && typeof raw.metadata === "object"
       ? raw.metadata
       : (raw.meta && typeof raw.meta === "object" ? raw.meta : {});
-    const meta = normalizeMessageMeta(persistedMeta);
-    if (role === "user") replayUserPromptLine(content, meta);
+    const meta = role === "assistant" && index === latestAssistantIndex
+      ? normalizeMessageMeta(persistedMeta)
+      : null;
+    if (role === "user") replayUserPromptLine(content);
     else if (role === "assistant") replayAssistantLine(content, meta);
-    else if (role === "tool") replayToolLine(content, meta);
+    else if (role === "tool") replayToolLine(content);
     else if (role === "system") {
       const output = chatOutputRoot();
       if (!output) return;
@@ -1751,7 +1875,7 @@ function replayChatMessages(messages) {
       node.textContent = content;
       output.appendChild(node);
     }
-  }
+  });
   scrollChatToBottom();
 }
 
@@ -1824,6 +1948,12 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     const messages = loadingOlder
       ? page.concat(chatHistoryWindow.messages)
       : page;
+    const latestAssistantIndex = (() => {
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (String(messages[index]?.role || "").toLowerCase() === "assistant") return index;
+      }
+      return -1;
+    })();
     const offset = loadingOlder
       ? requestedOffset
       : Math.max(0, totalCount - page.length);
@@ -1841,24 +1971,17 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
         const normalized = normalizeMessageMeta(stored);
         if (Object.keys(normalized).length) return normalized;
       }
-      const isLatest = messages.indexOf(msg) === messages.length - 1;
       if (role === "user") {
-        return {
-          cli: persisted.cli || persisted.provider,
-          model: persisted.model,
-          mode: persisted.mode,
-          effort: persisted.effort,
-          sentAt: persisted.sentAt,
-        };
+        return {};
       }
       return {
         cli: persisted.cli || persisted.provider,
         model: persisted.model,
         mode: persisted.mode,
         effort: persisted.effort,
-        tokenUsage: isLatest ? persisted.tokenUsage : "",
-        receivedAt: isLatest ? persisted.receivedAt : "",
-        elapsed: isLatest ? persisted.elapsed : "",
+        tokenUsage: persisted.tokenUsage || "",
+        receivedAt: persisted.receivedAt || "",
+        elapsed: persisted.elapsed || "",
       };
     };
     if (offset > 0) {
@@ -1876,32 +1999,35 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
         output.appendChild(loadOlder);
       }
     }
-    for (const raw of messages) {
-      if (!raw) continue;
+    messages.forEach((raw, index) => {
+      if (!raw) return;
       const role = String(raw.role || "").toLowerCase();
       const content = raw.content == null ? "" : String(raw.content);
-      const meta = replayMeta(raw, role);
-      if (role === "user") replayUserPromptLine(content, meta);
+      const meta = role === "assistant" && index === latestAssistantIndex
+        ? replayMeta(raw, role)
+        : null;
+      if (role === "user") replayUserPromptLine(content);
       else if (role === "assistant") replayAssistantLine(content, meta);
-      else if (role === "tool") replayToolLine(content, meta);
+      else if (role === "tool") replayToolLine(content);
       else if (role === "system") {
         const output = chatOutputRoot();
-        if (!output) continue;
+        if (!output) return;
         const node = document.createElement("div");
         node.className = "chat-line-system";
         node.textContent = content;
         output.appendChild(node);
       }
-    }
+    });
     const output = chatOutputRoot();
     if (loadingOlder && output) {
       output.scrollTop = Math.max(0, output.scrollHeight - previousHeight + previousTop);
     } else {
       scrollChatToBottom();
     }
-    // Restore the per-session overrides + footer (legacy slot).
+    // Restore per-session overrides without showing the legacy global
+    // metadata slot; only the latest assistant response owns metadata.
     loadSessionOverridesIntoState(sessionId);
-    renderChatFooter(getSessionOverridesFor(sessionId));
+    renderChatFooter(null);
     updateChatEmptyState();
     return true;
   } catch (error) {
@@ -1972,7 +2098,6 @@ async function startNewChatForProject(projectPath) {
   state.pendingChatSessionId = placeholderId;
   state.preferences.lastChatSessionId = placeholderId;
   state.chatBuffer = "";
-  state.cliPickerVisible = true;
   if (!state.expandedProjectPaths.has(projectPath)) {
     state.expandedProjectPaths.add(projectPath);
     saveExpandedProjectPaths();
@@ -2486,7 +2611,6 @@ function renderChatFooter(meta) {
   if (meta.model) items.push(`<span class="meta">Model: <strong>${escapeHtml(meta.model)}</strong></span>`);
   if (meta.mode) items.push(`<span class="meta">Mode: <strong>${escapeHtml(meta.mode)}</strong></span>`);
   if (meta.effort) items.push(`<span class="meta">Effort: <strong>${escapeHtml(meta.effort)}</strong></span>`);
-  if (meta.tokenUsage) items.push(`<span class="meta">Tokens: <strong>${escapeHtml(meta.tokenUsage)}</strong></span>`);
   if (meta.receivedAt) items.push(`<span class="meta">Received: <strong>${escapeHtml(meta.receivedAt)}</strong></span>`);
   if (meta.elapsed) items.push(`<span class="meta">Elapsed: <strong>${escapeHtml(meta.elapsed)}</strong></span>`);
   if (items.length) {
@@ -4174,6 +4298,11 @@ function clearChatImages() {
 
 function renderChatImages() {
   const target = qs("#chat-image-preview");
+  const count = qs("#chat-image-count");
+  if (count) {
+    count.textContent = String(state.chatImages.length);
+    count.setAttribute("aria-label", `${state.chatImages.length} image${state.chatImages.length === 1 ? "" : "s"}`);
+  }
   if (!target) return;
   target.innerHTML = state.chatImages.length
     ? state.chatImages.map((image) => `<article class="image-preview">
@@ -4207,15 +4336,30 @@ function updateChatComposerState() {
   const input = qs("#chat-prompt");
   const clear = qs("#clear-chat");
   const submit = qs("#chat-submit");
+  const thinking = qs("#chat-thinking-toggle");
   const hasPrompt = Boolean(input?.value.trim());
   const canSubmit = hasPrompt || state.chatImages.length > 0;
+  const busy = Boolean(state.currentSession || state.chatProcessing);
 
   if (clear) {
     clear.classList.toggle("is-empty", !hasPrompt);
     clear.setAttribute("aria-hidden", hasPrompt ? "false" : "true");
     clear.tabIndex = hasPrompt ? 0 : -1;
   }
-  if (submit) submit.disabled = !canSubmit;
+  if (thinking) {
+    const enabled = chatThinkingValue();
+    thinking.classList.toggle("active", enabled);
+    thinking.dataset.symbol = enabled ? "thinking-on" : "thinking-off";
+    thinking.setAttribute("aria-label", enabled ? "Disable thinking" : "Enable thinking");
+    thinking.title = enabled ? "Disable thinking" : "Enable thinking";
+  }
+  if (submit) {
+    submit.disabled = !busy && !canSubmit;
+    submit.dataset.symbol = busy ? "stop" : "send";
+    submit.setAttribute("aria-label", busy ? "Abort chat" : "Send");
+    submit.title = busy ? "Abort chat" : "Send";
+    submit.classList.toggle("is-stop", busy);
+  }
 }
 
 function formatBytes(value) {
@@ -4226,6 +4370,103 @@ function formatBytes(value) {
 }
 
 function renderMarkdownLite(value) {
+  return renderMarkdownLiteWithSections(value).body;
+}
+
+// Parse a chat bubble into a series of markdown segments interleaved with
+// structured `exec / Parameters` / `exec / Details` (Codex) or
+// `tool / Parameters` / `tool / Details` (generic tool normalizer)
+// collapsibles, plus a collapsible `thinking` block for the model's
+// chain-of-thought. The chat UI used to render them all as plain text,
+// which made long tool calls and reasoning blocks unreadable. The non-exec
+// parts keep their original Markdown rendering so headings, bold, code
+// fences, and lists still work.
+function renderMarkdownLiteWithSections(value) {
+  const lines = String(value || "").replace(/\r\n?/g, "\n").split("\n");
+  const sections = [];
+  let buffer = [];
+  let currentSection = null;
+
+  const flushBuffer = () => {
+    if (!buffer.length) return;
+    sections.push({ kind: "markdown", text: buffer.join("\n") });
+    buffer = [];
+  };
+
+  const HEADER_RE = /^(exec|tool)\s*\/\s*(Parameters|Details)\s*$/i;
+  const THINKING_HEADER_RE = /^thinking\s*$/i;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const header = line.match(HEADER_RE);
+    if (header) {
+      flushBuffer();
+      const kind = header[1].toLowerCase();
+      const variant = header[2].toLowerCase();
+      currentSection = { kind, variant, lines: [] };
+      sections.push(currentSection);
+      continue;
+    }
+    if (THINKING_HEADER_RE.test(line)) {
+      // `thinking` starts a reasoning block. Everything after the header
+      // until the next blank line that precedes a non-thinking segment
+      // (or the next structured header) belongs to the block.
+      flushBuffer();
+      currentSection = { kind: "thinking", variant: "block", lines: [] };
+      sections.push(currentSection);
+      continue;
+    }
+    if (currentSection && /^[a-zA-Z]/.test(line) && !line.startsWith("```") && !line.match(/^\s+/)) {
+      const next = lines[i + 1];
+      if (next && (next.match(HEADER_RE) || THINKING_HEADER_RE.test(next))) {
+        flushBuffer();
+        sections.push({ kind: "markdown", text: line });
+        continue;
+      }
+    }
+    if (currentSection) {
+      currentSection.lines.push(line);
+    } else {
+      buffer.push(line);
+    }
+  }
+  flushBuffer();
+
+  const html = [];
+  for (const section of sections) {
+    if (section.kind === "markdown") {
+      html.push(renderMarkdownSegment(section.text));
+    } else if (section.kind === "thinking") {
+      const body = section.lines.join("\n").trim();
+      html.push(
+        `<details class="thinking-section"${chatDisplaySettings().expandThinking ? " open" : ""}>` +
+          `<summary><span class="thinking-title">Thinking</span></summary>` +
+          `<div class="thinking-body">${renderMarkdownSegment(
+            body || "*No reasoning captured.*"
+          )}</div>` +
+          `</details>`
+      );
+    } else {
+      const variant = section.variant === "parameters" ? "parameters" : "details";
+      const kindCap = section.kind.charAt(0).toUpperCase() + section.kind.slice(1);
+      const variantCap = section.variant.charAt(0).toUpperCase() + section.variant.slice(1);
+      const label = `${kindCap} / ${variantCap}`;
+      const body = section.lines.join("\n").trim();
+      const open = variant === "parameters" && chatDisplaySettings().expandParameters;
+      html.push(
+        `<details class="exec-section exec-${variant}"${open ? " open" : ""}>` +
+          `<summary><span class="exec-title">${escapeHtml(label)}</span></summary>` +
+          `<div class="exec-body">${renderMarkdownSegment(
+            body || "*No data captured.*"
+          )}</div>` +
+          `</details>`
+      );
+    }
+  }
+  return { body: html.join(""), sections };
+}
+
+function renderMarkdownSegment(value) {
   const lines = String(value || "").replace(/\r\n?/g, "\n").split("\n");
   const html = [];
   let inCode = false;
@@ -6545,12 +6786,19 @@ function connectWs() {
         if (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer) {
           finishChatProcessing(payload);
         }
+        if (!payload.sessionId || state.currentSession?.sessionId === payload.sessionId) {
+          state.currentSession = null;
+        }
       } else if (status === "failed" || status === "aborted") {
         const label = status === "aborted" ? "Aborted" : "Failed";
         if (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer.trim()) {
           finishChatProcessing(payload, label);
         }
+        if (!payload.sessionId || state.currentSession?.sessionId === payload.sessionId) {
+          state.currentSession = null;
+        }
       }
+      updateChatComposerState();
     }
     if (payload.type === "output") {
       state.currentSession = {
@@ -6565,6 +6813,10 @@ function connectWs() {
         const hasAssistantContent = Boolean(state.chatBuffer.trim());
         if (!hasAssistantContent && state.chatProcessing?.sessionId === payload.sessionId) {
           finishChatProcessing(payload);
+        }
+        if (!payload.sessionId || state.currentSession?.sessionId === payload.sessionId) {
+          state.currentSession = null;
+          updateChatComposerState();
         }
         if (!hasAssistantContent) return;
         const receivedAt = new Date().toISOString();
@@ -7078,6 +7330,7 @@ function commandPaletteCommands() {
             provider: state.currentSession.provider,
             sessionId: state.currentSession.sessionId,
           }));
+          updateChatComposerState();
         }
       },
     },
@@ -7500,9 +7753,6 @@ function bindForms() {
   document.querySelectorAll("[data-chat-provider-option]").forEach((button) => {
     button.addEventListener("click", () => chooseNewChatProvider(button.dataset.chatProviderOption));
   });
-  document.querySelectorAll("[data-chat-cli-option]").forEach((button) => {
-    button.addEventListener("click", () => chooseNewChatProvider(button.dataset.chatCliOption));
-  });
   qs("#folder-browser-close").addEventListener("click", closeFolderBrowser);
   qs("#folder-browser").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) closeFolderBrowser();
@@ -7678,11 +7928,31 @@ function bindForms() {
   qs("#load-direct-ai").addEventListener("click", () => loadSettingsView("/api/settings/direct-ai").catch(showError));
   qs("#load-direct-ai-models").addEventListener("click", () => loadSettingsView("/api/settings/direct-ai/models").catch(showError));
   qs("#load-git-config").addEventListener("click", () => loadSettingsView("/api/user/git-config").catch(showError));
+  qs("#prompt-config-toggle")?.addEventListener("click", () => togglePromptConfigPanel());
   qs("#chat-upload-images").addEventListener("click", () => qs("#chat-image-input").click());
   qs("#chat-image-input").addEventListener("change", () => uploadChatImages().catch(showError));
+  qs("#clear-chat-images")?.addEventListener("click", clearChatImages);
+  qs("#prompt-history-prev")?.addEventListener("click", () => navigateChatPromptHistory(-1));
+  qs("#prompt-history-next")?.addEventListener("click", () => navigateChatPromptHistory(1));
+  qs("#chat-thinking-toggle")?.addEventListener("click", () => {
+    state.preferences.chatThinking = !chatThinkingValue();
+    savePreferences();
+    const sid = state.chatSessionId || state.pendingChatSessionId || state.preferences.lastChatSessionId;
+    if (sid) saveSessionOverrides(sid, { thinking: state.preferences.chatThinking });
+    updatePendingChatProvider(chatCliValue());
+    updateChatComposerState();
+  });
+  qs("#reload-chat-session")?.addEventListener("click", (event) => {
+    const sessionId = state.chatSessionId || state.preferences.lastChatSessionId || "";
+    if (!sessionId) return;
+    withButtonLoading(event.currentTarget, () => loadChatHistoryForSession(sessionId)).catch(showError);
+  });
+  qs("#chat-session-config")?.addEventListener("click", showChatSessionConfigModal);
   qs("#chat-prompt").addEventListener("input", () => {
     autosizeChatPrompt();
     scheduleChatPromptDraftSave();
+    state.chatPromptHistoryIndex = (state.chatPromptHistory || []).length;
+    state.chatPromptHistoryScratch = qs("#chat-prompt").value || "";
   });
   qs("#chat-prompt").addEventListener("focus", autosizeChatPrompt);
   qs("#clear-chat").addEventListener("click", () => {
@@ -7756,6 +8026,19 @@ function bindForms() {
 
   qs("#chat-form").addEventListener("submit", (event) => {
     event.preventDefault();
+    if (state.currentSession) {
+      if (state.ws?.readyState !== WebSocket.OPEN) {
+        showError(new Error("Chat connection is not ready."));
+        return;
+      }
+      state.ws.send(JSON.stringify({
+        type: "abort_session",
+        provider: state.currentSession.provider,
+        sessionId: state.currentSession.sessionId,
+      }));
+      updateChatComposerState();
+      return;
+    }
     const projectPath = activeProjectPath();
     if (!projectPath) {
       showError(new Error("Select a project before sending chat."));
@@ -7764,12 +8047,11 @@ function bindForms() {
     const cli = chatCliValue();
     if (!cli) {
       showError(new Error("Pick a CLI (Codex, Claude, or Gemini) before sending a prompt."));
-      const picker = qs(".chat-cli-picker");
-      if (picker) picker.scrollIntoView({ block: "center", behavior: "smooth" });
       return;
     }
     const prompt = chatPromptWithImages(qs("#chat-prompt").value.trim());
     if (!prompt) return;
+    rememberChatPrompt(qs("#chat-prompt").value.trim());
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
       connectWs();
       showError(new Error("Chat connection is not ready. Reconnecting now."));
@@ -7807,7 +8089,6 @@ function bindForms() {
     };
     if (sessionId) message.sessionId = sessionId;
     state.ws.send(JSON.stringify(message));
-    state.cliPickerVisible = false;
     renderChatProviderPicker();
     // Drop the placeholder entry for this session; the server will adopt the
     // id and the next `projects_updated` broadcast will surface the real
@@ -7840,6 +8121,7 @@ function bindForms() {
       provider: cli,
       sessionId: sessionId || state.chatSessionId,
     });
+    updateChatComposerState();
   });
   // Chat-controls row: persist model/mode/effort changes immediately.
   qs("#chat-model")?.addEventListener("change", () => {
@@ -7861,18 +8143,6 @@ function bindForms() {
     const sid = state.chatSessionId || state.pendingChatSessionId || state.preferences.lastChatSessionId;
     if (sid) saveSessionOverrides(sid, { effort: state.preferences.chatEffort });
   });
-
-
-
-  qs("#abort-session").addEventListener("click", () => {
-    if (!state.currentSession || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
-    state.ws.send(JSON.stringify({
-      type: "abort_session",
-      provider: state.currentSession.provider,
-      sessionId: state.currentSession.sessionId,
-    }));
-  });
-
   qs("#stop-shell").addEventListener("click", async () => {
     if (!state.currentShellProcess) return;
     await api(`/api/process/${state.currentShellProcess}`, { method: "DELETE" });
@@ -7960,9 +8230,10 @@ function escapeHtml(value) {
 function appendUserPromptToChat(prompt, meta) {
   const output = chatOutputRoot();
   if (!output) {
-    if (meta) renderChatFooter({ ...meta, role: "user" });
+    renderChatFooter(null);
     return;
   }
+  clearChatLineMetadata();
   clearChatProcessing();
   // Finalize any pending assistant stream so the user prompt doesn't get
   // stacked behind an in-progress stream node.
@@ -7974,20 +8245,11 @@ function appendUserPromptToChat(prompt, meta) {
   }
   const { node, text, footer } = buildChatLineNode("user");
   text.textContent = prompt;
-  const sentAt = meta?.sentAt || new Date().toISOString();
-  const inlineMeta = {
-    cli: meta?.cli,
-    model: meta?.model,
-    mode: meta?.mode,
-    effort: meta?.effort,
-    thinking: meta?.thinking,
-    sentAt: formatReceivedDateTime(sentAt),
-  };
-  renderChatLineFooter(footer, inlineMeta);
+  renderChatLineFooter(footer, null);
   output.appendChild(node);
   scrollChatToBottom();
   updateChatEmptyState();
-  if (meta) renderChatFooter({ ...meta, role: "user" });
+  renderChatFooter(null);
 }
 
 function pad2(n) { return n < 10 ? `0${n}` : `${n}`; }
@@ -8033,9 +8295,16 @@ function appendChat(value) {
       output.appendChild(chatStream.node);
     }
   }
-  chatStream.text.textContent = state.chatBuffer;
+  // Render as Markdown so exec / Parameters and exec / Details sections
+  // become collapsible blocks while the rest stays in plain Markdown form.
+  // renderChatBubbleHtml keeps `textContent` safe by escaping every line.
+  chatStream.text.innerHTML = renderChatBubbleHtml(state.chatBuffer);
   scrollChatToBottom();
   updateChatEmptyState();
+}
+
+function renderChatBubbleHtml(value) {
+  return renderMarkdownLiteWithSections(value).body;
 }
 
 function appendChatLine(value) {
