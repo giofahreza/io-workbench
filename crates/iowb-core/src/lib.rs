@@ -2,7 +2,9 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
     ffi::OsString,
+    fs::OpenOptions,
     future::Future,
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
@@ -21,9 +23,9 @@ use hmac::{Hmac, Mac};
 use iowb_fs::{FileService, WorkspacePathValidator};
 use iowb_process::ProcessManager;
 use iowb_protocol::{
-    AuthStatusResponse, AuthTokenResponse, CONFIG_DIR_NAME, ChatMessage, DATABASE_FILE_NAME,
-    MessageRole, PRODUCT_NAME, ProjectSummary, Provider, ServerStatusResponse, SessionSummary,
-    UserProfile, WsServerEvent, new_id,
+    AuthStatusResponse, AuthTokenResponse, CONFIG_DIR_NAME, ChatMessage, ChatRuntime,
+    DATABASE_FILE_NAME, MessageRole, PRODUCT_NAME, ProjectSummary, Provider, ServerStatusResponse,
+    SessionSummary, UserProfile, WsServerEvent, new_id,
 };
 use iowb_storage::{Storage, StoredDurableChatRun};
 use serde_json::Value;
@@ -58,6 +60,10 @@ const AGENT_ABORT_TERM_GRACE: Duration = Duration::from_millis(250);
 const AGENT_ABORT_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const AGENT_ABORT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const DURABLE_AGENT_RUN_ENV: &str = "IO_WORKBENCH_DURABLE_RUN_ID";
+const DURABLE_AGENT_SCOPE_ENV: &str = "IO_WORKBENCH_DURABLE_RUN_SCOPE";
+const DURABLE_AGENT_OWNER_PID_ENV: &str = "IO_WORKBENCH_DURABLE_OWNER_PID";
+const DURABLE_AGENT_OWNER_START_ENV: &str = "IO_WORKBENCH_DURABLE_OWNER_START";
+const IO_WORKBENCH_GATEWAY_KEY_ENV: &str = "IOWB_IO_GATEWAY_API_KEY";
 pub const DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS: u32 = 3;
 const DURABLE_CHAT_RUN_RECOVERY_PROMPT_LIMIT: usize = 6_000;
 
@@ -69,6 +75,8 @@ pub enum CoreError {
     Storage(#[from] iowb_storage::StorageError),
     #[error("filesystem error: {0}")]
     Fs(#[from] iowb_fs::FsError),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("project not found: {0}")]
     ProjectNotFound(String),
     #[error("session not found: {0}")]
@@ -225,6 +233,7 @@ impl AppState {
         effort: Option<String>,
         mode: Option<String>,
         thinking: Option<bool>,
+        runtime: ChatRuntime,
         direct_ai_config: Option<DirectAiRuntimeConfig>,
         user_id: Option<String>,
     ) -> Result<SessionSummary> {
@@ -285,6 +294,7 @@ impl AppState {
                 session_id,
                 external,
                 model.clone(),
+                Some(runtime),
                 effort.clone(),
                 mode.clone(),
                 thinking,
@@ -299,6 +309,7 @@ impl AppState {
             let user_metadata = serde_json::json!({
                 "cli": provider.as_str(),
                 "model": model.clone().unwrap_or_default(),
+                "runtime": runtime,
                 "effort": effort.clone().unwrap_or_default(),
                 "mode": mode.clone().unwrap_or_default(),
                 "thinking": thinking.unwrap_or(false),
@@ -382,6 +393,7 @@ impl AppState {
                 project_path: resolved_project_path,
                 prompt,
                 model,
+                runtime,
                 effort: effort.clone(),
                 mode: mode.clone(),
                 thinking,
@@ -422,6 +434,9 @@ impl AppState {
             .storage
             .get_session(&run.session_id)?
             .ok_or_else(|| CoreError::SessionNotFound(run.session_id.clone()))?;
+        let runtime = stored_session
+            .runtime
+            .unwrap_or_else(|| legacy_chat_runtime(run.model.as_deref()));
 
         if stored_session.provider != provider {
             return Err(CoreError::InvalidInput(format!(
@@ -515,6 +530,7 @@ impl AppState {
                 project_path: resolved_project_path,
                 prompt: recovery_prompt,
                 model: run.model.clone(),
+                runtime,
                 effort: run.effort.clone(),
                 mode: run.mode.clone(),
                 thinking: run.thinking,
@@ -886,6 +902,7 @@ impl SessionManager {
         session_id: Option<String>,
         external: bool,
         model: Option<String>,
+        runtime: Option<ChatRuntime>,
         effort: Option<String>,
         mode: Option<String>,
         thinking: Option<bool>,
@@ -905,6 +922,7 @@ impl SessionManager {
                 last_activity: now,
                 active: true,
                 model: model.clone(),
+                runtime,
                 effort: effort.clone(),
                 mode: mode.clone(),
                 thinking,
@@ -919,6 +937,9 @@ impl SessionManager {
         session.external = external;
         if let Some(model) = model {
             session.model = Some(model);
+        }
+        if let Some(runtime) = runtime {
+            session.runtime = Some(runtime);
         }
         if let Some(effort) = effort {
             session.effort = Some(effort);
@@ -1171,6 +1192,74 @@ impl SessionManager {
             return Ok(messages);
         }
         self.messages(session_id)
+    }
+
+    async fn sync_codex_turn_to_native_rollout(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        assistant_output: &str,
+    ) -> Result<bool> {
+        let prompt = prompt.trim();
+        let assistant_output = assistant_output.trim();
+        if prompt.is_empty() || assistant_output.is_empty() {
+            return Ok(false);
+        }
+
+        let Some(record) = self.external_record_for_messages(session_id).await else {
+            return Ok(false);
+        };
+        if record.summary.provider != Provider::Codex {
+            return Ok(false);
+        }
+
+        let messages = load_external_messages(&record);
+        let mut has_prompt = false;
+        let mut has_assistant_after_prompt = false;
+        for message in messages {
+            if message.role == MessageRole::User && message.content.trim() == prompt {
+                has_prompt = true;
+                continue;
+            }
+            if has_prompt
+                && message.role == MessageRole::Assistant
+                && message.content.trim() == assistant_output
+            {
+                has_assistant_after_prompt = true;
+                break;
+            }
+        }
+        if has_prompt && has_assistant_after_prompt {
+            return Ok(false);
+        }
+
+        let now = Utc::now();
+        let mut entries = Vec::new();
+        if !has_prompt {
+            entries.push(codex_rollout_user_message(now, prompt));
+        }
+        if !has_assistant_after_prompt {
+            entries.push(codex_rollout_assistant_message(
+                now + chrono::Duration::milliseconds(entries.len() as i64),
+                assistant_output,
+            ));
+        }
+        append_codex_rollout_entries(&record.file_path, &entries)?;
+
+        {
+            let mut cache = self.external_cache.write().await;
+            cache.loaded_at = None;
+            cache.messages.remove(&external_session_cache_key(&record));
+        }
+
+        info!(
+            session_id,
+            native_session_id = %record.summary.id,
+            path = %record.file_path.display(),
+            appended = entries.len(),
+            "synced Workbench Codex turn into native rollout"
+        );
+        Ok(true)
     }
 
     /// Return a window of the oldest messages for `session_id`. Use
@@ -1572,6 +1661,7 @@ struct AgentStartContext {
     project_path: PathBuf,
     prompt: String,
     model: Option<String>,
+    runtime: ChatRuntime,
     effort: Option<String>,
     mode: Option<String>,
     thinking: Option<bool>,
@@ -1600,6 +1690,7 @@ struct AgentCommandSpec {
     command: String,
     args: Vec<String>,
     stdin_prompt: bool,
+    prompt: String,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1649,13 +1740,17 @@ impl AgentRuntimeManager {
     }
 
     async fn start(&self, context: AgentStartContext) -> Result<()> {
-        let runtime_provider =
-            effective_agent_command_provider(context.provider, context.model.as_deref());
+        let key = agent_run_key(context.provider, &context.session_id);
+        let runtime_provider = if context.runtime == ChatRuntime::IoGateway {
+            context.provider
+        } else {
+            effective_agent_command_provider(context.provider, context.model.as_deref())
+        };
         if should_use_direct_ai_gateway_runtime(context.provider, context.model.as_deref()) {
             return self.start_direct_ai(context).await;
         }
 
-        let command = resolve_agent_command(
+        let mut command = match resolve_agent_command(
             runtime_provider,
             &context.prompt,
             &context.session_id,
@@ -1664,9 +1759,39 @@ impl AgentRuntimeManager {
             context.mode.as_deref(),
             context.thinking,
             context.native_resume_session_id.as_deref(),
-        )?;
+            context.runtime,
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                let error_message = error.to_string();
+                self.publish(
+                    &context.hub,
+                    &key,
+                    WsServerEvent::Error {
+                        message: "failed to prepare agent command".to_string(),
+                        details: Some(error_message.clone()),
+                    },
+                )
+                .await;
+                self.finish(
+                    &key,
+                    &context,
+                    iowb_protocol::SessionRuntimeStatus::Failed,
+                    Some(error_message),
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Codex {
+            let Some(config) = context.direct_ai_config.as_ref() else {
+                return Err(CoreError::InvalidInput(
+                    "IO Gateway is not configured for this session".to_string(),
+                ));
+            };
+            apply_codex_cli_io_gateway_args(&mut command.args, &config.base_url);
+        }
         let (abort_tx, abort_rx) = oneshot::channel();
-        let key = agent_run_key(context.provider, &context.session_id);
 
         self.register(key.clone(), abort_tx).await;
 
@@ -1691,17 +1816,17 @@ impl AgentRuntimeManager {
             .env("PATH", augmented_user_path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if should_force_claude_cli_io_gateway(context.provider, context.model.as_deref()) {
+        if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Claude {
             let Some(config) = context.direct_ai_config.as_ref() else {
+                let error_message =
+                    "IO Gateway is not configured. Configure the IO Gateway URL and API key in Settings."
+                        .to_string();
                 self.publish(
                     &context.hub,
                     &key,
                     WsServerEvent::Error {
-                        message: "Claude IO gateway is not configured".to_string(),
-                        details: Some(
-                            "Set CODEX_GATEWAY_KEY before using prefixed Claude gateway models."
-                                .to_string(),
-                        ),
+                        message: "IO Gateway is not configured".to_string(),
+                        details: Some(error_message.clone()),
                     },
                 )
                 .await;
@@ -1709,18 +1834,34 @@ impl AgentRuntimeManager {
                     &key,
                     &context,
                     iowb_protocol::SessionRuntimeStatus::Failed,
-                    None,
+                    Some(error_message),
                 )
                 .await;
                 return Ok(());
             };
             apply_claude_cli_io_gateway_env(&mut child_command, config);
         }
+        if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Codex {
+            let Some(config) = context.direct_ai_config.as_ref() else {
+                unreachable!("gateway configuration was validated above");
+            };
+            child_command.env(IO_WORKBENCH_GATEWAY_KEY_ENV, &config.api_key);
+        }
         if let Some(run_id) = context.durable_run_id.as_deref() {
-            // Descendants inherit this marker. If the Rust server is SIGKILLed
-            // and a CLI wrapper leaves grandchildren behind, the next server
-            // can identify and terminate only processes belonging to this run.
-            child_command.env(DURABLE_AGENT_RUN_ENV, run_id);
+            // Descendants inherit these markers. The database scope prevents a
+            // server opened on a copied database from targeting the original
+            // run, while the process identity distinguishes a live owner from
+            // a server process that has actually exited.
+            child_command.env(DURABLE_AGENT_RUN_ENV, run_id).env(
+                DURABLE_AGENT_SCOPE_ENV,
+                durable_agent_run_scope(context.storage.path()),
+            );
+            #[cfg(target_os = "linux")]
+            if let Some((owner_pid, owner_start)) = current_process_identity() {
+                child_command
+                    .env(DURABLE_AGENT_OWNER_PID_ENV, owner_pid.to_string())
+                    .env(DURABLE_AGENT_OWNER_START_ENV, owner_start.to_string());
+            }
         }
         // Log the exact spawn so misconfigured flag sets are easy to spot.
         let rendered_cmd = std::iter::once(command.command.clone())
@@ -1744,12 +1885,16 @@ impl AgentRuntimeManager {
         let mut child = match child_command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                let error_message = format!(
+                    "failed to spawn agent provider: {}: {}",
+                    command.command, error
+                );
                 self.publish(
                     &context.hub,
                     &key,
                     WsServerEvent::Error {
                         message: "failed to spawn agent provider".to_string(),
-                        details: Some(format!("{}: {}", command.command, error)),
+                        details: Some(error_message.clone()),
                     },
                 )
                 .await;
@@ -1757,7 +1902,7 @@ impl AgentRuntimeManager {
                     &key,
                     &context,
                     iowb_protocol::SessionRuntimeStatus::Failed,
-                    None,
+                    Some(error_message),
                 )
                 .await;
                 return Ok(());
@@ -1766,7 +1911,7 @@ impl AgentRuntimeManager {
 
         if command.stdin_prompt {
             if let Some(mut stdin) = child.stdin.take() {
-                let prompt = context.prompt.clone();
+                let prompt = command.prompt.clone();
                 tokio::spawn(async move {
                     let _ = stdin.write_all(prompt.as_bytes()).await;
                     let _ = stdin.write_all(b"\n").await;
@@ -1865,7 +2010,7 @@ impl AgentRuntimeManager {
                         persist_codex_tool_messages(&context, &mut codex_normalizer).await;
                         let provider_specific_final = codex_final_assistant
                             .or(claude_final_assistant);
-                        let persisted_output = provider_specific_final
+                        let mut persisted_output = provider_specific_final
                             .unwrap_or_else(|| output.clone());
                         match status {
                             Ok(status) if status.success() => {
@@ -1879,6 +2024,11 @@ impl AgentRuntimeManager {
                             Ok(status) => {
                                 append_bounded(
                                     &mut output,
+                                    &format!("\nAgent exited with status {status}"),
+                                    manager.max_output_bytes,
+                                );
+                                append_bounded(
+                                    &mut persisted_output,
                                     &format!("\nAgent exited with status {status}"),
                                     manager.max_output_bytes,
                                 );
@@ -1954,15 +2104,15 @@ impl AgentRuntimeManager {
         .await;
 
         let Some(config) = context.direct_ai_config.clone() else {
+            let error_message =
+                "Direct AI gateway is not configured. Configure IO Gateway in Settings before using gateway models with Claude/Gemini."
+                    .to_string();
             self.publish(
                 &context.hub,
                 &key,
                 WsServerEvent::Error {
                     message: "Direct AI gateway is not configured".to_string(),
-                    details: Some(
-                        "Set Direct AI settings or CODEX_GATEWAY_KEY before using gateway models with Claude/Gemini."
-                            .to_string(),
-                    ),
+                    details: Some(error_message.clone()),
                 },
             )
             .await;
@@ -1970,7 +2120,7 @@ impl AgentRuntimeManager {
                 &key,
                 &context,
                 iowb_protocol::SessionRuntimeStatus::Failed,
-                None,
+                Some(error_message),
             )
             .await;
             return Ok(());
@@ -1983,11 +2133,12 @@ impl AgentRuntimeManager {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
         else {
+            let error_message = "Direct AI model is missing".to_string();
             self.publish(
                 &context.hub,
                 &key,
                 WsServerEvent::Error {
-                    message: "Direct AI model is missing".to_string(),
+                    message: error_message.clone(),
                     details: None,
                 },
             )
@@ -1996,7 +2147,7 @@ impl AgentRuntimeManager {
                 &key,
                 &context,
                 iowb_protocol::SessionRuntimeStatus::Failed,
-                None,
+                Some(error_message),
             )
             .await;
             return Ok(());
@@ -2089,15 +2240,16 @@ impl AgentRuntimeManager {
                             ).await;
                         }
                         Err(error) => {
+                            let error_message = format!("Direct AI gateway request failed\n\n{error}");
                             manager.publish(&context.hub, &key, WsServerEvent::Error {
                                 message: "Direct AI gateway request failed".to_string(),
-                                details: Some(error),
+                                details: Some(error_message.clone()),
                             }).await;
                             manager.finish(
                                 &key,
                                 &context,
                                 iowb_protocol::SessionRuntimeStatus::Failed,
-                                None,
+                                Some(error_message),
                             ).await;
                         }
                     }
@@ -2161,15 +2313,21 @@ impl AgentRuntimeManager {
         assistant_output: Option<String>,
     ) {
         let received_at = Utc::now();
-        if let Some(output) = assistant_output
+        let output = assistant_output
             .map(|output| output.trim().to_string())
             .filter(|output| !output.is_empty())
-        {
+            .or_else(|| match status {
+                iowb_protocol::SessionRuntimeStatus::Failed => Some("Failed".to_string()),
+                iowb_protocol::SessionRuntimeStatus::Aborted => Some("Aborted".to_string()),
+                _ => None,
+            });
+        if let Some(output) = output {
             let output = bound_agent_text(
                 &output,
                 AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
                 "assistant response",
             );
+            let persisted_output = output.clone();
             // Persist the assistant message with footer metadata so the
             // bubble at the bottom of the reply stays populated after a
             // refresh or session switch.
@@ -2184,12 +2342,14 @@ impl AgentRuntimeManager {
                 "cli": context.provider.as_str(),
                 "durableRunId": context.durable_run_id,
                 "model": context.model.clone().unwrap_or_default(),
+                "runtime": context.runtime,
                 "effort": context.effort.clone().unwrap_or_default(),
                 "mode": context.mode.clone().unwrap_or_default(),
                 "thinking": context.thinking.unwrap_or(false),
                 "receivedAt": received_at.to_rfc3339(),
                 "sentAt": sent_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
                 "elapsedMs": elapsed_ms,
+                "status": status,
             });
             if let Err(error) = context
                 .sessions
@@ -2211,18 +2371,41 @@ impl AgentRuntimeManager {
                         "cli": context.provider.as_str(),
                         "durableRunId": context.durable_run_id,
                         "model": context.model.clone().unwrap_or_default(),
+                        "runtime": context.runtime,
                         "effort": context.effort.clone().unwrap_or_default(),
                         "mode": context.mode.clone().unwrap_or_default(),
                         "thinking": context.thinking.unwrap_or(false),
                         "receivedAt": received_at.to_rfc3339(),
                         "sentAt": sent_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
                         "elapsedMs": elapsed_ms,
+                        "status": status,
                     });
                     let _ = context.sessions.stamp_latest_message_metadata(
                         &context.session_id,
                         MessageRole::Assistant,
                         updated,
                     );
+                }
+                if matches!(status, iowb_protocol::SessionRuntimeStatus::Completed)
+                    && context.provider == Provider::Codex
+                {
+                    let native_prompt = resolve_cli_slash_prompt(Provider::Codex, &context.prompt)
+                        .unwrap_or_else(|_| context.prompt.clone());
+                    if let Err(error) = context
+                        .sessions
+                        .sync_codex_turn_to_native_rollout(
+                            &context.session_id,
+                            &native_prompt,
+                            &persisted_output,
+                        )
+                        .await
+                    {
+                        warn!(
+                            error = %error,
+                            session_id = %context.session_id,
+                            "failed to sync Codex turn into native rollout"
+                        );
+                    }
                 }
             }
         }
@@ -2376,20 +2559,86 @@ fn isolate_agent_process(command: &mut Command) {
     }
 }
 
-/// Kill provider descendants left behind by a forced server stop before a
-/// durable continuation is launched. Linux `/proc` exposes the inherited run
-/// marker even when the original process-group leader has already exited.
+fn durable_agent_run_scope(database_path: &Path) -> String {
+    let canonical_path = std::fs::canonicalize(database_path).unwrap_or_else(|_| {
+        if database_path.is_absolute() {
+            database_path.to_path_buf()
+        } else {
+            env::current_dir()
+                .map(|current_dir| current_dir.join(database_path))
+                .unwrap_or_else(|_| database_path.to_path_buf())
+        }
+    });
+    hex::encode(Sha256::digest(
+        canonical_path.as_os_str().as_encoded_bytes(),
+    ))
+}
+
 #[cfg(target_os = "linux")]
-pub fn terminate_orphaned_agent_run_processes(run_id: &str) -> usize {
+fn process_start_time(process_id: libc::pid_t) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(')')?;
+    fields.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_identity() -> Option<(libc::pid_t, u64)> {
+    let process_id = std::process::id() as libc::pid_t;
+    process_start_time(process_id).map(|start_time| (process_id, start_time))
+}
+
+#[cfg(target_os = "linux")]
+fn process_environment_value<'a>(environment: &'a [u8], key: &str) -> Option<&'a [u8]> {
+    let key = key.as_bytes();
+    environment
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(key)?.strip_prefix(b"="))
+}
+
+#[cfg(target_os = "linux")]
+fn marked_process_owner_is_alive(environment: &[u8]) -> bool {
+    let owner_pid = process_environment_value(environment, DURABLE_AGENT_OWNER_PID_ENV)
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<libc::pid_t>().ok());
+    let owner_start = process_environment_value(environment, DURABLE_AGENT_OWNER_START_ENV)
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<u64>().ok());
+
+    match (owner_pid, owner_start) {
+        (Some(owner_pid), Some(owner_start)) => process_start_time(owner_pid) == Some(owner_start),
+        // New scoped processes always carry a complete owner identity. Treat
+        // incomplete markers as live so cleanup fails closed rather than
+        // risking termination of a process owned by another server.
+        _ => true,
+    }
+}
+
+/// Kill provider descendants left behind by a stopped server before a durable
+/// continuation is launched. A process must match both the run and canonical
+/// database path, and its recorded server owner must no longer be alive.
+/// Linux `/proc` exposes these inherited markers even when the original
+/// process-group leader has already exited.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanedAgentRunCleanup {
+    pub terminated_process_groups: usize,
+    pub live_owner: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub fn terminate_orphaned_agent_run_processes(
+    run_id: &str,
+    database_path: impl AsRef<Path>,
+) -> OrphanedAgentRunCleanup {
     let run_id = run_id.trim();
     if run_id.is_empty() {
-        return 0;
+        return OrphanedAgentRunCleanup::default();
     }
-    let marker = format!("{DURABLE_AGENT_RUN_ENV}={run_id}");
+    let expected_scope = durable_agent_run_scope(database_path.as_ref());
     let current_process_group = unsafe { libc::getpgrp() };
     let mut process_groups = HashSet::<libc::pid_t>::new();
+    let mut live_owner = false;
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return 0;
+        return OrphanedAgentRunCleanup::default();
     };
 
     for entry in entries.flatten() {
@@ -2403,16 +2652,27 @@ pub fn terminate_orphaned_agent_run_processes(run_id: &str) -> usize {
         let Ok(environment) = std::fs::read(entry.path().join("environ")) else {
             continue;
         };
-        if !environment
-            .split(|byte| *byte == 0)
-            .any(|entry| entry == marker.as_bytes())
+        if process_environment_value(&environment, DURABLE_AGENT_RUN_ENV) != Some(run_id.as_bytes())
+            || process_environment_value(&environment, DURABLE_AGENT_SCOPE_ENV)
+                != Some(expected_scope.as_bytes())
         {
+            continue;
+        }
+        if marked_process_owner_is_alive(&environment) {
+            live_owner = true;
             continue;
         }
         let process_group = unsafe { libc::getpgid(process_id) };
         if process_group > 0 && process_group != current_process_group {
             process_groups.insert(process_group);
         }
+    }
+
+    if live_owner {
+        return OrphanedAgentRunCleanup {
+            terminated_process_groups: 0,
+            live_owner: true,
+        };
     }
 
     let mut terminated = 0;
@@ -2436,12 +2696,18 @@ pub fn terminate_orphaned_agent_run_processes(run_id: &str) -> usize {
             }
         }
     }
-    terminated
+    OrphanedAgentRunCleanup {
+        terminated_process_groups: terminated,
+        live_owner,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn terminate_orphaned_agent_run_processes(_run_id: &str) -> usize {
-    0
+pub fn terminate_orphaned_agent_run_processes(
+    _run_id: &str,
+    _database_path: impl AsRef<Path>,
+) -> OrphanedAgentRunCleanup {
+    OrphanedAgentRunCleanup::default()
 }
 
 async fn terminate_agent_process_tree(child: &mut tokio::process::Child, session_id: &str) {
@@ -3243,8 +3509,13 @@ fn resolve_agent_command(
     mode: Option<&str>,
     thinking: Option<bool>,
     native_resume_session_id: Option<&str>,
+    runtime: ChatRuntime,
 ) -> Result<AgentCommandSpec> {
-    let command_provider = effective_agent_command_provider(provider, model);
+    let command_provider = if runtime == ChatRuntime::IoGateway {
+        provider
+    } else {
+        effective_agent_command_provider(provider, model)
+    };
     let provider_prefix = format!(
         "IO_WORKBENCH_{}_",
         command_provider.as_str().to_ascii_uppercase()
@@ -3262,6 +3533,7 @@ fn resolve_agent_command(
     let args_template = env::var(format!("{provider_prefix}ARGS_JSON"))
         .ok()
         .or_else(|| env::var("IO_WORKBENCH_AGENT_ARGS_JSON").ok());
+    let cli_prompt = resolve_cli_slash_prompt(command_provider, prompt)?;
     let args = if let Some(args_template) = args_template {
         let raw_args: Vec<String> = serde_json::from_str(&args_template).map_err(|error| {
             CoreError::InvalidInput(format!("invalid agent args JSON: {error}"))
@@ -3269,18 +3541,25 @@ fn resolve_agent_command(
         raw_args
             .into_iter()
             .map(|arg| {
-                expand_agent_template(arg, prompt, session_id, model, native_resume_session_id)
+                expand_agent_template(
+                    arg,
+                    &cli_prompt,
+                    session_id,
+                    model,
+                    native_resume_session_id,
+                )
             })
             .collect()
     } else {
         default_agent_args_with_resume(
             command_provider,
-            prompt,
+            &cli_prompt,
             mode,
             effort,
             thinking,
             model,
             native_resume_session_id,
+            runtime,
         )
     };
 
@@ -3291,7 +3570,181 @@ fn resolve_agent_command(
         command,
         args,
         stdin_prompt,
+        prompt: cli_prompt,
     })
+}
+
+fn resolve_cli_slash_prompt(provider: Provider, prompt: &str) -> Result<String> {
+    if provider != Provider::Codex || !prompt.trim_start().starts_with('/') {
+        return Ok(prompt.to_string());
+    }
+    let codex_home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")));
+    resolve_codex_slash_prompt(prompt, codex_home.as_deref())
+}
+
+fn resolve_codex_slash_prompt(prompt: &str, codex_home: Option<&Path>) -> Result<String> {
+    let trimmed = prompt.trim();
+    let Some(command_token) = trimmed.split_whitespace().next() else {
+        return Ok(prompt.to_string());
+    };
+    let arguments = trimmed
+        .strip_prefix(command_token)
+        .unwrap_or_default()
+        .trim();
+
+    if let Some(name) = command_token.strip_prefix("/prompts:") {
+        let Some(codex_home) = codex_home else {
+            return Err(CoreError::InvalidInput(
+                "CODEX_HOME is unavailable for custom slash commands".to_string(),
+            ));
+        };
+        return expand_codex_custom_prompt(codex_home, name, arguments);
+    }
+
+    let name = command_token.trim_start_matches('/');
+    if valid_codex_extension_name(name)
+        && codex_home.is_some_and(|home| codex_skill_exists(home, name))
+    {
+        return Ok(if arguments.is_empty() {
+            format!("${name}")
+        } else {
+            format!("${name} {arguments}")
+        });
+    }
+
+    Ok(prompt.to_string())
+}
+
+fn codex_skill_exists(codex_home: &Path, name: &str) -> bool {
+    [
+        codex_home.join("skills").join(name).join("SKILL.md"),
+        codex_home
+            .join("skills")
+            .join(".system")
+            .join(name)
+            .join("SKILL.md"),
+        codex_home
+            .parent()
+            .map(|home| {
+                home.join(".agents")
+                    .join("skills")
+                    .join(name)
+                    .join("SKILL.md")
+            })
+            .unwrap_or_default(),
+    ]
+    .iter()
+    .any(|path| path.is_file())
+}
+
+fn expand_codex_custom_prompt(codex_home: &Path, name: &str, arguments: &str) -> Result<String> {
+    if !valid_codex_extension_name(name) {
+        return Err(CoreError::InvalidInput(format!(
+            "invalid Codex slash command name: {name}"
+        )));
+    }
+    let path = codex_home.join("prompts").join(format!("{name}.md"));
+    let content = std::fs::read_to_string(&path).map_err(|error| {
+        CoreError::InvalidInput(format!(
+            "Codex custom slash command /prompts:{name} is unavailable: {error}"
+        ))
+    })?;
+    let template = strip_markdown_frontmatter(&content);
+    let values = parse_slash_arguments(arguments)?;
+    let positional = values
+        .iter()
+        .filter(|value| !value.contains('='))
+        .cloned()
+        .collect::<Vec<_>>();
+    let named = values
+        .iter()
+        .filter_map(|value| value.split_once('='))
+        .filter(|(key, _)| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        })
+        .collect::<HashMap<_, _>>();
+
+    let dollar_placeholder = "\u{0}IOWB_DOLLAR\u{0}";
+    let mut expanded = template.replace("$$", dollar_placeholder);
+    expanded = expanded.replace("$ARGUMENTS", arguments);
+    for index in 1..=9 {
+        expanded = expanded.replace(
+            &format!("${index}"),
+            positional.get(index - 1).map(String::as_str).unwrap_or(""),
+        );
+    }
+    for (key, value) in named {
+        expanded = expanded.replace(&format!("${key}"), value);
+    }
+    Ok(expanded.replace(dollar_placeholder, "$"))
+}
+
+fn valid_codex_extension_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+fn strip_markdown_frontmatter(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return content;
+    };
+    rest.split_once("\n---\n")
+        .map(|(_, body)| body)
+        .unwrap_or(content)
+}
+
+fn parse_slash_arguments(arguments: &str) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in arguments.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                values.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if quote.is_some() {
+        return Err(CoreError::InvalidInput(
+            "slash command contains an unterminated quote".to_string(),
+        ));
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        values.push(current);
+    }
+    Ok(values)
 }
 
 fn effective_agent_command_provider(provider: Provider, model: Option<&str>) -> Provider {
@@ -3319,6 +3772,7 @@ fn uses_codex_aiproxy_cli_runtime(model: &str) -> bool {
     gateway_model_prefix(model).is_some_and(|prefix| prefix == "cod")
 }
 
+#[cfg(test)]
 fn uses_claude_aiproxy_cli_runtime(model: &str) -> bool {
     let Some(prefix) = gateway_model_prefix(model) else {
         return false;
@@ -3326,8 +3780,22 @@ fn uses_claude_aiproxy_cli_runtime(model: &str) -> bool {
     prefix != "cod"
 }
 
+#[cfg(test)]
 fn should_force_claude_cli_io_gateway(provider: Provider, model: Option<&str>) -> bool {
     provider == Provider::Claude && model.is_some_and(uses_claude_aiproxy_cli_runtime)
+}
+
+#[cfg(test)]
+fn should_force_codex_cli_io_gateway(model: Option<&str>) -> bool {
+    model.is_some_and(looks_like_proxy_model)
+}
+
+fn legacy_chat_runtime(model: Option<&str>) -> ChatRuntime {
+    if model.is_some_and(looks_like_proxy_model) {
+        ChatRuntime::IoGateway
+    } else {
+        ChatRuntime::NativeCli
+    }
 }
 
 fn default_agent_command(provider: Provider) -> String {
@@ -3410,7 +3878,14 @@ fn default_agent_args_with(
     thinking: Option<bool>,
     model: Option<&str>,
 ) -> Vec<String> {
-    default_agent_args_with_resume(provider, prompt, mode, effort, thinking, model, None)
+    let runtime = if model.is_some_and(looks_like_proxy_model) {
+        ChatRuntime::IoGateway
+    } else {
+        ChatRuntime::NativeCli
+    };
+    default_agent_args_with_resume(
+        provider, prompt, mode, effort, thinking, model, None, runtime,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3422,6 +3897,7 @@ fn default_agent_args_with_resume(
     thinking: Option<bool>,
     model: Option<&str>,
     resume_session_id: Option<&str>,
+    runtime: ChatRuntime,
 ) -> Vec<String> {
     let mut args: Vec<String> = match provider {
         Provider::Claude => {
@@ -3436,7 +3912,7 @@ fn default_agent_args_with_resume(
                 "--verbose".to_string(),
                 "--include-partial-messages".to_string(),
             ];
-            if should_force_claude_cli_io_gateway(provider, model) {
+            if runtime == ChatRuntime::IoGateway {
                 args.push("--setting-sources".to_string());
                 args.push("project,local".to_string());
             }
@@ -3460,13 +3936,13 @@ fn default_agent_args_with_resume(
     };
     // Always relax Codex's directory / git repo enforcement so it can run in
     // arbitrary project directories, which is the common case for an embedded
-    // workspace UI. Codex chat is deliberately pinned to the IO gateway here
-    // as well. This is independent of the selected model spelling: unprefixed
-    // ids such as `gpt-5.6-sol` must not fall back to the CLI's built-in
-    // OpenAI/ChatGPT OAuth provider.
+    // workspace UI. Native runs inherit the CLI provider configuration; IO
+    // Gateway runs receive an isolated provider definition below.
     if matches!(provider, Provider::Codex) {
         args.push("--skip-git-repo-check".to_string());
-        push_codex_provider_override(&mut args, "aiproxy");
+        if runtime == ChatRuntime::IoGateway {
+            push_codex_provider_override(&mut args, "iowb_gateway");
+        }
     }
     // Per-mode flags (Claude supports --permission-mode; Codex exec uses
     // --sandbox / --dangerously-bypass-approvals-and-sandbox). Provider-specific.
@@ -3524,45 +4000,34 @@ fn default_agent_args_with_resume(
         }
     }
     // The user-selected model is independent from reasoning effort so the
-    // dropdown value the user actually picked is what gets sent.
-    if let Some(model) = model {
-        let trimmed = model.trim();
-        if !trimmed.is_empty() {
-            if !args.iter().any(|a| a == "--model") {
-                args.push("--model".to_string());
-                args.push(agent_cli_model_arg(provider, trimmed));
-            }
-        }
+    // dropdown value the user actually picked is what gets sent. Native Codex
+    // can omit stale legacy model ids and inherit the model from its own config.
+    let selected_model = model.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(trimmed) = selected_model
+        && !args.iter().any(|a| a == "--model")
+        && let Some(cli_model) = agent_cli_model_arg(provider, trimmed)
+    {
+        args.push("--model".to_string());
+        args.push(cli_model);
     }
-    if let Some(effort) = effort {
-        match provider {
-            Provider::Claude => {
-                args.push("--effort".to_string());
-                args.push(effort.to_string());
-            }
-            Provider::Codex => {
-                let reasoning_effort = match effort {
-                    "minimal" | "low" | "medium" | "high" | "xhigh" => effort,
-                    "max" => "xhigh",
-                    _ => "",
-                };
-                if !reasoning_effort.is_empty() {
-                    push_codex_config_override(
-                        &mut args,
-                        "model_reasoning_effort",
-                        &format!("\"{reasoning_effort}\""),
-                    );
-                }
-            }
-            Provider::Gemini => {}
+    if matches!(provider, Provider::Codex) {
+        if let Some(reasoning_effort) =
+            effective_codex_reasoning_effort(effort, thinking.unwrap_or(false))
+        {
+            push_codex_config_override(
+                &mut args,
+                "model_reasoning_effort",
+                &format!("\"{reasoning_effort}\""),
+            );
         }
+    } else if let Some(effort) = effort
+        && matches!(provider, Provider::Claude)
+    {
+        args.push("--effort".to_string());
+        args.push(effort.to_string());
     }
-    if thinking.unwrap_or(false) {
-        if matches!(provider, Provider::Codex) {
-            push_codex_config_override(&mut args, "model_reasoning_effort", "\"xhigh\"");
-        } else if matches!(provider, Provider::Gemini) {
-            args.push("--thinking".to_string());
-        }
+    if thinking.unwrap_or(false) && matches!(provider, Provider::Gemini) {
+        args.push("--thinking".to_string());
     }
     if matches!(provider, Provider::Codex) {
         if let Some(session_id) = resume_session_id {
@@ -3578,9 +4043,19 @@ fn default_agent_args_with_resume(
     args
 }
 
-/// Returns true when a model id belongs to the IO gateway namespace. Codex is
-/// pinned to `aiproxy` independently of this check; the prefix remains useful
-/// for choosing the gateway runtime and endpoint for other UI providers.
+fn effective_codex_reasoning_effort(effort: Option<&str>, thinking: bool) -> Option<&str> {
+    let selected = effort.and_then(|value| match value {
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => Some(value),
+        _ => None,
+    });
+    if thinking && !matches!(selected, Some("xhigh" | "max" | "ultra")) {
+        Some("xhigh")
+    } else {
+        selected
+    }
+}
+
+/// Returns true when a model id belongs to the IO gateway namespace.
 fn looks_like_proxy_model(model: &str) -> bool {
     gateway_model_prefix(model).is_some()
 }
@@ -3605,8 +4080,29 @@ fn gateway_model_prefix(model: &str) -> Option<String> {
     })
 }
 
-fn agent_cli_model_arg(_provider: Provider, model: &str) -> String {
-    model.to_string()
+fn agent_cli_model_arg(provider: Provider, model: &str) -> Option<String> {
+    if provider == Provider::Codex {
+        normalize_codex_cli_model(model).map(str::to_string)
+    } else {
+        Some(model.to_string())
+    }
+}
+
+fn normalize_codex_cli_model(model: &str) -> Option<&str> {
+    let trimmed = model.trim();
+    if is_local_codex_cli_model(trimmed) || looks_like_proxy_model(trimmed) {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
+fn is_local_codex_cli_model(model: &str) -> bool {
+    let trimmed = model.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains(':')
+        && gateway_model_prefix(trimmed).is_none()
+        && !trimmed.eq_ignore_ascii_case("gpt-5-codex")
 }
 
 fn normalize_agent_mode(mode: &str) -> Option<&'static str> {
@@ -3629,9 +4125,28 @@ fn apply_claude_cli_io_gateway_env(command: &mut Command, config: &DirectAiRunti
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
 }
 
-/// Insert the `-c key=value` override before the `exec` positional so
-/// codex applies the override to its subcommand invocation. Existing
-/// overrides for the same key are skipped so we don't double up.
+fn apply_codex_cli_io_gateway_args(args: &mut Vec<String>, base_url: &str) {
+    push_codex_config_override(args, "model_provider", "iowb_gateway");
+    push_codex_config_override(args, "model_providers.iowb_gateway.name", "\"IO Gateway\"");
+    push_codex_config_override(
+        args,
+        "model_providers.iowb_gateway.base_url",
+        &format!("{:?}", base_url.trim_end_matches('/')),
+    );
+    push_codex_config_override(
+        args,
+        "model_providers.iowb_gateway.env_key",
+        &format!("\"{IO_WORKBENCH_GATEWAY_KEY_ENV}\""),
+    );
+    push_codex_config_override(
+        args,
+        "model_providers.iowb_gateway.wire_api",
+        "\"responses\"",
+    );
+}
+
+/// Keep `-c key=value` overrides before the `resume` positional so Codex
+/// applies the ephemeral provider configuration to resumed turns.
 fn push_codex_provider_override(args: &mut Vec<String>, provider: &str) {
     push_codex_config_override(args, "model_provider", provider);
 }
@@ -3644,8 +4159,14 @@ fn push_codex_config_override(args: &mut Vec<String>, key: &str, value: &str) {
     {
         args[index + 1] = format!("{key}={value}");
     } else {
-        args.push("-c".to_string());
-        args.push(format!("{key}={value}"));
+        let insert_at = args
+            .iter()
+            .position(|arg| arg == "resume")
+            .unwrap_or(args.len());
+        args.splice(
+            insert_at..insert_at,
+            ["-c".to_string(), format!("{key}={value}")],
+        );
     }
 }
 
@@ -3699,6 +4220,48 @@ fn durable_chat_recovery_prompt(original_prompt: &str) -> String {
     format!(
         "<system-reminder>\nThe io-workbench Rust server was forced to stop while the previous turn was still running. Continue the interrupted task now in the current repository and conversation. Inspect the current files and state before acting, avoid repeating work that is already complete, and finish the original request. Do not ask the user to resend it.\n\nOriginal user request:\n{clipped}\n</system-reminder>"
     )
+}
+
+fn codex_rollout_user_message(timestamp: DateTime<Utc>, prompt: &str) -> Value {
+    serde_json::json!({
+        "timestamp": timestamp.to_rfc3339(),
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": prompt,
+            "kind": "plain",
+            "source": "io-workbench"
+        }
+    })
+}
+
+fn codex_rollout_assistant_message(timestamp: DateTime<Utc>, assistant_output: &str) -> Value {
+    serde_json::json!({
+        "timestamp": timestamp.to_rfc3339(),
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "id": format!("msg_{}", Uuid::new_v4().simple()),
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": assistant_output
+            }],
+            "source": "io-workbench"
+        }
+    })
+}
+
+fn append_codex_rollout_entries(path: &Path, entries: &[Value]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    for entry in entries {
+        writeln!(file, "{}", serde_json::to_string(entry)?)?;
+    }
+    file.flush()?;
+    Ok(())
 }
 
 fn append_bounded(output: &mut String, chunk: &str, max_bytes: usize) {
@@ -5355,12 +5918,27 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
-    async fn startup_cleanup_kills_marked_orphan_process_group() {
+    async fn startup_cleanup_is_scoped_to_database_and_dead_owner() {
         let run_id = format!("run-orphan-test-{}", Uuid::new_v4());
+        let root = env::temp_dir().join(format!("iowb-orphan-test-{}", Uuid::new_v4()));
+        let original_database = root.join("original/io-workbench.db");
+        let copied_database = root.join("copy/io-workbench.db");
+        std::fs::create_dir_all(original_database.parent().expect("original parent"))
+            .expect("create original parent");
+        std::fs::create_dir_all(copied_database.parent().expect("copy parent"))
+            .expect("create copy parent");
+        std::fs::write(&original_database, []).expect("create original database");
+        std::fs::write(&copied_database, []).expect("create copied database");
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "sleep 60 </dev/null >/dev/null 2>&1 & echo $!"])
             .env(DURABLE_AGENT_RUN_ENV, &run_id)
+            .env(
+                DURABLE_AGENT_SCOPE_ENV,
+                durable_agent_run_scope(&original_database),
+            )
+            .env(DURABLE_AGENT_OWNER_PID_ENV, "2147483647")
+            .env(DURABLE_AGENT_OWNER_START_ENV, "1")
             .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -5371,7 +5949,18 @@ mod tests {
             .parse::<libc::pid_t>()
             .expect("orphan pid");
 
-        assert_eq!(terminate_orphaned_agent_run_processes(&run_id), 1);
+        assert_eq!(
+            terminate_orphaned_agent_run_processes(&run_id, &copied_database),
+            OrphanedAgentRunCleanup::default()
+        );
+        assert!(std::fs::metadata(format!("/proc/{orphan_pid}")).is_ok());
+        assert_eq!(
+            terminate_orphaned_agent_run_processes(&run_id, &original_database),
+            OrphanedAgentRunCleanup {
+                terminated_process_groups: 1,
+                live_owner: false,
+            }
+        );
         timeout(Duration::from_secs(1), async {
             loop {
                 let state = std::fs::read_to_string(format!("/proc/{orphan_pid}/stat"))
@@ -5389,6 +5978,40 @@ mod tests {
         })
         .await
         .expect("marked orphan was not killed");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_cleanup_preserves_process_with_live_owner() {
+        let run_id = format!("run-live-owner-test-{}", Uuid::new_v4());
+        let database = env::temp_dir().join(format!("iowb-live-owner-{}.db", Uuid::new_v4()));
+        std::fs::write(&database, []).expect("create database");
+        let (owner_pid, owner_start) = current_process_identity().expect("test process identity");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 60"])
+            .env(DURABLE_AGENT_RUN_ENV, &run_id)
+            .env(DURABLE_AGENT_SCOPE_ENV, durable_agent_run_scope(&database))
+            .env(DURABLE_AGENT_OWNER_PID_ENV, owner_pid.to_string())
+            .env(DURABLE_AGENT_OWNER_START_ENV, owner_start.to_string())
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("spawn live-owned process");
+
+        sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            terminate_orphaned_agent_run_processes(&run_id, &database),
+            OrphanedAgentRunCleanup {
+                terminated_process_groups: 0,
+                live_owner: true,
+            }
+        );
+        assert!(child.try_wait().expect("read child state").is_none());
+
+        terminate_agent_process_tree(&mut child, "live-owner-test").await;
+        let _ = std::fs::remove_file(database);
     }
 
     #[test]
@@ -5863,6 +6486,7 @@ mod tests {
             last_activity: now,
             active: true,
             model: Some("gpt-test".to_string()),
+            runtime: Some(ChatRuntime::NativeCli),
             effort: Some("medium".to_string()),
             mode: Some("default".to_string()),
             thinking: Some(false),
@@ -5987,6 +6611,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("internal session");
@@ -6094,6 +6719,7 @@ mod tests {
             None,
             None,
             stored.native_session_id.as_deref(),
+            ChatRuntime::NativeCli,
         );
         assert!(
             args.contains(&"--json".to_string()),
@@ -6103,6 +6729,119 @@ mod tests {
             &args[args.iter().position(|arg| arg == "resume").unwrap()..],
             ["resume", native_id, "second prompt"]
         );
+
+        drop(sessions);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_rollout_sync_appends_missing_workbench_turn_once() {
+        let root = std::env::temp_dir().join(format!("iowb-codex-sync-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project dir");
+
+        let native_id = "44444444-4444-4444-8444-444444444444";
+        let now = Utc::now();
+        let rollout = root
+            .join(".codex/sessions/2026/08/06")
+            .join(format!("rollout-2026-08-06T00-00-00-{native_id}.jsonl"));
+        std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("rollout dir");
+        std::fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "session_meta",
+                    "payload": {"id": native_id, "cwd": project}
+                }),
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "original cli prompt",
+                        "kind": "plain"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "original cli answer"}]
+                    }
+                })
+            ),
+        )
+        .expect("rollout");
+
+        let storage = Storage::open(config_dir.join("test.db")).expect("storage");
+        let mut sessions = SessionManager::load(storage.clone(), 10).expect("sessions");
+        sessions.external_home = Arc::new(root.clone());
+        let internal = sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("workbench-session".to_string()),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("internal session");
+        sessions
+            .set_native_session_id(&internal.id, native_id)
+            .await
+            .expect("native id");
+
+        let appended = sessions
+            .sync_codex_turn_to_native_rollout(
+                &internal.id,
+                "continued in Workbench",
+                "answer from Workbench",
+            )
+            .await
+            .expect("sync append");
+        assert!(appended);
+
+        let messages = sessions
+            .messages_including_external(&internal.id)
+            .await
+            .expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "original cli prompt",
+                "original cli answer",
+                "continued in Workbench",
+                "answer from Workbench"
+            ]
+        );
+
+        let second = sessions
+            .sync_codex_turn_to_native_rollout(
+                &internal.id,
+                "continued in Workbench",
+                "answer from Workbench",
+            )
+            .await
+            .expect("sync duplicate");
+        assert!(!second);
+        let messages_after_second = sessions
+            .messages_including_external(&internal.id)
+            .await
+            .expect("messages after duplicate sync");
+        assert_eq!(messages_after_second.len(), messages.len());
 
         drop(sessions);
         drop(storage);
@@ -6187,6 +6926,7 @@ mod tests {
                 None,
                 None,
                 None,
+                ChatRuntime::NativeCli,
                 None,
                 None,
             )
@@ -6300,6 +7040,7 @@ mod tests {
                 project.display().to_string(),
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -6601,6 +7342,93 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_ai_failure_persists_assistant_error_message() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake gateway");
+        let gateway_addr = listener.local_addr().expect("gateway address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept gateway request");
+            let mut buffer = [0u8; 1024];
+            let _ = stream
+                .read(&mut buffer)
+                .await
+                .expect("read gateway request");
+            let body = r#"{"error":"upstream unavailable"}"#;
+            let response = format!(
+                "HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write gateway error response");
+        });
+
+        let root = std::env::temp_dir().join(format!("iowb-direct-ai-fail-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let state = AppState::initialize(AppConfig {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+
+        let session = state
+            .start_agent_session(
+                Provider::Gemini,
+                project.display().to_string(),
+                "trigger failure",
+                None,
+                Some("agw:gemini-3.6-flash-medium".to_string()),
+                None,
+                None,
+                None,
+                ChatRuntime::NativeCli,
+                Some(DirectAiRuntimeConfig {
+                    base_url: format!("http://{gateway_addr}"),
+                    api_key: "test-key".to_string(),
+                    max_tokens: Some(32),
+                }),
+                None,
+            )
+            .await
+            .expect("direct gateway session starts");
+
+        let mut persisted_error = None;
+        for _ in 0..20 {
+            let messages = state.sessions.messages(&session.id).expect("messages");
+            persisted_error = messages.into_iter().find(|message| {
+                message.role == MessageRole::Assistant
+                    && message.content.contains("Direct AI gateway request failed")
+            });
+            if persisted_error.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        let assistant = persisted_error.expect("persisted assistant error");
+        assert!(assistant.content.contains("502 Bad Gateway"));
+        assert_eq!(assistant.metadata["status"], "failed");
+        assert_eq!(assistant.metadata["cli"], "gemini");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     async fn assert_gateway_model_calls_direct_ai_api(
         provider: Provider,
         model: &str,
@@ -6691,6 +7519,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("existing session");
@@ -6719,6 +7548,7 @@ mod tests {
                 None,
                 None,
                 None,
+                ChatRuntime::NativeCli,
                 Some(DirectAiRuntimeConfig {
                     base_url: format!("http://{gateway_addr}"),
                     api_key: "test-key".to_string(),
@@ -6819,6 +7649,7 @@ mod tests {
             None,
             None,
             Some(session_id),
+            ChatRuntime::NativeCli,
         );
         assert!(
             claude
@@ -6862,6 +7693,7 @@ mod tests {
             None,
             None,
             Some(session_id),
+            ChatRuntime::NativeCli,
         );
         let resume_index = codex.iter().position(|arg| arg == "resume").unwrap();
         let sandbox_index = codex.iter().position(|arg| arg == "--sandbox").unwrap();
@@ -6876,6 +7708,7 @@ mod tests {
             None,
             None,
             Some(session_id),
+            ChatRuntime::NativeCli,
         );
         assert!(
             gemini
@@ -6890,6 +7723,56 @@ mod tests {
     }
 
     #[test]
+    fn claude_and_gemini_keep_native_slash_commands_unchanged() {
+        for provider in [Provider::Claude, Provider::Gemini] {
+            assert_eq!(
+                resolve_cli_slash_prompt(provider, "/compact preserve decisions").unwrap(),
+                "/compact preserve decisions"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_expands_custom_slash_prompts_for_headless_exec() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-codex-slash-prompt-{}", uuid::Uuid::new_v4()));
+        let prompts = root.join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompt directory");
+        std::fs::write(
+            prompts.join("draftpr.md"),
+            "---\ndescription: Draft a PR\n---\nReview $1 for $FOCUS. Args: $ARGUMENTS. Cost: $$5.",
+        )
+        .expect("custom prompt");
+
+        let expanded = resolve_codex_slash_prompt(
+            "/prompts:draftpr src/lib.rs FOCUS=\"error handling\"",
+            Some(&root),
+        )
+        .expect("slash prompt expands");
+
+        assert_eq!(
+            expanded,
+            "Review src/lib.rs for error handling. Args: src/lib.rs FOCUS=\"error handling\". Cost: $5."
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_slash_skill_uses_headless_skill_mention() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-codex-slash-skill-{}", uuid::Uuid::new_v4()));
+        let skill = root.join("skills").join("security-review");
+        std::fs::create_dir_all(&skill).expect("skill directory");
+        std::fs::write(skill.join("SKILL.md"), "# Security review").expect("skill");
+
+        assert_eq!(
+            resolve_codex_slash_prompt("/security-review staged changes", Some(&root)).unwrap(),
+            "$security-review staged changes"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn codex_bypass_uses_bypass_flag() {
         let args = default_agent_args_with(Provider::Codex, "hi", Some("bypass"), None, None, None);
         eprintln!("codex bypass args: {:?}", args);
@@ -6897,7 +7780,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_user_model_overrides_effort_default() {
+    fn codex_proxy_model_uses_isolated_gateway_cli_provider() {
         let args = default_agent_args_with(
             Provider::Codex,
             "hi",
@@ -6909,15 +7792,12 @@ mod tests {
         eprintln!("codex proxy model args: {:?}", args);
         assert!(args.contains(&"--model".to_string()));
         assert!(args.contains(&"agw:claude-opus-4-6-thinking".to_string()));
-        // Proxy models also reroute codex to the user's `aiproxy` provider.
-        assert!(args.iter().any(|a| a == "-c"));
-        assert!(args.iter().any(|a| a == "model_provider=aiproxy"));
-        // Reasoning effort must not silently replace the selected model.
-        assert!(!args.contains(&"gpt-5".to_string()));
+        assert!(args.iter().any(|a| a == "model_provider=iowb_gateway"));
+        assert!(!args.iter().any(|a| a == "model_provider=openai"));
     }
 
     #[test]
-    fn codex_minimax_alias_stays_on_io_gateway() {
+    fn codex_minimax_alias_uses_isolated_gateway_cli_provider() {
         let args = default_agent_args_with(
             Provider::Codex,
             "hi",
@@ -6926,24 +7806,19 @@ mod tests {
             None,
             Some("min:MiniMax-M3"),
         );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["-c", "model_provider=aiproxy"]),
-            "args: {args:?}"
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--model", "min:MiniMax-M3"]),
-            "args: {args:?}"
-        );
+        assert!(args.iter().any(|arg| arg == "--model"));
+        assert!(args.iter().any(|arg| arg == "model_provider=iowb_gateway"));
+        assert!(!args.iter().any(|arg| arg == "model_provider=openai"));
+        assert!(args.iter().any(|arg| arg == "min:MiniMax-M3"));
         assert!(!args.iter().any(|arg| arg == "model_provider=minimax"));
     }
 
     #[test]
     fn codex_effort_uses_reasoning_config_without_forcing_an_old_model() {
         let args = default_agent_args_with(Provider::Codex, "hi", None, Some("medium"), None, None);
+        assert!(!args.iter().any(|arg| arg == "model_provider=aiproxy"));
+        assert!(!args.iter().any(|arg| arg.starts_with("model_provider=")));
         assert!(!args.iter().any(|arg| arg == "--model"));
-        assert!(args.iter().any(|arg| arg == "model_provider=aiproxy"));
         assert!(
             args.windows(2)
                 .any(|pair| { pair == ["-c", "model_reasoning_effort=\"medium\""] })
@@ -6966,12 +7841,50 @@ mod tests {
     }
 
     #[test]
-    fn codex_unprefixed_model_is_forced_through_io_gateway() {
+    fn codex_extended_efforts_are_forwarded_without_downgrade() {
+        for effort in ["xhigh", "max", "ultra"] {
+            let args = default_agent_args_with(
+                Provider::Codex,
+                "hi",
+                None,
+                Some(effort),
+                Some(true),
+                Some("gpt-5.6++"),
+            );
+            let expected = format!("model_reasoning_effort=\"{effort}\"");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["-c", expected.as_str()])
+            );
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| arg.starts_with("model_reasoning_effort="))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn codex_unprefixed_model_uses_local_cli_provider() {
+        let args =
+            default_agent_args_with(Provider::Codex, "hi", None, None, None, Some("gpt-5.4"));
+        eprintln!("codex real model args: {:?}", args);
+        assert!(args.contains(&"gpt-5.4".to_string()));
+        assert!(!args.iter().any(|a| a == "model_provider=aiproxy"));
+        assert!(!args.iter().any(|arg| arg.starts_with("model_provider=")));
+        assert!(args.contains(&"--skip-git-repo-check".to_string()));
+    }
+
+    #[test]
+    fn codex_legacy_model_is_ignored_for_local_cli() {
         let args =
             default_agent_args_with(Provider::Codex, "hi", None, None, None, Some("gpt-5-codex"));
-        eprintln!("codex real model args: {:?}", args);
-        assert!(args.contains(&"gpt-5-codex".to_string()));
-        assert!(args.iter().any(|a| a == "model_provider=aiproxy"));
+
+        assert!(!args.iter().any(|arg| arg == "--model"));
+        assert!(!args.iter().any(|arg| arg == "gpt-5-codex"));
+        assert!(!args.iter().any(|arg| arg == "model_provider=aiproxy"));
+        assert!(!args.iter().any(|arg| arg.starts_with("model_provider=")));
     }
 
     #[test]
@@ -7020,7 +7933,7 @@ mod tests {
             Provider::Codex,
             Some("cod:gpt-5.5")
         ));
-
+        assert!(should_force_codex_cli_io_gateway(Some("cod:gpt-5.5")));
         let args = default_agent_args_with(
             effective_agent_command_provider(Provider::Codex, Some("cod:gpt-5.5")),
             "hi",
@@ -7031,7 +7944,88 @@ mod tests {
         );
         assert!(args.contains(&"exec".to_string()));
         assert!(args.contains(&"cod:gpt-5.5".to_string()));
-        assert!(args.iter().any(|a| a == "model_provider=aiproxy"));
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.iter().any(|a| a == "model_provider=iowb_gateway"));
+        assert!(!args.iter().any(|a| a == "model_provider=openai"));
+    }
+
+    #[test]
+    fn codex_gateway_runtime_builds_complete_ephemeral_provider_config() {
+        let mut args = default_agent_args_with_resume(
+            Provider::Codex,
+            "hi",
+            None,
+            None,
+            None,
+            Some("gpt-custom"),
+            None,
+            ChatRuntime::IoGateway,
+        );
+        apply_codex_cli_io_gateway_args(&mut args, "https://gateway.example.com/codex/");
+
+        for expected in [
+            "model_provider=iowb_gateway",
+            "model_providers.iowb_gateway.name=\"IO Gateway\"",
+            "model_providers.iowb_gateway.base_url=\"https://gateway.example.com/codex\"",
+            "model_providers.iowb_gateway.env_key=\"IOWB_IO_GATEWAY_API_KEY\"",
+            "model_providers.iowb_gateway.wire_api=\"responses\"",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "args: {args:?}");
+        }
+    }
+
+    #[test]
+    fn codex_gateway_provider_config_precedes_resume_positional() {
+        let mut args = default_agent_args_with_resume(
+            Provider::Codex,
+            "continue",
+            Some("bypass"),
+            Some("medium"),
+            None,
+            Some("min:MiniMax-M3"),
+            Some("native-session-id"),
+            ChatRuntime::IoGateway,
+        );
+        apply_codex_cli_io_gateway_args(&mut args, "https://gateway.example.com/codex");
+
+        let resume_index = args
+            .iter()
+            .position(|arg| arg == "resume")
+            .expect("resume positional");
+        for key in [
+            "model_provider=",
+            "model_providers.iowb_gateway.name=",
+            "model_providers.iowb_gateway.base_url=",
+            "model_providers.iowb_gateway.env_key=",
+            "model_providers.iowb_gateway.wire_api=",
+        ] {
+            let config_index = args
+                .iter()
+                .position(|arg| arg.starts_with(key))
+                .unwrap_or_else(|| panic!("missing {key} in {args:?}"));
+            assert!(config_index < resume_index, "args: {args:?}");
+        }
+        assert_eq!(
+            &args[resume_index..resume_index + 3],
+            ["resume", "native-session-id", "continue"]
+        );
+    }
+
+    #[test]
+    fn native_runtime_does_not_override_codex_provider() {
+        let args = default_agent_args_with_resume(
+            Provider::Codex,
+            "hi",
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChatRuntime::NativeCli,
+        );
+
+        assert!(!args.iter().any(|arg| arg.starts_with("model_provider=")));
+        assert!(!args.iter().any(|arg| arg == "--model"));
     }
 
     #[test]

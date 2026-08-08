@@ -272,11 +272,11 @@
       "put": { "tags": ["Settings"], "summary": "Save sidebar active sessions" }
     },
     "/api/settings/direct-ai": {
-      "get": { "tags": ["Settings"], "summary": "Read Direct AI configuration" },
-      "put": { "tags": ["Settings"], "summary": "Save Direct AI configuration" }
+      "get": { "tags": ["Settings"], "summary": "Read IO Gateway configuration" },
+      "put": { "tags": ["Settings"], "summary": "Save IO Gateway configuration" }
     },
     "/api/settings/direct-ai/models": {
-      "get": { "tags": ["Settings"], "summary": "List Direct AI models" }
+      "get": { "tags": ["Settings"], "summary": "List IO Gateway models" }
     },
     "/api/settings/api-keys": {
       "get": { "tags": ["Settings"], "summary": "List API keys" },

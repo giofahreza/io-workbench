@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260805-05";
+const APP_VERSION = "20260808-01";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -21,6 +21,11 @@ const CHAT_SWIPE_MAX_VERTICAL_DRIFT = 64;
 const CHAT_SWIPE_DIRECTION_RATIO = 1.5;
 
 const CHAT_PROVIDERS = new Set(["codex", "claude", "cursor", "gemini"]);
+
+document.documentElement.classList.toggle(
+  "android-web",
+  /\bAndroid\b/i.test(navigator.userAgent || ""),
+);
 
 function readJsonStorage(key, fallback) {
   try {
@@ -82,6 +87,7 @@ const state = {
   chatPromptHistoryIndex: -1,
   chatPromptHistoryScratch: "",
   chatProcessing: null,
+  sessionStatusById: {},
   lastSessionMessages: [],
   shellBuffer: "",
   virtualLists: {},
@@ -156,6 +162,10 @@ const state = {
     showHidden: false,
     loading: false,
   },
+  boardRuns: [],
+  boardRun: null,
+  boardSelectedRunId: window.localStorage.getItem("iowb.boardSelectedRunId") || "",
+  boardLoading: false,
 };
 
 const qs = (selector) => document.querySelector(selector);
@@ -223,6 +233,7 @@ function attachAuthProtectedShell() {
 }
 
 const VIEW_NAMES = {
+  board: "Board",
   files: "Project Files",
   chat: "Chat",
   shell: "Shell",
@@ -232,12 +243,13 @@ const VIEW_NAMES = {
 };
 
 const VIEW_SUBTITLES = {
+  board: "Track agentic runs and task boards.",
   files: "Browse, edit, upload, and organize project files.",
   chat: "Start or resume agent sessions in the selected project.",
   shell: "Run a PTY-backed terminal in the selected project.",
   git: "Review changes, resolve conflicts, and commit selected work.",
   database: "Manage connections, explore schemas, and run SQL.",
-  settings: "Configure credentials, notifications, Direct AI, and server state.",
+  settings: "Configure credentials, notifications, IO Gateway, and server state.",
 };
 
 async function api(path, options = {}) {
@@ -955,6 +967,33 @@ function sidebarProviderIcon(provider) {
   return "/icons/codex-white.svg";
 }
 
+function normalizeSidebarSessionStatus(status) {
+  const value = String(status || "").toLowerCase();
+  if (["starting", "running", "waiting-for-input", "processing", "pending"].includes(value)) return "running";
+  if (["completed", "complete", "done", "success"].includes(value)) return "completed";
+  if (["failed", "aborted", "cancelled", "canceled", "error"].includes(value)) return "failed";
+  return "";
+}
+
+function sidebarSessionStatus(session) {
+  const live = state.sessionStatusById?.[session.id];
+  return normalizeSidebarSessionStatus(live?.status || session.status || (session.pending ? "pending" : ""));
+}
+
+function rememberSidebarSessionStatus(payload = {}) {
+  const sessionId = payload.sessionId || payload.id || "";
+  if (!sessionId) return;
+  const status = normalizeSidebarSessionStatus(payload.status);
+  if (!status) return;
+  state.sessionStatusById[sessionId] = {
+    status,
+    provider: payload.provider || "",
+    updatedAt: new Date().toISOString(),
+  };
+  renderSidebarProjects();
+  renderPinnedSidebarSessions();
+}
+
 function sidebarSessionCardHtml(session, options = {}) {
   const title = session.title || session.summary || session.id;
   const projectPath = options.projectPath || session.projectPath || "";
@@ -970,12 +1009,17 @@ function sidebarSessionCardHtml(session, options = {}) {
   const messageCountLabel = session.external ? "history" : String(messageCount);
   const messageCountTitle = session.external ? "External CLI history" : `${messageCount} messages`;
   const pending = session.pending ? "true" : "false";
+  const status = sidebarSessionStatus(session);
+  const statusLabel = status === "running" ? "Running" : status === "completed" ? "Completed" : status === "failed" ? "Failed" : "";
   const projectLabel = showProject
     ? (options.projectName || session.projectName || projectPath || "")
     : "";
-  return `<article class="sidebar-history-item${isActive ? " active" : ""}${pinned ? " pinned" : ""}" data-sidebar-session-card="${escapeHtml(session.id)}" data-pending="${pending}">
+  return `<article class="sidebar-history-item${isActive ? " active" : ""}${pinned ? " pinned" : ""}${status ? ` is-${escapeHtml(status)}` : ""}" data-sidebar-session-card="${escapeHtml(session.id)}" data-pending="${pending}" data-status="${escapeHtml(status)}">
     <button type="button" class="sidebar-history-main" data-sidebar-session="${escapeHtml(session.id)}" data-sidebar-provider="${escapeHtml(cli)}" data-sidebar-project-path="${escapeHtml(projectPath)}" data-pending="${pending}">
-      <div class="session-title">${escapeHtml(title)}</div>
+      <div class="session-title-row">
+        ${status ? `<span class="session-status-icon" aria-label="${escapeHtml(statusLabel)}" title="${escapeHtml(statusLabel)}"></span>` : ""}
+        <div class="session-title">${escapeHtml(title)}</div>
+      </div>
       ${projectLabel ? `<div class="session-project">${escapeHtml(projectLabel)}</div>` : ""}
       <div class="session-bottom">
         <span class="meta-time">${escapeHtml(relative || "never")}</span>
@@ -1651,16 +1695,31 @@ function chatEventSessionIds() {
   return new Set([
     state.chatSessionId,
     state.pendingChatSessionId,
-    state.currentSession?.sessionId,
-    state.preferences?.lastChatSessionId,
   ].filter(Boolean));
 }
 
 function isActiveChatSessionEvent(payload = {}) {
   if (!payload.sessionId) return false;
   const ids = chatEventSessionIds();
-  if (!ids.size) return true;
+  if (!ids.size) return false;
   return ids.has(payload.sessionId);
+}
+
+function selectedRunningChatSession() {
+  const ids = chatEventSessionIds();
+  for (const sessionId of ids) {
+    const live = state.sessionStatusById?.[sessionId];
+    if (normalizeSidebarSessionStatus(live?.status) !== "running") continue;
+    const session = findChatSession(sessionId);
+    return {
+      provider: live?.provider || sessionProvider(session),
+      sessionId,
+    };
+  }
+  if (state.currentSession?.sessionId && ids.has(state.currentSession.sessionId)) {
+    return state.currentSession;
+  }
+  return null;
 }
 
 function sessionMetaForStatus(payload = {}) {
@@ -2187,6 +2246,41 @@ async function navigateAdjacentChatSession(direction) {
   return true;
 }
 
+async function navigatePinnedChatSession(direction) {
+  const entries = pinnedChatEntries();
+  if (!entries.length) return false;
+  const currentIndex = entries.findIndex((session) => session.id === state.chatSessionId);
+  let nextIndex;
+  if (currentIndex < 0) {
+    nextIndex = direction > 0 ? 0 : entries.length - 1;
+  } else {
+    nextIndex = (currentIndex + direction + entries.length) % entries.length;
+  }
+  const next = entries[nextIndex];
+  if (!next?.id || (entries.length === 1 && next.id === state.chatSessionId)) return false;
+  hapticFeedback(8);
+  await pickChatSession(next.id, sessionProjectPath(next, activeProjectPath()));
+  renderSidebarProjects();
+  return true;
+}
+
+function isPinnedChatShortcut(event) {
+  if (!event?.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return 0;
+  if (event.code === "Comma" || event.key === ",") return -1;
+  if (event.code === "Period" || event.key === ".") return 1;
+  return 0;
+}
+
+function bindPinnedChatShortcuts() {
+  document.addEventListener("keydown", (event) => {
+    const direction = isPinnedChatShortcut(event);
+    if (!direction) return;
+    event.preventDefault();
+    event.stopPropagation();
+    navigatePinnedChatSession(direction).catch(showError);
+  }, true);
+}
+
 function chatSwipeIgnoredTarget(target) {
   if (!(target instanceof HTMLElement)) return false;
   return Boolean(target.closest("button, a, input, textarea, select, .chat-composer, .chat-provider-picker"));
@@ -2366,6 +2460,18 @@ function formatDate(value) {
   if (!value) return "";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
+function formatShortDate(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function resultBadge(success) {
@@ -4339,7 +4445,7 @@ function updateChatComposerState() {
   const thinking = qs("#chat-thinking-toggle");
   const hasPrompt = Boolean(input?.value.trim());
   const canSubmit = hasPrompt || state.chatImages.length > 0;
-  const busy = Boolean(state.currentSession || state.chatProcessing);
+  const busy = Boolean(selectedRunningChatSession() || state.chatProcessing);
 
   if (clear) {
     clear.classList.toggle("is-empty", !hasPrompt);
@@ -6771,19 +6877,24 @@ function connectWs() {
     }
     if (payload.type === "session_status") {
       const status = String(payload.status || "").toLowerCase();
+      rememberSidebarSessionStatus(payload);
       if (isActiveChatSessionEvent(payload)) {
         state.currentSession = {
           provider: payload.provider,
           sessionId: payload.sessionId,
         };
+      } else if (payload.sessionId && state.currentSession?.sessionId === payload.sessionId) {
+        state.currentSession = null;
       }
       if (status === "starting" || status === "running" || status === "waiting-for-input") {
-        ensureChatProcessing(payload);
-        if (status === "running" || status === "waiting-for-input") {
-          updateProcessingLabel("Processing");
+        if (isActiveChatSessionEvent(payload)) {
+          ensureChatProcessing(payload);
+          if (status === "running" || status === "waiting-for-input") {
+            updateProcessingLabel("Processing");
+          }
         }
       } else if (status === "completed") {
-        if (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer) {
+        if (isActiveChatSessionEvent(payload) && (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer)) {
           finishChatProcessing(payload);
         }
         if (!payload.sessionId || state.currentSession?.sessionId === payload.sessionId) {
@@ -6791,7 +6902,7 @@ function connectWs() {
         }
       } else if (status === "failed" || status === "aborted") {
         const label = status === "aborted" ? "Aborted" : "Failed";
-        if (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer.trim()) {
+        if (isActiveChatSessionEvent(payload) && (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer.trim())) {
           finishChatProcessing(payload, label);
         }
         if (!payload.sessionId || state.currentSession?.sessionId === payload.sessionId) {
@@ -6801,6 +6912,13 @@ function connectWs() {
       updateChatComposerState();
     }
     if (payload.type === "output") {
+      if (!isActiveChatSessionEvent(payload)) {
+        if (payload.done && state.currentSession?.sessionId === payload.sessionId) {
+          state.currentSession = null;
+          updateChatComposerState();
+        }
+        return;
+      }
       state.currentSession = {
         provider: payload.provider,
         sessionId: payload.sessionId,
@@ -7068,9 +7186,9 @@ function activeView() {
 }
 
 function syncNavigationState(view = activeView()) {
-  const primaryMobileViews = new Set(["chat", "files", "shell", "git", "database"]);
+  const primaryMobileViews = new Set(["chat", "files", "shell", "git", "board", "database"]);
   qs("#bottom-more")?.classList.toggle("active", !primaryMobileViews.has(view));
-  qs(".more-nav")?.classList.toggle("active", !["chat", "files", "shell", "git", "database"].includes(view));
+  qs(".more-nav")?.classList.toggle("active", !["chat", "files", "shell", "git", "board", "database"].includes(view));
 }
 
 async function switchView(view) {
@@ -7089,6 +7207,7 @@ async function switchView(view) {
   document.body.dataset.activeView = view;
   panel.classList.add("active");
   panel.setAttribute("aria-hidden", "false");
+  updateMainHeader(view);
   const title = qs("#view-title");
   const subtitle = qs("#view-subtitle");
   if (title) title.textContent = VIEW_NAMES[view] || view;
@@ -7110,6 +7229,7 @@ async function switchView(view) {
 }
 
 async function loadView(view) {
+  if (view === "board") await loadBoard();
   if (view === "files") await loadFiles();
   if (view === "git") await loadGitStatus();
   if (view === "shell") await loadProcesses();
@@ -7130,7 +7250,8 @@ async function loadView(view) {
 
 async function refreshCurrentView() {
   const view = activeView();
-  if (view === "files") await loadFiles();
+  if (view === "board") await loadBoard();
+  else if (view === "files") await loadFiles();
   else if (view === "git") await loadGitStatus();
   else if (view === "database") await loadDbConnections();
   else if (view === "settings") {
@@ -7139,6 +7260,353 @@ async function refreshCurrentView() {
     await loadToolRuns();
   }
   else if (view === "shell") await loadProcesses();
+}
+
+const BOARD_COLUMNS = [
+  { id: "backlog", title: "Backlog", description: "Needs human approval" },
+  { id: "todo", title: "Todo", description: "Ready to run" },
+  { id: "active", title: "In Progress", description: "Currently executing" },
+  { id: "review", title: "QA", description: "Validation and fixes" },
+  { id: "blocked", title: "Blocked", description: "Waiting on other tasks" },
+  { id: "done", title: "Done", description: "Completed groups" },
+];
+
+function boardSelectedStorageKey(projectPath = activeProjectPath()) {
+  return `iowb.boardSelectedRunId.${projectPath || "default"}`;
+}
+
+function boardSelectedRunId(projectPath = activeProjectPath()) {
+  return window.localStorage.getItem(boardSelectedStorageKey(projectPath)) || state.boardSelectedRunId || "";
+}
+
+function setBoardSelectedRunId(runId, projectPath = activeProjectPath()) {
+  state.boardSelectedRunId = runId || "";
+  window.localStorage.setItem("iowb.boardSelectedRunId", state.boardSelectedRunId);
+  if (projectPath) window.localStorage.setItem(boardSelectedStorageKey(projectPath), state.boardSelectedRunId);
+}
+
+async function loadBoard() {
+  const projectPath = activeProjectPath();
+  const label = qs("#board-project-label");
+  if (label) label.textContent = projectPath ? selectedProjectLabel("#active-project") : "No project selected";
+  if (!projectPath) {
+    state.boardRuns = [];
+    state.boardRun = null;
+    renderBoard();
+    return;
+  }
+  state.boardLoading = true;
+  renderBoard();
+  try {
+    const query = new URLSearchParams({ projectPath, includeHistory: "true" });
+    const body = await api(`/api/danger/runs?${query.toString()}`);
+    state.boardRuns = Array.isArray(body.runs) ? body.runs : [];
+    let runId = boardSelectedRunId(projectPath);
+    if (!state.boardRuns.some((run) => run.id === runId)) {
+      runId = state.boardRuns[0]?.id || "";
+      setBoardSelectedRunId(runId, projectPath);
+    }
+    state.boardRun = runId ? await loadBoardRunDetail(runId) : null;
+  } finally {
+    state.boardLoading = false;
+    renderBoard();
+  }
+}
+
+async function loadBoardRunDetail(runId) {
+  const body = await api(`/api/danger/runs/${encodeURIComponent(runId)}`);
+  return body.run || null;
+}
+
+function renderBoard() {
+  renderBoardRunSelect();
+  renderBoardRunControls();
+  const status = qs("#board-status");
+  const columns = qs("#board-columns");
+  const details = qs("#board-run-details");
+  if (!columns) return;
+  const projectPath = activeProjectPath();
+  if (!projectPath) {
+    if (status) status.textContent = "Select a project to use the agentic board.";
+    if (details) details.innerHTML = "";
+    columns.innerHTML = "";
+    return;
+  }
+  if (state.boardLoading) {
+    if (status) status.textContent = "Loading board...";
+    if (details) details.innerHTML = "";
+    columns.innerHTML = "";
+    return;
+  }
+  if (!state.boardRun) {
+    if (status) status.textContent = "No board for this project yet.";
+    if (details) details.innerHTML = "";
+    columns.innerHTML = BOARD_COLUMNS.map((column) => renderBoardColumn(column, [])).join("");
+    return;
+  }
+  const run = state.boardRun;
+  const tasks = Array.isArray(run.tasks) ? run.tasks : [];
+  if (status) {
+    status.innerHTML = `
+      <strong>${escapeHtml(run.projectName || "Project board")}</strong>
+      <span>${escapeHtml(run.status || "paused")}</span>
+      <span>${escapeHtml(tasks.length)} task${tasks.length === 1 ? "" : "s"}</span>
+      <span>${escapeHtml(run.provider || "claude")}${run.model ? ` · ${escapeHtml(run.model)}` : ""}</span>
+      <span>TDD ${run.tddEnabled ? "on" : "off"}</span>
+      <span>RAG ${run.ragEnabled ? "on" : "off"} · ${escapeHtml(run.ragQueryCount || 0)} queries</span>
+    `;
+  }
+  if (details) details.innerHTML = renderBoardRunDetails(run);
+  const byColumn = new Map(BOARD_COLUMNS.map((column) => [column.id, []]));
+  tasks.forEach((task) => {
+    byColumn.get(boardColumnForTask(task))?.push(task);
+  });
+  columns.innerHTML = BOARD_COLUMNS.map((column) => renderBoardColumn(column, byColumn.get(column.id) || [])).join("");
+}
+
+function renderBoardRunDetails(run) {
+  const requirements = Array.isArray(run.requirementMatrix) ? run.requirementMatrix : [];
+  const validations = Array.isArray(run.validationRuns) ? run.validationRuns : [];
+  const promotions = Array.isArray(run.promotionCandidates) ? run.promotionCandidates : [];
+  const finalReview = run.finalReview || {};
+  const tddPolicy = run.tddPolicy || {};
+  const latestValidations = validations.slice(-4).reverse();
+  const latestPromotions = promotions.slice(-4).reverse();
+  const requirementCounts = requirements.reduce((counts, requirement) => {
+    const status = requirement.status || "unknown";
+    counts[status] = (counts[status] || 0) + 1;
+    return counts;
+  }, {});
+  return `
+    <section class="board-run-details-grid">
+      <article>
+        <h3>TDD Policy</h3>
+        <p>Failing baseline: ${escapeHtml(String(tddPolicy.requireFailingTestBeforeDev !== false))}</p>
+        <p>Max fixes: ${escapeHtml(tddPolicy.maxFixAttempts ?? 3)}</p>
+      </article>
+      <article>
+        <h3>Requirements</h3>
+        <p>${escapeHtml(requirements.length)} total</p>
+        <p>${Object.entries(requirementCounts).map(([key, value]) => `${escapeHtml(key)} ${escapeHtml(value)}`).join(" · ") || "No matrix yet"}</p>
+      </article>
+      <article>
+        <h3>Validation</h3>
+        ${latestValidations.length ? latestValidations.map((item) => `<p>${escapeHtml(item.stage || item.command || "validation")} · ${item.passed === false ? "fail" : "pass"}</p>`).join("") : "<p>No validation runs yet</p>"}
+      </article>
+      <article>
+        <h3>Promotion</h3>
+        <p>${escapeHtml(promotions.length)} candidate${promotions.length === 1 ? "" : "s"}</p>
+        ${latestPromotions.length ? latestPromotions.map((item) => {
+          const name = item.title || item.taskId || "candidate";
+          const summary = item.summary && item.summary !== name ? ` — ${item.summary}` : "";
+          return `<p>${escapeHtml(`${name}${summary}`)}</p>`;
+        }).join("") : "<p>No candidates yet</p>"}
+      </article>
+      <article>
+        <h3>Final QA</h3>
+        <p>${finalReview.complete === true ? "Complete" : finalReview.complete === false ? "Incomplete" : "Pending"}</p>
+        ${finalReview.summary ? `<p>${escapeHtml(finalReview.summary)}</p>` : ""}
+      </article>
+    </section>
+  `;
+}
+
+function renderBoardRunSelect() {
+  const select = qs("#board-run-select");
+  if (!select) return;
+  if (!state.boardRuns.length) {
+    select.innerHTML = `<option value="">No boards</option>`;
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  const selected = state.boardRun?.id || boardSelectedRunId();
+  select.innerHTML = state.boardRuns.map((run) => {
+    const title = `${run.projectName || "Board"} · ${formatShortDate(run.updatedAt || run.createdAt)}`;
+    return `<option value="${escapeHtml(run.id)}"${run.id === selected ? " selected" : ""}>${escapeHtml(title)}</option>`;
+  }).join("");
+}
+
+function renderBoardRunControls() {
+  const run = state.boardRun;
+  const status = String(run?.status || "").toLowerCase();
+  const hasRun = Boolean(run?.id);
+  const running = hasRun && ["running", "planning", "in_progress"].includes(status);
+  const terminal = hasRun && ["completed", "cancelled", "failed"].includes(status);
+  const hasTodo = Array.isArray(run?.tasks) && run.tasks.some((task) => ["pending", "planned"].includes(String(task.status || "").toLowerCase()));
+  const resume = qs("#board-run-resume");
+  const pause = qs("#board-run-pause");
+  const abort = qs("#board-run-abort");
+  if (resume) resume.disabled = !hasRun || running || (terminal && !hasTodo);
+  if (pause) pause.disabled = !hasRun || !running;
+  if (abort) abort.disabled = !hasRun || terminal;
+}
+
+function renderBoardColumn(column, tasks) {
+  return `
+    <section class="board-column" data-board-column="${escapeHtml(column.id)}">
+      <header>
+        <div>
+          <h3>${escapeHtml(column.title)}</h3>
+          <span>${escapeHtml(column.description)}</span>
+        </div>
+        <strong>${tasks.length}</strong>
+      </header>
+      <div class="board-card-list">
+        ${tasks.length ? tasks.map(renderBoardCard).join("") : `<div class="board-empty-column">No cards</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderBoardCard(task) {
+  const status = String(task.status || "backlog");
+  const details = task.details || task.description || task.prompt || "";
+  const references = Array.isArray(task.references) ? task.references : [];
+  const acceptance = Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria : [];
+  const ragRefs = Array.isArray(task.ragContextRefs) ? task.ragContextRefs : [];
+  const qaTests = Array.isArray(task.qaTestPaths) ? task.qaTestPaths : [];
+  const qaCommands = Array.isArray(task.qaTestCommands) ? task.qaTestCommands : [];
+  const baselinePassed = task.qaBaselineValidation?.passed;
+  const tddPhase = task.tddPhase || "";
+  return `
+    <article class="board-card" data-board-task-id="${escapeHtml(task.id)}">
+      <div class="board-card-topline">
+        <span class="badge">${escapeHtml(statusLabel(status))}</span>
+        <span>${escapeHtml(task.priority || "medium")}</span>
+      </div>
+      <div class="board-card-signals">
+        ${tddPhase ? `<span class="badge ${tddPhase === "done" ? "ok" : tddPhase.includes("blocked") || tddPhase.includes("review") ? "danger" : "warn"}">TDD ${escapeHtml(statusLabel(tddPhase))}</span>` : ""}
+        ${qaTests.length || qaCommands.length ? `<span class="badge">Tests ${escapeHtml(qaTests.length || qaCommands.length)}</span>` : ""}
+        ${baselinePassed === false ? `<span class="badge danger">Baseline failed</span>` : baselinePassed === true ? `<span class="badge ok">Baseline passed</span>` : ""}
+        ${ragRefs.length ? `<span class="badge">RAG ${escapeHtml(ragRefs.length)}</span>` : ""}
+        ${task.fixAttempts ? `<span class="badge warn">Fix ${escapeHtml(task.fixAttempts)}</span>` : ""}
+      </div>
+      <h4>${escapeHtml(task.title || task.id || "Task")}</h4>
+      ${details ? `<p>${escapeHtml(details)}</p>` : ""}
+      ${acceptance.length ? `<ul>${acceptance.slice(0, 3).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}
+      ${references.length ? `<div class="board-card-meta">${references.slice(0, 3).map((item) => `<code>${escapeHtml(item)}</code>`).join("")}</div>` : ""}
+      <div class="board-card-actions">
+        ${boardMoveButton(task, "backlog", "Backlog")}
+        ${boardMoveButton(task, "pending", "Todo")}
+        ${boardMoveButton(task, "in_progress", "Progress")}
+        ${boardMoveButton(task, "qa", "QA")}
+        ${boardMoveButton(task, "blocked", "Block")}
+        ${boardMoveButton(task, "completed", "Done")}
+        <button type="button" class="danger" data-board-delete-task="${escapeHtml(task.id)}">Delete</button>
+      </div>
+    </article>
+  `;
+}
+
+function boardMoveButton(task, status, label) {
+  if (String(task.status || "") === status) return "";
+  return `<button type="button" data-board-task-status="${escapeHtml(status)}" data-board-task-id="${escapeHtml(task.id)}">${escapeHtml(label)}</button>`;
+}
+
+function boardColumnForTask(task) {
+  const status = String(task.status || "").toLowerCase();
+  if (status.startsWith("backlog")) return "backlog";
+  if (status === "completed" || status === "done") return "done";
+  if (status === "blocked" || status === "failed" || status === "cancelled") return "blocked";
+  if (status === "running" || status === "in_progress" || status === "pausing" || status === "cancelling") return "active";
+  if (status === "qa" || status === "review" || String(task.tddPhase || "").startsWith("qa") || task.qaTask || task.finalQaTask || task.qaFixTask || task.taskLevelQa) return "review";
+  return "todo";
+}
+
+function statusLabel(status) {
+  return String(status || "backlog")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+async function createBoard(event) {
+  event.preventDefault();
+  const projectPath = activeProjectPath();
+  if (!projectPath) throw new Error("Select a project before creating a board.");
+  const prompt = qs("#board-start-prompt")?.value.trim() || "";
+  if (!prompt) throw new Error("Enter a board prompt.");
+  const provider = qs("#board-provider")?.value || "claude";
+  const model = qs("#board-model")?.value.trim() || "";
+  const body = await api("/api/danger/runs", {
+    method: "POST",
+    body: JSON.stringify({
+      command: prompt,
+      projectPath,
+      projectName: activeProjectName() || selectedProjectLabel("#active-project"),
+      provider,
+      model,
+      forceNewRun: true,
+    }),
+  });
+  const run = body.run || null;
+  if (run?.id) setBoardSelectedRunId(run.id, projectPath);
+  qs("#board-start-prompt").value = "";
+  await loadBoard();
+  showToast("Board created", "ok");
+}
+
+async function addBoardTask(event) {
+  event.preventDefault();
+  const run = state.boardRun;
+  if (!run?.id) throw new Error("Create or select a board first.");
+  const prompt = qs("#board-task-prompt")?.value.trim() || "";
+  if (!prompt) throw new Error("Enter a task prompt.");
+  const lines = prompt.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length > 1) {
+    await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks/backlog-from-prompt`, {
+      method: "POST",
+      body: JSON.stringify({ prompt }),
+    });
+  } else {
+    await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks`, {
+      method: "POST",
+      body: JSON.stringify({ prompt, status: "backlog" }),
+    });
+  }
+  qs("#board-task-prompt").value = "";
+  await loadBoard();
+  showToast("Task added", "ok");
+}
+
+async function moveBoardTask(taskId, status) {
+  const run = state.boardRun;
+  if (!run?.id || !taskId) return;
+  if (status === "pending") {
+    await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/promote`, { method: "POST" });
+  } else if (status === "backlog") {
+    await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/demote`, { method: "POST" });
+  } else {
+    await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
+    });
+  }
+  await loadBoard();
+}
+
+async function deleteBoardTask(taskId) {
+  const run = state.boardRun;
+  if (!run?.id || !taskId) return;
+  await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" });
+  await loadBoard();
+  showToast("Task deleted", "ok");
+}
+
+async function boardRunAction(action) {
+  const run = state.boardRun;
+  if (!run?.id) throw new Error("Create or select a board first.");
+  const body = action === "pause"
+    ? { reason: "user request" }
+    : action === "abort"
+      ? { reason: "user request" }
+      : {};
+  await api(`/api/danger/runs/${encodeURIComponent(run.id)}/${action}`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  await loadBoard();
+  showToast(action === "resume" ? "Board running" : action === "pause" ? "Board paused" : "Board aborted", "ok");
 }
 
 function commandPaletteCommands() {
@@ -7322,13 +7790,14 @@ function commandPaletteCommands() {
       title: "Abort Current Chat Session",
       section: "Chat",
       keywords: "stop cancel agent",
-      disabled: () => !state.currentSession,
+      disabled: () => !selectedRunningChatSession(),
       run: async () => {
-        if (await switchView("chat") && state.currentSession && state.ws?.readyState === WebSocket.OPEN) {
+        const selectedRun = selectedRunningChatSession();
+        if (await switchView("chat") && selectedRun && state.ws?.readyState === WebSocket.OPEN) {
           state.ws.send(JSON.stringify({
             type: "abort_session",
-            provider: state.currentSession.provider,
-            sessionId: state.currentSession.sessionId,
+            provider: selectedRun.provider,
+            sessionId: selectedRun.sessionId,
           }));
           updateChatComposerState();
         }
@@ -7750,6 +8219,27 @@ function bindForms() {
   qs("#refresh-tool-runs").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadToolRuns).catch(showError));
   qs("#refresh-metrics").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadMetrics).catch(showError));
   qs("#refresh-settings").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadSettings).catch(showError));
+  qs("#board-refresh")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadBoard).catch(showError));
+  qs("#board-run-resume")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardRunAction("resume")).catch(showError));
+  qs("#board-run-pause")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardRunAction("pause")).catch(showError));
+  qs("#board-run-abort")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardRunAction("abort")).catch(showError));
+  qs("#board-run-select")?.addEventListener("change", async (event) => {
+    setBoardSelectedRunId(event.currentTarget.value, activeProjectPath());
+    await loadBoard().catch(showError);
+  });
+  qs("#board-start-form")?.addEventListener("submit", (event) => withButtonLoading(event.submitter, () => createBoard(event)).catch(showError));
+  qs("#board-task-form")?.addEventListener("submit", (event) => withButtonLoading(event.submitter, () => addBoardTask(event)).catch(showError));
+  qs("#board-columns")?.addEventListener("click", (event) => {
+    const moveButton = event.target.closest("[data-board-task-status]");
+    if (moveButton) {
+      withButtonLoading(moveButton, () => moveBoardTask(moveButton.dataset.boardTaskId, moveButton.dataset.boardTaskStatus)).catch(showError);
+      return;
+    }
+    const deleteButton = event.target.closest("[data-board-delete-task]");
+    if (deleteButton) {
+      withButtonLoading(deleteButton, () => deleteBoardTask(deleteButton.dataset.boardDeleteTask)).catch(showError);
+    }
+  });
   document.querySelectorAll("[data-chat-provider-option]").forEach((button) => {
     button.addEventListener("click", () => chooseNewChatProvider(button.dataset.chatProviderOption));
   });
@@ -7955,6 +8445,22 @@ function bindForms() {
     state.chatPromptHistoryScratch = qs("#chat-prompt").value || "";
   });
   qs("#chat-prompt").addEventListener("focus", autosizeChatPrompt);
+  qs("#chat-prompt").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey) {
+      event.preventDefault();
+      qs("#chat-form")?.requestSubmit();
+      return;
+    }
+    if ((event.key === "ArrowUp" || event.key === "ArrowDown") && !event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey) {
+      const input = event.currentTarget;
+      const atStart = (input.selectionStart ?? 0) === 0 && (input.selectionEnd ?? 0) === 0;
+      const atEnd = (input.selectionStart ?? 0) === input.value.length && (input.selectionEnd ?? 0) === input.value.length;
+      if ((event.key === "ArrowUp" && atStart) || (event.key === "ArrowDown" && atEnd)) {
+        event.preventDefault();
+        navigateChatPromptHistory(event.key === "ArrowUp" ? -1 : 1);
+      }
+    }
+  });
   qs("#clear-chat").addEventListener("click", () => {
     const prompt = qs("#chat-prompt");
     prompt.value = "";
@@ -8026,15 +8532,16 @@ function bindForms() {
 
   qs("#chat-form").addEventListener("submit", (event) => {
     event.preventDefault();
-    if (state.currentSession) {
+    const selectedRun = selectedRunningChatSession();
+    if (selectedRun) {
       if (state.ws?.readyState !== WebSocket.OPEN) {
         showError(new Error("Chat connection is not ready."));
         return;
       }
       state.ws.send(JSON.stringify({
         type: "abort_session",
-        provider: state.currentSession.provider,
-        sessionId: state.currentSession.sessionId,
+        provider: selectedRun.provider,
+        sessionId: selectedRun.sessionId,
       }));
       updateChatComposerState();
       return;
@@ -8076,6 +8583,7 @@ function bindForms() {
     const sessionId = chatSessionIdForSubmit();
     if (sessionId) {
       saveSessionOverrides(sessionId, { cli, model, effort, mode, thinking, sentAt: startedAt });
+      rememberSidebarSessionStatus({ sessionId, provider: cli, status: "starting" });
     }
     const message = {
       type: "start_session",
@@ -8206,6 +8714,9 @@ function showError(error) {
     setOutput("#git-output", message, "error-output");
   } else if (qs("#files-view")?.classList.contains("active")) {
     const status = qs("#file-editor-status");
+    if (status) status.textContent = message;
+  } else if (qs("#board-view")?.classList.contains("active")) {
+    const status = qs("#board-status");
     if (status) status.textContent = message;
   } else if (qs("#settings-view")?.classList.contains("active")) {
     setOutput("#settings-json", message, "error-output");
@@ -8439,6 +8950,7 @@ function initXterm() {
 
 bindNavigation();
 bindFloatingNavigationPosition();
+bindPinnedChatShortcuts();
 bindCommandPalette();
 bindForms();
 applyPreferences();

@@ -155,6 +155,14 @@ pub enum SessionMode {
     ReadOnly,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRuntime {
+    #[default]
+    NativeCli,
+    IoGateway,
+}
+
 impl SessionMode {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -222,6 +230,8 @@ pub struct SessionSummary {
     pub active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<ChatRuntime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

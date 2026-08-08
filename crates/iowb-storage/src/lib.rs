@@ -1676,6 +1676,84 @@ impl Storage {
         })
     }
 
+    pub fn get_active_credential_value_by_name(
+        &self,
+        user_id: &str,
+        credential_name: &str,
+        credential_type: &str,
+    ) -> Result<Option<String>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT credential_value
+                FROM credentials
+                WHERE user_id = ?1
+                  AND credential_name = ?2
+                  AND credential_type = ?3
+                  AND is_active = 1
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                "#,
+                params![user_id, credential_name, credential_type],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    pub fn upsert_named_credential(
+        &self,
+        user_id: &str,
+        credential_name: &str,
+        credential_type: &str,
+        credential_value: &str,
+        description: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                r#"
+                UPDATE credentials
+                SET credential_value = ?1, description = ?2, is_active = 1, updated_at = ?3
+                WHERE id = (
+                    SELECT id FROM credentials
+                    WHERE user_id = ?4 AND credential_name = ?5 AND credential_type = ?6
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                )
+                "#,
+                params![
+                    credential_value,
+                    description,
+                    now,
+                    user_id,
+                    credential_name,
+                    credential_type,
+                ],
+            )?;
+            if changed == 0 {
+                conn.execute(
+                    r#"
+                    INSERT INTO credentials (
+                        user_id, credential_name, credential_type, credential_value,
+                        description, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                    "#,
+                    params![
+                        user_id,
+                        credential_name,
+                        credential_type,
+                        credential_value,
+                        description,
+                        now,
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn create_credential(
         &self,
         user_id: &str,
@@ -2152,6 +2230,9 @@ fn serialize_session_metadata(session: &SessionSummary) -> String {
     if let Some(model) = session.model.as_ref() {
         value.insert("model".into(), json!(model));
     }
+    if let Some(runtime) = session.runtime {
+        value.insert("runtime".into(), json!(runtime));
+    }
     if let Some(effort) = session.effort.as_ref() {
         value.insert("effort".into(), json!(effort));
     }
@@ -2193,6 +2274,9 @@ fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
     }
     if let Some(v) = value.get("model").and_then(Value::as_str) {
         session.model = Some(v.to_string());
+    }
+    if let Some(v) = value.get("runtime") {
+        session.runtime = serde_json::from_value(v.clone()).ok();
     }
     if let Some(v) = value.get("effort").and_then(Value::as_str) {
         session.effort = Some(v.to_string());
@@ -2351,6 +2435,7 @@ fn parse_role(raw: &str) -> MessageRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iowb_protocol::ChatRuntime;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_storage(label: &str) -> (Storage, PathBuf) {
@@ -2385,6 +2470,7 @@ mod tests {
             title: "Test".to_string(),
             last_activity: Utc::now(),
             native_session_id: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            runtime: Some(ChatRuntime::IoGateway),
             ..Default::default()
         };
 
@@ -2394,6 +2480,54 @@ mod tests {
             .expect("query")
             .expect("stored session");
         assert_eq!(restored.native_session_id, session.native_session_id);
+        assert_eq!(restored.runtime, Some(ChatRuntime::IoGateway));
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn named_credentials_are_scoped_and_updated_in_place() {
+        let (storage, root) = temporary_storage("named-credential");
+        storage
+            .create_user("user-1", "user-1", "test-hash")
+            .expect("create first user");
+        storage
+            .create_user("user-2", "user-2", "test-hash")
+            .expect("create second user");
+
+        storage
+            .upsert_named_credential(
+                "user-1",
+                "gateway-key",
+                "io_gateway_api_key",
+                "first-secret",
+                None,
+            )
+            .expect("create credential");
+        storage
+            .upsert_named_credential(
+                "user-1",
+                "gateway-key",
+                "io_gateway_api_key",
+                "updated-secret",
+                None,
+            )
+            .expect("update credential");
+
+        assert_eq!(
+            storage
+                .get_active_credential_value_by_name("user-1", "gateway-key", "io_gateway_api_key",)
+                .expect("read credential")
+                .as_deref(),
+            Some("updated-secret")
+        );
+        assert_eq!(
+            storage
+                .get_active_credential_value_by_name("user-2", "gateway-key", "io_gateway_api_key",)
+                .expect("read other user"),
+            None
+        );
 
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");

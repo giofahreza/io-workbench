@@ -12,7 +12,7 @@
     <link href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;500;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/vendor/codemirror/codemirror.css" />
     <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260805-05" />
+    <link rel="stylesheet" href="/styles.css?v=20260808-01" />
   </head>
   <body class="auth-pending">
     <aside class="sidebar">
@@ -94,6 +94,7 @@
           </div>
         </div>
         <nav class="main-tab-switcher" aria-label="Workspace views">
+          <button data-view="board" data-symbol="nav-board" aria-label="Board" title="Board">Board</button>
           <button data-view="shell" data-symbol="nav-shell" aria-label="Shell" title="Shell">Shell</button>
           <button data-view="files" data-symbol="nav-files" aria-label="Files" title="Files">Files</button>
           <button data-view="chat" data-symbol="nav-chat" aria-label="Chat" title="Chat">Chat</button>
@@ -275,6 +276,61 @@
             </div>
             <div id="chat-image-preview" class="image-preview-list"></div>
           </form>
+        </div>
+      </section>
+
+      <section id="board-view" class="panel view workbench-panel board-panel">
+        <div class="board-workbench">
+          <header class="board-header">
+            <div class="board-title-block">
+              <h2>Agentic Board</h2>
+              <span id="board-project-label">No project selected</span>
+            </div>
+            <div class="board-header-actions">
+              <select id="board-run-select" aria-label="Board run"></select>
+              <div class="board-run-controls" aria-label="Board execution controls">
+                <button id="board-run-resume" class="icon-button" type="button" aria-label="Run board" title="Run board" data-symbol="play"></button>
+                <button id="board-run-pause" class="icon-button" type="button" aria-label="Pause board" title="Pause board" data-symbol="pause"></button>
+                <button id="board-run-abort" class="icon-button danger" type="button" aria-label="Abort board" title="Abort board" data-symbol="stop"></button>
+              </div>
+              <button id="board-refresh" class="icon-button" type="button" aria-label="Refresh board" title="Refresh board" data-symbol="refresh"></button>
+            </div>
+          </header>
+          <div class="board-compose-row">
+            <form id="board-start-form" class="board-form">
+              <label>
+                <span>New Board Prompt</span>
+                <textarea id="board-start-prompt" rows="3" placeholder="Describe the work for a new board"></textarea>
+              </label>
+              <div class="board-form-grid">
+                <label>
+                  <span>Provider</span>
+                  <select id="board-provider">
+                    <option value="claude">Claude</option>
+                    <option value="codex">Codex</option>
+                    <option value="gemini">Gemini</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Model</span>
+                  <input id="board-model" placeholder="Optional model" />
+                </label>
+                <button class="primary-action" type="submit">Create Board</button>
+              </div>
+            </form>
+            <form id="board-task-form" class="board-form">
+              <label>
+                <span>Add Backlog Task</span>
+                <textarea id="board-task-prompt" rows="3" placeholder="Describe a task or paste multiple lines"></textarea>
+              </label>
+              <div class="board-form-grid board-form-grid-single">
+                <button class="primary-action" type="submit">Add To Backlog</button>
+              </div>
+            </form>
+          </div>
+          <div id="board-status" class="board-status">Loading board...</div>
+          <div id="board-run-details" class="board-run-details"></div>
+          <div id="board-columns" class="board-columns"></div>
         </div>
       </section>
 
@@ -544,7 +600,7 @@
               <button type="button" data-settings-tab="git" data-symbol="nav-git">Git</button>
               <button type="button" data-settings-tab="api" data-symbol="key">API Tokens</button>
               <button type="button" data-settings-tab="notifications" data-symbol="alert">Notifications</button>
-              <button type="button" data-settings-tab="direct-ai" data-symbol="globe">Direct AI</button>
+              <button type="button" data-settings-tab="direct-ai" data-symbol="globe">IO Gateway</button>
               <button type="button" data-settings-tab="server-status" data-symbol="nav-database">Server Status</button>
               <button type="button" data-settings-tab="tools" data-symbol="nav-command">Tools</button>
               <button type="button" data-settings-tab="about" data-symbol="info">About</button>
@@ -656,11 +712,11 @@
               <section class="settings-tab-panel" data-settings-panel="direct-ai">
                 <article class="settings-card">
                   <header class="settings-card-header">
-                    <h3>Direct AI</h3>
+                    <h3>IO Gateway</h3>
                     <span>Gateway configuration and available model metadata.</span>
                   </header>
                   <div class="settings-action-grid">
-                    <button id="load-direct-ai" type="button">Direct AI</button>
+                    <button id="load-direct-ai" type="button">IO Gateway</button>
                     <button id="load-direct-ai-models" type="button">AI Models</button>
                   </div>
                 </article>
@@ -792,7 +848,7 @@
                         <option value="credential-toggle">Toggle Credential</option>
                         <option value="git-config">Save Git Config</option>
                         <option value="notification">Save Notifications JSON</option>
-                        <option value="direct-ai">Save Direct AI JSON</option>
+                        <option value="direct-ai">Save IO Gateway JSON</option>
                         <option value="onboarding">Complete Onboarding</option>
                       </select>
                     </label>
@@ -867,6 +923,7 @@
         <span id="bottom-view-meta">No project</span>
       </div>
       <div class="bottom-nav-tabs" role="tablist" aria-label="Workspace views">
+        <button data-view="board" data-symbol="nav-board" aria-label="Board" title="Board">Board</button>
         <button data-view="shell" data-symbol="nav-shell" aria-label="Shell" title="Shell">Shell</button>
         <button data-view="files" data-symbol="nav-files" aria-label="Files" title="Files">Files</button>
         <button data-view="chat" data-symbol="nav-chat" aria-label="Chat" title="Chat">Chat</button>
@@ -892,6 +949,6 @@
     <script src="/vendor/codemirror/mode/yaml.js"></script>
     <script src="/vendor/codemirror/mode/toml.js"></script>
     <script src="/vendor/xterm/xterm.js"></script>
-    <script src="/app.js?v=20260805-05" type="module"></script>
+    <script src="/app.js?v=20260808-01" type="module"></script>
   </body>
 </html>

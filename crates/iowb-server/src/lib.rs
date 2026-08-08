@@ -1,5 +1,9 @@
+#![recursion_limit = "256"]
+
+mod agentic_board;
 mod database;
 mod git;
+mod rag_client;
 
 use std::{
     cmp::Ordering,
@@ -38,7 +42,7 @@ use iowb_fs::FsError;
 use iowb_process::{ProcessError, ProcessEvent};
 use iowb_protocol::{
     ApiErrorBody, AuthStatusResponse, BatchCopyFileRequest, BatchDeleteFileRequest,
-    BatchRenameFileRequest, BrowseFilesystemResponse, ChatMessage, CopyFileRequest,
+    BatchRenameFileRequest, BrowseFilesystemResponse, ChatMessage, ChatRuntime, CopyFileRequest,
     CreateFileRequest, CreateProjectRequest, CreateWorkspaceRequest, DeleteFcmTokenRequest,
     DeleteFileRequest, FcmTokenResponse, FileContentResponse, FileEntry, HealthResponse,
     HealthStatus, LoginRequest, MessageRole, MessagesResponse, PRODUCT_NAME, PlaceholderResponse,
@@ -87,7 +91,10 @@ const SYS_THERMAL_PATH: &str = "/sys/class/thermal";
 const SYS_HWMON_PATH: &str = "/sys/class/hwmon";
 const SYS_POWER_SUPPLY_PATH: &str = "/sys/class/power_supply";
 const DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL: &str = "http://141.144.197.96:8319/claude";
-const IO_GATEWAY_API_KEY_ENV: &str = "CODEX_GATEWAY_KEY";
+const IO_GATEWAY_API_KEY_CREDENTIAL: &str = "io-workbench-io-gateway-api-key";
+const IO_GATEWAY_API_KEY_CREDENTIAL_TYPE: &str = "io_gateway_api_key";
+const IO_GATEWAY_OTP_CREDENTIAL: &str = "io-workbench-io-gateway-otp";
+const IO_GATEWAY_OTP_CREDENTIAL_TYPE: &str = "io_gateway_otp";
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let addr = config.socket_addr();
@@ -153,13 +160,23 @@ async fn recover_interrupted_chat_runs(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
 
+        let cleanup = terminate_orphaned_agent_run_processes(&run.id, state.storage.path());
+        if cleanup.live_owner {
+            recovered_session_ids.insert(run.session_id.clone());
+            info!(
+                run_id = %run.id,
+                session_id = %run.session_id,
+                "left durable chat run attached to its live server owner"
+            );
+            continue;
+        }
+
         let Some(claimed) = state
             .storage
             .mark_durable_chat_run_recovering(&run.id, DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS)?
         else {
             continue;
         };
-        terminate_orphaned_agent_run_processes(&claimed.id);
         let direct_ai_config = parse_provider_param(&claimed.provider)
             .ok()
             .and_then(|provider| {
@@ -275,6 +292,8 @@ async fn synthesize_legacy_durable_runs(state: &AppState) -> anyhow::Result<()> 
 }
 
 pub fn build_router(state: AppState) -> Router {
+    agentic_board::recover_active_runs(&state);
+
     let protected_routes = Router::new()
         .route("/api/auth/logout", post(auth_logout))
         .route("/api/auth/user", get(auth_user))
@@ -421,8 +440,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/plugins/install", post(install_plugin))
         .route("/api/plugins/remove", post(remove_plugin))
         .route("/api/plugins/run", post(run_plugin_command))
-        .route("/api/danger/run", post(run_danger))
-        .route("/api/danger/runs", get(list_danger_runs))
+        .merge(agentic_board::router())
         .route(
             "/api/devices/fcm-token",
             post(register_fcm_token).delete(delete_fcm_token),
@@ -2427,7 +2445,7 @@ struct CreateFolderRequest {
 async fn list_settings(State(state): State<AppState>) -> Result<Json<Value>> {
     Ok(Json(serde_json::json!({
         "success": true,
-        "settings": state.storage.list_settings()?,
+        "settings": public_settings(state.storage.list_settings()?),
     })))
 }
 
@@ -2535,14 +2553,21 @@ async fn mobile_settings_overview(
         _ => {}
     }
 
-    let direct_ai = resolved_direct_ai_config_for_user(&state, user_id);
+    let direct_ai_status = io_gateway_settings_status(&state, user_id)?;
+    let direct_ai_effective = direct_ai_status
+        .get("effective")
+        .cloned()
+        .unwrap_or_else(default_direct_ai_config);
     let (runtime, claude_status, codex_status, gemini_status, cursor_status, direct_ai_models) = tokio::join!(
         runtime_metrics_payload(&state),
         provider_cli_status(Provider::Claude),
         provider_cli_status(Provider::Codex),
         provider_cli_status(Provider::Gemini),
         cursor_cli_status(),
-        timeout(Duration::from_secs(2), fetch_direct_ai_models(&direct_ai),),
+        timeout(
+            Duration::from_secs(2),
+            fetch_direct_ai_models(&direct_ai_effective),
+        ),
     );
     let runtime = runtime?;
     let mut providers = serde_json::Map::new();
@@ -2704,13 +2729,16 @@ async fn mobile_settings_overview(
         },
         "plugins": plugins,
         "directAi": {
-            "config": direct_ai,
-            "runtimeReady": direct_ai_endpoint_config(&direct_ai).is_some(),
+            "config": direct_ai_status.get("config").cloned().unwrap_or(Value::Null),
+            "effective": direct_ai_status.get("effective").cloned().unwrap_or(Value::Null),
+            "runtimeReady": direct_ai_status.get("runtimeReady").cloned().unwrap_or(Value::Bool(false)),
+            "apiKeyConfigured": direct_ai_status.get("apiKeyConfigured").cloned().unwrap_or(Value::Bool(false)),
+            "auth": direct_ai_status.get("auth").cloned().unwrap_or(Value::Null),
             "models": direct_ai_models,
             "modelsEndpoint": "/api/settings/direct-ai/models",
         },
         "settings": {
-            "all": state.storage.list_settings()?,
+            "all": public_settings(state.storage.list_settings()?),
         },
         "about": {
             "product": PRODUCT_NAME,
@@ -2723,10 +2751,13 @@ async fn get_setting(
     State(state): State<AppState>,
     AxumPath(key): AxumPath<String>,
 ) -> Result<Json<Value>> {
-    let value = state
+    let mut value = state
         .storage
         .get_setting(&key)?
         .ok_or_else(|| ServerError::new(StatusCode::NOT_FOUND, "setting not found"))?;
+    if is_io_gateway_setting_key(&key) {
+        value = public_direct_ai_config(&value);
+    }
     Ok(Json(serde_json::json!({
         "success": true,
         "key": key,
@@ -2937,32 +2968,59 @@ fn sidebar_active_sessions_empty(value: &Value) -> bool {
     }
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct DirectAiSettingsQuery {
+    #[serde(default, rename = "revealSecrets")]
+    reveal_secrets: bool,
+}
+
 async fn get_direct_ai(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-) -> Result<Json<Value>> {
-    let key = user_setting_key(&user.0.id, "direct-ai");
-    let config = state
-        .storage
-        .get_setting(&key)?
-        .unwrap_or_else(default_direct_ai_config);
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "config": config,
-    })))
+    Query(query): Query<DirectAiSettingsQuery>,
+) -> Result<impl IntoResponse> {
+    let mut status = io_gateway_settings_status(&state, &user.0.id)?;
+    if query.reveal_secrets {
+        let resolved = resolved_direct_ai_config_for_user(&state, &user.0.id);
+        add_direct_ai_secrets(&mut status, &resolved);
+    }
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(status)))
+}
+
+fn add_direct_ai_secrets(status: &mut Value, resolved: &Value) {
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert(
+            "secrets".to_string(),
+            serde_json::json!({
+                "gatewayApiKey": resolved
+                    .get("gatewayApiKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                "gatewayOtpSecret": resolved
+                    .get("gatewayOtpSecret")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            }),
+        );
+    }
 }
 
 async fn set_direct_ai(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    Json(config): Json<Value>,
+    Json(mut config): Json<Value>,
 ) -> Result<Json<Value>> {
-    validate_direct_ai_config(&config)?;
     let key = user_setting_key(&user.0.id, "direct-ai");
+    if let Some(stored) = state.storage.get_setting(&key)? {
+        preserve_direct_ai_secrets(&stored, &mut config);
+    }
+    validate_direct_ai_config(&config)?;
+    persist_io_gateway_secrets(&state, &user.0.id, &mut config)?;
     state.storage.set_setting(&key, &config)?;
+    let status = io_gateway_settings_status(&state, &user.0.id)?;
     Ok(Json(serde_json::json!({
         "success": true,
-        "config": config,
+        "config": status.get("config").cloned().unwrap_or(Value::Null),
     })))
 }
 
@@ -2972,10 +3030,9 @@ struct ChatModelsQuery {
     provider: Option<String>,
 }
 
-/// Per-provider model catalog used by the chat UI's model picker. IO gateway
-/// models are exposed alongside familiar unprefixed aliases, but the backend
-/// routing policy—not the spelling shown here—forces Codex and Claude traffic
-/// through the IO gateway.
+/// Per-provider model catalog used by the chat UI's model picker. Native CLI
+/// mode reads local/fallback models, while IO Gateway mode reads the
+/// configured gateway catalog without failing the picker when unavailable.
 async fn chat_provider_models(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -2985,58 +3042,61 @@ async fn chat_provider_models(
         Some(name) => parse_provider_param(name)?,
         None => Provider::Codex,
     };
-
-    let gateway_models = direct_ai_models_for_user(&state, &user.0.id, provider)
-        .await
-        .unwrap_or_default();
+    let runtime = configured_chat_runtime(&state, &user.0.id);
     let mut models: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
+    let mut gateway_available = true;
 
-    if matches!(provider, Provider::Codex) {
-        for model in &gateway_models {
-            push_chat_model(&mut models, &mut seen, model);
-        }
-        let cached_models = cached_codex_models().await;
-        let base_models = if !cached_models.is_empty() {
-            cached_models
-        } else {
-            let command = provider_command(provider);
-            let cli_models = fetch_cli_models(&command).await;
-            if cli_models.is_empty() {
-                configured_codex_model()
-                    .await
-                    .map(|model| vec![model])
-                    .unwrap_or_else(|| fallback_models(provider))
-            } else {
-                cli_models
+    if runtime == ChatRuntime::IoGateway && matches!(provider, Provider::Codex | Provider::Claude) {
+        if let Some(gateway_models) = direct_ai_models_for_user(&state, &user.0.id, provider).await
+        {
+            for model in gateway_models {
+                push_chat_model(&mut models, &mut seen, model);
             }
-        };
-        for model in base_models {
-            push_chat_model(&mut models, &mut seen, model);
+        } else {
+            gateway_available = false;
         }
+    } else if matches!(provider, Provider::Codex) {
+        let mut base_models = Vec::new();
+        if let Some(model) = configured_codex_model()
+            .await
+            .filter(|model| is_local_codex_cli_model(model))
+        {
+            base_models.push(model);
+        }
+        base_models.extend(
+            cached_codex_models()
+                .await
+                .into_iter()
+                .filter(|model| is_local_codex_cli_model(model)),
+        );
+        push_codex_chat_models(&mut models, &mut seen, base_models);
     } else {
         for model in fallback_models(provider) {
             push_chat_model(&mut models, &mut seen, model);
         }
-        for model in &gateway_models {
-            push_chat_model(&mut models, &mut seen, model);
-        }
     }
 
-    let models: Vec<Value> = models
-        .into_iter()
-        .map(|value| {
-            serde_json::json!({
-                "value": value,
-                "label": value,
-            })
+    let mut model_values: Vec<Value> = Vec::new();
+    if runtime == ChatRuntime::NativeCli && matches!(provider, Provider::Codex | Provider::Claude) {
+        model_values.push(serde_json::json!({
+            "value": "",
+            "label": "CLI default",
+        }));
+    }
+    model_values.extend(models.into_iter().map(|value| {
+        serde_json::json!({
+            "value": value,
+            "label": value,
         })
-        .collect();
+    }));
 
     Ok(Json(serde_json::json!({
         "success": true,
         "provider": provider.as_str(),
-        "models": models,
+        "runtime": runtime,
+        "gatewayAvailable": gateway_available,
+        "models": model_values,
     })))
 }
 
@@ -3053,6 +3113,50 @@ fn push_chat_model(
     if seen.insert(key) {
         models.push(value.to_string());
     }
+}
+
+fn push_codex_chat_models(
+    models: &mut Vec<String>,
+    seen: &mut std::collections::BTreeSet<String>,
+    base_models: Vec<String>,
+) {
+    for model in base_models {
+        if is_local_codex_cli_model(&model) {
+            push_chat_model(models, seen, model);
+        }
+    }
+}
+
+fn is_local_codex_cli_model(model: &str) -> bool {
+    let trimmed = model.trim();
+    looks_like_model_id(trimmed)
+        && !trimmed.contains(':')
+        && !trimmed.eq_ignore_ascii_case("gpt-5-codex")
+}
+
+fn is_io_gateway_model(model: &str) -> bool {
+    let trimmed = model.trim();
+    let Some((prefix, rest)) = trimmed.split_once(':') else {
+        return false;
+    };
+    !rest.trim().is_empty()
+        && looks_like_model_id(trimmed)
+        && matches!(
+            prefix.to_ascii_lowercase().as_str(),
+            "agw"
+                | "cod"
+                | "proxy"
+                | "gateway"
+                | "aiproxy"
+                | "cld"
+                | "gem"
+                | "cop"
+                | "ctm"
+                | "dsk"
+                | "glm"
+                | "grk"
+                | "min"
+        )
 }
 
 async fn cached_codex_models() -> Vec<String> {
@@ -3087,11 +3191,7 @@ async fn configured_codex_model() -> Option<String> {
         .map(str::to_string)
 }
 
-/// Fetch the chat runtime's model list and return the model ids. Codex and
-/// Claude use the forced IO gateway config; other providers retain their
-/// resolved Direct-AI setting. A missing key or failed catalog request returns
-/// None so the picker can still show its familiar aliases, which are routed by
-/// the same backend policy when selected.
+/// Fetch the configured gateway's model list for a chat provider.
 async fn direct_ai_models_for_user(
     state: &AppState,
     user_id: &str,
@@ -3138,20 +3238,105 @@ fn direct_ai_runtime_config_for_user(
     })
 }
 
-/// Resolve the credential/config used by an actual chat turn. Codex and
-/// Claude are pinned to the IO gateway even if the persisted Direct-AI setting
-/// points at Anthropic, MiniMax, or is disabled. Missing gateway credentials
-/// therefore fail closed instead of falling back to a locally authenticated
-/// provider CLI.
+/// Resolve the gateway credential/config used for model discovery and gateway
+/// CLI turns.
 fn chat_ai_config_for_user(state: &AppState, user_id: &str, provider: Provider) -> Value {
     let mut config = resolved_direct_ai_config_for_user(state, user_id);
     if matches!(provider, Provider::Codex | Provider::Claude) {
-        force_io_gateway_config(&mut config);
+        apply_io_gateway_config(&mut config, provider);
     }
     config
 }
 
-fn force_io_gateway_config(config: &mut Value) {
+fn configured_chat_runtime(state: &AppState, user_id: &str) -> ChatRuntime {
+    let key = user_setting_key(user_id, "direct-ai");
+    let config = state.storage.get_setting(&key).ok().flatten();
+    config
+        .as_ref()
+        .and_then(|config| {
+            config
+                .get("chatRuntime")
+                .or_else(|| config.get("chat_runtime"))
+        })
+        .and_then(Value::as_str)
+        .and_then(parse_chat_runtime)
+        .unwrap_or_else(|| {
+            let has_legacy_key = config
+                .as_ref()
+                .is_some_and(|config| direct_ai_secret_configured(config, "gatewayApiKey"))
+                || state
+                    .storage
+                    .get_active_credential_value_by_name(
+                        user_id,
+                        IO_GATEWAY_API_KEY_CREDENTIAL,
+                        IO_GATEWAY_API_KEY_CREDENTIAL_TYPE,
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some();
+            if has_legacy_key {
+                ChatRuntime::IoGateway
+            } else {
+                ChatRuntime::NativeCli
+            }
+        })
+}
+
+fn parse_chat_runtime(value: &str) -> Option<ChatRuntime> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "native_cli" | "native" | "cli" | "default" => Some(ChatRuntime::NativeCli),
+        "io_gateway" | "gateway" | "custom_api" | "aiproxy" => Some(ChatRuntime::IoGateway),
+        _ => None,
+    }
+}
+
+fn io_gateway_settings_status(state: &AppState, user_id: &str) -> Result<Value> {
+    let key = user_setting_key(user_id, "direct-ai");
+    let config = state
+        .storage
+        .get_setting(&key)?
+        .unwrap_or_else(default_direct_ai_config);
+    let mut effective = resolved_direct_ai_config_for_user(state, user_id);
+    apply_io_gateway_config(&mut effective, Provider::Claude);
+
+    let api_key_configured = direct_ai_secret_configured(&effective, "gatewayApiKey");
+    let otp_configured = direct_ai_secret_configured(&effective, "gatewayOtpSecret");
+    let auth = state.auth.status(None)?;
+
+    let mut public_config = public_direct_ai_config(&config);
+    if let Some(obj) = public_config.as_object_mut() {
+        obj.insert(
+            "gatewayApiKeyConfigured".to_string(),
+            Value::Bool(api_key_configured),
+        );
+        obj.insert(
+            "gatewayOtpConfigured".to_string(),
+            Value::Bool(otp_configured),
+        );
+    }
+
+    Ok(serde_json::json!({
+        "success": true,
+        "config": public_config,
+        "effective": {
+            "chatRuntime": configured_chat_runtime(state, user_id),
+            "mode": effective.get("mode").cloned().unwrap_or(Value::Null),
+            "baseUrl": effective.get("baseUrl").cloned().unwrap_or(Value::Null),
+            "apiKeyEnv": effective.get("apiKeyEnv").cloned().unwrap_or(Value::Null),
+            "model": effective.get("model").cloned().unwrap_or(Value::Null),
+        },
+        "runtimeReady": direct_ai_endpoint_config(&effective).is_some(),
+        "apiKeyConfigured": api_key_configured,
+        "gatewayOtpConfigured": otp_configured,
+        "auth": {
+            "mode": auth.auth_mode,
+            "otpConfigured": state.config.otp_secret.is_some(),
+            "tokenConfigured": state.config.local_token.is_some(),
+        },
+    }))
+}
+
+fn apply_io_gateway_config(config: &mut Value, provider: Provider) {
     if !config.is_object() {
         *config = default_direct_ai_config();
     }
@@ -3161,15 +3346,122 @@ fn force_io_gateway_config(config: &mut Value) {
     };
     obj.insert("mode".to_string(), Value::String("aiproxy".to_string()));
     obj.remove("base_url");
-    obj.insert(
-        "baseUrl".to_string(),
-        Value::String(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string()),
-    );
+    let gateway_root = obj
+        .get("gatewayUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .or_else(|| {
+            obj.get("baseUrl")
+                .and_then(Value::as_str)
+                .and_then(url_origin)
+        })
+        .unwrap_or_else(|| {
+            url_origin(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL)
+                .unwrap_or_else(|| DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string())
+        });
+    let endpoint_key = if provider == Provider::Codex {
+        "codexEndpoint"
+    } else {
+        "claudeEndpoint"
+    };
+    let default_endpoint = if provider == Provider::Codex {
+        "codex"
+    } else {
+        "claude"
+    };
+    let endpoint = obj
+        .get(endpoint_key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_endpoint);
+    let base_url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.trim_end_matches('/').to_string()
+    } else {
+        format!(
+            "{}/{}",
+            gateway_root.trim_end_matches('/'),
+            endpoint.trim_matches('/')
+        )
+    };
+    obj.insert("baseUrl".to_string(), Value::String(base_url));
     obj.remove("api_key_env");
-    obj.insert(
-        "apiKeyEnv".to_string(),
-        Value::String(IO_GATEWAY_API_KEY_ENV.to_string()),
-    );
+    obj.remove("apiKeyEnv");
+}
+
+fn direct_ai_secret_configured(config: &Value, key: &str) -> bool {
+    config
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn preserve_direct_ai_secrets(stored: &Value, config: &mut Value) {
+    let (Some(stored), Some(config)) = (stored.as_object(), config.as_object_mut()) else {
+        return;
+    };
+    for key in ["gatewayApiKey", "gatewayOtpSecret"] {
+        if !config.contains_key(key) {
+            if let Some(value) = stored.get(key) {
+                config.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+}
+
+fn persist_io_gateway_secrets(state: &AppState, user_id: &str, config: &mut Value) -> Result<()> {
+    let Some(obj) = config.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(secret) = obj
+        .remove("gatewayApiKey")
+        .and_then(|value| value.as_str().map(str::trim).map(str::to_string))
+        .filter(|value| !value.is_empty())
+    {
+        state.storage.upsert_named_credential(
+            user_id,
+            IO_GATEWAY_API_KEY_CREDENTIAL,
+            IO_GATEWAY_API_KEY_CREDENTIAL_TYPE,
+            &secret,
+            Some("IO Gateway API key"),
+        )?;
+    }
+    if let Some(secret) = obj
+        .remove("gatewayOtpSecret")
+        .and_then(|value| value.as_str().map(str::trim).map(str::to_string))
+        .filter(|value| !value.is_empty())
+    {
+        state.storage.upsert_named_credential(
+            user_id,
+            IO_GATEWAY_OTP_CREDENTIAL,
+            IO_GATEWAY_OTP_CREDENTIAL_TYPE,
+            &secret,
+            Some("IO Gateway TOTP secret"),
+        )?;
+    }
+    Ok(())
+}
+
+fn public_direct_ai_config(config: &Value) -> Value {
+    let mut public = config.clone();
+    let api_key_configured = direct_ai_secret_configured(config, "gatewayApiKey");
+    let otp_configured = direct_ai_secret_configured(config, "gatewayOtpSecret");
+    if let Some(obj) = public.as_object_mut() {
+        obj.remove("gatewayApiKey");
+        obj.remove("gatewayOtpSecret");
+        obj.insert(
+            "gatewayApiKeyConfigured".to_string(),
+            Value::Bool(api_key_configured),
+        );
+        obj.insert(
+            "gatewayOtpConfigured".to_string(),
+            Value::Bool(otp_configured),
+        );
+    }
+    public
 }
 
 fn resolved_direct_ai_config_for_user(state: &AppState, user_id: &str) -> Value {
@@ -3180,142 +3472,44 @@ fn resolved_direct_ai_config_for_user(state: &AppState, user_id: &str) -> Value 
         .ok()
         .flatten()
         .unwrap_or_else(default_direct_ai_config);
-    apply_implicit_gateway_env_config(&mut config);
-    config
-}
-
-fn apply_implicit_gateway_env_config(config: &mut Value) {
-    if !config.is_object() {
-        *config = default_direct_ai_config();
-    }
-
-    let has_gateway_key = env::var(IO_GATEWAY_API_KEY_ENV)
-        .ok()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    if !has_gateway_key {
-        return;
-    }
-
-    let mode = config.get("mode").and_then(Value::as_str).unwrap_or("off");
-    if mode != "off" && !mode.is_empty() {
-        return;
-    }
-
-    let Some(obj) = config.as_object_mut() else {
-        return;
-    };
-    obj.insert("mode".to_string(), Value::String("aiproxy".to_string()));
-    let has_base_url = obj
-        .get("baseUrl")
-        .and_then(Value::as_str)
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    if !has_base_url {
-        obj.insert(
-            "baseUrl".to_string(),
-            Value::String(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string()),
-        );
-    }
-    let has_key_env = obj
-        .get("apiKeyEnv")
-        .and_then(Value::as_str)
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    if !has_key_env {
-        obj.insert(
-            "apiKeyEnv".to_string(),
-            Value::String(IO_GATEWAY_API_KEY_ENV.to_string()),
-        );
-    }
-}
-
-/// How long to wait for a provider CLI's `models` subcommand before falling
-/// back to the curated list. Some CLIs (notably `claude`) treat `models`
-/// as an interactive prompt and never return when stdin is not a TTY,
-/// which would otherwise hang the `/api/chat/models` endpoint.
-const CLI_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-async fn fetch_cli_models(command: &str) -> Vec<String> {
-    // Try `cmd models --json` or `cmd models list`; ignore failures and let
-    // the caller fall back to a curated list.
-    for args in [
-        vec!["models", "--json"],
-        vec!["models", "list", "--json"],
-        vec!["models", "list"],
-        vec!["models"],
-    ] {
-        let invocation = async {
-            tokio::process::Command::new(command)
-                .args(args)
-                .env("PATH", augmented_user_path())
-                .stdin(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .output()
-                .await
-        };
-        let output = match tokio::time::timeout(CLI_MODEL_TIMEOUT, invocation).await {
-            Ok(result) => result,
-            Err(_) => {
-                // CLI hung past the timeout; try the next invocation and
-                // eventually fall back to the curated list.
-                continue;
-            }
-        };
-        if let Ok(out) = output {
-            if !out.status.success() {
-                continue;
-            }
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            // Try JSON first.
-            if let Ok(parsed) = serde_json::from_str::<Value>(stdout.trim()) {
-                if let Some(arr) = parsed.get("data").and_then(|v| v.as_array()) {
-                    let names: Vec<String> = arr
-                        .iter()
-                        .filter_map(|v| {
-                            v.get("id")
-                                .or_else(|| v.get("name"))
-                                .and_then(|n| n.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .filter(|s| looks_like_model_id(s))
-                        .collect();
-                    if !names.is_empty() {
-                        return names;
-                    }
-                } else if let Some(arr) = parsed.as_array() {
-                    let names: Vec<String> = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .filter(|s| looks_like_model_id(s))
-                        .collect();
-                    if !names.is_empty() {
-                        return names;
-                    }
-                }
-            }
-            // Otherwise treat each non-empty line as an id, but only keep
-            // tokens that look like model slugs (e.g. `claude-opus-4-1`,
-            // `gpt-5`, `gemini-2.5-pro`). The Claude CLI prints an
-            // interactive clarification prompt on `claude models` that exits
-            // 0 with prose like "1. **List supported models** — ..." which
-            // would otherwise be parsed as a list of model names.
-            let ids: Vec<String> = stdout
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(|l| {
-                    // Drop whitespace-delimited extras after the id.
-                    l.split_whitespace().next().unwrap_or("").to_string()
-                })
-                .filter(|l| looks_like_model_id(l))
-                .collect();
-            if !ids.is_empty() {
-                return ids;
-            }
+    if direct_ai_secret_configured(&config, "gatewayApiKey")
+        || direct_ai_secret_configured(&config, "gatewayOtpSecret")
+    {
+        let mut sanitized = config.clone();
+        if sanitized
+            .get("chatRuntime")
+            .or_else(|| sanitized.get("chat_runtime"))
+            .is_none()
+            && direct_ai_secret_configured(&sanitized, "gatewayApiKey")
+            && let Some(obj) = sanitized.as_object_mut()
+        {
+            obj.insert(
+                "chatRuntime".to_string(),
+                Value::String("io_gateway".to_string()),
+            );
+        }
+        if persist_io_gateway_secrets(state, user_id, &mut sanitized).is_ok() {
+            let _ = state.storage.set_setting(&key, &sanitized);
+            config = sanitized;
         }
     }
-    Vec::new()
+    if let Some(obj) = config.as_object_mut() {
+        if let Ok(Some(secret)) = state.storage.get_active_credential_value_by_name(
+            user_id,
+            IO_GATEWAY_API_KEY_CREDENTIAL,
+            IO_GATEWAY_API_KEY_CREDENTIAL_TYPE,
+        ) {
+            obj.insert("gatewayApiKey".to_string(), Value::String(secret));
+        }
+        if let Ok(Some(secret)) = state.storage.get_active_credential_value_by_name(
+            user_id,
+            IO_GATEWAY_OTP_CREDENTIAL,
+            IO_GATEWAY_OTP_CREDENTIAL_TYPE,
+        ) {
+            obj.insert("gatewayOtpSecret".to_string(), Value::String(secret));
+        }
+    }
+    config
 }
 
 /// Heuristic check that a token is a plausible model identifier. Model ids
@@ -3386,7 +3580,8 @@ async fn direct_ai_models(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Json<Value> {
-    let config = resolved_direct_ai_config_for_user(&state, &user.0.id);
+    let mut config = resolved_direct_ai_config_for_user(&state, &user.0.id);
+    apply_io_gateway_config(&mut config, Provider::Claude);
     let models = fetch_direct_ai_models(&config).await.unwrap_or_default();
     Json(serde_json::json!({
         "success": true,
@@ -4438,6 +4633,23 @@ async fn handle_ws_command(
             mode,
             thinking,
         } => {
+            let runtime = resolve_session_chat_runtime(
+                state,
+                &user.id,
+                provider,
+                session_id.as_deref(),
+                model.as_deref(),
+            );
+            let (model, effort, mode, thinking) = if runtime == ChatRuntime::NativeCli
+                && model.as_deref().is_none_or(|model| model.trim().is_empty())
+            {
+                (None, None, None, None)
+            } else {
+                (model, effort, mode, thinking)
+            };
+            let direct_ai_config = (runtime == ChatRuntime::IoGateway)
+                .then(|| direct_ai_runtime_config_for_user(state, &user.id, provider))
+                .flatten();
             if let Err(error) = state
                 .start_agent_session(
                     provider,
@@ -4448,7 +4660,8 @@ async fn handle_ws_command(
                     effort,
                     mode,
                     thinking,
-                    direct_ai_runtime_config_for_user(state, &user.id, provider),
+                    runtime,
+                    direct_ai_config,
                     Some(user.id.clone()),
                 )
                 .await
@@ -4508,6 +4721,33 @@ async fn handle_ws_command(
             }
         }
     }
+}
+
+fn resolve_session_chat_runtime(
+    state: &AppState,
+    user_id: &str,
+    provider: Provider,
+    session_id: Option<&str>,
+    model: Option<&str>,
+) -> ChatRuntime {
+    if provider == Provider::Gemini {
+        return ChatRuntime::NativeCli;
+    }
+    if let Some(session) =
+        session_id.and_then(|session_id| state.storage.get_session(session_id).ok().flatten())
+    {
+        return session.runtime.unwrap_or_else(|| {
+            if model
+                .or(session.model.as_deref())
+                .is_some_and(is_io_gateway_model)
+            {
+                ChatRuntime::IoGateway
+            } else {
+                ChatRuntime::NativeCli
+            }
+        });
+    }
+    configured_chat_runtime(state, user_id)
 }
 
 async fn send_ws_event(
@@ -5064,6 +5304,22 @@ fn user_setting_key(user_id: &str, key: &str) -> String {
     format!("user:{user_id}:{key}")
 }
 
+fn is_io_gateway_setting_key(key: &str) -> bool {
+    key == "direct-ai" || key.ends_with(":direct-ai")
+}
+
+fn public_settings(settings: Vec<iowb_protocol::SettingEntry>) -> Vec<iowb_protocol::SettingEntry> {
+    settings
+        .into_iter()
+        .map(|mut setting| {
+            if is_io_gateway_setting_key(&setting.key) {
+                setting.value = public_direct_ai_config(&setting.value);
+            }
+            setting
+        })
+        .collect()
+}
+
 fn current_git_config_overview(state: &AppState, user_id: &str) -> Result<Value> {
     let stored = state
         .storage
@@ -5104,7 +5360,7 @@ fn default_claude_agent_settings() -> Value {
         "skipPermissions": false,
         "providerMode": "anthropic",
         "aiProxyBaseUrl": "",
-        "aiProxyApiKeyEnv": "CODEX_GATEWAY_KEY",
+        "aiProxyApiKeyEnv": "",
         "minimaxBaseUrl": "https://api.minimax.io/anthropic",
         "minimaxApiKeyEnv": "MINIMAX_API_KEY",
         "minimaxModel": "MiniMax-M3"
@@ -5183,6 +5439,7 @@ fn default_notification_preferences() -> Value {
 fn default_direct_ai_config() -> Value {
     serde_json::json!({
         "mode": "off",
+        "chatRuntime": "native_cli",
         "baseUrl": null,
         "apiKeyEnv": null,
         "model": null
@@ -5631,7 +5888,7 @@ async fn fetch_direct_ai_models(config: &Value) -> std::result::Result<Vec<Value
         .map_err(|error| {
             ServerError::with_details(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to create Direct AI client",
+                "failed to create IO Gateway client",
                 error.to_string(),
             )
         })?;
@@ -5672,6 +5929,7 @@ async fn fetch_direct_ai_models(config: &Value) -> std::result::Result<Vec<Value
             .get("data")
             .or_else(|| body.get("models"))
             .and_then(Value::as_array)
+            .or_else(|| body.as_array())
             .cloned()
             .unwrap_or_default();
         if raw_models.is_empty() {
@@ -5778,18 +6036,30 @@ fn direct_ai_endpoint_config(config: &Value) -> Option<(String, String)> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let api_key = env_key
-        .and_then(|key| env::var(key).ok())
-        .or_else(|| match mode {
-            "direct" | "anthropic" => env::var("ANTHROPIC_API_KEY")
-                .or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))
-                .ok(),
-            "minimax" => env::var("MINIMAX_API_KEY")
-                .or_else(|_| env::var("ANTHROPIC_API_KEY"))
-                .ok(),
-            _ => env::var(IO_GATEWAY_API_KEY_ENV).ok(),
+    let stored_gateway_key = config
+        .get("gatewayApiKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let api_key = if matches!(mode, "proxy" | "aiproxy") {
+        stored_gateway_key
+    } else {
+        stored_gateway_key.or_else(|| {
+            env_key
+                .and_then(|key| env::var(key).ok())
+                .or_else(|| match mode {
+                    "direct" | "anthropic" => env::var("ANTHROPIC_API_KEY")
+                        .or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))
+                        .ok(),
+                    "minimax" => env::var("MINIMAX_API_KEY")
+                        .or_else(|_| env::var("ANTHROPIC_API_KEY"))
+                        .ok(),
+                    _ => None,
+                })
         })
-        .filter(|value| !value.trim().is_empty())?;
+    }
+    .filter(|value| !value.trim().is_empty())?;
 
     Some((base_url, api_key))
 }
@@ -5800,9 +6070,20 @@ fn validate_direct_ai_config(config: &Value) -> Result<()> {
         if !allowed_modes.contains(&mode) {
             return Err(ServerError::new(
                 StatusCode::BAD_REQUEST,
-                "invalid direct AI mode",
+                "invalid IO Gateway mode",
             ));
         }
+    }
+    if let Some(runtime) = config
+        .get("chatRuntime")
+        .or_else(|| config.get("chat_runtime"))
+        .and_then(Value::as_str)
+        && parse_chat_runtime(runtime).is_none()
+    {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid chat runtime",
+        ));
     }
     Ok(())
 }
@@ -6548,33 +6829,6 @@ async fn run_taskmaster(
     .await
 }
 
-async fn run_danger(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-    Json(request): Json<Value>,
-) -> Result<Json<Value>> {
-    run_external_tool_json(
-        &state,
-        &user.0.id,
-        "danger",
-        "IO_WORKBENCH_DANGER_COMMAND",
-        "IO_WORKBENCH_DANGER_ARGS_JSON",
-        "run",
-        request,
-    )
-    .await
-}
-
-async fn list_danger_runs(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-) -> Result<Json<Value>> {
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "runs": load_tool_runs(&state, &user.0.id, "danger")?,
-    })))
-}
-
 async fn register_fcm_token(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -7200,26 +7454,52 @@ mod tests {
     }
 
     #[test]
-    fn forced_io_gateway_config_replaces_non_gateway_provider_settings() {
+    fn io_gateway_config_uses_provider_specific_endpoint_without_env_key() {
         let mut config = serde_json::json!({
             "mode": "anthropic",
-            "baseUrl": "https://api.anthropic.com",
+            "gatewayUrl": "https://gateway.example.com",
             "apiKeyEnv": "ANTHROPIC_API_KEY",
             "maxTokens": 1234,
         });
 
-        force_io_gateway_config(&mut config);
+        apply_io_gateway_config(&mut config, Provider::Claude);
 
         assert_eq!(config.get("mode").and_then(Value::as_str), Some("aiproxy"));
         assert_eq!(
             config.get("baseUrl").and_then(Value::as_str),
-            Some(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL)
+            Some("https://gateway.example.com/claude")
+        );
+        assert!(config.get("apiKeyEnv").is_none());
+        assert_eq!(config.get("maxTokens").and_then(Value::as_u64), Some(1234));
+        apply_io_gateway_config(&mut config, Provider::Codex);
+        assert_eq!(
+            config.get("baseUrl").and_then(Value::as_str),
+            Some("https://gateway.example.com/codex")
+        );
+    }
+
+    #[test]
+    fn io_gateway_runtime_does_not_fall_back_to_environment_credentials() {
+        let config = serde_json::json!({
+            "mode": "aiproxy",
+            "baseUrl": "https://gateway.example.com/claude",
+            "apiKeyEnv": "PATH",
+        });
+
+        assert_eq!(direct_ai_endpoint_config(&config), None);
+    }
+
+    #[test]
+    fn parses_supported_chat_runtime_values() {
+        assert_eq!(
+            parse_chat_runtime("native_cli"),
+            Some(ChatRuntime::NativeCli)
         );
         assert_eq!(
-            config.get("apiKeyEnv").and_then(Value::as_str),
-            Some(IO_GATEWAY_API_KEY_ENV)
+            parse_chat_runtime("io_gateway"),
+            Some(ChatRuntime::IoGateway)
         );
-        assert_eq!(config.get("maxTokens").and_then(Value::as_u64), Some(1234));
+        assert_eq!(parse_chat_runtime("invalid"), None);
     }
 
     #[test]
@@ -7234,23 +7514,254 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn io_gateway_chat_models_returns_empty_success_when_catalog_unavailable() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-server-chat-models-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).expect("config directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+        let user_id = "model-test-user";
+        state
+            .storage
+            .set_setting(
+                &user_setting_key(user_id, "direct-ai"),
+                &serde_json::json!({
+                    "chatRuntime": "io_gateway",
+                    "mode": "aiproxy",
+                    "gatewayUrl": "http://127.0.0.1:1",
+                    "gatewayApiKey": "test-key",
+                }),
+            )
+            .expect("setting");
+
+        let Json(body) = chat_provider_models(
+            State(state),
+            Extension(AuthenticatedUser(iowb_protocol::UserProfile {
+                id: user_id.to_string(),
+                username: "model-test".to_string(),
+                email: None,
+                created_at: chrono::Utc::now(),
+            })),
+            Query(ChatModelsQuery {
+                provider: Some("codex".to_string()),
+            }),
+        )
+        .await
+        .expect("models response");
+
+        assert_eq!(body.get("success").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            body.get("gatewayAvailable").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            body.get("models").and_then(Value::as_array).map(Vec::len),
+            Some(0)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
-    fn forced_io_gateway_config_replaces_explicit_proxy_endpoint() {
+    fn codex_chat_models_merge_local_and_gateway_models() {
+        let mut models = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let base_models = vec![
+            "gpt-5".to_string(),
+            "gpt-5.4".to_string(),
+            "cod:gpt-5.5".to_string(),
+            "min:MiniMax-M3".to_string(),
+            "gpt-5-codex".to_string(),
+        ];
+
+        push_codex_chat_models(&mut models, &mut seen, base_models);
+        for model in ["cod:gpt-5.5", "min:MiniMax-M3", "unknown:model"] {
+            if is_io_gateway_model(model) {
+                push_chat_model(&mut models, &mut seen, model);
+            }
+        }
+
+        assert_eq!(
+            models,
+            vec![
+                "gpt-5".to_string(),
+                "gpt-5.4".to_string(),
+                "cod:gpt-5.5".to_string(),
+                "min:MiniMax-M3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn io_gateway_config_replaces_legacy_env_reference() {
         let mut config = serde_json::json!({
             "mode": "aiproxy",
             "baseUrl": "http://127.0.0.1:8319/claude",
             "apiKeyEnv": "WRONG_KEY",
         });
 
-        force_io_gateway_config(&mut config);
+        apply_io_gateway_config(&mut config, Provider::Claude);
 
         assert_eq!(
             config.get("baseUrl").and_then(Value::as_str),
-            Some(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL)
+            Some("http://127.0.0.1:8319/claude")
+        );
+        assert!(config.get("apiKeyEnv").is_none());
+    }
+
+    #[test]
+    fn forced_io_gateway_config_uses_stored_gateway_url() {
+        let mut config = serde_json::json!({
+            "mode": "aiproxy",
+            "gatewayUrl": "https://gateway.example.com/root/",
+            "gatewayApiKey": "stored-key",
+        });
+
+        apply_io_gateway_config(&mut config, Provider::Claude);
+
+        assert_eq!(
+            config.get("baseUrl").and_then(Value::as_str),
+            Some("https://gateway.example.com/root/claude")
         );
         assert_eq!(
-            config.get("apiKeyEnv").and_then(Value::as_str),
-            Some(IO_GATEWAY_API_KEY_ENV)
+            direct_ai_endpoint_config(&config),
+            Some((
+                "https://gateway.example.com/root/claude".to_string(),
+                "stored-key".to_string(),
+            ))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn io_gateway_model_catalog_uses_stored_key_and_keeps_full_list() {
+        async fn models(headers: HeaderMap) -> impl IntoResponse {
+            let bearer = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+            let api_key = headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok());
+            if bearer != Some("Bearer stored-key") || api_key != Some("stored-key") {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            Json(serde_json::json!({
+                "data": [
+                    {"id": "gpt-5.4"},
+                    {"id": "claude-sonnet-4-5"},
+                    {"id": "minimax-m3"}
+                ]
+            }))
+            .into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/claude/models", get(models))).await
+        });
+        let config = serde_json::json!({
+            "mode": "aiproxy",
+            "baseUrl": format!("http://{address}/claude"),
+            "gatewayApiKey": "stored-key",
+        });
+
+        let models = fetch_direct_ai_models(&config).await.expect("models");
+        let values: Vec<_> = models
+            .iter()
+            .filter_map(|model| model.get("value").and_then(Value::as_str))
+            .collect();
+        assert_eq!(values, ["gpt-5.4", "claude-sonnet-4-5", "minimax-m3"]);
+
+        server.abort();
+    }
+
+    #[test]
+    fn public_direct_ai_config_redacts_stored_secrets() {
+        let config = serde_json::json!({
+            "mode": "aiproxy",
+            "gatewayUrl": "https://gateway.example.com",
+            "gatewayApiKey": "private-key",
+            "gatewayOtpSecret": "PRIVATEOTP",
+        });
+
+        let public = public_direct_ai_config(&config);
+
+        assert!(public.get("gatewayApiKey").is_none());
+        assert!(public.get("gatewayOtpSecret").is_none());
+        assert_eq!(
+            public
+                .get("gatewayApiKeyConfigured")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            public.get("gatewayOtpConfigured").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn direct_ai_secret_reveal_is_explicit_and_scoped() {
+        let resolved = serde_json::json!({
+            "gatewayApiKey": "private-key",
+            "gatewayOtpSecret": "PRIVATEOTP",
+        });
+        let mut status = serde_json::json!({"success": true});
+
+        assert!(status.get("secrets").is_none());
+        add_direct_ai_secrets(&mut status, &resolved);
+
+        assert_eq!(
+            status
+                .get("secrets")
+                .and_then(|secrets| secrets.get("gatewayApiKey"))
+                .and_then(Value::as_str),
+            Some("private-key")
+        );
+        assert_eq!(
+            status
+                .get("secrets")
+                .and_then(|secrets| secrets.get("gatewayOtpSecret"))
+                .and_then(Value::as_str),
+            Some("PRIVATEOTP")
+        );
+    }
+
+    #[test]
+    fn direct_ai_updates_preserve_omitted_stored_secrets() {
+        let stored = serde_json::json!({
+            "gatewayApiKey": "private-key",
+            "gatewayOtpSecret": "PRIVATEOTP",
+        });
+        let mut update = serde_json::json!({
+            "mode": "aiproxy",
+            "gatewayUrl": "https://new-gateway.example.com",
+        });
+
+        preserve_direct_ai_secrets(&stored, &mut update);
+
+        assert_eq!(
+            update.get("gatewayApiKey").and_then(Value::as_str),
+            Some("private-key")
+        );
+        assert_eq!(
+            update.get("gatewayOtpSecret").and_then(Value::as_str),
+            Some("PRIVATEOTP")
         );
     }
 
@@ -7345,6 +7856,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("session");
@@ -7425,6 +7937,7 @@ mod tests {
                 project.display().to_string(),
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
