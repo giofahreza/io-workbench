@@ -24,8 +24,9 @@ use iowb_fs::{FileService, WorkspacePathValidator};
 use iowb_process::ProcessManager;
 use iowb_protocol::{
     AuthStatusResponse, AuthTokenResponse, CONFIG_DIR_NAME, ChatMessage, ChatRuntime,
-    DATABASE_FILE_NAME, MessageRole, PRODUCT_NAME, ProjectSummary, Provider, ServerStatusResponse,
-    SessionSummary, UserProfile, WsServerEvent, new_id,
+    DATABASE_FILE_NAME, MessageRole, PRODUCT_NAME, ProjectSummary, PromptHistoryCursor,
+    PromptHistoryEntry, Provider, ServerStatusResponse, SessionSummary, UserProfile, WsServerEvent,
+    new_id,
 };
 use iowb_storage::{Storage, StoredDurableChatRun};
 use serde_json::Value;
@@ -1304,6 +1305,38 @@ impl SessionManager {
         let (_, total) = self.messages_page(session_id, 1, 0)?;
         let start = total.saturating_sub(limit);
         self.messages_page(session_id, limit, start)
+    }
+
+    pub async fn user_prompts_page_including_external(
+        &self,
+        session_id: &str,
+        limit: usize,
+        before: Option<PromptHistoryCursor>,
+    ) -> Result<(Vec<PromptHistoryEntry>, bool)> {
+        let limit = limit.max(1).min(500);
+        if let Some(messages) = self.external_messages_for_session(session_id).await? {
+            let mut prompts = messages
+                .into_iter()
+                .filter(|message| message.role == MessageRole::User)
+                .map(|message| PromptHistoryEntry {
+                    id: message.id,
+                    content: message.content,
+                    timestamp: message.timestamp,
+                })
+                .collect::<Vec<_>>();
+            if let Some(cursor) = before {
+                prompts.retain(|prompt| {
+                    prompt.timestamp < cursor.timestamp
+                        || (prompt.timestamp == cursor.timestamp && prompt.id < cursor.id)
+                });
+            }
+            let start = prompts.len().saturating_sub(limit);
+            let has_more = start > 0;
+            return Ok((prompts[start..].to_vec(), has_more));
+        }
+        Ok(self
+            .storage
+            .list_user_prompts_page(session_id, limit, before.as_ref())?)
     }
 
     pub async fn get(&self, session_id: &str) -> Result<SessionSummary> {

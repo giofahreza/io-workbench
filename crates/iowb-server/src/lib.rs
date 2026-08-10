@@ -31,7 +31,7 @@ use axum::{
     routing::{any, delete, get, patch, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use iowb_core::{
     AppConfig, AppState, CoreError, DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS, DirectAiRuntimeConfig,
@@ -47,10 +47,10 @@ use iowb_protocol::{
     DeleteFileRequest, FcmTokenResponse, FileContentResponse, FileEntry, HealthResponse,
     HealthStatus, LoginRequest, MessageRole, MessagesResponse, PRODUCT_NAME, PlaceholderResponse,
     ProcessInputRequest, ProcessResizeRequest, ProcessStartRequest, ProcessStartResponse,
-    ProjectListResponse, ProjectSummary, Provider, RegisterFcmTokenRequest, RenameFileRequest,
-    ServerStatusResponse, SessionDraftResponse, SessionSnapshotResponse, SessionSummary,
-    UpdateSessionDraftRequest, WS_COMMAND_CHANNEL_CAPACITY, WorkspaceType, WsClientCommand,
-    WsServerEvent, new_id,
+    ProjectListResponse, ProjectSummary, PromptHistoryCursor, PromptHistoryResponse, Provider,
+    RegisterFcmTokenRequest, RenameFileRequest, ServerStatusResponse, SessionDraftResponse,
+    SessionSnapshotResponse, SessionSummary, UpdateSessionDraftRequest,
+    WS_COMMAND_CHANNEL_CAPACITY, WorkspaceType, WsClientCommand, WsServerEvent, new_id,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -77,6 +77,8 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_HISTORY: usize = 50;
 const SESSION_HISTORY_DEFAULT_MESSAGES: usize = 30;
 const SESSION_HISTORY_MAX_MESSAGES: usize = 100;
+const SESSION_PROMPT_HISTORY_DEFAULT: usize = 10;
+const SESSION_PROMPT_HISTORY_MAX: usize = 100;
 const SESSION_RESPONSE_MAX_CONTENT_BYTES: usize = 512 * 1024;
 const SESSION_RESPONSE_ASSISTANT_MAX_BYTES: usize = 256 * 1024;
 const SESSION_RESPONSE_TOOL_MAX_BYTES: usize = 64 * 1024;
@@ -356,6 +358,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/sessions/{session_id}", delete(delete_session))
         .route("/api/sessions/{session_id}/messages", get(session_messages))
+        .route("/api/sessions/{session_id}/prompts", get(session_prompts))
         .route("/api/sessions/{session_id}/snapshot", get(session_snapshot))
         .route(
             "/api/sessions/{session_id}/draft",
@@ -518,6 +521,20 @@ impl ServerError {
         Self {
             status,
             body: ApiErrorBody::with_details(error, details),
+        }
+    }
+
+    pub(crate) fn database(
+        status: StatusCode,
+        error: impl Into<String>,
+        details: Option<String>,
+        code: impl Into<String>,
+        category: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            status,
+            body: ApiErrorBody::database(error, details, code, category, retryable),
         }
     }
 }
@@ -3938,6 +3955,16 @@ struct SessionMessagesQuery {
     tail: bool,
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct SessionPromptsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default, alias = "beforeTimestamp")]
+    before_timestamp: Option<String>,
+    #[serde(default, alias = "beforeId")]
+    before_id: Option<String>,
+}
+
 fn sanitize_session_response_text(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len().min(SESSION_RESPONSE_MAX_CONTENT_BYTES));
     let mut line_chars = 0;
@@ -4131,6 +4158,60 @@ async fn session_messages(
         messages: bound_session_messages_for_response(messages),
         has_more,
         total_count,
+    }))
+}
+
+async fn session_prompts(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+    Query(query): Query<SessionPromptsQuery>,
+) -> Result<Json<PromptHistoryResponse>> {
+    let limit = query
+        .limit
+        .unwrap_or(SESSION_PROMPT_HISTORY_DEFAULT)
+        .max(1)
+        .min(SESSION_PROMPT_HISTORY_MAX);
+    let before = match (
+        query.before_timestamp.as_deref(),
+        query.before_id.as_deref(),
+    ) {
+        (Some(timestamp), Some(id)) if !id.trim().is_empty() => Some(PromptHistoryCursor {
+            timestamp: DateTime::parse_from_rfc3339(timestamp)
+                .map_err(|_| ServerError::new(StatusCode::BAD_REQUEST, "Invalid prompt cursor."))?
+                .with_timezone(&Utc),
+            id: id.trim().to_string(),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "Prompt cursor requires before_timestamp and before_id.",
+            ));
+        }
+    };
+    let (prompts, has_more) = state
+        .sessions
+        .user_prompts_page_including_external(&session_id, limit, before)
+        .await?;
+    let oldest_cursor = prompts.first().map(|prompt| PromptHistoryCursor {
+        timestamp: prompt.timestamp.clone(),
+        id: prompt.id.clone(),
+    });
+    Ok(Json(PromptHistoryResponse {
+        session_id,
+        prompts: prompts
+            .into_iter()
+            .map(|mut prompt| {
+                prompt.content = bound_session_response_text(
+                    &prompt.content,
+                    SESSION_RESPONSE_USER_MAX_BYTES,
+                    "chat prompt",
+                );
+                prompt
+            })
+            .collect(),
+        has_more,
+        oldest_cursor,
     }))
 }
 

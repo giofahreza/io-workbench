@@ -6,8 +6,8 @@ use std::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use iowb_protocol::{
     ChatMessage, DatabaseConnectionInput, DatabaseConnectionProfile, DatabaseTestStatus,
-    DatabaseTransferJob, MessageRole, ProjectSummary, Provider, SessionDraftResponse,
-    SessionSummary, SettingEntry, SupportedDatabaseType,
+    DatabaseTransferJob, MessageRole, ProjectSummary, PromptHistoryCursor, PromptHistoryEntry,
+    Provider, SessionDraftResponse, SessionSummary, SettingEntry, SupportedDatabaseType,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -262,6 +262,9 @@ impl Storage {
                     metadata TEXT NOT NULL DEFAULT 'null',
                     FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_messages_session_role_time
+                    ON messages(session_id, role, timestamp, id);
 
                 CREATE TABLE IF NOT EXISTS api_keys (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1413,6 +1416,101 @@ impl Storage {
         })
     }
 
+    pub fn list_user_prompts_page(
+        &self,
+        session_id: &str,
+        limit: usize,
+        before: Option<&PromptHistoryCursor>,
+    ) -> Result<(Vec<PromptHistoryEntry>, bool)> {
+        let limit = limit.max(1) as i64;
+        self.with_connection(|conn| {
+            let user_role = role_to_str(MessageRole::User);
+            let prompts = if let Some(cursor) = before {
+                let before_timestamp = cursor.timestamp.to_rfc3339();
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT id, content, timestamp
+                    FROM (
+                        SELECT id, content, timestamp
+                        FROM messages
+                        WHERE session_id = ?1
+                          AND role = ?2
+                          AND (timestamp < ?3 OR (timestamp = ?3 AND id < ?4))
+                        ORDER BY timestamp DESC, id DESC
+                        LIMIT ?5
+                    )
+                    ORDER BY timestamp ASC, id ASC
+                    "#,
+                )?;
+                let rows = stmt.query_map(
+                    params![session_id, user_role, before_timestamp, cursor.id, limit],
+                    |row| {
+                        Ok(PromptHistoryEntry {
+                            id: row.get(0)?,
+                            content: row.get(1)?,
+                            timestamp: parse_time_sql(row.get::<_, String>(2)?)?,
+                        })
+                    },
+                )?;
+                let mut prompts = Vec::new();
+                for row in rows {
+                    prompts.push(row?);
+                }
+                prompts
+            } else {
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT id, content, timestamp
+                    FROM (
+                        SELECT id, content, timestamp
+                        FROM messages
+                        WHERE session_id = ?1 AND role = ?2
+                        ORDER BY timestamp DESC, id DESC
+                        LIMIT ?3
+                    )
+                    ORDER BY timestamp ASC, id ASC
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![session_id, user_role, limit], |row| {
+                    Ok(PromptHistoryEntry {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                        timestamp: parse_time_sql(row.get::<_, String>(2)?)?,
+                    })
+                })?;
+                let mut prompts = Vec::new();
+                for row in rows {
+                    prompts.push(row?);
+                }
+                prompts
+            };
+
+            let has_more = prompts
+                .first()
+                .map(|oldest| {
+                    let oldest_timestamp = oldest.timestamp.to_rfc3339();
+                    conn.query_row(
+                        r#"
+                        SELECT EXISTS(
+                            SELECT 1
+                            FROM messages
+                            WHERE session_id = ?1
+                              AND role = ?2
+                              AND (timestamp < ?3 OR (timestamp = ?3 AND id < ?4))
+                        )
+                        "#,
+                        params![session_id, user_role, oldest_timestamp, oldest.id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|value| value != 0)
+                })
+                .transpose()?
+                .unwrap_or(false);
+
+            Ok((prompts, has_more))
+        })
+    }
+
     pub fn search_messages(
         &self,
         query: &str,
@@ -2481,6 +2579,72 @@ mod tests {
             .expect("stored session");
         assert_eq!(restored.native_session_id, session.native_session_id);
         assert_eq!(restored.runtime, Some(ChatRuntime::IoGateway));
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn user_prompt_history_pages_only_user_messages_with_cursor() {
+        let (storage, root) = temporary_storage("prompt-history");
+        let session = SessionSummary {
+            id: "session-prompts".to_string(),
+            provider: Provider::Codex,
+            project_path: "/tmp/project".to_string(),
+            title: "Prompt history".to_string(),
+            last_activity: Utc::now(),
+            ..Default::default()
+        };
+        storage.upsert_session(&session).expect("upsert session");
+        for (index, role, content) in [
+            (0, MessageRole::User, "first"),
+            (1, MessageRole::Assistant, "ignored assistant"),
+            (2, MessageRole::User, "second"),
+            (3, MessageRole::Tool, "ignored tool"),
+            (4, MessageRole::User, "second"),
+            (5, MessageRole::User, "third"),
+        ] {
+            storage
+                .append_message(
+                    &session.id,
+                    &ChatMessage {
+                        id: format!("m{index}"),
+                        role,
+                        content: content.to_string(),
+                        timestamp: Utc::now() + chrono::Duration::seconds(index),
+                        metadata: Value::Null,
+                    },
+                )
+                .expect("append message");
+        }
+
+        let (latest, has_more) = storage
+            .list_user_prompts_page(&session.id, 2, None)
+            .expect("latest prompts");
+        assert_eq!(
+            latest
+                .iter()
+                .map(|prompt| prompt.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "third"]
+        );
+        assert!(has_more);
+
+        let cursor = PromptHistoryCursor {
+            timestamp: latest.first().expect("oldest latest prompt").timestamp,
+            id: latest.first().expect("oldest latest prompt").id.clone(),
+        };
+        let (older, has_more) = storage
+            .list_user_prompts_page(&session.id, 2, Some(&cursor))
+            .expect("older prompts");
+        assert_eq!(
+            older
+                .iter()
+                .map(|prompt| prompt.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert!(!has_more);
 
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");

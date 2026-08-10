@@ -17,6 +17,12 @@ pub struct ApiErrorBody {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
 }
 
 impl ApiErrorBody {
@@ -24,6 +30,9 @@ impl ApiErrorBody {
         Self {
             error: error.into(),
             details: None,
+            code: None,
+            category: None,
+            retryable: None,
         }
     }
 
@@ -31,6 +40,25 @@ impl ApiErrorBody {
         Self {
             error: error.into(),
             details: Some(details.into()),
+            code: None,
+            category: None,
+            retryable: None,
+        }
+    }
+
+    pub fn database(
+        error: impl Into<String>,
+        details: Option<String>,
+        code: impl Into<String>,
+        category: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            error: error.into(),
+            details,
+            code: Some(code.into()),
+            category: Some(category.into()),
+            retryable: Some(retryable),
         }
     }
 }
@@ -287,6 +315,28 @@ pub struct MessagesResponse {
     pub has_more: bool,
     /// Total number of messages stored for the session.
     pub total_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptHistoryEntry {
+    pub id: String,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptHistoryCursor {
+    pub timestamp: DateTime<Utc>,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptHistoryResponse {
+    pub session_id: String,
+    pub prompts: Vec<PromptHistoryEntry>,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_cursor: Option<PromptHistoryCursor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -873,16 +923,30 @@ pub struct DatabaseTestConnectionRequest {
 pub struct DatabaseTestResult {
     pub status: DatabaseTestStatus,
     pub message: String,
+    #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseCapabilities {
-    #[serde(rename = "supportsSchemas")]
+    #[serde(rename = "supportsDatabases", default)]
+    pub supports_databases: bool,
+    #[serde(rename = "supportsSchemas", default)]
     pub supports_schemas: bool,
-    #[serde(rename = "supportsMultipleDatabases")]
+    #[serde(rename = "supportsViews", default)]
+    pub supports_views: bool,
+    #[serde(rename = "supportsIndexes", default)]
+    pub supports_indexes: bool,
+    #[serde(rename = "supportsMultipleDatabases", default)]
     pub supports_multiple_databases: bool,
-    #[serde(rename = "supportsForeignKeys")]
+    #[serde(rename = "supportsForeignKeys", default)]
     pub supports_foreign_keys: bool,
+    #[serde(rename = "supportsParameterizedQueries", default)]
+    pub supports_parameterized_queries: bool,
+    #[serde(rename = "supportsOffset", default)]
+    pub supports_offset: bool,
+    #[serde(rename = "supportedObjectTypes", default)]
+    pub supported_object_types: Vec<DatabaseObjectType>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

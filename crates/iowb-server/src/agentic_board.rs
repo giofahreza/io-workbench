@@ -1343,10 +1343,14 @@ async fn schedule_run(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<ScheduleRequest>,
 ) -> Result<Json<Value>> {
-    let scheduled_start_at = request
-        .scheduled_start_at
-        .as_deref()
-        .and_then(parse_rfc3339_utc)
+    let scheduled_start_at = trim_string(request.scheduled_start_at);
+    let Some(scheduled_start_at) = scheduled_start_at else {
+        return mutate_run(&state, &user.0.id, &id, |run| {
+            clear_run_schedule(run);
+            Ok(())
+        });
+    };
+    let scheduled_start_at = parse_rfc3339_utc(&scheduled_start_at)
         .ok_or_else(|| bad_request("Scheduled start time is invalid"))?;
     if scheduled_start_at <= Utc::now() {
         let stored = begin_run(&state, &user.0.id, &id)?;
@@ -1376,6 +1380,20 @@ async fn schedule_run(
         run.append_log(format!("Run scheduled to start at {scheduled_start_at}"));
         Ok(())
     })
+}
+
+fn clear_run_schedule(run: &mut BoardRun) {
+    run.scheduled_start_at = None;
+    if run.status == "scheduled" {
+        run.status = "paused".to_string();
+        run.active = false;
+        run.loop_started = false;
+        run.auto_run_enabled = false;
+        run.pause_requested = false;
+        run.paused_at = Some(Utc::now());
+        run.pause_reason = Some("schedule cleared".to_string());
+    }
+    run.append_log("Cleared board scheduled start");
 }
 
 async fn abort_run(
@@ -9634,6 +9652,26 @@ mod tests {
         );
         assert_eq!(task.requirement_ids, vec!["REQ-1"]);
         assert_eq!(task.depends_on, vec!["task-0"]);
+    }
+
+    #[test]
+    fn clearing_schedule_returns_scheduled_run_to_paused_state() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project",
+            "scheduledStartAt": "2099-08-09T01:00:00Z"
+        }));
+        run.status = "scheduled".to_string();
+        run.active = false;
+        run.loop_started = false;
+        run.auto_run_enabled = true;
+
+        clear_run_schedule(&mut run);
+
+        assert_eq!(run.status, "paused");
+        assert_eq!(run.scheduled_start_at, None);
+        assert!(!run.auto_run_enabled);
+        assert_eq!(run.pause_reason.as_deref(), Some("schedule cleared"));
     }
 
     #[test]
