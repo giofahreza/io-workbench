@@ -1,15 +1,28 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260808-01";
+const APP_VERSION = "20260810-01";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
+const ACTIVE_CHAT_SESSION_KEY = "iowb.web.activeChatSession";
+const ACTIVE_CHAT_SERVER_KEY = "iowb.web.activeChatServer";
+const ACTIVE_CHAT_PROJECT_KEY = "iowb.web.activeChatProject";
+const CHAT_TRANSCRIPT_CACHE_KEY = "iowb.web.chatTranscriptCache";
 const APP_VERSION_STORAGE_KEY = "iowb.web.version";
 const APP_RELOAD_STORAGE_KEY = `iowb.web.reloaded.${APP_VERSION}`;
 const WS_CONNECT_TIMEOUT_MS = 8000;
 const WS_RETRY_BASE_MS = 1200;
 const WS_RETRY_MAX_MS = 10000;
+const CHAT_ACTIVE_POLL_INTERVAL_MS = 2000;
+const CHAT_COMPLETION_RECONCILE_DELAYS_MS = [280, 750, 1500, 3000];
+const CHAT_TRANSCRIPT_CACHE_VERSION = 1;
+const MAX_CHAT_TRANSCRIPT_CACHE = 16;
+const CHAT_AUTOSCROLL_THRESHOLD_PX = 160;
+const CHAT_HISTORY_LOAD_THRESHOLD_PX = 96;
+const MAX_PROMPT_HISTORY = 80;
+const PROMPT_HISTORY_PAGE_SIZE = 10;
+const PROMPT_HISTORY_PREFETCH_REMAINING = 5;
 
 // Minimum time the user must hold the project grip before movement becomes a
 // drag-to-reorder gesture. Only the grip starts dragging; the rest of the row
@@ -83,10 +96,23 @@ const state = {
   chatPromptDraftSessionId: "",
   chatPromptDraftSaveTimer: null,
   chatPromptDraftLoadingSessionId: "",
-  chatPromptHistory: readJsonStorage("iowb.chatPromptHistory", []),
+  chatPromptHistory: [],
+  chatPromptHistoryScope: "",
   chatPromptHistoryIndex: -1,
   chatPromptHistoryScratch: "",
+  chatPromptHistoryHasOlder: false,
+  chatPromptHistoryLoadScope: "",
+  chatPromptHistoryPendingPreviousAfterLoad: false,
   chatProcessing: null,
+  chatStoppingSessionId: "",
+  chatResponseStateBySession: {},
+  chatOutputBuffersBySession: {},
+  chatTranscriptCache: readJsonStorage(CHAT_TRANSCRIPT_CACHE_KEY, { version: CHAT_TRANSCRIPT_CACHE_VERSION, entries: [] }),
+  chatReconcileTimers: {},
+  chatActivityPollTimer: null,
+  chatSuppressAutoOpenOnce: false,
+  chatOlderMessagesLoadingSessionId: "",
+  chatJumpToLatestPending: false,
   sessionStatusById: {},
   lastSessionMessages: [],
   shellBuffer: "",
@@ -1052,6 +1078,8 @@ function removeChatSessionFromState(sessionId) {
       project.sessions = project.sessions.filter((session) => session.id !== sessionId);
     }
   }
+  state.chatTranscriptCache.entries = chatCacheEntries().filter((entry) => entry.sessionId !== sessionId);
+  persistChatTranscriptCache();
 }
 
 function deleteSessionOverride(sessionId) {
@@ -1071,6 +1099,7 @@ function clearSelectedChatSession(sessionId) {
     state.preferences.lastChatSessionId = "";
     savePreferences();
   }
+  clearActiveChatSelection(sessionId);
   resetChatOutputDom();
   const prompt = qs("#chat-prompt");
   if (prompt) {
@@ -1137,39 +1166,287 @@ function renderChatProviderPicker() {
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", active ? "true" : "false");
   });
+  document.querySelectorAll(".chat-config-provider-picker").forEach((picker) => {
+    picker.classList.toggle("hidden", !selectedChatIsFreshDraft());
+  });
+}
+
+function chatPromptHistoryScope(sessionId = state.chatSessionId) {
+  const server = normalizedWebServerUrl();
+  const id = (sessionId || "").trim();
+  if (id) return `${server}::session::${id}`;
+  return `${server}::${activeProjectPath() || "default"}::new`;
+}
+
+function chatPromptHistoryStorageKey(scope = state.chatPromptHistoryScope) {
+  return `iowb.chatPromptHistory:${scope || chatPromptHistoryScope()}`;
+}
+
+function promptHistoryHash(value) {
+  let hash = 0;
+  const input = String(value || "");
+  for (let index = 0; index < input.length; index += 1) {
+    hash = ((hash << 5) - hash + input.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+function normalizePromptHistoryItem(entry, index = 0) {
+  if (typeof entry === "string") {
+    const content = entry.trim();
+    if (!content) return null;
+    return {
+      id: `legacy:${index}:${promptHistoryHash(content)}`,
+      content,
+      timestamp: new Date(0 + index).toISOString(),
+      local: true,
+    };
+  }
+  if (!entry || typeof entry !== "object") return null;
+  const content = String(entry.content || "").trim();
+  if (!content) return null;
+  const id = String(entry.id || entry.localId || entry.local_id || "").trim()
+    || `local:${index}:${promptHistoryHash(content)}`;
+  const rawTimestamp = String(entry.timestamp || entry.createdAt || entry.created_at || "").trim();
+  const timestamp = rawTimestamp && !Number.isNaN(new Date(rawTimestamp).getTime())
+    ? new Date(rawTimestamp).toISOString()
+    : new Date(0 + index).toISOString();
+  return {
+    id,
+    content,
+    timestamp,
+    local: Boolean(entry.local),
+  };
+}
+
+function readChatPromptHistoryCache(scope) {
+  const raw = readJsonStorage(chatPromptHistoryStorageKey(scope), null);
+  let prompts = [];
+  let hasOlder = false;
+  if (Array.isArray(raw)) {
+    prompts = raw;
+  } else if (raw && typeof raw === "object") {
+    prompts = Array.isArray(raw.prompts) ? raw.prompts : [];
+    hasOlder = raw.hasOlder === true || raw.has_more === true;
+  } else {
+    prompts = readJsonStorage("iowb.chatPromptHistory", []);
+  }
+  return {
+    prompts: prompts
+      .map(normalizePromptHistoryItem)
+      .filter(Boolean)
+      .slice(-MAX_PROMPT_HISTORY),
+    hasOlder,
+  };
+}
+
+function ensureChatPromptHistoryScope(sessionId = state.chatSessionId) {
+  const scope = chatPromptHistoryScope(sessionId);
+  if (state.chatPromptHistoryScope === scope) return;
+  state.chatPromptHistoryLoadScope = "";
+  state.chatPromptHistoryPendingPreviousAfterLoad = false;
+  state.chatPromptHistoryScope = scope;
+  const cached = readChatPromptHistoryCache(scope);
+  state.chatPromptHistory = cached.prompts;
+  state.chatPromptHistoryHasOlder = cached.hasOlder;
+  state.chatPromptHistoryIndex = state.chatPromptHistory.length;
+  state.chatPromptHistoryScratch = "";
+  loadChatPromptHistoryPage(sessionId, { older: false }).catch((error) => {
+    console.warn("Unable to load prompt history", error);
+  });
 }
 
 function persistChatPromptHistory() {
+  ensureChatPromptHistoryScope();
   state.chatPromptHistory = (state.chatPromptHistory || [])
-    .filter((item) => typeof item === "string" && item.trim())
-    .slice(-80);
-  window.localStorage.setItem("iowb.chatPromptHistory", JSON.stringify(state.chatPromptHistory));
+    .map(normalizePromptHistoryItem)
+    .filter(Boolean)
+    .sort((left, right) => String(left.timestamp).localeCompare(String(right.timestamp)) || String(left.id).localeCompare(String(right.id)))
+    .slice(-MAX_PROMPT_HISTORY);
+  window.localStorage.setItem(chatPromptHistoryStorageKey(), JSON.stringify({
+    prompts: state.chatPromptHistory,
+    hasOlder: state.chatPromptHistoryHasOlder === true,
+  }));
+}
+
+function mergeChatPromptHistory(items, options = {}) {
+  ensureChatPromptHistoryScope();
+  const normalizedItems = (items || []).map(normalizePromptHistoryItem).filter(Boolean);
+  if (!normalizedItems.length) {
+    if (typeof options.hasOlder === "boolean") state.chatPromptHistoryHasOlder = options.hasOlder;
+    persistChatPromptHistory();
+    return;
+  }
+  const previousSize = state.chatPromptHistory.length;
+  const wasAtEnd = state.chatPromptHistoryIndex >= previousSize;
+  const selectedId = state.chatPromptHistory[state.chatPromptHistoryIndex]?.id || "";
+  const merged = new Map();
+  for (const item of state.chatPromptHistory) {
+    merged.set(item.id, item);
+  }
+  for (const item of normalizedItems) {
+    if (!item.local) {
+      for (const [key, existing] of merged.entries()) {
+        if (existing.local && existing.content === item.content) {
+          merged.delete(key);
+          break;
+        }
+      }
+    }
+    merged.set(item.id, item);
+  }
+  state.chatPromptHistory = Array.from(merged.values())
+    .sort((left, right) => String(left.timestamp).localeCompare(String(right.timestamp)) || String(left.id).localeCompare(String(right.id)))
+    .slice(-MAX_PROMPT_HISTORY);
+  if (typeof options.hasOlder === "boolean") state.chatPromptHistoryHasOlder = options.hasOlder;
+  if (selectedId) {
+    const selectedIndex = state.chatPromptHistory.findIndex((item) => item.id === selectedId);
+    state.chatPromptHistoryIndex = selectedIndex >= 0 ? selectedIndex : state.chatPromptHistory.length;
+  } else if (wasAtEnd) {
+    state.chatPromptHistoryIndex = state.chatPromptHistory.length;
+  } else {
+    state.chatPromptHistoryIndex = Math.max(0, Math.min(state.chatPromptHistoryIndex, state.chatPromptHistory.length));
+  }
+  persistChatPromptHistory();
 }
 
 function rememberChatPrompt(prompt) {
+  ensureChatPromptHistoryScope();
   const value = String(prompt || "").trim();
   if (!value) return;
-  state.chatPromptHistory = (state.chatPromptHistory || []).filter((item) => item !== value);
-  state.chatPromptHistory.push(value);
+  state.chatPromptHistory = (state.chatPromptHistory || []).filter((item) => !(item?.local && item?.content === value));
+  state.chatPromptHistory.push({
+    id: `local:${Date.now()}:${promptHistoryHash(value)}`,
+    content: value,
+    timestamp: new Date().toISOString(),
+    local: true,
+  });
+  state.chatPromptHistory = state.chatPromptHistory.slice(-MAX_PROMPT_HISTORY);
   persistChatPromptHistory();
   state.chatPromptHistoryIndex = state.chatPromptHistory.length;
   state.chatPromptHistoryScratch = "";
 }
 
+function chatPromptHistoryCursor() {
+  return (state.chatPromptHistory || []).find((item) => !item.local && item.timestamp && item.id) || null;
+}
+
+async function loadChatPromptHistoryPage(sessionId = state.chatSessionId, options = {}) {
+  const id = (sessionId || "").trim();
+  ensureChatPromptHistoryScope(id);
+  const session = id ? (findChatSession(id) || cachedChatSession(id)?.session) : null;
+  if (!id || !session || session.pending || state.pendingChatSessionId === id || !canLoadProtectedData()) return false;
+  const scope = chatPromptHistoryScope(id);
+  const older = options.older === true;
+  let cursor = null;
+  if (older) {
+    if (!state.chatPromptHistoryHasOlder) return false;
+    cursor = chatPromptHistoryCursor();
+    if (!cursor) return false;
+  }
+  if (state.chatPromptHistoryLoadScope === scope) return false;
+  state.chatPromptHistoryLoadScope = scope;
+  try {
+    const params = new URLSearchParams({ limit: String(PROMPT_HISTORY_PAGE_SIZE) });
+    if (cursor) {
+      params.set("before_timestamp", cursor.timestamp);
+      params.set("before_id", cursor.id);
+    }
+    const body = await api(`/api/sessions/${encodeURIComponent(id)}/prompts?${params.toString()}`);
+    if ((body?.session_id || body?.sessionId || id) !== id || state.chatPromptHistoryScope !== scope) return false;
+    mergeChatPromptHistory(body?.prompts || [], {
+      hasOlder: body?.has_more === true || body?.hasMore === true,
+    });
+    if (state.chatPromptHistoryPendingPreviousAfterLoad && state.chatPromptHistory.length) {
+      state.chatPromptHistoryPendingPreviousAfterLoad = false;
+      navigateChatPromptHistory(-1);
+    } else if (!state.chatPromptHistory.length) {
+      state.chatPromptHistoryPendingPreviousAfterLoad = false;
+    }
+    return true;
+  } catch (error) {
+    state.chatPromptHistoryPendingPreviousAfterLoad = false;
+    console.warn("Unable to load prompt history", error);
+    return false;
+  } finally {
+    if (state.chatPromptHistoryLoadScope === scope) {
+      state.chatPromptHistoryLoadScope = "";
+    }
+  }
+}
+
+async function loadChatPromptHistory(sessionId) {
+  return loadChatPromptHistoryPage(sessionId, { older: false });
+}
+
+function maybePrefetchOlderChatPromptHistory() {
+  if (state.chatPromptHistoryIndex <= PROMPT_HISTORY_PREFETCH_REMAINING) {
+    loadChatPromptHistoryPage(state.chatSessionId, { older: true }).catch((error) => {
+      console.warn("Unable to prefetch prompt history", error);
+    });
+  }
+}
+
+function syncChatPromptHistoryFromMessages(messages, sessionId = state.chatSessionId) {
+  ensureChatPromptHistoryScope(sessionId);
+  const items = (messages || [])
+    .map((message, index) => {
+      if (String(message?.role || "").toLowerCase() !== "user") return null;
+      const content = String(message?.content || "").trim();
+      if (!content) return null;
+      return {
+        id: String(message.id || message.localId || message.local_id || `transcript:${index}:${promptHistoryHash(content)}`),
+        content,
+        timestamp: message.timestamp || new Date(0 + index).toISOString(),
+        local: !message.id,
+      };
+    })
+    .filter(Boolean);
+  mergeChatPromptHistory(items);
+}
+
 function navigateChatPromptHistory(direction) {
+  ensureChatPromptHistoryScope();
   const history = state.chatPromptHistory || [];
-  if (!history.length) return;
   const prompt = qs("#chat-prompt");
   if (!prompt) return;
+  if (!history.length) {
+    if (direction < 0) {
+      state.chatPromptHistoryPendingPreviousAfterLoad = true;
+      loadChatPromptHistoryPage(state.chatSessionId, { older: false }).catch((error) => {
+        console.warn("Unable to load prompt history", error);
+      });
+    }
+    return;
+  }
   if (state.chatPromptHistoryIndex < 0 || state.chatPromptHistoryIndex > history.length) {
     state.chatPromptHistoryIndex = history.length;
   }
-  if (state.chatPromptHistoryIndex === history.length) {
-    state.chatPromptHistoryScratch = prompt.value || "";
+  if (direction < 0) {
+    if (state.chatPromptHistoryIndex >= history.length) {
+      state.chatPromptHistoryScratch = prompt.value || "";
+    }
+    if (state.chatPromptHistoryIndex <= 0) {
+      if (state.chatPromptHistoryHasOlder) {
+        state.chatPromptHistoryPendingPreviousAfterLoad = true;
+        loadChatPromptHistoryPage(state.chatSessionId, { older: true }).catch((error) => {
+          console.warn("Unable to load older prompt history", error);
+        });
+      }
+      return;
+    }
+    state.chatPromptHistoryIndex = Math.max(0, state.chatPromptHistoryIndex - 1);
+    setChatPromptValue(history[state.chatPromptHistoryIndex]?.content || "");
+    maybePrefetchOlderChatPromptHistory();
+  } else {
+    if (state.chatPromptHistoryIndex < history.length - 1) {
+      state.chatPromptHistoryIndex += 1;
+      setChatPromptValue(history[state.chatPromptHistoryIndex]?.content || "");
+    } else {
+      state.chatPromptHistoryIndex = history.length;
+      setChatPromptValue(state.chatPromptHistoryScratch);
+    }
   }
-  const next = Math.max(0, Math.min(history.length, state.chatPromptHistoryIndex + direction));
-  state.chatPromptHistoryIndex = next;
-  setChatPromptValue(next === history.length ? state.chatPromptHistoryScratch : history[next]);
   scheduleChatPromptDraftSave();
 }
 
@@ -1197,6 +1474,7 @@ function showChatSessionConfigModal() {
         <button type="button" class="icon-button" data-chat-session-config-close aria-label="Close" title="Close" data-symbol="close"></button>
       </header>
       <div class="chat-session-config-body">
+        <p class="chat-session-config-scope">${escapeHtml(chatDisplaySettingsScopeLabel())}</p>
         <label><input type="checkbox" data-chat-display-setting="expandThinking"${settings.expandThinking ? " checked" : ""} /> Auto expand thinking</label>
         <label><input type="checkbox" data-chat-display-setting="expandParameters"${settings.expandParameters ? " checked" : ""} /> Auto expand parameters</label>
         <label><input type="checkbox" data-chat-display-setting="autoScrollToBottom"${settings.autoScrollToBottom ? " checked" : ""} /> Auto scroll to bottom</label>
@@ -1212,11 +1490,13 @@ function showChatSessionConfigModal() {
   });
   modal?.querySelectorAll("[data-chat-display-setting]").forEach((input) => {
     input.addEventListener("change", () => {
-      state.preferences.chatExpandThinking = modal.querySelector('[data-chat-display-setting="expandThinking"]')?.checked !== false;
-      state.preferences.chatExpandParameters = modal.querySelector('[data-chat-display-setting="expandParameters"]')?.checked !== false;
-      state.preferences.chatAutoScrollToBottom = modal.querySelector('[data-chat-display-setting="autoScrollToBottom"]')?.checked !== false;
-      savePreferences();
+      saveChatDisplaySettings({
+        expandThinking: modal.querySelector('[data-chat-display-setting="expandThinking"]')?.checked !== false,
+        expandParameters: modal.querySelector('[data-chat-display-setting="expandParameters"]')?.checked !== false,
+        autoScrollToBottom: modal.querySelector('[data-chat-display-setting="autoScrollToBottom"]')?.checked === true,
+      });
       if (state.chatSessionId) loadChatHistoryForSession(state.chatSessionId).catch(showError);
+      updateChatJumpToLatestButton();
     });
   });
 }
@@ -1243,9 +1523,36 @@ function chatSessionIdForSubmit() {
 function currentChatDraftSessionId() {
   const id = state.chatSessionId || "";
   if (!id || state.pendingChatSessionId === id) return "";
-  const session = findChatSession(id);
-  if (session?.pending) return "";
+  const session = findChatSession(id) || cachedChatSession(id)?.session;
+  if (!session || session.pending) return "";
   return id;
+}
+
+function chatDraftScope(sessionId = state.chatSessionId) {
+  const server = normalizedWebServerUrl();
+  const id = (sessionId || "").trim();
+  const session = id ? (findChatSession(id) || cachedChatSession(id)?.session) : null;
+  if (id && session && !session.pending && state.pendingChatSessionId !== id) {
+    return `${server}::session::${id}`;
+  }
+  return `${server}::${activeProjectPath() || "default"}::new`;
+}
+
+function chatDraftStorageKey(scope = chatDraftScope()) {
+  return `iowb.chatDraft:${scope}`;
+}
+
+function readLocalChatPromptDraft(sessionId = state.chatSessionId) {
+  return window.localStorage.getItem(chatDraftStorageKey(chatDraftScope(sessionId))) || "";
+}
+
+function writeLocalChatPromptDraft(content, sessionId = state.chatSessionId) {
+  const key = chatDraftStorageKey(chatDraftScope(sessionId));
+  if (String(content || "").trim()) {
+    window.localStorage.setItem(key, content || "");
+  } else {
+    window.localStorage.removeItem(key);
+  }
 }
 
 function setChatPromptValue(value) {
@@ -1266,7 +1573,13 @@ async function loadChatPromptDraft(sessionId) {
   const id = (sessionId || "").trim();
   if (!id) {
     state.chatPromptDraftSessionId = "";
-    setChatPromptValue("");
+    setChatPromptValue(readLocalChatPromptDraft(""));
+    return;
+  }
+  const session = findChatSession(id) || cachedChatSession(id)?.session;
+  if (!session || session.pending || state.pendingChatSessionId === id) {
+    state.chatPromptDraftSessionId = "";
+    setChatPromptValue(readLocalChatPromptDraft(id));
     return;
   }
   state.chatPromptDraftLoadingSessionId = id;
@@ -1274,10 +1587,11 @@ async function loadChatPromptDraft(sessionId) {
     const body = await api(`/api/sessions/${encodeURIComponent(id)}/draft`);
     if (state.chatPromptDraftLoadingSessionId !== id || currentChatDraftSessionId() !== id) return;
     state.chatPromptDraftSessionId = id;
-    setChatPromptValue(body?.content || "");
+    setChatPromptValue(body?.content || readLocalChatPromptDraft(id));
   } catch (error) {
     if (state.chatPromptDraftLoadingSessionId === id && currentChatDraftSessionId() === id) {
-      showError(new Error(`Could not load prompt draft: ${error.message}`));
+      setChatPromptValue(readLocalChatPromptDraft(id));
+      console.warn("Could not load remote prompt draft", error);
     }
   } finally {
     if (state.chatPromptDraftLoadingSessionId === id) {
@@ -1293,8 +1607,10 @@ async function saveChatPromptDraftNow() {
   }
   const sessionId = currentChatDraftSessionId();
   const prompt = qs("#chat-prompt");
-  if (!sessionId || !prompt) return;
+  if (!prompt) return;
   const content = prompt.value || "";
+  writeLocalChatPromptDraft(content, sessionId);
+  if (!sessionId) return;
   state.chatPromptDraftSessionId = sessionId;
   if (!content.trim()) {
     await api(`/api/sessions/${encodeURIComponent(sessionId)}/draft`, { method: "DELETE" });
@@ -1335,6 +1651,7 @@ function updateChatEmptyState() {
   const shouldShow = activeView() === "chat" && chatOutputIsEmpty() && selectedChatIsFreshDraft();
   emptyState.classList.toggle("hidden", !shouldShow);
   renderChatProviderPicker();
+  updateChatJumpToLatestButton();
 }
 
 function chooseNewChatProvider(provider) {
@@ -1664,19 +1981,270 @@ function chatOutputRoot() {
   return qs("#chat-output");
 }
 
+function normalizedWebServerUrl() {
+  return window.location.origin.replace(/\/+$/, "");
+}
+
+function chatCacheKey(sessionId) {
+  return `${normalizedWebServerUrl()}::session::${sessionId || ""}`;
+}
+
+function activeChatSelectionMatchesServer() {
+  const savedServer = window.localStorage.getItem(ACTIVE_CHAT_SERVER_KEY) || "";
+  return savedServer && savedServer === normalizedWebServerUrl();
+}
+
+function savedActiveChatSessionId() {
+  if (!activeChatSelectionMatchesServer()) return "";
+  return (window.localStorage.getItem(ACTIVE_CHAT_SESSION_KEY) || "").trim();
+}
+
+function persistActiveChatSelection(sessionId = state.chatSessionId, projectPath = activeProjectPath()) {
+  const id = (sessionId || "").trim();
+  if (!id) return;
+  window.localStorage.setItem(ACTIVE_CHAT_SESSION_KEY, id);
+  window.localStorage.setItem(ACTIVE_CHAT_SERVER_KEY, normalizedWebServerUrl());
+  window.localStorage.setItem(ACTIVE_CHAT_PROJECT_KEY, projectPath || "");
+  state.preferences.lastChatSessionId = id;
+  savePreferences();
+}
+
+function clearActiveChatSelection(sessionId = state.chatSessionId) {
+  const saved = savedActiveChatSessionId();
+  if (sessionId && saved && saved !== sessionId) return;
+  window.localStorage.removeItem(ACTIVE_CHAT_SESSION_KEY);
+  window.localStorage.removeItem(ACTIVE_CHAT_SERVER_KEY);
+  window.localStorage.removeItem(ACTIVE_CHAT_PROJECT_KEY);
+}
+
+function chatCacheEntries() {
+  if (!state.chatTranscriptCache || state.chatTranscriptCache.version !== CHAT_TRANSCRIPT_CACHE_VERSION) {
+    state.chatTranscriptCache = { version: CHAT_TRANSCRIPT_CACHE_VERSION, entries: [] };
+  }
+  if (!Array.isArray(state.chatTranscriptCache.entries)) {
+    state.chatTranscriptCache.entries = [];
+  }
+  return state.chatTranscriptCache.entries;
+}
+
+function persistChatTranscriptCache() {
+  const entries = chatCacheEntries().slice(-MAX_CHAT_TRANSCRIPT_CACHE);
+  state.chatTranscriptCache = { version: CHAT_TRANSCRIPT_CACHE_VERSION, entries };
+  window.localStorage.setItem(CHAT_TRANSCRIPT_CACHE_KEY, JSON.stringify(state.chatTranscriptCache));
+}
+
+function cachedChatSession(sessionId) {
+  const key = chatCacheKey((sessionId || "").trim());
+  return chatCacheEntries().find((entry) => entry.key === key) || null;
+}
+
+function chatSessionIsLive(sessionId = state.chatSessionId) {
+  const live = state.sessionStatusById?.[sessionId];
+  return normalizeSidebarSessionStatus(live?.status) === "running"
+    || Boolean(state.chatProcessing?.sessionId === sessionId)
+    || Boolean(state.currentSession?.sessionId === sessionId);
+}
+
+function rememberCurrentChatSession(patch = {}) {
+  const sessionId = (patch.sessionId || state.chatSessionId || state.pendingChatSessionId || "").trim();
+  if (!sessionId) return;
+  const key = chatCacheKey(sessionId);
+  const cached = cachedChatSession(sessionId);
+  const entries = chatCacheEntries().filter((entry) => entry.key !== key);
+  const session = patch.session || findChatSession(sessionId) || cached?.session || null;
+  const projectPath = patch.projectPath || sessionProjectPath(session, activeProjectPath());
+  const messages = Array.isArray(patch.messages)
+    ? patch.messages
+    : (chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.messages : (cached?.messages || []));
+  const offset = Number(patch.offset ?? (chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.offset : cached?.offset || 0)) || 0;
+  const totalCount = Number(patch.totalCount ?? (chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.totalCount : cached?.totalCount || messages.length)) || messages.length;
+  entries.push({
+    key,
+    sessionId,
+    projectPath,
+    session,
+    status: patch.status || (session ? sidebarSessionStatus(session) : "") || (chatSessionIsLive(sessionId) ? "running" : "completed"),
+    messages: messages.slice(-CHAT_HISTORY_PAGE_SIZE * 2),
+    offset: Math.max(0, offset + Math.max(0, messages.length - CHAT_HISTORY_PAGE_SIZE * 2)),
+    totalCount: Math.max(totalCount, messages.length),
+    live: patch.live ?? chatSessionIsLive(sessionId),
+    updatedAt: new Date().toISOString(),
+  });
+  state.chatTranscriptCache.entries = entries.slice(-MAX_CHAT_TRANSCRIPT_CACHE);
+  persistChatTranscriptCache();
+}
+
+function renderCachedChatSession(sessionId) {
+  const cached = cachedChatSession(sessionId);
+  if (!cached) return false;
+  const messages = Array.isArray(cached.messages) ? cached.messages : [];
+  state.chatSessionId = sessionId;
+  state.pendingChatSessionId = "";
+  chatHistoryWindow = {
+    sessionId,
+    offset: Math.max(0, Number(cached.offset) || 0),
+    totalCount: Math.max(Number(cached.totalCount) || messages.length, messages.length),
+    messages,
+  };
+  resetChatOutputDom();
+  replayChatMessages(messages);
+  scrollChatToBottom(true);
+  if (cached.live || chatSessionIsLive(sessionId)) {
+    ensureChatProcessing({
+      sessionId,
+      provider: sessionProvider(cached.session),
+    });
+  }
+  loadSessionOverridesIntoState(sessionId);
+  renderChatFooter(null);
+  updateChatEmptyState();
+  return true;
+}
+
+function rememberBackgroundChatOutput(payload = {}) {
+  const sessionId = (payload.sessionId || "").trim();
+  if (!sessionId || isActiveChatSessionEvent(payload)) return false;
+  const cached = cachedChatSession(sessionId);
+  const session = findChatSession(sessionId) || cached?.session || null;
+  if (!cached && !session) return false;
+  const previous = state.chatOutputBuffersBySession[sessionId] || "";
+  const nextBuffer = `${previous}${payload.content || ""}`.slice(-CHAT_LIVE_RENDER_MAX_CHARS);
+  let messages = Array.isArray(cached?.messages) ? cached.messages.slice() : [];
+  if (nextBuffer.trim()) {
+    const streamingId = `local-stream-${sessionId}`;
+    const existingIndex = messages.findIndex((message) => message.id === streamingId);
+    const message = {
+      id: payload.done ? `local-assistant-${Date.now()}` : streamingId,
+      role: "assistant",
+      content: nextBuffer,
+      timestamp: new Date().toISOString(),
+      metadata: {
+        cli: payload.provider || sessionProvider(session),
+        model: state.preferences.chatModel || "",
+        effort: state.preferences.chatEffort || "",
+        mode: state.preferences.chatMode || "",
+      },
+    };
+    if (existingIndex >= 0) messages[existingIndex] = message;
+    else messages = messages.concat(message);
+  }
+  if (payload.done) delete state.chatOutputBuffersBySession[sessionId];
+  else state.chatOutputBuffersBySession[sessionId] = nextBuffer;
+  rememberCurrentChatSession({
+    sessionId,
+    session,
+    messages,
+    live: !payload.done,
+    status: payload.done ? "completed" : "running",
+  });
+  if (payload.done) scheduleCompletedChatReconciliation(sessionId);
+  return true;
+}
+
+function chatDisplaySettingsScope(sessionId = state.chatSessionId) {
+  const id = (sessionId || "").trim();
+  const server = normalizedWebServerUrl();
+  if (id) return `${server}::session::${id}`;
+  return `${server}::new`;
+}
+
+function chatDisplaySettingsKey(scope = chatDisplaySettingsScope()) {
+  return `iowb.chatDisplaySettings:${scope}`;
+}
+
+function chatDisplaySettingsScopeLabel() {
+  const session = state.chatSessionId?.trim();
+  const title = session ? findChatSession(session)?.title : "";
+  return title || (session ? `Session ${session}` : "New chat");
+}
+
 function chatDisplaySettings() {
+  const scoped = readJsonStorage(chatDisplaySettingsKey(), null);
+  if (scoped && typeof scoped === "object") {
+    return {
+      expandThinking: scoped.expandThinking !== false,
+      expandParameters: scoped.expandParameters !== false,
+      autoScrollToBottom: scoped.autoScrollToBottom === true,
+    };
+  }
   return {
     expandThinking: state.preferences.chatExpandThinking !== false,
     expandParameters: state.preferences.chatExpandParameters !== false,
-    autoScrollToBottom: state.preferences.chatAutoScrollToBottom !== false,
+    autoScrollToBottom: state.preferences.chatAutoScrollToBottom === true,
   };
 }
 
-function scrollChatToBottom() {
-  if (!chatDisplaySettings().autoScrollToBottom) return;
+function saveChatDisplaySettings(settings) {
+  window.localStorage.setItem(chatDisplaySettingsKey(), JSON.stringify({
+    expandThinking: settings.expandThinking !== false,
+    expandParameters: settings.expandParameters !== false,
+    autoScrollToBottom: settings.autoScrollToBottom === true,
+  }));
+}
+
+function isChatNearBottom() {
+  const output = chatOutputRoot();
+  if (!output || output.scrollHeight <= output.clientHeight) return true;
+  return output.scrollHeight - output.clientHeight - output.scrollTop <= CHAT_AUTOSCROLL_THRESHOLD_PX;
+}
+
+function scrollChatToBottom(force = false) {
+  const shouldScroll = force || state.chatJumpToLatestPending || chatDisplaySettings().autoScrollToBottom;
+  if (!shouldScroll) {
+    updateChatJumpToLatestButton();
+    return;
+  }
   const output = chatOutputRoot();
   if (!output) return;
   output.scrollTop = output.scrollHeight;
+  state.chatJumpToLatestPending = false;
+  updateChatJumpToLatestButton();
+}
+
+function updateChatJumpToLatestButton() {
+  const button = qs("#chat-jump-latest");
+  if (!button) return;
+  const output = chatOutputRoot();
+  const hasRows = Boolean(output && output.children.length > 0 && output.textContent.trim());
+  button.classList.toggle("hidden", activeView() !== "chat" || !hasRows);
+  button.disabled = !hasRows || state.chatJumpToLatestPending || isChatNearBottom();
+}
+
+function jumpToLatestChatMessage() {
+  state.chatJumpToLatestPending = true;
+  scrollChatToBottom(true);
+}
+
+function showOlderMessagesLoading() {
+  const output = chatOutputRoot();
+  if (!output || output.querySelector(".chat-history-loading")) return;
+  const row = document.createElement("div");
+  row.className = "chat-history-loading";
+  row.textContent = "Loading older messages";
+  output.prepend(row);
+}
+
+function maybeLoadOlderChatMessages() {
+  const sessionId = state.chatSessionId || "";
+  const output = chatOutputRoot();
+  if (
+    activeView() !== "chat" ||
+    !sessionId ||
+    state.chatOlderMessagesLoadingSessionId ||
+    chatHistoryWindow.sessionId !== sessionId ||
+    chatHistoryWindow.offset <= 0 ||
+    !output ||
+    output.scrollTop > CHAT_HISTORY_LOAD_THRESHOLD_PX
+  ) {
+    return;
+  }
+  state.chatOlderMessagesLoadingSessionId = sessionId;
+  showOlderMessagesLoading();
+  loadChatHistoryForSession(sessionId, { older: true }).finally(() => {
+    if (state.chatOlderMessagesLoadingSessionId === sessionId) {
+      state.chatOlderMessagesLoadingSessionId = "";
+    }
+  });
 }
 
 function buildChatLineNode(role) {
@@ -1698,11 +2266,76 @@ function chatEventSessionIds() {
   ].filter(Boolean));
 }
 
+function selectedChatIsStopping() {
+  const ids = chatEventSessionIds();
+  return Boolean(state.chatStoppingSessionId && ids.has(state.chatStoppingSessionId));
+}
+
 function isActiveChatSessionEvent(payload = {}) {
   if (!payload.sessionId) return false;
   const ids = chatEventSessionIds();
   if (!ids.size) return false;
   return ids.has(payload.sessionId);
+}
+
+function chatEventResponseId(payload = {}) {
+  return String(payload.responseId || payload.response_id || "").trim();
+}
+
+function chatEventSequence(payload = {}) {
+  const value = payload.sequence;
+  if (value == null || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function chatResponseState(sessionId) {
+  const id = (sessionId || "").trim();
+  if (!id) return {};
+  const current = state.chatResponseStateBySession[id];
+  if (current && typeof current === "object") return current;
+  const next = { activeResponseId: "", completedResponseId: "", sequence: 0 };
+  state.chatResponseStateBySession[id] = next;
+  return next;
+}
+
+function acceptsOrderedChatResponseEvent(payload = {}, options = {}) {
+  const sessionId = String(payload.sessionId || "").trim();
+  if (!sessionId) return true;
+  const responseId = chatEventResponseId(payload);
+  const sequence = chatEventSequence(payload);
+  if (!responseId || sequence == null) return true;
+  const tracked = chatResponseState(sessionId);
+  const runningEvent = options.runningEvent === true;
+  const allowNewResponse = options.allowNewResponse === true;
+  if (responseId === tracked.completedResponseId) {
+    return !runningEvent && sequence > (Number(tracked.sequence) || 0);
+  }
+  if (tracked.activeResponseId && tracked.activeResponseId !== responseId) {
+    return false;
+  }
+  if (!tracked.activeResponseId && responseId !== tracked.completedResponseId && !allowNewResponse) {
+    return false;
+  }
+  if (!tracked.activeResponseId && responseId !== tracked.completedResponseId && allowNewResponse) {
+    return true;
+  }
+  return sequence > (Number(tracked.sequence) || 0);
+}
+
+function rememberOrderedChatResponseEvent(payload = {}, options = {}) {
+  const sessionId = String(payload.sessionId || "").trim();
+  const responseId = chatEventResponseId(payload);
+  const sequence = chatEventSequence(payload);
+  if (!sessionId || !responseId || sequence == null) return;
+  const tracked = chatResponseState(sessionId);
+  tracked.sequence = Math.max(Number(tracked.sequence) || 0, sequence);
+  if (options.terminal === true) {
+    tracked.activeResponseId = "";
+    tracked.completedResponseId = responseId;
+  } else {
+    tracked.activeResponseId = responseId;
+  }
 }
 
 function selectedRunningChatSession() {
@@ -1893,6 +2526,7 @@ function replayAssistantLine(content, meta) {
 function replayToolLine(content) {
   const output = chatOutputRoot();
   if (!output) return;
+  if (!String(content || "").trim()) return;
   const { node, text, footer } = buildChatLineNode("assistant");
   node.classList.add("chat-line-tool-message");
   // Tool rows already contain structured `exec/tool / Parameters|Details`
@@ -1903,13 +2537,108 @@ function replayToolLine(content) {
   output.appendChild(node);
 }
 
+function stripAnsi(value) {
+  return String(value || "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+}
+
+function normalizeChatToolHeading(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^[#>*\-` ]+/, "")
+    .replace(/[#*` ]+$/, "")
+    .trim();
+}
+
+function isChatAssistantBoundary(value) {
+  return /^(codex|claude|assistant|response)$/i.test(normalizeChatToolHeading(value));
+}
+
+function isChatToolTelemetryHeading(value) {
+  return /^(?:exec(?:\s*\/\s*(?:parameters|details))?|bash(?:\s*\/\s*(?:parameters|details))?|shell(?:\s+command)?(?:\s*\/\s*(?:parameters|details))?|command_execution|function_call(?:_output)?|custom_tool_call(?:_output)?|tool(?:\s*\/\s*(?:parameters|details))?|(?:edit|create|delete|move)\s*\/\s*.+|file_change(?:\s*\/\s*.+)?|apply[_\s]+patch(?:\s*\/\s*(?:parameters|details))?|patch\s*:.*|diff\s+--git\b.*)$/i
+    .test(normalizeChatToolHeading(value));
+}
+
+function withoutChatTokenUsageSections(value) {
+  const visible = [];
+  let skippingUsageValues = false;
+  let fenced = false;
+  const usageValue = /^(?:(?:used|total|input|output|cached?|cache creation|cache read)\s*[:=]\s*)?[\d,.]+(?:\.\d+)?\s*(?:tokens?|tok|[kmb])?(?:\s*\([^)]*\))?$/i;
+  for (const line of String(value || "").split("\n")) {
+    const fenceBoundary = line.trimStart().startsWith("```");
+    const normalized = normalizeChatToolHeading(line);
+    if (!fenced && /^(tokens used|token usage)$/i.test(normalized)) {
+      skippingUsageValues = true;
+    } else if (skippingUsageValues && !fenced && (
+      isChatAssistantBoundary(line) ||
+      /^response$/i.test(normalized) ||
+      isChatToolTelemetryHeading(line)
+    )) {
+      skippingUsageValues = false;
+      visible.push(line);
+    } else if (skippingUsageValues && !fenced && (!normalized || usageValue.test(normalized))) {
+      // Drop token accounting rows.
+    } else if (skippingUsageValues) {
+      skippingUsageValues = false;
+      visible.push(line);
+    } else {
+      visible.push(line);
+    }
+    if (fenceBoundary) fenced = !fenced;
+  }
+  return visible.join("\n").trim();
+}
+
+function chatTimelineDisplay(value) {
+  return withoutChatTokenUsageSections(value).trim();
+}
+
+function assistantResponseContent(value, provider, previousPrompt) {
+  const normalized = stripAnsi(value)
+    .replace(/\r\n?/g, "\n")
+    .trim();
+  if (!normalized) return "";
+  const isCodex = String(provider || "").toLowerCase() === "codex" || normalized.split("\n").some((line) => line.startsWith("OpenAI Codex v"));
+  if (!isCodex) return chatTimelineDisplay(normalized);
+  const lines = normalized.split("\n");
+  const separators = lines
+    .map((line, index) => line.trim() === "--------" ? index : -1)
+    .filter((index) => index >= 0);
+  let remainder = separators.length >= 2
+    ? lines.slice(separators[1] + 1).join("\n").trim()
+    : normalized;
+  if (/^user\n/i.test(remainder)) {
+    remainder = remainder.slice(remainder.indexOf("\n") + 1).trimStart();
+    const prompt = String(previousPrompt || "").trim();
+    if (prompt && remainder.startsWith(prompt)) {
+      remainder = remainder.slice(prompt.length).trimStart();
+    }
+  }
+  return chatTimelineDisplay(
+    remainder
+      .split("\n")
+      .filter((line) => {
+        const trimmed = line.trim();
+        return !(
+          trimmed.startsWith("Reading additional input from stdin") ||
+          trimmed.startsWith("OpenAI Codex v") ||
+          trimmed === "--------" ||
+          /^warning: Model metadata/i.test(trimmed)
+        );
+      })
+      .join("\n")
+      .trim(),
+  );
+}
+
 function replayChatMessages(messages) {
+  syncChatPromptHistoryFromMessages(messages);
   const latestAssistantIndex = (() => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       if (String(messages[index]?.role || "").toLowerCase() === "assistant") return index;
     }
     return -1;
   })();
+  let previousPrompt = "";
   messages.forEach((raw, index) => {
     if (!raw) return;
     const role = String(raw.role || "").toLowerCase();
@@ -1923,9 +2652,13 @@ function replayChatMessages(messages) {
     const meta = role === "assistant" && index === latestAssistantIndex
       ? normalizeMessageMeta(persistedMeta)
       : null;
-    if (role === "user") replayUserPromptLine(content);
-    else if (role === "assistant") replayAssistantLine(content, meta);
-    else if (role === "tool") replayToolLine(content);
+    if (role === "user") {
+      previousPrompt = content;
+      replayUserPromptLine(content);
+    } else if (role === "assistant") {
+      const displayContent = assistantResponseContent(content, raw.provider || persistedMeta.provider, previousPrompt);
+      if (displayContent) replayAssistantLine(displayContent, meta);
+    } else if (role === "tool") replayToolLine(content);
     else if (role === "system") {
       const output = chatOutputRoot();
       if (!output) return;
@@ -1999,11 +2732,59 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     if (loadingOlder && requestedLimit <= 0) return true;
     const query = loadingOlder
       ? `limit=${requestedLimit}&offset=${requestedOffset}`
-      : `limit=${CHAT_HISTORY_PAGE_SIZE}&tail=true`;
-    const url = `/api/sessions/${encodeURIComponent(sessionId)}/messages?${query}`;
-    const body = await api(url);
+      : `limit=${CHAT_HISTORY_PAGE_SIZE}`;
+    const url = loadingOlder
+      ? `/api/sessions/${encodeURIComponent(sessionId)}/messages?${query}`
+      : `/api/sessions/${encodeURIComponent(sessionId)}/snapshot?${query}`;
+    let body;
+    try {
+      body = await api(url);
+    } catch (error) {
+      if (loadingOlder) throw error;
+      await loadProjects().catch(() => {});
+      const fallbackSession = findChatSession(sessionId);
+      if (!fallbackSession) throw error;
+      const fallbackOffset = Math.max(
+        0,
+        (Number(fallbackSession.messageCount) || 0) - CHAT_HISTORY_PAGE_SIZE,
+      );
+      const fallbackQuery = [
+        `limit=${CHAT_HISTORY_PAGE_SIZE}`,
+        `offset=${fallbackOffset}`,
+        fallbackSession.external ? "tail=true" : "",
+      ].filter(Boolean).join("&");
+      const response = await api(`/api/sessions/${encodeURIComponent(sessionId)}/messages?${fallbackQuery}`);
+      body = {
+        session: fallbackSession,
+        messages: response?.messages || [],
+        hasMore: response?.has_more ?? response?.hasMore ?? fallbackOffset > 0,
+        totalCount: response?.total_count ?? response?.totalCount ?? fallbackSession.messageCount ?? 0,
+      };
+    }
     const page = Array.isArray(body) ? body : (body.messages || []);
     const totalCount = Number(body?.total_count ?? body?.totalCount ?? page.length) || page.length;
+    const snapshotSession = body?.session || findChatSession(sessionId);
+    if (snapshotSession?.id) {
+      if (snapshotSession.projectPath) {
+        setActiveProject(snapshotSession.projectPath);
+      }
+      state.sessions = (state.sessions || []).filter((session) => session?.id !== snapshotSession.id);
+      state.sessions.push(snapshotSession);
+      state.projects = (state.projects || []).map((project) => {
+        const matchesProject = snapshotSession.projectPath && project.path === snapshotSession.projectPath;
+        const hasSession = (project.sessions || []).some((session) => session.id === snapshotSession.id);
+        if (!matchesProject && !hasSession) return project;
+        const sessions = (project.sessions || [])
+          .filter((session) => session.id !== snapshotSession.id)
+          .concat({ ...snapshotSession, projectPath: snapshotSession.projectPath || project.path });
+        return { ...project, sessions };
+      });
+      rememberSidebarSessionStatus({
+        sessionId: snapshotSession.id,
+        provider: snapshotSession.provider,
+        status: snapshotSession.active ? "running" : "completed",
+      });
+    }
     const messages = loadingOlder
       ? page.concat(chatHistoryWindow.messages)
       : page;
@@ -2017,6 +2798,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       ? requestedOffset
       : Math.max(0, totalCount - page.length);
     chatHistoryWindow = { sessionId, offset, totalCount, messages };
+    syncChatPromptHistoryFromMessages(messages, sessionId);
     resetChatOutputDom();
     const persisted = getSessionOverridesFor(sessionId) || {};
     const replayMeta = (msg, role) => {
@@ -2043,21 +2825,6 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
         elapsed: persisted.elapsed || "",
       };
     };
-    if (offset > 0) {
-      const output = chatOutputRoot();
-      if (output) {
-        const loadOlder = document.createElement("button");
-        loadOlder.type = "button";
-        loadOlder.className = "chat-history-load-older";
-        loadOlder.textContent = `Load older messages (${offset} remaining)`;
-        loadOlder.addEventListener("click", async () => {
-          loadOlder.disabled = true;
-          loadOlder.textContent = "Loading older messages…";
-          await loadChatHistoryForSession(sessionId, { older: true });
-        });
-        output.appendChild(loadOlder);
-      }
-    }
     messages.forEach((raw, index) => {
       if (!raw) return;
       const role = String(raw.role || "").toLowerCase();
@@ -2080,19 +2847,76 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     const output = chatOutputRoot();
     if (loadingOlder && output) {
       output.scrollTop = Math.max(0, output.scrollHeight - previousHeight + previousTop);
+    } else if (opts.forceBottom || state.chatJumpToLatestPending) {
+      scrollChatToBottom(true);
     } else {
       scrollChatToBottom();
     }
+    maybeLoadOlderChatMessages();
     // Restore per-session overrides without showing the legacy global
     // metadata slot; only the latest assistant response owns metadata.
     loadSessionOverridesIntoState(sessionId);
     renderChatFooter(null);
+    rememberCurrentChatSession({
+      sessionId,
+      session: snapshotSession,
+      messages,
+      offset,
+      totalCount,
+      live: Boolean(snapshotSession?.active),
+      status: snapshotSession?.active ? "running" : "completed",
+    });
+    persistActiveChatSelection(sessionId, snapshotSession?.projectPath || activeProjectPath());
     updateChatEmptyState();
     return true;
   } catch (error) {
     showError(new Error(`Could not load chat history: ${error.message}`));
     return false;
   }
+}
+
+function scheduleChatReconciliation(sessionId = state.chatSessionId, opts = {}) {
+  const id = (sessionId || "").trim();
+  if (!id || !canLoadProtectedData()) return;
+  if (state.chatReconcileTimers[id]) {
+    window.clearTimeout(state.chatReconcileTimers[id]);
+  }
+  state.chatReconcileTimers[id] = window.setTimeout(async () => {
+    delete state.chatReconcileTimers[id];
+    if (state.chatSessionId !== id && state.pendingChatSessionId !== id) return;
+    const ok = await loadChatHistoryForSession(id);
+    if (ok) {
+      await loadChatPromptDraft(id).catch((error) => {
+        console.warn("Unable to load prompt draft after chat reconciliation", error);
+      });
+    } else if (opts.reportFailure) {
+      showToast("Could not reconcile chat session", "danger");
+    }
+  }, opts.delayMs ?? 0);
+}
+
+function scheduleCompletedChatReconciliation(sessionId) {
+  const id = (sessionId || "").trim();
+  if (!id) return;
+  for (const delayMs of CHAT_COMPLETION_RECONCILE_DELAYS_MS) {
+    window.setTimeout(() => {
+      if (state.chatSessionId === id || state.pendingChatSessionId === id) {
+        scheduleChatReconciliation(id);
+      }
+    }, delayMs);
+  }
+}
+
+function startChatActivityPoll() {
+  if (state.chatActivityPollTimer) {
+    window.clearInterval(state.chatActivityPollTimer);
+  }
+  state.chatActivityPollTimer = window.setInterval(() => {
+    const sessionId = state.chatSessionId || state.pendingChatSessionId || "";
+    if (!sessionId || !canLoadProtectedData()) return;
+    if (!chatSessionIsLive(sessionId)) return;
+    scheduleChatReconciliation(sessionId);
+  }, CHAT_ACTIVE_POLL_INTERVAL_MS);
 }
 
 async function pickChatSession(sessionId, projectPath) {
@@ -2104,6 +2928,7 @@ async function pickChatSession(sessionId, projectPath) {
   const session = findChatSession(id);
   state.pendingChatSessionId = id;
   state.chatSessionId = id;
+  ensureChatPromptHistoryScope(id);
   state.preferences.lastChatSessionId = id;
   savePreferences();
   if (projectPath) setActiveProject(projectPath);
@@ -2115,48 +2940,37 @@ async function pickChatSession(sessionId, projectPath) {
     return;
   }
   state.pendingChatSessionId = "";
-  await loadChatHistoryForSession(id);
+  const renderedCached = renderCachedChatSession(id);
+  persistActiveChatSelection(id, projectPath || sessionProjectPath(session, activeProjectPath()));
+  if (renderedCached) {
+    scheduleChatReconciliation(id, { reportFailure: true });
+    await loadChatPromptDraft(id).catch((error) => {
+      console.warn("Unable to load prompt draft for cached session", error);
+    });
+    await loadChatPromptHistory(id);
+    return;
+  }
+  await loadChatHistoryForSession(id, { forceBottom: true });
   await loadChatPromptDraft(id);
+  await loadChatPromptHistory(id);
 }
 
-// Start a fresh chat session for a given project. Wipes any active session
-// pointer, makes the project the active one, focuses the prompt, and clears
-// the chat output so the user can type and send right away. Also inserts a
-// placeholder session entry under the project in the sidebar so the user
-// can see where the new chat will live before they type anything; the
-// server adopts this id when the first message is submitted, so the entry
-// transitions seamlessly from placeholder to real session.
+// Start a fresh chat for a project. Like the Android controller, this does
+// not create a session id yet; the temporary id is allocated only when the
+// first prompt is sent.
 async function startNewChatForProject(projectPath) {
   if (!projectPath) return;
   await saveChatPromptDraftNow().catch((error) => {
     console.warn("Unable to sync prompt draft before starting new chat", error);
   });
   setActiveProject(projectPath);
-  const project = (state.projects || []).find((p) => p.path === projectPath);
-  const cli = chatCliValue();
-  const placeholderId = `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  if (!Array.isArray(state.sessions)) state.sessions = [];
-  // Remove any other placeholder session we created earlier in this project
-  // so the sidebar only ever shows one "new chat" pending entry.
-  state.sessions = state.sessions.filter((session) => {
-    if (!session || !session.pending) return true;
-    const sessionPath = session.projectPath || session.projectName;
-    return sessionPath !== projectPath && sessionPath !== (project && project.name);
-  });
-  state.sessions.push({
-    id: placeholderId,
-    provider: cli,
-    projectPath,
-    projectName: project && project.name,
-    title: "New chat",
-    messageCount: 0,
-    pending: true,
-    lastActivity: new Date().toISOString(),
-  });
-  state.chatSessionId = placeholderId;
-  state.pendingChatSessionId = placeholderId;
-  state.preferences.lastChatSessionId = placeholderId;
+  state.chatSessionId = "";
+  state.pendingChatSessionId = "";
+  state.currentSession = null;
+  clearActiveChatSelection();
+  ensureChatPromptHistoryScope("");
   state.chatBuffer = "";
+  chatHistoryWindow = { sessionId: "", offset: 0, totalCount: 0, messages: [] };
   if (!state.expandedProjectPaths.has(projectPath)) {
     state.expandedProjectPaths.add(projectPath);
     saveExpandedProjectPaths();
@@ -2164,12 +2978,13 @@ async function startNewChatForProject(projectPath) {
   savePreferences();
   renderProjects();
   renderSidebarProjects();
+  state.chatSuppressAutoOpenOnce = true;
   await switchView("chat");
   resetChatOutputDom();
   updateChatEmptyState();
   const prompt = qs("#chat-prompt");
   if (prompt) {
-    prompt.value = "";
+    prompt.value = readLocalChatPromptDraft("");
     state.chatPromptDraftSessionId = "";
     prompt.focus();
     autosizeChatPrompt();
@@ -4445,7 +5260,8 @@ function updateChatComposerState() {
   const thinking = qs("#chat-thinking-toggle");
   const hasPrompt = Boolean(input?.value.trim());
   const canSubmit = hasPrompt || state.chatImages.length > 0;
-  const busy = Boolean(selectedRunningChatSession() || state.chatProcessing);
+  const stopping = selectedChatIsStopping();
+  const busy = Boolean(selectedRunningChatSession() || state.chatProcessing || stopping);
 
   if (clear) {
     clear.classList.toggle("is-empty", !hasPrompt);
@@ -4460,10 +5276,10 @@ function updateChatComposerState() {
     thinking.title = enabled ? "Disable thinking" : "Enable thinking";
   }
   if (submit) {
-    submit.disabled = !busy && !canSubmit;
+    submit.disabled = stopping || (!busy && !canSubmit);
     submit.dataset.symbol = busy ? "stop" : "send";
-    submit.setAttribute("aria-label", busy ? "Abort chat" : "Send");
-    submit.title = busy ? "Abort chat" : "Send";
+    submit.setAttribute("aria-label", stopping ? "Stopping" : (busy ? "Abort chat" : "Send"));
+    submit.title = stopping ? "Stopping" : (busy ? "Abort chat" : "Send");
     submit.classList.toggle("is-stop", busy);
   }
 }
@@ -6856,6 +7672,7 @@ function connectWs() {
     setWsStatus("connected");
     ws.send(JSON.stringify({ type: "ping", nonce: String(Date.now()) }));
     ws.send(JSON.stringify({ type: "subscribe", topics: ["sessions", "processes", "projects"] }));
+    startChatActivityPoll();
   });
 
   ws.addEventListener("message", (event) => {
@@ -6877,7 +7694,25 @@ function connectWs() {
     }
     if (payload.type === "session_status") {
       const status = String(payload.status || "").toLowerCase();
+      const statusRunning = status === "starting" || status === "running" || status === "waiting-for-input";
+      if (!acceptsOrderedChatResponseEvent(payload, {
+        runningEvent: statusRunning,
+        allowNewResponse: statusRunning
+          || state.chatProcessing?.sessionId === payload.sessionId
+          || state.currentSession?.sessionId === payload.sessionId,
+      })) {
+        return;
+      }
+      rememberOrderedChatResponseEvent(payload, { terminal: !statusRunning });
       rememberSidebarSessionStatus(payload);
+      if (!isActiveChatSessionEvent(payload) && cachedChatSession(payload.sessionId || "")) {
+        const normalized = normalizeSidebarSessionStatus(status);
+        rememberCurrentChatSession({
+          sessionId: payload.sessionId,
+          live: normalized === "running",
+          status: normalized || "",
+        });
+      }
       if (isActiveChatSessionEvent(payload)) {
         state.currentSession = {
           provider: payload.provider,
@@ -6886,16 +7721,22 @@ function connectWs() {
       } else if (payload.sessionId && state.currentSession?.sessionId === payload.sessionId) {
         state.currentSession = null;
       }
-      if (status === "starting" || status === "running" || status === "waiting-for-input") {
+      if (statusRunning) {
         if (isActiveChatSessionEvent(payload)) {
+          rememberCurrentChatSession({ sessionId: payload.sessionId, live: true, status: "running" });
           ensureChatProcessing(payload);
-          if (status === "running" || status === "waiting-for-input") {
+          if (!selectedChatIsStopping() && (status === "running" || status === "waiting-for-input")) {
             updateProcessingLabel("Processing");
           }
         }
       } else if (status === "completed") {
         if (isActiveChatSessionEvent(payload) && (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer)) {
           finishChatProcessing(payload);
+        }
+        if (isActiveChatSessionEvent(payload)) {
+          if (state.chatStoppingSessionId === payload.sessionId) state.chatStoppingSessionId = "";
+          rememberCurrentChatSession({ sessionId: payload.sessionId, live: false, status: "completed" });
+          scheduleCompletedChatReconciliation(payload.sessionId);
         }
         if (!payload.sessionId || state.currentSession?.sessionId === payload.sessionId) {
           state.currentSession = null;
@@ -6905,6 +7746,11 @@ function connectWs() {
         if (isActiveChatSessionEvent(payload) && (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer.trim())) {
           finishChatProcessing(payload, label);
         }
+        if (isActiveChatSessionEvent(payload)) {
+          if (state.chatStoppingSessionId === payload.sessionId) state.chatStoppingSessionId = "";
+          rememberCurrentChatSession({ sessionId: payload.sessionId, live: false, status: "failed" });
+          scheduleCompletedChatReconciliation(payload.sessionId);
+        }
         if (!payload.sessionId || state.currentSession?.sessionId === payload.sessionId) {
           state.currentSession = null;
         }
@@ -6912,7 +7758,17 @@ function connectWs() {
       updateChatComposerState();
     }
     if (payload.type === "output") {
+      if (!acceptsOrderedChatResponseEvent(payload, {
+        runningEvent: payload.done !== true,
+        allowNewResponse: chatSessionIsLive(payload.sessionId)
+          || state.chatProcessing?.sessionId === payload.sessionId
+          || state.currentSession?.sessionId === payload.sessionId,
+      })) {
+        return;
+      }
+      rememberOrderedChatResponseEvent(payload, { terminal: payload.done === true });
       if (!isActiveChatSessionEvent(payload)) {
+        rememberBackgroundChatOutput(payload);
         if (payload.done && state.currentSession?.sessionId === payload.sessionId) {
           state.currentSession = null;
           updateChatComposerState();
@@ -6936,10 +7792,18 @@ function connectWs() {
           state.currentSession = null;
           updateChatComposerState();
         }
+        if (state.chatStoppingSessionId === payload.sessionId) state.chatStoppingSessionId = "";
         if (!hasAssistantContent) return;
         const receivedAt = new Date().toISOString();
         const sid = payload.sessionId;
         const proj = state.preferences.chatCli || state.preferences.chatProvider || "codex";
+        let assistantMeta = {
+          cli: proj,
+          model: state.preferences.chatModel || "",
+          effort: state.preferences.chatEffort || "",
+          mode: state.preferences.chatMode || "",
+          receivedAt: formatReceivedDateTime(receivedAt),
+        };
         const finalizeBubble = (entry) => {
           if (chatStream.node && chatStream.role === "assistant") {
             renderChatLineFooter(chatStream.node.querySelector(".chat-line-footer"), entry);
@@ -6959,6 +7823,7 @@ function connectWs() {
             receivedAt: formatReceivedDateTime(receivedAt),
           };
           if (prev.sentAt) provisional.elapsed = formatElapsed(prev.sentAt, receivedAt);
+          assistantMeta = provisional;
           finalizeBubble(provisional);
           const usageProvider = runtimeProviderForModel(
             proj,
@@ -6985,8 +7850,40 @@ function connectWs() {
               if (state.chatSessionId === sid || state.pendingChatSessionId === sid) {
                 finalizeBubble(persistedEntry);
               }
+              if (chatHistoryWindow.sessionId === sid) {
+                const messages = chatHistoryWindow.messages.map((message) => {
+                  if (message.id !== assistantMeta.id) return message;
+                  return { ...message, metadata: persistedEntry };
+                });
+                chatHistoryWindow = { ...chatHistoryWindow, messages };
+                rememberCurrentChatSession({ sessionId: sid, messages, live: false, status: "completed" });
+              }
             }).catch(() => {});
           }
+        }
+        if (sid) {
+          const assistantMessage = {
+            id: `local-assistant-${Date.now()}`,
+            role: "assistant",
+            content: state.chatBuffer,
+            timestamp: receivedAt,
+            metadata: assistantMeta,
+          };
+          assistantMeta.id = assistantMessage.id;
+          const currentMessages = chatHistoryWindow.sessionId === sid ? chatHistoryWindow.messages : [];
+          const messages = currentMessages.concat(assistantMessage);
+          chatHistoryWindow = {
+            sessionId: sid,
+            offset: chatHistoryWindow.sessionId === sid ? chatHistoryWindow.offset : 0,
+            totalCount: Math.max(
+              chatHistoryWindow.sessionId === sid ? chatHistoryWindow.totalCount + 1 : messages.length,
+              messages.length,
+            ),
+            messages,
+          };
+          rememberSidebarSessionStatus({ sessionId: sid, provider: payload.provider || proj, status: "completed" });
+          rememberCurrentChatSession({ sessionId: sid, messages, live: false, status: "completed" });
+          scheduleCompletedChatReconciliation(sid);
         }
       }
     }
@@ -6994,6 +7891,14 @@ function connectWs() {
       // Server broadcasts final metadata when the agent finishes. Update the
       // footer stored on the active stream node and persist it.
       const sid = payload.sessionId;
+      if (!acceptsOrderedChatResponseEvent(payload, {
+        runningEvent: false,
+        allowNewResponse: state.chatProcessing?.sessionId === sid
+          || state.currentSession?.sessionId === sid,
+      })) {
+        return;
+      }
+      rememberOrderedChatResponseEvent(payload, { terminal: true });
       if (sid) {
         const all = readSessionOverrides();
         const prev = all[sid] || {};
@@ -7241,10 +8146,13 @@ async function loadView(view) {
       loadToolRuns().catch(showError),
     ]);
   }
-  if (view === "chat" && !state.chatSessionId) {
+  if (view === "chat" && !state.chatSessionId && !state.chatSuppressAutoOpenOnce) {
     // No session is open yet — auto-open the most recent session so the chat
     // tab is never blank when the user lands on it.
     await autoOpenLatestChatSession().catch(showError);
+  }
+  if (view === "chat") {
+    state.chatSuppressAutoOpenOnce = false;
   }
 }
 
@@ -7794,12 +8702,16 @@ function commandPaletteCommands() {
       run: async () => {
         const selectedRun = selectedRunningChatSession();
         if (await switchView("chat") && selectedRun && state.ws?.readyState === WebSocket.OPEN) {
+          state.chatStoppingSessionId = selectedRun.sessionId;
+          updateProcessingLabel("Stopping");
+          rememberCurrentChatSession({ sessionId: selectedRun.sessionId, live: true, status: "running" });
           state.ws.send(JSON.stringify({
             type: "abort_session",
             provider: selectedRun.provider,
             sessionId: selectedRun.sessionId,
           }));
           updateChatComposerState();
+          scheduleChatReconciliation(selectedRun.sessionId, { delayMs: CHAT_ACTIVE_POLL_INTERVAL_MS });
         }
       },
     },
@@ -8136,6 +9048,12 @@ function bindForms() {
   chatBody?.addEventListener("touchmove", handleChatTouchMove, { passive: true });
   chatBody?.addEventListener("touchend", handleChatTouchEnd, { passive: true });
   chatBody?.addEventListener("touchcancel", resetChatSwipe, { passive: true });
+  const chatOutput = qs("#chat-output");
+  chatOutput?.addEventListener("scroll", () => {
+    maybeLoadOlderChatMessages();
+    updateChatJumpToLatestButton();
+  }, { passive: true });
+  qs("#chat-jump-latest")?.addEventListener("click", jumpToLatestChatMessage);
   qs("#pref-compact").addEventListener("change", (event) => {
     state.preferences.compact = event.currentTarget.checked;
     savePreferences();
@@ -8441,6 +9359,7 @@ function bindForms() {
   qs("#chat-prompt").addEventListener("input", () => {
     autosizeChatPrompt();
     scheduleChatPromptDraftSave();
+    ensureChatPromptHistoryScope();
     state.chatPromptHistoryIndex = (state.chatPromptHistory || []).length;
     state.chatPromptHistoryScratch = qs("#chat-prompt").value || "";
   });
@@ -8466,7 +9385,9 @@ function bindForms() {
     prompt.value = "";
     autosizeChatPrompt();
     const sessionId = currentChatDraftSessionId();
+    writeLocalChatPromptDraft("", sessionId);
     if (sessionId) clearRemoteChatPromptDraft(sessionId);
+    updateChatComposerState();
     prompt.focus();
   });
   qs("#clear-shell").addEventListener("click", () => {
@@ -8532,18 +9453,23 @@ function bindForms() {
 
   qs("#chat-form").addEventListener("submit", (event) => {
     event.preventDefault();
+    if (selectedChatIsStopping()) return;
     const selectedRun = selectedRunningChatSession();
     if (selectedRun) {
       if (state.ws?.readyState !== WebSocket.OPEN) {
         showError(new Error("Chat connection is not ready."));
         return;
       }
+      state.chatStoppingSessionId = selectedRun.sessionId;
+      updateProcessingLabel("Stopping");
+      rememberCurrentChatSession({ sessionId: selectedRun.sessionId, live: true, status: "running" });
       state.ws.send(JSON.stringify({
         type: "abort_session",
         provider: selectedRun.provider,
         sessionId: selectedRun.sessionId,
       }));
       updateChatComposerState();
+      scheduleChatReconciliation(selectedRun.sessionId, { delayMs: CHAT_ACTIVE_POLL_INTERVAL_MS });
       return;
     }
     const projectPath = activeProjectPath();
@@ -8558,7 +9484,6 @@ function bindForms() {
     }
     const prompt = chatPromptWithImages(qs("#chat-prompt").value.trim());
     if (!prompt) return;
-    rememberChatPrompt(qs("#chat-prompt").value.trim());
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
       connectWs();
       showError(new Error("Chat connection is not ready. Reconnecting now."));
@@ -8580,7 +9505,14 @@ function bindForms() {
     savePreferences();
 
     const startedAt = new Date().toISOString();
-    const sessionId = chatSessionIdForSubmit();
+    let sessionId = chatSessionIdForSubmit();
+    if (!sessionId) {
+      sessionId = `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      state.chatSessionId = sessionId;
+      state.pendingChatSessionId = sessionId;
+    }
+    ensureChatPromptHistoryScope(sessionId);
+    rememberChatPrompt(qs("#chat-prompt").value.trim());
     if (sessionId) {
       saveSessionOverrides(sessionId, { cli, model, effort, mode, thinking, sentAt: startedAt });
       rememberSidebarSessionStatus({ sessionId, provider: cli, status: "starting" });
@@ -8598,21 +9530,11 @@ function bindForms() {
     if (sessionId) message.sessionId = sessionId;
     state.ws.send(JSON.stringify(message));
     renderChatProviderPicker();
-    // Drop the placeholder entry for this session; the server will adopt the
-    // id and the next `projects_updated` broadcast will surface the real
-    // session row in its place.
-    if (sessionId && Array.isArray(state.sessions)) {
-      state.sessions = state.sessions.filter((session) => {
-        if (!session) return false;
-        if (session.id !== sessionId) return true;
-        return !session.pending;
-      });
-      renderSidebarProjects();
-    }
     if (sessionId) {
       state.chatSessionId = sessionId;
       state.preferences.lastChatSessionId = sessionId;
       savePreferences();
+      writeLocalChatPromptDraft("", sessionId);
       if (currentChatDraftSessionId() === sessionId) clearRemoteChatPromptDraft(sessionId);
     }
     state.pendingChatSessionId = "";
@@ -8624,6 +9546,31 @@ function bindForms() {
     // current overrides footer so the data below the prompt is visible.
     appendUserPromptToChat(prompt, {
       cli, model, effort, mode, thinking, sentAt: startedAt,
+    });
+    const currentMessages = chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.messages : [];
+    const nextMessages = currentMessages.concat({
+      id: `local-user-${Date.now()}`,
+      role: "user",
+      content: prompt,
+      timestamp: startedAt,
+      metadata: { cli, model, effort, mode, thinking, sentAt: startedAt },
+    });
+    chatHistoryWindow = {
+      sessionId,
+      offset: chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.offset : 0,
+      totalCount: Math.max(
+        chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.totalCount + 1 : nextMessages.length,
+        nextMessages.length,
+      ),
+      messages: nextMessages,
+    };
+    persistActiveChatSelection(sessionId, projectPath);
+    rememberCurrentChatSession({
+      sessionId,
+      projectPath,
+      messages: nextMessages,
+      live: true,
+      status: "running",
     });
     ensureChatProcessing({
       provider: cli,
@@ -8692,11 +9639,25 @@ async function bootstrapProtected() {
   connectWs();
   const savedView = window.localStorage.getItem("iowb.lastView") || activeView() || "chat";
   const targetView = qs(`#${savedView}-view`) ? savedView : "chat";
+  const savedProjectPath = activeChatSelectionMatchesServer()
+    ? (window.localStorage.getItem(ACTIVE_CHAT_PROJECT_KEY) || "")
+    : "";
+  if (savedProjectPath && state.projects.some((project) => project.path === savedProjectPath)) {
+    setActiveProject(savedProjectPath);
+  }
+  const savedSessionId = savedActiveChatSessionId();
+  if (targetView === "chat" && savedSessionId) {
+    state.chatSessionId = savedSessionId;
+    renderCachedChatSession(savedSessionId);
+  }
   await switchView(targetView);
-  // If we landed on the chat view and nothing is selected, auto-open the
-  // most recent session for the current project (or the most recent session
-  // across all projects if no project is currently active).
-  if (targetView === "chat" && !state.chatSessionId) {
+  if (targetView === "chat" && savedSessionId) {
+    const session = findChatSession(savedSessionId);
+    await pickChatSession(savedSessionId, sessionProjectPath(session, savedProjectPath || activeProjectPath())).catch(showError);
+  } else if (targetView === "chat" && !state.chatSessionId) {
+    // If we landed on the chat view and nothing is selected, auto-open the
+    // most recent session for the current project (or the most recent session
+    // across all projects if no project is currently active).
     await autoOpenLatestChatSession().catch(showError);
   }
 }
@@ -8756,9 +9717,9 @@ function appendUserPromptToChat(prompt, meta) {
   }
   const { node, text, footer } = buildChatLineNode("user");
   text.textContent = prompt;
-  renderChatLineFooter(footer, null);
+  renderChatLineFooter(footer, meta);
   output.appendChild(node);
-  scrollChatToBottom();
+  scrollChatToBottom(true);
   updateChatEmptyState();
   renderChatFooter(null);
 }
@@ -8793,6 +9754,17 @@ function rememberSessionMeta(sessionId, patch) {
   saveSessionOverrides(sessionId, patch);
 }
 
+function lastChatUserPromptContent() {
+  const sessionId = state.chatSessionId || state.pendingChatSessionId || "";
+  const messages = chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.messages : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (String(messages[index]?.role || "").toLowerCase() === "user") {
+      return String(messages[index]?.content || "");
+    }
+  }
+  return "";
+}
+
 function appendChat(value) {
   const output = chatOutputRoot();
   if (!output) return;
@@ -8809,7 +9781,12 @@ function appendChat(value) {
   // Render as Markdown so exec / Parameters and exec / Details sections
   // become collapsible blocks while the rest stays in plain Markdown form.
   // renderChatBubbleHtml keeps `textContent` safe by escaping every line.
-  chatStream.text.innerHTML = renderChatBubbleHtml(state.chatBuffer);
+  const displayContent = assistantResponseContent(
+    state.chatBuffer,
+    state.currentSession?.provider || chatCliValue(),
+    lastChatUserPromptContent(),
+  );
+  chatStream.text.innerHTML = renderChatBubbleHtml(displayContent);
   scrollChatToBottom();
   updateChatEmptyState();
 }

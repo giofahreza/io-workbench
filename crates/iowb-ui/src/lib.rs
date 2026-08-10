@@ -163,15 +163,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chat_history_treats_agent_content_as_text_and_pages_from_the_tail() {
+    fn chat_history_treats_agent_content_as_sanitized_markdown_and_uses_snapshot() {
         let app = get_asset("app.js").expect("app.js");
         let source = std::str::from_utf8(app.bytes).expect("utf-8 JavaScript");
-        assert!(source.contains("text.textContent = String(content)"));
+        assert!(source.contains("text.innerHTML = renderChatBubbleHtml(String(content));"));
         assert!(source.contains("text.textContent = String(prompt)"));
         assert!(!source.contains("text.innerHTML = content"));
         assert!(!source.contains("text.innerHTML = prompt"));
-        assert!(source.contains("tail=true"));
-        assert!(source.contains("chat-history-load-older"));
+        assert!(source.contains("/snapshot?${query}"));
+        assert!(source.contains("maybeLoadOlderChatMessages"));
+        assert!(source.contains("chat-history-loading"));
+        assert!(source.contains("before_timestamp"));
+        assert!(source.contains("acceptsOrderedChatResponseEvent"));
         assert!(source.contains("replayToolLine"));
     }
 }
