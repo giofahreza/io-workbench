@@ -1,12 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Utc};
-use iowb_protocol::{ChatMessage, MessageRole, Provider, SessionSummary};
+use iowb_protocol::{ChatMessage, MessageRole, Provider, SessionSummary, SessionTitleSource};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -340,6 +340,7 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
                 active: false,
                 model,
                 last_message_at: Some(last_activity),
+                title_source: Some(SessionTitleSource::External),
                 ..Default::default()
             },
             file_path,
@@ -478,6 +479,7 @@ fn finish_builder(
             active: false,
             model: builder.model,
             last_message_at: Some(last_activity),
+            title_source: Some(SessionTitleSource::External),
             ..Default::default()
         },
         file_path,
@@ -574,7 +576,14 @@ fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
                         if role == MessageRole::User {
                             content = visible_user_text(&content);
                         }
-                        push_message(&mut messages, record, role, content, timestamp);
+                        push_message_with_metadata(
+                            &mut messages,
+                            record,
+                            role,
+                            content,
+                            timestamp,
+                            codex_response_message_metadata(payload),
+                        );
                     }
                     Some("reasoning") => {
                         let content = extract_text(payload.get("summary"));
@@ -701,7 +710,93 @@ fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
             _ => {}
         }
     });
-    deduplicate_adjacent(messages)
+    deduplicate_adjacent(filter_legacy_codex_transcript_messages(messages))
+}
+
+fn codex_response_message_metadata(payload: &Value) -> Value {
+    let mut metadata = serde_json::Map::new();
+    for (source, target) in [
+        ("id", "nativeMessageId"),
+        ("phase", "phase"),
+        ("source", "source"),
+    ] {
+        if let Some(value) = payload.get(source).filter(|value| !value.is_null()) {
+            metadata.insert(target.to_string(), value.clone());
+        }
+    }
+    Value::Object(metadata)
+}
+
+fn filter_legacy_codex_transcript_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut turn = 0_usize;
+    let mut message_turns = Vec::with_capacity(messages.len());
+    let mut native_final_turns = HashSet::new();
+
+    for message in &messages {
+        if message.role == MessageRole::User {
+            turn += 1;
+        }
+        message_turns.push(turn);
+        if is_native_codex_final_message(message) {
+            native_final_turns.insert(turn);
+        }
+    }
+
+    messages
+        .into_iter()
+        .zip(message_turns)
+        .filter(|(message, turn)| {
+            !(native_final_turns.contains(turn)
+                && is_io_workbench_codex_message(message)
+                && looks_like_codex_live_transcript(&message.content))
+        })
+        .map(|(message, _)| message)
+        .collect()
+}
+
+fn is_native_codex_final_message(message: &ChatMessage) -> bool {
+    if message.role != MessageRole::Assistant || is_io_workbench_codex_message(message) {
+        return false;
+    }
+    if message.metadata.get("kind").and_then(Value::as_str) == Some("thinking")
+        || message.metadata.get("kind").and_then(Value::as_str) == Some("terminal_status")
+        || message.metadata.get("phase").and_then(Value::as_str) == Some("commentary")
+    {
+        return false;
+    }
+    let content = message.content.trim_start();
+    !content.starts_with("thinking\n") && !content.starts_with("ERROR:")
+}
+
+fn is_io_workbench_codex_message(message: &ChatMessage) -> bool {
+    message
+        .metadata
+        .get("source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.eq_ignore_ascii_case("io-workbench"))
+}
+
+pub(crate) fn looks_like_codex_live_transcript(content: &str) -> bool {
+    let mut has_thinking = false;
+    let mut has_tool = false;
+    let mut has_codex = false;
+    let mut has_token_usage = false;
+
+    for line in content.lines().map(str::trim) {
+        match line {
+            "thinking" => has_thinking = true,
+            "codex" => has_codex = true,
+            "tokens used" => has_token_usage = true,
+            _ if line.ends_with(" / Parameters") || line.ends_with(" / Details") => {
+                has_tool = true;
+            }
+            _ => {}
+        }
+    }
+
+    (has_token_usage && (has_thinking || has_tool || has_codex))
+        || (has_codex && (has_thinking || has_tool))
+        || (content.len() >= 16 * 1024 && has_thinking && has_tool)
 }
 
 fn codex_task_error_detail(error: &Value) -> Option<String> {
@@ -1470,6 +1565,52 @@ mod tests {
             "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
         );
         assert!(terminal.content.starts_with("ERROR: The 'gpt-5.6-sol'"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hides_legacy_workbench_transcript_when_native_final_exists() {
+        let root = std::env::temp_dir().join(format!("iowb-external-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "99999999-9999-4999-8999-999999999999";
+        let file = root
+            .join(".codex/sessions/2026/08/11")
+            .join(format!("rollout-2026-08-11T09-00-00-{session_id}.jsonl"));
+        let transcript = format!(
+            "thinking\n{}\n\nexec / Parameters\n**Tool:** `command_execution`\n\ncodex\nOnly the native final should remain.\n\ntokens used\n{{\"output_tokens\":12}}",
+            "x".repeat(103_000)
+        );
+        write_jsonl(
+            &file,
+            &[
+                json!({"timestamp":"2026-08-11T09:00:00Z","type":"session_meta","payload":{"id":session_id,"cwd":project}}),
+                json!({"timestamp":"2026-08-11T09:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Explain the fix","kind":"plain"}}),
+                json!({"timestamp":"2026-08-11T09:00:02Z","type":"response_item","payload":{"type":"message","id":"msg-native","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Only the native final should remain."}]}}),
+                json!({"timestamp":"2026-08-11T09:00:03Z","type":"response_item","payload":{"type":"message","id":"msg-workbench","role":"assistant","source":"io-workbench","content":[{"type":"output_text","text":transcript}]}}),
+            ],
+        );
+
+        let record = discover_external_sessions(&root)
+            .into_iter()
+            .find(|record| record.summary.id == session_id)
+            .unwrap();
+        let messages = load_external_messages(&record);
+
+        assert_eq!(2, messages.len(), "{messages:#?}");
+        assert_eq!(MessageRole::Assistant, messages[1].role);
+        assert_eq!("Only the native final should remain.", messages[1].content);
+        assert_eq!(Some("final_answer"), messages[1].metadata["phase"].as_str());
+        assert_eq!(
+            Some("msg-native"),
+            messages[1].metadata["nativeMessageId"].as_str()
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.metadata["source"].as_str() != Some("io-workbench"))
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

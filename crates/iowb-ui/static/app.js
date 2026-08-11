@@ -1194,6 +1194,19 @@ function findChatSession(sessionId) {
   return (state.sessions || []).find((item) => item.id === sessionId) || null;
 }
 
+function mergeSessionIntoProjects(session) {
+  if (!session?.id) return;
+  state.projects = (state.projects || []).map((project) => {
+    const matchesProject = session.projectPath && project.path === session.projectPath;
+    const hasSession = (project.sessions || []).some((item) => item.id === session.id);
+    if (!matchesProject && !hasSession) return project;
+    const sessions = (project.sessions || [])
+      .filter((item) => item.id !== session.id)
+      .concat({ ...session, projectPath: session.projectPath || project.path });
+    return { ...project, sessions };
+  });
+}
+
 function removeChatSessionFromState(sessionId) {
   state.sessions = (state.sessions || []).filter((session) => session.id !== sessionId);
   for (const project of state.projects || []) {
@@ -7943,6 +7956,8 @@ function connectWs() {
     }
     if (payload.type === "active_sessions") {
       state.sessions = payload.sessions || [];
+      state.sessions.forEach(mergeSessionIntoProjects);
+      renderSidebarProjects();
       renderSessions();
     }
     if (payload.type === "session_status") {

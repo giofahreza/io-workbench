@@ -11,6 +11,109 @@ pub const ENV_PREFIX: &str = "IO_WORKBENCH_";
 
 pub const WS_COMMAND_CHANNEL_CAPACITY: usize = 128;
 pub const WS_EVENT_CHANNEL_CAPACITY: usize = 512;
+pub const AUTO_SESSION_TITLE_MAX_CHARS: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTitleSource {
+    Prompt,
+    Manual,
+    External,
+}
+
+pub fn session_title_from_prompt(prompt: &str) -> Option<String> {
+    let visible = replace_markdown_images(prompt);
+    let visible = omit_inline_base64_data_urls(&visible);
+    let normalized = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.chars().count() <= AUTO_SESSION_TITLE_MAX_CHARS {
+        return Some(normalized);
+    }
+
+    Some(format!(
+        "{}...",
+        normalized
+            .chars()
+            .take(AUTO_SESSION_TITLE_MAX_CHARS)
+            .collect::<String>()
+    ))
+}
+
+fn replace_markdown_images(input: &str) -> String {
+    let mut output = String::with_capacity(input.len().min(4_096));
+    let mut cursor = 0;
+
+    while let Some(relative_start) = input[cursor..].find("![") {
+        let start = cursor + relative_start;
+        output.push_str(&input[cursor..start]);
+        let alt_start = start + 2;
+        let Some(relative_alt_end) = input[alt_start..].find("](") else {
+            output.push_str(&input[start..]);
+            return output;
+        };
+        let alt_end = alt_start + relative_alt_end;
+        let target_start = alt_end + 2;
+        let Some(relative_target_end) = input[target_start..].find(')') else {
+            output.push_str(&input[start..]);
+            return output;
+        };
+        let target_end = target_start + relative_target_end;
+        let alt = input[alt_start..alt_end].trim();
+        if alt.is_empty() {
+            output.push_str("Attached image");
+        } else {
+            output.push_str("Attached image: ");
+            output.push_str(alt);
+        }
+        cursor = target_end + 1;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
+
+fn omit_inline_base64_data_urls(input: &str) -> String {
+    let mut output = String::with_capacity(input.len().min(4_096));
+    let mut cursor = 0;
+
+    while let Some(relative_start) = input[cursor..].find("data:") {
+        let start = cursor + relative_start;
+        let Some(relative_marker) = input[start + 5..].find(";base64,") else {
+            output.push_str(&input[cursor..]);
+            return output;
+        };
+        let marker = start + 5 + relative_marker;
+        if marker.saturating_sub(start) > 128 {
+            output.push_str(&input[cursor..=start + 4]);
+            cursor = start + 5;
+            continue;
+        }
+        let payload_start = marker + ";base64,".len();
+        let mut payload_end = payload_start;
+        while payload_end < input.len() {
+            let byte = input.as_bytes()[payload_end];
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_') {
+                payload_end += 1;
+            } else {
+                break;
+            }
+        }
+        if payload_end == payload_start {
+            output.push_str(&input[cursor..payload_start]);
+            cursor = payload_start;
+            continue;
+        }
+
+        output.push_str(&input[cursor..start]);
+        output.push_str("[attachment]");
+        cursor = payload_end;
+    }
+
+    output.push_str(&input[cursor..]);
+    output
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiErrorBody {
@@ -248,6 +351,8 @@ pub struct SessionSummary {
     /// from API payloads.
     #[serde(skip)]
     pub native_session_id: Option<String>,
+    #[serde(skip)]
+    pub title_source: Option<SessionTitleSource>,
     #[serde(rename = "projectPath")]
     pub project_path: String,
     pub title: String,
@@ -1474,7 +1579,7 @@ fn default_terminal_rows() -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionMode;
+    use super::{SessionMode, session_title_from_prompt};
 
     #[test]
     fn session_mode_parse_accepts_bypass_permissions_alias() {
@@ -1485,6 +1590,35 @@ mod tests {
         assert_eq!(
             SessionMode::parse(Some("bypassPermissions")),
             SessionMode::Bypass
+        );
+    }
+
+    #[test]
+    fn session_title_normalizes_multiline_unicode_prompt() {
+        assert_eq!(
+            session_title_from_prompt("  Build a café page\n\nwith responsive cards  "),
+            Some("Build a café page with responsive cards".to_string())
+        );
+    }
+
+    #[test]
+    fn session_title_truncates_by_unicode_characters() {
+        let prompt = "界".repeat(60);
+        assert_eq!(
+            session_title_from_prompt(&prompt),
+            Some(format!("{}...", "界".repeat(50)))
+        );
+    }
+
+    #[test]
+    fn session_title_replaces_inline_image_payload() {
+        assert_eq!(
+            session_title_from_prompt("![diagram.png](data:image/png;base64,QUJDRA==)"),
+            Some("Attached image: diagram.png".to_string())
+        );
+        assert_eq!(
+            session_title_from_prompt("Review this\n\n![screen](data:image/png;base64,QUJDRA==)"),
+            Some("Review this Attached image: screen".to_string())
         );
     }
 }

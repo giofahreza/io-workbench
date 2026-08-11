@@ -7,7 +7,8 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use iowb_protocol::{
     ChatMessage, DatabaseConnectionInput, DatabaseConnectionProfile, DatabaseTestStatus,
     DatabaseTransferJob, MessageRole, ProjectSummary, PromptHistoryCursor, PromptHistoryEntry,
-    Provider, SessionDraftResponse, SessionSummary, SettingEntry, SupportedDatabaseType,
+    Provider, SessionDraftResponse, SessionSummary, SessionTitleSource, SettingEntry,
+    SupportedDatabaseType, session_title_from_prompt,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -173,6 +174,7 @@ impl Storage {
             connection: Arc::new(Mutex::new(connection)),
         };
         storage.migrate()?;
+        storage.backfill_session_title_sources()?;
         Ok(storage)
     }
 
@@ -411,6 +413,94 @@ impl Storage {
                 [],
             )?;
 
+            Ok(())
+        })
+    }
+
+    fn backfill_session_title_sources(&self) -> Result<()> {
+        self.with_connection(|conn| {
+            let rows = {
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT s.id, s.title, s.metadata,
+                           (
+                               SELECT m.content
+                               FROM messages m
+                               WHERE m.session_id = s.id
+                                 AND m.role = 'user'
+                                 AND TRIM(m.content) <> ''
+                               ORDER BY m.timestamp ASC, m.rowid ASC
+                               LIMIT 1
+                           ) AS first_user_prompt,
+                           (
+                               SELECT m.content
+                               FROM messages m
+                               WHERE m.session_id = s.id
+                                 AND m.role = 'user'
+                                 AND TRIM(m.content) <> ''
+                               ORDER BY m.timestamp DESC, m.rowid DESC
+                               LIMIT 1
+                           ) AS latest_user_prompt
+                    FROM sessions s
+                    "#,
+                )?;
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+
+            let transaction = conn.unchecked_transaction()?;
+            for (id, current_title, raw_metadata, first_prompt, latest_prompt) in rows {
+                let mut metadata = raw_metadata
+                    .as_deref()
+                    .and_then(deserialize_session_metadata)
+                    .and_then(|value| value.as_object().cloned())
+                    .unwrap_or_default();
+                if metadata.contains_key("titleSource") {
+                    continue;
+                }
+
+                let external = metadata
+                    .get("external")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let legacy_auto_title = first_prompt.as_deref().is_some_and(|prompt| {
+                    current_title == legacy_session_title_from_prompt(prompt)
+                        || session_title_from_prompt(prompt).as_deref()
+                            == Some(current_title.as_str())
+                });
+                let title_source = if current_title == "New Session" || legacy_auto_title {
+                    SessionTitleSource::Prompt
+                } else if external && first_prompt.is_none() {
+                    SessionTitleSource::External
+                } else {
+                    SessionTitleSource::Manual
+                };
+                let next_title = if title_source == SessionTitleSource::Prompt {
+                    latest_prompt
+                        .as_deref()
+                        .and_then(session_title_from_prompt)
+                        .unwrap_or(current_title)
+                } else {
+                    current_title
+                };
+                metadata.insert(
+                    "titleSource".to_string(),
+                    serde_json::to_value(title_source)?,
+                );
+                transaction.execute(
+                    "UPDATE sessions SET title = ?2, metadata = ?3 WHERE id = ?1",
+                    params![id, next_title, Value::Object(metadata).to_string()],
+                )?;
+            }
+            transaction.commit()?;
             Ok(())
         })
     }
@@ -2361,6 +2451,9 @@ fn serialize_session_metadata(session: &SessionSummary) -> String {
     if let Some(native_session_id) = session.native_session_id.as_ref() {
         value.insert("nativeSessionId".into(), json!(native_session_id));
     }
+    if let Some(title_source) = session.title_source {
+        value.insert("titleSource".into(), json!(title_source));
+    }
     if let Some(model) = session.model.as_ref() {
         value.insert("model".into(), json!(model));
     }
@@ -2406,6 +2499,9 @@ fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
     if let Some(v) = value.get("nativeSessionId").and_then(Value::as_str) {
         session.native_session_id = Some(v.to_string());
     }
+    if let Some(v) = value.get("titleSource") {
+        session.title_source = serde_json::from_value(v.clone()).ok();
+    }
     if let Some(v) = value.get("model").and_then(Value::as_str) {
         session.model = Some(v.to_string());
     }
@@ -2441,6 +2537,15 @@ fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
             session.token_usage = Some(usage);
         }
     }
+}
+
+fn legacy_session_title_from_prompt(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.chars().count() <= 50 {
+        return trimmed.to_string();
+    }
+
+    format!("{}...", trimmed.chars().take(50).collect::<String>())
 }
 
 fn map_user_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredUser> {
@@ -2604,6 +2709,7 @@ mod tests {
             title: "Test".to_string(),
             last_activity: Utc::now(),
             native_session_id: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            title_source: Some(SessionTitleSource::Manual),
             runtime: Some(ChatRuntime::IoGateway),
             ..Default::default()
         };
@@ -2614,9 +2720,89 @@ mod tests {
             .expect("query")
             .expect("stored session");
         assert_eq!(restored.native_session_id, session.native_session_id);
+        assert_eq!(restored.title_source, session.title_source);
         assert_eq!(restored.runtime, Some(ChatRuntime::IoGateway));
 
         drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn legacy_prompt_titles_backfill_to_latest_and_preserve_manual_titles() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "iowb-storage-title-backfill-{}-{unique}",
+            std::process::id()
+        ));
+        let database = root.join("test.db");
+        let now = Utc::now();
+
+        {
+            let storage = Storage::open(&database).expect("storage");
+            for (id, title) in [
+                ("legacy-auto", "first prompt"),
+                ("legacy-manual", "Pinned release investigation"),
+            ] {
+                storage
+                    .upsert_session(&SessionSummary {
+                        id: id.to_string(),
+                        provider: Provider::Codex,
+                        project_path: "/tmp/project".to_string(),
+                        title: title.to_string(),
+                        last_activity: now,
+                        ..Default::default()
+                    })
+                    .expect("upsert legacy session");
+                for (index, content) in ["first prompt", "  latest\n\nprompt  "]
+                    .into_iter()
+                    .enumerate()
+                {
+                    storage
+                        .append_message(
+                            id,
+                            &ChatMessage {
+                                id: format!("{id}-message-{index}"),
+                                role: MessageRole::User,
+                                content: content.to_string(),
+                                timestamp: now + chrono::Duration::seconds(index as i64),
+                                metadata: Value::Null,
+                            },
+                        )
+                        .expect("append legacy prompt");
+                }
+            }
+        }
+
+        let storage = Storage::open(&database).expect("reopen storage");
+        let automatic = storage
+            .get_session("legacy-auto")
+            .expect("automatic query")
+            .expect("automatic session");
+        assert_eq!(automatic.title, "latest prompt");
+        assert_eq!(automatic.title_source, Some(SessionTitleSource::Prompt));
+
+        let manual = storage
+            .get_session("legacy-manual")
+            .expect("manual query")
+            .expect("manual session");
+        assert_eq!(manual.title, "Pinned release investigation");
+        assert_eq!(manual.title_source, Some(SessionTitleSource::Manual));
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("second reopen");
+        assert_eq!(
+            reopened
+                .get_session("legacy-auto")
+                .expect("idempotent query")
+                .expect("idempotent session")
+                .title,
+            "latest prompt"
+        );
+
+        drop(reopened);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

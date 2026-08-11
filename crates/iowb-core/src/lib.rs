@@ -25,8 +25,8 @@ use iowb_process::ProcessManager;
 use iowb_protocol::{
     AuthStatusResponse, AuthTokenResponse, CONFIG_DIR_NAME, ChatMessage, ChatRuntime,
     DATABASE_FILE_NAME, MessageRole, PRODUCT_NAME, ProjectSummary, PromptHistoryCursor,
-    PromptHistoryEntry, Provider, ServerStatusResponse, SessionSummary, UserProfile, WsServerEvent,
-    new_id,
+    PromptHistoryEntry, Provider, ServerStatusResponse, SessionSummary, SessionTitleSource,
+    UserProfile, WsServerEvent, new_id, session_title_from_prompt,
 };
 use iowb_storage::{Storage, StoredDurableChatRun};
 use serde_json::Value;
@@ -42,7 +42,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use external_sessions::{
-    ExternalSessionRecord, discover_external_sessions, load_external_messages, same_project_path,
+    ExternalSessionRecord, discover_external_sessions, load_external_messages,
+    looks_like_codex_live_transcript, same_project_path,
 };
 
 type HmacSha1 = Hmac<Sha1>;
@@ -57,6 +58,8 @@ const AGENT_TOOL_MESSAGES_MAX_COUNT: usize = 96;
 const AGENT_TOOL_MESSAGES_MAX_TOTAL_BYTES: usize = 512 * 1024;
 const AGENT_ASSISTANT_MESSAGE_MAX_BYTES: usize = 256 * 1024;
 const AGENT_DISPLAY_MAX_LINE_CHARS: usize = 8 * 1024;
+const CODEX_MISSING_FINAL_RESPONSE: &str =
+    "ERROR: Codex completed without a final assistant response.";
 const AGENT_ABORT_TERM_GRACE: Duration = Duration::from_millis(250);
 const AGENT_ABORT_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const AGENT_ABORT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
@@ -287,7 +290,7 @@ impl AppState {
             (false, None)
         };
 
-        let session = self
+        let mut session = self
             .sessions
             .create_or_update(
                 provider,
@@ -341,6 +344,7 @@ impl AppState {
                     self.storage.upsert_session(&cloned)?;
                 }
             }
+            session = self.sessions.get(&session.id).await?;
         }
 
         let direct_ai_messages = if should_use_direct_ai_gateway_runtime(provider, model.as_deref())
@@ -932,6 +936,7 @@ impl SessionManager {
                 received_at: None,
                 token_usage: None,
                 native_session_id: None,
+                title_source: Some(SessionTitleSource::Prompt),
             });
 
         session.provider = provider;
@@ -993,8 +998,12 @@ impl SessionManager {
                 .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
             session.message_count += 1;
             session.last_activity = message.timestamp;
-            if role == MessageRole::User && session.title == "New Session" {
-                session.title = summarize(&message.content);
+            if role == MessageRole::User
+                && session.title_source != Some(SessionTitleSource::Manual)
+                && let Some(title) = session_title_from_prompt(&message.content)
+            {
+                session.title = title;
+                session.title_source = Some(SessionTitleSource::Prompt);
             }
             self.storage.upsert_session(session)?;
         }
@@ -1165,12 +1174,23 @@ impl SessionManager {
             }) {
                 if existing.external {
                     let active = existing.active;
+                    let title = existing.title.clone();
+                    let title_source = existing.title_source;
+                    let preserve_local_title = matches!(
+                        title_source,
+                        Some(SessionTitleSource::Prompt | SessionTitleSource::Manual)
+                    ) || (title_source.is_none()
+                        && title != "New Session");
                     let model = existing.model.clone().or(record.summary.model.clone());
                     let effort = existing.effort.clone();
                     let mode = existing.mode.clone();
                     let thinking = existing.thinking;
                     *existing = record.summary;
                     existing.active = active;
+                    if preserve_local_title {
+                        existing.title = title;
+                        existing.title_source = title_source;
+                    }
                     existing.model = model;
                     existing.effort = effort;
                     existing.mode = mode;
@@ -1206,6 +1226,14 @@ impl SessionManager {
         if prompt.is_empty() || assistant_output.is_empty() {
             return Ok(false);
         }
+        if looks_like_codex_live_transcript(assistant_output) {
+            warn!(
+                session_id,
+                assistant_bytes = assistant_output.len(),
+                "refused to append a Codex live transcript to the native rollout"
+            );
+            return Ok(false);
+        }
 
         let Some(record) = self.external_record_for_messages(session_id).await else {
             return Ok(false);
@@ -1215,22 +1243,17 @@ impl SessionManager {
         }
 
         let messages = load_external_messages(&record);
-        let mut has_prompt = false;
-        let mut has_assistant_after_prompt = false;
-        for message in messages {
-            if message.role == MessageRole::User && message.content.trim() == prompt {
-                has_prompt = true;
-                continue;
-            }
-            if has_prompt
-                && message.role == MessageRole::Assistant
-                && message.content.trim() == assistant_output
-            {
-                has_assistant_after_prompt = true;
-                break;
-            }
-        }
-        if has_prompt && has_assistant_after_prompt {
+        let matching_prompt_index = messages.iter().rposition(|message| {
+            message.role == MessageRole::User && message.content.trim() == prompt
+        });
+        let has_prompt = matching_prompt_index.is_some();
+        let has_assistant_after_prompt = matching_prompt_index.is_some_and(|prompt_index| {
+            messages[prompt_index + 1..]
+                .iter()
+                .take_while(|message| message.role != MessageRole::User)
+                .any(is_codex_assistant_response)
+        });
+        if has_assistant_after_prompt {
             return Ok(false);
         }
 
@@ -1590,6 +1613,7 @@ impl SessionManager {
             .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
 
         session.title = title;
+        session.title_source = Some(SessionTitleSource::Manual);
         session.last_activity = Utc::now();
         self.storage.upsert_session(&session)?;
         sessions.insert(session.id.clone(), session.clone());
@@ -1753,6 +1777,7 @@ struct CodexLiveOutputNormalizer {
     pending_agent_message: Option<String>,
     pending_thread_id: Option<String>,
     final_assistant_message: Option<String>,
+    saw_structured_event: bool,
     tool_messages: Vec<NormalizedToolMessage>,
     tool_message_bytes: usize,
 }
@@ -2041,6 +2066,9 @@ impl AgentRuntimeManager {
                             &mut gemini_normalizer,
                             &mut output,
                         ).await;
+                        let codex_saw_structured_event = codex_normalizer
+                            .as_ref()
+                            .is_some_and(CodexLiveOutputNormalizer::saw_structured_event);
                         let codex_final_assistant = codex_normalizer
                             .as_mut()
                             .and_then(CodexLiveOutputNormalizer::take_final_assistant_message);
@@ -2050,18 +2078,42 @@ impl AgentRuntimeManager {
                         persist_codex_tool_messages(&context, &mut codex_normalizer).await;
                         let provider_specific_final = codex_final_assistant
                             .or(claude_final_assistant);
-                        let mut persisted_output = provider_specific_final
-                            .unwrap_or_else(|| output.clone());
                         match status {
                             Ok(status) if status.success() => {
-                                manager.finish(
-                                    &key,
-                                    &context,
-                                    iowb_protocol::SessionRuntimeStatus::Completed,
-                                    Some(persisted_output.clone()),
-                                ).await;
+                                match select_completed_agent_output(
+                                    runtime_provider,
+                                    provider_specific_final,
+                                    &output,
+                                    codex_saw_structured_event,
+                                ) {
+                                    Ok(persisted_output) => {
+                                        manager.finish(
+                                            &key,
+                                            &context,
+                                            iowb_protocol::SessionRuntimeStatus::Completed,
+                                            Some(persisted_output),
+                                        ).await;
+                                    }
+                                    Err(error_output) => {
+                                        manager.publish(&context.hub, &key, WsServerEvent::Error {
+                                            message: "Codex completed without a final assistant response".to_string(),
+                                            details: Some(
+                                                "The Codex process exited successfully, but its event stream did not contain a final assistant message. The accumulated CLI transcript was not saved as the reply."
+                                                    .to_string(),
+                                            ),
+                                        }).await;
+                                        manager.finish(
+                                            &key,
+                                            &context,
+                                            iowb_protocol::SessionRuntimeStatus::Failed,
+                                            Some(error_output),
+                                        ).await;
+                                    }
+                                }
                             }
                             Ok(status) => {
+                                let mut persisted_output = provider_specific_final
+                                    .unwrap_or_else(|| output.clone());
                                 append_bounded(
                                     &mut output,
                                     &format!("\nAgent exited with status {status}"),
@@ -2080,6 +2132,8 @@ impl AgentRuntimeManager {
                                 ).await;
                             }
                             Err(error) => {
+                                let persisted_output = provider_specific_final
+                                    .unwrap_or_else(|| output.clone());
                                 manager.publish(&context.hub, &key, WsServerEvent::Error {
                                     message: "agent process wait failed".to_string(),
                                     details: Some(error.to_string()),
@@ -4304,6 +4358,35 @@ fn append_codex_rollout_entries(path: &Path, entries: &[Value]) -> Result<()> {
     Ok(())
 }
 
+fn is_codex_assistant_response(message: &ChatMessage) -> bool {
+    if message.role != MessageRole::Assistant {
+        return false;
+    }
+    if message.metadata.get("kind").and_then(Value::as_str) == Some("thinking")
+        || message.metadata.get("phase").and_then(Value::as_str) == Some("commentary")
+    {
+        return false;
+    }
+    !message.content.trim_start().starts_with("thinking\n")
+}
+
+fn select_completed_agent_output(
+    runtime_provider: Provider,
+    provider_specific_final: Option<String>,
+    accumulated_output: &str,
+    codex_saw_structured_event: bool,
+) -> std::result::Result<String, String> {
+    if runtime_provider == Provider::Codex {
+        if let Some(final_output) = provider_specific_final {
+            return Ok(final_output);
+        }
+        if codex_saw_structured_event || looks_like_codex_live_transcript(accumulated_output) {
+            return Err(CODEX_MISSING_FINAL_RESPONSE.to_string());
+        }
+    }
+    Ok(provider_specific_final.unwrap_or_else(|| accumulated_output.to_string()))
+}
+
 fn append_bounded(output: &mut String, chunk: &str, max_bytes: usize) {
     output.push_str(chunk);
     if output.len() > max_bytes {
@@ -4659,6 +4742,7 @@ impl CodexLiveOutputNormalizer {
         let Some(event_type) = event.get("type").and_then(Value::as_str) else {
             return line.to_string();
         };
+        self.saw_structured_event = true;
         match event_type {
             "thread.started" => {
                 if let Some(thread_id) = event
@@ -4726,7 +4810,11 @@ impl CodexLiveOutputNormalizer {
                 return String::new();
             }
             return match item.get("phase").and_then(Value::as_str) {
-                Some("commentary") => format!("thinking\n{}", content.trim()),
+                Some("commentary") => {
+                    let mut output = self.take_pending_agent_message(true);
+                    append_live_section(&mut output, &format!("thinking\n{}", content.trim()));
+                    output
+                }
                 Some("final_answer") => {
                     self.final_assistant_message = Some(bound_agent_text(
                         content.trim(),
@@ -4745,7 +4833,7 @@ impl CodexLiveOutputNormalizer {
             };
         }
 
-        let mut output = self.take_pending_agent_message(true);
+        let mut output = String::new();
         let item_output = match item_type {
             "reasoning" => item
                 .get("text")
@@ -4830,6 +4918,10 @@ impl CodexLiveOutputNormalizer {
 
     fn take_final_assistant_message(&mut self) -> Option<String> {
         self.final_assistant_message.take()
+    }
+
+    fn saw_structured_event(&self) -> bool {
+        self.saw_structured_event
     }
 
     fn take_tool_messages(&mut self) -> Vec<NormalizedToolMessage> {
@@ -5772,17 +5864,6 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn summarize(content: &str) -> String {
-    let trimmed = content.trim();
-    if trimmed.chars().count() <= 50 {
-        return trimmed.to_string();
-    }
-
-    let mut summary = trimmed.chars().take(50).collect::<String>();
-    summary.push_str("...");
-    summary
-}
-
 fn validate_credentials(username: &str, password: &str) -> Result<()> {
     let username = username.trim();
     if username.is_empty() || password.is_empty() {
@@ -6057,7 +6138,135 @@ mod tests {
     #[test]
     fn summary_truncates_long_prompts() {
         let prompt = "a".repeat(80);
-        assert_eq!(summarize(&prompt), format!("{}...", "a".repeat(50)));
+        assert_eq!(
+            session_title_from_prompt(&prompt),
+            Some(format!("{}...", "a".repeat(50)))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn latest_user_prompt_updates_auto_title_but_manual_title_stays_locked() {
+        let root = env::temp_dir().join(format!("iowb-session-title-{}", Uuid::new_v4()));
+        let storage = Storage::open(root.join("test.db")).expect("storage");
+        let sessions = SessionManager::load(storage.clone(), 10).expect("sessions");
+        let session = sessions
+            .create_or_update(
+                Provider::Codex,
+                root.display().to_string(),
+                Some("session-title-test".to_string()),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+
+        sessions
+            .append_message(
+                &session.id,
+                MessageRole::User,
+                "  First title\n\nwith spacing  ",
+            )
+            .await
+            .expect("first prompt");
+        assert_eq!(
+            sessions.get(&session.id).await.expect("first title").title,
+            "First title with spacing"
+        );
+
+        sessions
+            .append_message(&session.id, MessageRole::Assistant, "assistant reply")
+            .await
+            .expect("assistant reply");
+        assert_eq!(
+            sessions
+                .get(&session.id)
+                .await
+                .expect("assistant keeps title")
+                .title,
+            "First title with spacing"
+        );
+
+        sessions
+            .append_message(&session.id, MessageRole::User, "latest prompt")
+            .await
+            .expect("latest prompt");
+        let automatic = sessions.get(&session.id).await.expect("automatic title");
+        assert_eq!(automatic.title, "latest prompt");
+        assert_eq!(automatic.title_source, Some(SessionTitleSource::Prompt));
+
+        sessions
+            .rename(&session.id, "Manual investigation".to_string())
+            .await
+            .expect("manual rename");
+        sessions
+            .append_message(&session.id, MessageRole::User, "do not replace manual")
+            .await
+            .expect("prompt after manual rename");
+        let manual = sessions.get(&session.id).await.expect("manual title");
+        assert_eq!(manual.title, "Manual investigation");
+        assert_eq!(manual.title_source, Some(SessionTitleSource::Manual));
+
+        drop(sessions);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_refresh_preserves_workbench_prompt_title() {
+        let root = env::temp_dir().join(format!("iowb-external-title-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        let storage = Storage::open(root.join("test.db")).expect("storage");
+        storage
+            .upsert_session(&SessionSummary {
+                id: "external-title-session".to_string(),
+                provider: Provider::Codex,
+                external: true,
+                project_path: project.display().to_string(),
+                title: "latest Workbench prompt".to_string(),
+                last_activity: Utc::now(),
+                title_source: Some(SessionTitleSource::Prompt),
+                ..Default::default()
+            })
+            .expect("stored external session");
+
+        let sessions = SessionManager::load(storage.clone(), 10).expect("sessions");
+        {
+            let mut cache = sessions.external_cache.write().await;
+            cache.loaded_at = Some(Instant::now());
+            cache.records = vec![ExternalSessionRecord {
+                summary: SessionSummary {
+                    id: "external-title-session".to_string(),
+                    provider: Provider::Codex,
+                    external: true,
+                    project_path: project.display().to_string(),
+                    title: "provider first prompt".to_string(),
+                    last_activity: Utc::now(),
+                    title_source: Some(SessionTitleSource::External),
+                    ..Default::default()
+                },
+                file_path: root.join("missing-rollout.jsonl"),
+            }];
+        }
+
+        let listed = sessions
+            .list_for_project(&project.display().to_string())
+            .await
+            .expect("project sessions");
+        let session = listed
+            .into_iter()
+            .find(|session| session.id == "external-title-session")
+            .expect("external session");
+        assert_eq!(session.title, "latest Workbench prompt");
+        assert_eq!(session.title_source, Some(SessionTitleSource::Prompt));
+
+        drop(sessions);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -6234,6 +6443,104 @@ mod tests {
         let tools = normalizer.take_tool_messages();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "apply_patch");
+    }
+
+    #[test]
+    fn codex_unphased_final_survives_trailing_todo_before_completion() {
+        let mut normalizer = CodexLiveOutputNormalizer::default();
+        let mut output = normalizer.push(concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"message-final\",\"type\":\"agent_message\",",
+            "\"text\":\"Only one clean final response.\"}}\n"
+        ));
+        assert!(output.is_empty(), "{output}");
+
+        output.push_str(&normalizer.push(concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"todo-final\",\"type\":\"todo_list\",",
+            "\"items\":[{\"text\":\"Done\",\"completed\":true}]}}\n"
+        )));
+        assert!(
+            !output.contains("Only one clean final response."),
+            "{output}"
+        );
+
+        output.push_str(&normalizer.push(
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":6}}\n",
+        ));
+
+        assert!(
+            output.contains("codex\nOnly one clean final response."),
+            "{output}"
+        );
+        assert!(
+            !output.contains("thinking\nOnly one clean final response."),
+            "{output}"
+        );
+        assert_eq!(output.matches("Only one clean final response.").count(), 1);
+        assert_eq!(
+            normalizer.take_final_assistant_message().as_deref(),
+            Some("Only one clean final response.")
+        );
+    }
+
+    #[test]
+    fn codex_explicit_final_remains_canonical_across_trailing_tools() {
+        let mut normalizer = CodexLiveOutputNormalizer::default();
+        let output = normalizer.push(concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"commentary\",\"type\":\"agent_message\",",
+            "\"phase\":\"commentary\",\"text\":\"Checking the result.\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"command\",\"type\":\"command_execution\",",
+            "\"command\":\"true\",\"aggregated_output\":\"\",\"exit_code\":0,\"status\":\"completed\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"final\",\"type\":\"agent_message\",",
+            "\"phase\":\"final_answer\",\"text\":\"The final answer is stable.\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"todo\",\"type\":\"todo_list\",\"items\":[]}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":8}}\n"
+        ));
+
+        assert!(
+            output.contains("thinking\nChecking the result."),
+            "{output}"
+        );
+        assert!(
+            output.contains("codex\nThe final answer is stable."),
+            "{output}"
+        );
+        assert_eq!(output.matches("The final answer is stable.").count(), 1);
+        assert_eq!(
+            normalizer.take_final_assistant_message().as_deref(),
+            Some("The final answer is stable.")
+        );
+    }
+
+    #[test]
+    fn successful_codex_output_never_falls_back_to_live_transcript() {
+        let transcript = concat!(
+            "thinking\nInspecting files\n\n",
+            "exec / Parameters\n**Tool:** `command_execution`\n\n",
+            "codex\nThe actual final.\n\n",
+            "tokens used\n{\"output_tokens\":8}"
+        );
+
+        assert_eq!(
+            select_completed_agent_output(Provider::Codex, None, transcript, true),
+            Err(CODEX_MISSING_FINAL_RESPONSE.to_string())
+        );
+        assert_eq!(
+            select_completed_agent_output(
+                Provider::Codex,
+                Some("The actual final.".to_string()),
+                transcript,
+                true,
+            ),
+            Ok("The actual final.".to_string())
+        );
+        assert_eq!(
+            select_completed_agent_output(Provider::Claude, None, transcript, false),
+            Ok(transcript.to_string())
+        );
+        assert_eq!(
+            select_completed_agent_output(Provider::Codex, None, "plain custom output", false),
+            Ok("plain custom output".to_string())
+        );
     }
 
     #[test]
@@ -6535,6 +6842,7 @@ mod tests {
             received_at: None,
             token_usage: None,
             native_session_id: Some("native-session".to_string()),
+            title_source: Some(SessionTitleSource::Manual),
         };
         storage
             .upsert_session(&session)
@@ -6968,6 +7276,231 @@ mod tests {
             .await
             .expect("messages after duplicate sync");
         assert_eq!(messages_after_second.len(), messages.len());
+
+        drop(sessions);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_rollout_sync_trusts_existing_response_and_rejects_transcript() {
+        let root = std::env::temp_dir().join(format!("iowb-codex-sync-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project dir");
+
+        let native_id = "55555555-5555-4555-8555-555555555555";
+        let now = Utc::now();
+        let rollout = root
+            .join(".codex/sessions/2026/08/11")
+            .join(format!("rollout-2026-08-11T10-00-00-{native_id}.jsonl"));
+        std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("rollout dir");
+        std::fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "session_meta",
+                    "payload": {"id": native_id, "cwd": project}
+                }),
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "continued in Workbench",
+                        "kind": "plain"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "Native answer with markdown."}]
+                    }
+                })
+            ),
+        )
+        .expect("rollout");
+
+        let storage = Storage::open(config_dir.join("test.db")).expect("storage");
+        let mut sessions = SessionManager::load(storage.clone(), 10).expect("sessions");
+        sessions.external_home = Arc::new(root.clone());
+        let internal = sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("workbench-session-existing-final".to_string()),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("internal session");
+        sessions
+            .set_native_session_id(&internal.id, native_id)
+            .await
+            .expect("native id");
+
+        let original_rollout = std::fs::read_to_string(&rollout).expect("original rollout");
+        let appended = sessions
+            .sync_codex_turn_to_native_rollout(
+                &internal.id,
+                "continued in Workbench",
+                "Native answer with different formatting",
+            )
+            .await
+            .expect("sync existing response");
+        assert!(!appended);
+        assert_eq!(
+            original_rollout,
+            std::fs::read_to_string(&rollout).expect("unchanged rollout")
+        );
+
+        let transcript = concat!(
+            "thinking\nInspecting files\n\n",
+            "exec / Parameters\n**Tool:** `command_execution`\n\n",
+            "codex\nSynthetic answer\n\n",
+            "tokens used\n{\"output_tokens\":8}"
+        );
+        let transcript_appended = sessions
+            .sync_codex_turn_to_native_rollout(&internal.id, "another prompt", transcript)
+            .await
+            .expect("sync transcript");
+        assert!(!transcript_appended);
+        assert_eq!(
+            original_rollout,
+            std::fs::read_to_string(&rollout).expect("rollout after transcript rejection")
+        );
+
+        drop(sessions);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mapped_codex_history_returns_one_main_response_for_legacy_duplicate() {
+        let root = std::env::temp_dir().join(format!("iowb-codex-history-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project dir");
+
+        let native_id = "66666666-6666-4666-8666-666666666666";
+        let now = Utc::now();
+        let rollout = root
+            .join(".codex/sessions/2026/08/11")
+            .join(format!("rollout-2026-08-11T11-00-00-{native_id}.jsonl"));
+        std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("rollout dir");
+        let transcript = format!(
+            "thinking\n{}\n\nexec / Parameters\n**Tool:** `command_execution`\n\ncodex\nNormal main response.\n\ntokens used\n{{\"output_tokens\":8}}",
+            "x".repeat(103_000)
+        );
+        std::fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "session_meta",
+                    "payload": {"id": native_id, "cwd": project}
+                }),
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "Why is the response duplicated?",
+                        "kind": "plain"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg-native-final",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "Normal main response."}]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg-workbench-transcript",
+                        "role": "assistant",
+                        "source": "io-workbench",
+                        "content": [{"type": "output_text", "text": transcript}]
+                    }
+                })
+            ),
+        )
+        .expect("rollout");
+
+        let storage = Storage::open(config_dir.join("test.db")).expect("storage");
+        let mut sessions = SessionManager::load(storage.clone(), 10).expect("sessions");
+        sessions.external_home = Arc::new(root.clone());
+        let internal = sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("workbench-session-legacy-duplicate".to_string()),
+                false,
+                None,
+                None,
+                Some("ultra".to_string()),
+                Some("ultra".to_string()),
+                Some(true),
+            )
+            .await
+            .expect("internal session");
+        sessions
+            .append_message(
+                &internal.id,
+                MessageRole::User,
+                "Why is the response duplicated?",
+            )
+            .await
+            .expect("stored user message");
+        sessions
+            .append_message(&internal.id, MessageRole::Assistant, transcript.clone())
+            .await
+            .expect("stored transcript");
+        sessions
+            .set_native_session_id(&internal.id, native_id)
+            .await
+            .expect("native id");
+
+        let messages = sessions
+            .messages_including_external(&internal.id)
+            .await
+            .expect("mapped messages");
+        let main_responses = messages
+            .iter()
+            .filter(|message| {
+                message.role == MessageRole::Assistant
+                    && !message.content.trim_start().starts_with("thinking\n")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(1, main_responses.len(), "{messages:#?}");
+        assert_eq!("Normal main response.", main_responses[0].content);
+        assert_eq!(
+            1,
+            messages
+                .iter()
+                .map(|message| message.content.matches("Normal main response.").count())
+                .sum::<usize>()
+        );
+        assert!(messages.iter().all(|message| message.content != transcript));
 
         drop(sessions);
         drop(storage);
