@@ -1405,14 +1405,21 @@ impl SessionManager {
             }
         }
 
-        let mapped_native_ids = self
-            .sessions
-            .read()
-            .await
-            .values()
-            .filter(|session| !session.external)
-            .filter_map(|session| session.native_session_id.clone())
-            .collect::<HashSet<_>>();
+        let mut mapped_native_ids = match self.storage.list_internal_native_session_ids() {
+            Ok(session_ids) => session_ids.into_iter().collect::<HashSet<_>>(),
+            Err(error) => {
+                warn!(%error, "failed to load persisted native session mappings");
+                HashSet::new()
+            }
+        };
+        mapped_native_ids.extend(
+            self.sessions
+                .read()
+                .await
+                .values()
+                .filter(|session| !session.external)
+                .filter_map(|session| session.native_session_id.clone()),
+        );
         let deleted_sessions = match self.storage.list_deleted_sessions() {
             Ok(sessions) => sessions.into_iter().collect::<HashSet<_>>(),
             Err(error) => {
@@ -6761,6 +6768,92 @@ mod tests {
         assert_eq!(
             &args[args.iter().position(|arg| arg == "resume").unwrap()..],
             ["resume", native_id, "second prompt"]
+        );
+
+        drop(sessions);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn persisted_native_mapping_hides_rollout_after_memory_eviction() {
+        let root = std::env::temp_dir().join(format!("iowb-native-eviction-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project dir");
+
+        let native_id = "44444444-4444-4444-8444-444444444444";
+        let now = Utc::now();
+        let rollout = root
+            .join(".codex/sessions/2026/08/11")
+            .join(format!("rollout-2026-08-11T00-00-00-{native_id}.jsonl"));
+        std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("rollout dir");
+        std::fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "session_meta",
+                    "payload": {"id": native_id, "cwd": project, "thread_source": "user"}
+                }),
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "mapped prompt",
+                        "kind": "plain"
+                    }
+                })
+            ),
+        )
+        .expect("rollout");
+
+        let storage = Storage::open(config_dir.join("test.db")).expect("storage");
+        let mapped_session = SessionSummary {
+            id: "mapped-workbench-session".to_string(),
+            provider: Provider::Codex,
+            project_path: project.display().to_string(),
+            title: "Mapped session".to_string(),
+            last_activity: now - chrono::Duration::minutes(1),
+            native_session_id: Some(native_id.to_string()),
+            ..Default::default()
+        };
+        storage
+            .upsert_session(&mapped_session)
+            .expect("mapped session");
+        storage
+            .upsert_session(&SessionSummary {
+                id: "newer-session".to_string(),
+                provider: Provider::Codex,
+                project_path: project.display().to_string(),
+                title: "Newer session".to_string(),
+                last_activity: now,
+                ..Default::default()
+            })
+            .expect("newer session");
+
+        let mut sessions = SessionManager::load(storage.clone(), 1).expect("sessions");
+        assert!(
+            sessions
+                .sessions
+                .read()
+                .await
+                .get(&mapped_session.id)
+                .is_none(),
+            "mapped session must be outside the in-memory cache for this regression"
+        );
+        sessions.external_home = Arc::new(root.clone());
+
+        let listed = sessions
+            .list_for_project(project.to_str().expect("project path"))
+            .await
+            .expect("project sessions");
+        assert!(listed.iter().any(|session| session.id == mapped_session.id));
+        assert!(
+            listed.iter().all(|session| session.id != native_id),
+            "persisted native mapping must hide the external rollout after eviction: {listed:#?}"
         );
 
         drop(sessions);

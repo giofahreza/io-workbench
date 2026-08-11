@@ -168,12 +168,14 @@ fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
         let fallback_time = modified_time(&path);
         let mut builder = SessionBuilder::default();
         let mut last_visible: Option<(MessageRole, String)> = None;
+        let mut subagent = false;
         for_each_json_line(&path, |entry| {
             let timestamp = value_timestamp(entry.get("timestamp"));
             builder.last_activity = latest(builder.last_activity, timestamp);
             match entry.get("type").and_then(Value::as_str) {
                 Some("session_meta") => {
                     let payload = entry.get("payload").unwrap_or(&Value::Null);
+                    subagent |= is_codex_subagent_session_meta(payload);
                     builder.id = payload
                         .get("id")
                         .and_then(Value::as_str)
@@ -234,6 +236,9 @@ fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
                 _ => {}
             }
         });
+        if subagent {
+            continue;
+        }
         if builder.id.is_empty() {
             builder.id = path
                 .file_stem()
@@ -263,7 +268,7 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
     let Ok(mut statement) = connection.prepare(
         r#"
         SELECT id, rollout_path, cwd, title, first_user_message,
-               updated_at_ms, updated_at, model
+               updated_at_ms, updated_at, model, thread_source
         FROM threads
         WHERE archived = 0 AND first_user_message <> ''
         ORDER BY updated_at_ms DESC
@@ -281,6 +286,7 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
             row.get::<_, Option<i64>>(5)?,
             row.get::<_, i64>(6)?,
             row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
         ))
     }) else {
         return false;
@@ -288,7 +294,20 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
 
     let mut found = false;
     for row in rows.flatten() {
-        let (id, rollout_path, project_path, title, first_user, updated_ms, updated, model) = row;
+        let (
+            id,
+            rollout_path,
+            project_path,
+            title,
+            first_user,
+            updated_ms,
+            updated,
+            model,
+            thread_source,
+        ) = row;
+        if is_codex_subagent_thread_source(thread_source.as_deref()) {
+            continue;
+        }
         if id.is_empty() || project_path.is_empty() || rollout_path.is_empty() {
             continue;
         }
@@ -328,6 +347,18 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
         found = true;
     }
     found
+}
+
+fn is_codex_subagent_thread_source(thread_source: Option<&str>) -> bool {
+    thread_source.is_some_and(|value| value.eq_ignore_ascii_case("subagent"))
+}
+
+fn is_codex_subagent_session_meta(payload: &Value) -> bool {
+    is_codex_subagent_thread_source(payload.get("thread_source").and_then(Value::as_str))
+        || payload
+            .get("source")
+            .and_then(|source| source.get("subagent"))
+            .is_some()
 }
 
 fn discover_gemini(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
@@ -499,20 +530,34 @@ fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
         match entry.get("type").and_then(Value::as_str) {
             Some("event_msg") => {
                 let payload = entry.get("payload").unwrap_or(&Value::Null);
-                if payload.get("type").and_then(Value::as_str) != Some("user_message")
-                    || payload
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .is_some_and(|kind| kind != "plain")
-                {
-                    return;
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("user_message") => {
+                        if payload
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .is_some_and(|kind| kind != "plain")
+                        {
+                            return;
+                        }
+                        let content = payload
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(visible_user_text)
+                            .unwrap_or_default();
+                        push_message(&mut messages, record, MessageRole::User, content, timestamp);
+                    }
+                    Some("task_complete") => {
+                        let Some(error) = payload.get("error").filter(|error| !error.is_null())
+                        else {
+                            return;
+                        };
+                        let Some(detail) = codex_task_error_detail(error) else {
+                            return;
+                        };
+                        push_codex_task_failure(&mut messages, record, detail, error, timestamp);
+                    }
+                    _ => {}
                 }
-                let content = payload
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(visible_user_text)
-                    .unwrap_or_default();
-                push_message(&mut messages, record, MessageRole::User, content, timestamp);
             }
             Some("response_item") => {
                 let payload = entry.get("payload").unwrap_or(&Value::Null);
@@ -659,6 +704,40 @@ fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
     deduplicate_adjacent(messages)
 }
 
+fn codex_task_error_detail(error: &Value) -> Option<String> {
+    json_error_detail(error)
+}
+
+fn json_error_detail(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<Value>(text)
+                .ok()
+                .and_then(|parsed| json_error_detail(&parsed))
+                .or_else(|| Some(text.to_string()))
+        }
+        Value::Object(values) => [
+            "errorDetail",
+            "error_detail",
+            "detail",
+            "message",
+            "error",
+            "reason",
+        ]
+        .into_iter()
+        .find_map(|key| values.get(key).and_then(json_error_detail))
+        .or_else(|| values.values().find_map(json_error_detail)),
+        Value::Array(values) => values.iter().find_map(json_error_detail),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Null => None,
+    }
+}
+
 fn load_gemini_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
     let Ok(raw) = fs::read_to_string(&record.file_path) else {
         return Vec::new();
@@ -733,6 +812,35 @@ fn push_message_with_metadata(
         content,
         timestamp: timestamp.unwrap_or(record.summary.last_activity),
         metadata,
+    });
+}
+
+fn push_codex_task_failure(
+    messages: &mut Vec<ChatMessage>,
+    record: &ExternalSessionRecord,
+    detail: String,
+    error: &Value,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    messages.push(ChatMessage {
+        id: format!(
+            "external_{}_{}_{}",
+            record.summary.provider.as_str(),
+            record.summary.id,
+            messages.len()
+        ),
+        role: MessageRole::Assistant,
+        content: format!("ERROR: {detail}"),
+        timestamp: timestamp.unwrap_or(record.summary.last_activity),
+        metadata: json!({
+            "external": true,
+            "cli": record.summary.provider.as_str(),
+            "model": record.summary.model,
+            "kind": "terminal_status",
+            "status": "failed",
+            "errorDetail": detail,
+            "error": error,
+        }),
     });
 }
 
@@ -1328,6 +1436,65 @@ mod tests {
     }
 
     #[test]
+    fn loads_codex_task_failure_after_reasoning_as_terminal_assistant_message() {
+        let root = std::env::temp_dir().join(format!("iowb-external-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "88888888-8888-4888-8888-888888888888";
+        let file = root
+            .join(".codex/sessions/2026/08/11")
+            .join(format!("rollout-2026-08-11T08-00-00-{session_id}.jsonl"));
+        write_jsonl(
+            &file,
+            &[
+                json!({"timestamp":"2026-08-11T08:00:00Z","type":"session_meta","payload":{"id":session_id,"cwd":project}}),
+                json!({"timestamp":"2026-08-11T08:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Run the full audit","kind":"plain"}}),
+                json!({"timestamp":"2026-08-11T08:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Inspecting tenant isolation"}]}}),
+                json!({"timestamp":"2026-08-11T08:00:03Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":null,"error":{"message":"{\"detail\":\"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.\"}","codex_error_info":"other"}}}),
+            ],
+        );
+
+        let record = discover_external_sessions(&root)
+            .into_iter()
+            .find(|record| record.summary.id == session_id)
+            .unwrap();
+        let messages = load_external_messages(&record);
+        let terminal = messages.last().expect("terminal failure message");
+
+        assert_eq!(3, messages.len(), "{messages:#?}");
+        assert_eq!(MessageRole::Assistant, terminal.role);
+        assert_eq!(terminal.metadata["kind"], "terminal_status");
+        assert_eq!(terminal.metadata["status"], "failed");
+        assert_eq!(
+            terminal.metadata["errorDetail"],
+            "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+        );
+        assert!(terminal.content.starts_with("ERROR: The 'gpt-5.6-sol'"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extracts_structured_and_plain_codex_task_errors() {
+        assert_eq!(
+            codex_task_error_detail(&json!({
+                "message": "{\"detail\":\"model unsupported\"}",
+                "codex_error_info": "other",
+            }))
+            .as_deref(),
+            Some("model unsupported"),
+        );
+        assert_eq!(
+            codex_task_error_detail(&json!({
+                "message": "This content was flagged for possible cybersecurity risk.",
+                "codex_error_info": "cyber_policy",
+            }))
+            .as_deref(),
+            Some("This content was flagged for possible cybersecurity risk."),
+        );
+    }
+
+    #[test]
     fn omits_inline_tool_data_and_bounds_external_tool_output() {
         let root = std::env::temp_dir().join(format!("iowb-external-{}", Uuid::new_v4()));
         let project = root.join("project");
@@ -1368,14 +1535,52 @@ mod tests {
     }
 
     #[test]
+    fn ignores_codex_subagent_rollouts_in_json_fallback() {
+        let root = std::env::temp_dir().join(format!("iowb-codex-subagent-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let sessions_dir = root.join(".codex/sessions/2026/08/11");
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let subagent_id = "22222222-2222-4222-8222-222222222222";
+        fs::create_dir_all(&project).unwrap();
+        write_jsonl(
+            &sessions_dir.join(format!("rollout-parent-{parent_id}.jsonl")),
+            &[
+                json!({"timestamp":"2026-08-11T00:00:00Z","type":"session_meta","payload":{"id":parent_id,"cwd":project,"thread_source":"user"}}),
+                json!({"timestamp":"2026-08-11T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Visible parent","kind":"plain"}}),
+            ],
+        );
+        write_jsonl(
+            &sessions_dir.join(format!("rollout-subagent-{subagent_id}.jsonl")),
+            &[
+                json!({"timestamp":"2026-08-11T00:00:02Z","type":"session_meta","payload":{"id":subagent_id,"cwd":project,"thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":parent_id}}}}}),
+                json!({"timestamp":"2026-08-11T00:00:03Z","type":"event_msg","payload":{"type":"user_message","message":"Hidden child","kind":"plain"}}),
+            ],
+        );
+
+        let records = discover_external_sessions(&root);
+        assert!(records.iter().any(|record| record.summary.id == parent_id));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.summary.id != subagent_id)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn codex_index_discovery_defers_rollout_message_loading() {
         let root = std::env::temp_dir().join(format!("iowb-codex-index-{}", Uuid::new_v4()));
         let project = root.join("project");
         let codex_dir = root.join(".codex");
         let session_id = "55555555-5555-4555-8555-555555555555";
+        let subagent_id = "66666666-6666-4666-8666-666666666666";
         let rollout = codex_dir
             .join("sessions/2026/07/31")
             .join(format!("rollout-{session_id}.jsonl"));
+        let subagent_rollout = codex_dir
+            .join("sessions/2026/07/31")
+            .join(format!("rollout-{subagent_id}.jsonl"));
         fs::create_dir_all(&project).unwrap();
         write_jsonl(
             &rollout,
@@ -1383,6 +1588,13 @@ mod tests {
                 json!({"timestamp":"2026-07-31T00:00:00Z","type":"session_meta","payload":{"id":session_id,"cwd":project}}),
                 json!({"timestamp":"2026-07-31T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Indexed question","kind":"plain"}}),
                 json!({"timestamp":"2026-07-31T00:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Indexed answer"}]}}),
+            ],
+        );
+        write_jsonl(
+            &subagent_rollout,
+            &[
+                json!({"timestamp":"2026-07-31T00:00:03Z","type":"session_meta","payload":{"id":subagent_id,"cwd":project,"thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":session_id}}}}}),
+                json!({"timestamp":"2026-07-31T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"Indexed child","kind":"plain"}}),
             ],
         );
 
@@ -1399,6 +1611,7 @@ mod tests {
                     updated_at_ms INTEGER,
                     updated_at INTEGER NOT NULL,
                     model TEXT,
+                    thread_source TEXT,
                     archived INTEGER NOT NULL DEFAULT 0
                 );
                 "#,
@@ -1409,8 +1622,8 @@ mod tests {
                 r#"
                 INSERT INTO threads (
                     id, rollout_path, cwd, title, first_user_message,
-                    updated_at_ms, updated_at, model, archived
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+                    updated_at_ms, updated_at, model, thread_source, archived
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
                 "#,
                 rusqlite::params![
                     session_id,
@@ -1421,17 +1634,45 @@ mod tests {
                     1_785_459_602_000_i64,
                     1_785_459_602_i64,
                     "gpt-test",
+                    "user",
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                INSERT INTO threads (
+                    id, rollout_path, cwd, title, first_user_message,
+                    updated_at_ms, updated_at, model, thread_source, archived
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+                "#,
+                rusqlite::params![
+                    subagent_id,
+                    subagent_rollout.display().to_string(),
+                    project.display().to_string(),
+                    "Indexed subagent",
+                    "Indexed child",
+                    1_785_459_603_000_i64,
+                    1_785_459_603_i64,
+                    "gpt-test",
+                    "subagent",
                 ],
             )
             .unwrap();
         drop(connection);
 
-        let record = discover_external_sessions(&root)
-            .into_iter()
+        let records = discover_external_sessions(&root);
+        let record = records
+            .iter()
             .find(|record| record.summary.id == session_id)
             .unwrap();
         assert_eq!(1, record.summary.message_count);
         assert_eq!(2, load_external_messages(&record).len());
+        assert!(
+            records
+                .iter()
+                .all(|record| record.summary.id != subagent_id)
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

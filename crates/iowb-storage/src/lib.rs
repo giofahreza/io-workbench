@@ -734,6 +734,42 @@ impl Storage {
         })
     }
 
+    pub fn list_internal_native_session_ids(&self) -> Result<Vec<String>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT metadata
+                FROM sessions
+                WHERE metadata IS NOT NULL AND metadata <> ''
+                "#,
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut native_session_ids = Vec::new();
+            for row in rows {
+                let raw = row?;
+                let Some(metadata) = deserialize_session_metadata(&raw) else {
+                    continue;
+                };
+                if metadata
+                    .get("external")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if let Some(native_session_id) = metadata
+                    .get("nativeSessionId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    native_session_ids.push(native_session_id.to_string());
+                }
+            }
+            Ok(native_session_ids)
+        })
+    }
+
     pub fn list_sessions_for_project(&self, project_path: &str) -> Result<Vec<SessionSummary>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
@@ -2579,6 +2615,52 @@ mod tests {
             .expect("stored session");
         assert_eq!(restored.native_session_id, session.native_session_id);
         assert_eq!(restored.runtime, Some(ChatRuntime::IoGateway));
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn lists_only_internal_native_session_ids() {
+        let (storage, root) = temporary_storage("internal-native-session-ids");
+        for session in [
+            SessionSummary {
+                id: "internal-session".to_string(),
+                provider: Provider::Codex,
+                project_path: "/tmp/project".to_string(),
+                title: "Internal".to_string(),
+                last_activity: Utc::now(),
+                native_session_id: Some("native-internal".to_string()),
+                ..Default::default()
+            },
+            SessionSummary {
+                id: "external-session".to_string(),
+                provider: Provider::Codex,
+                external: true,
+                project_path: "/tmp/project".to_string(),
+                title: "External".to_string(),
+                last_activity: Utc::now(),
+                native_session_id: Some("native-external".to_string()),
+                ..Default::default()
+            },
+            SessionSummary {
+                id: "without-native-session".to_string(),
+                provider: Provider::Codex,
+                project_path: "/tmp/project".to_string(),
+                title: "No native mapping".to_string(),
+                last_activity: Utc::now(),
+                ..Default::default()
+            },
+        ] {
+            storage.upsert_session(&session).expect("upsert session");
+        }
+
+        assert_eq!(
+            storage
+                .list_internal_native_session_ids()
+                .expect("native session ids"),
+            vec!["native-internal".to_string()]
+        );
 
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");

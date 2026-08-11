@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260810-01";
+const APP_VERSION = "20260811-02";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -34,6 +34,8 @@ const CHAT_SWIPE_MAX_VERTICAL_DRIFT = 64;
 const CHAT_SWIPE_DIRECTION_RATIO = 1.5;
 
 const CHAT_PROVIDERS = new Set(["codex", "claude", "cursor", "gemini"]);
+const CHAT_MODES = new Set(["default", "plan", "accept-edits", "bypass"]);
+const CHAT_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultra"]);
 
 document.documentElement.classList.toggle(
   "android-web",
@@ -168,6 +170,7 @@ const state = {
   sidebarSearch: "",
   openProjectMenuPath: "",
   pointerProjectDrag: null,
+  pointerPinnedChatDrag: null,
   chatSwipe: null,
   activeSettingsTab: window.localStorage.getItem("iowb.settingsTab") || "agents",
   suppressSidebarProjectClickUntil: 0,
@@ -901,6 +904,121 @@ function togglePinnedChatSession(sessionId, projectPath = "", provider = "") {
   renderSidebarProjects();
 }
 
+function movePinnedChatOrder(sourceKey, targetKey, placement = "before") {
+  if (!sourceKey || !targetKey || sourceKey === targetKey) return;
+  const pinned = normalizePinnedChatSessions(state.pinnedChatSessions);
+  const sourceIndex = pinned.findIndex((entry) => entry.key === sourceKey);
+  const targetIndex = pinned.findIndex((entry) => entry.key === targetKey);
+  if (sourceIndex < 0 || targetIndex < 0) return;
+  const [source] = pinned.splice(sourceIndex, 1);
+  const nextTargetIndex = pinned.findIndex((entry) => entry.key === targetKey);
+  const insertIndex = nextTargetIndex < 0
+    ? pinned.length
+    : nextTargetIndex + (placement === "after" ? 1 : 0);
+  pinned.splice(insertIndex, 0, source);
+  state.pinnedChatSessions = pinned;
+  persistPinnedChatSessions();
+  hapticFeedback(8);
+  renderPinnedSidebarSessions();
+}
+
+function clearPinnedChatDragClasses() {
+  document.querySelectorAll(".sidebar-history-item.pinned-reorderable.dragging, .sidebar-history-item.pinned-reorderable.drag-over, .sidebar-history-item.pinned-reorderable.drag-over-before, .sidebar-history-item.pinned-reorderable.drag-over-after").forEach((row) => {
+    row.classList.remove("dragging", "drag-over", "drag-over-before", "drag-over-after");
+  });
+}
+
+function finishPinnedChatPointerDrag() {
+  const drag = state.pointerPinnedChatDrag;
+  if (drag?.dragging && drag.overKey) {
+    movePinnedChatOrder(drag.key, drag.overKey, drag.placement || "before");
+  }
+  if (drag?.dragging) hapticFeedback([8, 20, 8]);
+  state.pointerPinnedChatDrag = null;
+  document.body.classList.remove("sidebar-pinned-dragging");
+  clearPinnedChatDragClasses();
+  document.removeEventListener("pointermove", handlePinnedChatPointerMove);
+  document.removeEventListener("pointerup", finishPinnedChatPointerDrag);
+  document.removeEventListener("pointercancel", finishPinnedChatPointerDrag);
+}
+
+function handlePinnedChatPointerMove(event) {
+  const drag = state.pointerPinnedChatDrag;
+  if (!drag) return;
+  const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+  if (!drag.dragging) {
+    const heldMs = Date.now() - drag.startedAt;
+    if (heldMs < SIDEBAR_DRAG_HOLD_MS || distance < SIDEBAR_DRAG_MOVE_PX) return;
+    drag.dragging = true;
+    hapticFeedback(12);
+  }
+  event.preventDefault();
+  document.body.classList.add("sidebar-pinned-dragging");
+  autoScrollSidebarDuringProjectDrag(event);
+  clearPinnedChatDragClasses();
+  const sourceRow = document.querySelector(`[data-sidebar-pinned-key="${CSS.escape(drag.key)}"]`);
+  sourceRow?.classList.add("dragging");
+  const overRow = document.elementFromPoint(event.clientX, event.clientY)?.closest("[data-sidebar-pinned-key]");
+  if (!overRow || overRow.dataset.sidebarPinnedKey === drag.key) {
+    drag.overKey = "";
+    drag.placement = "";
+    return;
+  }
+  const nextOverKey = overRow.dataset.sidebarPinnedKey;
+  const nextPlacement = projectDropPlacement(drag.key, nextOverKey, event, overRow);
+  overRow.classList.add("drag-over", `drag-over-${nextPlacement}`);
+  if (drag.overKey !== nextOverKey || drag.placement !== nextPlacement) hapticFeedback(8);
+  drag.overKey = nextOverKey;
+  drag.placement = nextPlacement;
+}
+
+function bindPinnedSessionReorder(target) {
+  target.querySelectorAll("[data-sidebar-pinned-drag-handle]").forEach((handle) => {
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      const key = handle.dataset.sidebarPinnedDragHandle;
+      if (!key || !handle.closest("[data-sidebar-pinned-key]")) return;
+      state.pointerPinnedChatDrag = {
+        key,
+        startX: event.clientX,
+        startY: event.clientY,
+        startedAt: Date.now(),
+        dragging: false,
+      };
+      hapticFeedback(6);
+      event.stopPropagation();
+      event.preventDefault();
+      document.addEventListener("pointermove", handlePinnedChatPointerMove, { passive: false });
+      document.addEventListener("pointerup", finishPinnedChatPointerDrag, { once: true });
+      document.addEventListener("pointercancel", finishPinnedChatPointerDrag, { once: true });
+    });
+    handle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+    });
+    handle.addEventListener("keydown", (event) => {
+      if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const key = handle.dataset.sidebarPinnedDragHandle;
+      const visibleKeys = [...target.querySelectorAll("[data-sidebar-pinned-drag-handle]")]
+        .map((item) => item.dataset.sidebarPinnedDragHandle)
+        .filter(Boolean);
+      const fromIndex = visibleKeys.indexOf(key);
+      if (fromIndex < 0) return;
+      const toIndex = event.key === "ArrowUp"
+        ? Math.max(0, fromIndex - 1)
+        : Math.min(visibleKeys.length - 1, fromIndex + 1);
+      if (toIndex === fromIndex) return;
+      movePinnedChatOrder(key, visibleKeys[toIndex], toIndex < fromIndex ? "before" : "after");
+      hapticFeedback([8, 20, 8]);
+      requestAnimationFrame(() => {
+        document.querySelector(`[data-sidebar-pinned-drag-handle="${CSS.escape(key)}"]`)?.focus();
+      });
+    });
+  });
+}
+
 function clearSidebarProjectDragClasses() {
   document.querySelectorAll(".project-sidebar-row.dragging, .project-sidebar-row.drag-over, .project-sidebar-row.drag-over-before, .project-sidebar-row.drag-over-after").forEach((row) => {
     row.classList.remove("dragging", "drag-over", "drag-over-before", "drag-over-after");
@@ -1028,6 +1146,8 @@ function sidebarSessionCardHtml(session, options = {}) {
   const cliIcon = sidebarProviderIcon(cli);
   const isActive = options.active ?? session.id === state.chatSessionId;
   const pinned = options.pinned ?? isChatSessionPinned(session, projectPath);
+  const reorderable = Boolean(options.reorderable);
+  const pinKey = options.pinKey || session.pinKey || pinnedChatKey(projectPath, session.id, cli);
   const showProject = Boolean(options.showProject);
   const lastActivity = session.lastActivity || session.updatedAt || session.createdAt;
   const relative = formatRelativeTime(lastActivity);
@@ -1040,7 +1160,7 @@ function sidebarSessionCardHtml(session, options = {}) {
   const projectLabel = showProject
     ? (options.projectName || session.projectName || projectPath || "")
     : "";
-  return `<article class="sidebar-history-item${isActive ? " active" : ""}${pinned ? " pinned" : ""}${status ? ` is-${escapeHtml(status)}` : ""}" data-sidebar-session-card="${escapeHtml(session.id)}" data-pending="${pending}" data-status="${escapeHtml(status)}">
+  return `<article class="sidebar-history-item${isActive ? " active" : ""}${pinned ? " pinned" : ""}${reorderable ? " pinned-reorderable" : ""}${status ? ` is-${escapeHtml(status)}` : ""}" data-sidebar-session-card="${escapeHtml(session.id)}"${reorderable ? ` data-sidebar-pinned-key="${escapeHtml(pinKey)}"` : ""} data-pending="${pending}" data-status="${escapeHtml(status)}">
     <button type="button" class="sidebar-history-main" data-sidebar-session="${escapeHtml(session.id)}" data-sidebar-provider="${escapeHtml(cli)}" data-sidebar-project-path="${escapeHtml(projectPath)}" data-pending="${pending}">
       <div class="session-title-row">
         ${status ? `<span class="session-status-icon" aria-label="${escapeHtml(statusLabel)}" title="${escapeHtml(statusLabel)}"></span>` : ""}
@@ -1057,8 +1177,11 @@ function sidebarSessionCardHtml(session, options = {}) {
         </span>
       </div>
     </button>
+    ${reorderable ? `<button type="button" class="pinned-session-drag-handle" data-sidebar-pinned-drag-handle="${escapeHtml(pinKey)}" aria-label="Drag to reorder ${escapeHtml(title)}" title="Drag to reorder" aria-keyshortcuts="ArrowUp ArrowDown">
+      <i></i><i></i><i></i><i></i><i></i><i></i>
+    </button>` : ""}
     <button type="button" class="session-pin icon-button${pinned ? " active" : ""}" data-sidebar-session-pin="${escapeHtml(session.id)}" data-sidebar-project-path="${escapeHtml(projectPath)}" data-sidebar-provider="${escapeHtml(cli)}" aria-label="${pinned ? "Unpin chat session" : "Pin chat session"}" title="${pinned ? "Unpin chat session" : "Pin chat session"}" data-symbol="pin"></button>
-    <button type="button" class="session-delete icon-button" data-sidebar-session-delete="${escapeHtml(session.id)}" data-sidebar-project-path="${escapeHtml(projectPath)}" aria-label="Delete chat session" title="Delete chat session" data-symbol="trash"></button>
+    ${reorderable ? "" : `<button type="button" class="session-delete icon-button" data-sidebar-session-delete="${escapeHtml(session.id)}" data-sidebar-project-path="${escapeHtml(projectPath)}" aria-label="Delete chat session" title="Delete chat session" data-symbol="trash"></button>`}
   </article>`;
 }
 
@@ -1717,10 +1840,13 @@ function renderPinnedSidebarSessions() {
   target.innerHTML = sessions.map((session) => sidebarSessionCardHtml(session, {
     projectName: session.projectName,
     projectPath: session.projectPath,
+    pinKey: session.pinKey,
     pinned: true,
+    reorderable: true,
     showProject: true,
   })).join("");
   bindSidebarSessionActions(target);
+  bindPinnedSessionReorder(target);
 }
 
 function renderSidebarProjects() {
@@ -2095,7 +2221,7 @@ function renderCachedChatSession(sessionId) {
       provider: sessionProvider(cached.session),
     });
   }
-  loadSessionOverridesIntoState(sessionId);
+  loadSessionOverridesIntoState(sessionId, cached.session);
   renderChatFooter(null);
   updateChatEmptyState();
   return true;
@@ -2855,7 +2981,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     maybeLoadOlderChatMessages();
     // Restore per-session overrides without showing the legacy global
     // metadata slot; only the latest assistant response owns metadata.
-    loadSessionOverridesIntoState(sessionId);
+    loadSessionOverridesIntoState(sessionId, snapshotSession);
     renderChatFooter(null);
     rememberCurrentChatSession({
       sessionId,
@@ -2922,6 +3048,7 @@ function startChatActivityPoll() {
 async function pickChatSession(sessionId, projectPath) {
   const id = (sessionId || "").trim();
   if (!id) return;
+  clearChatImages();
   await saveChatPromptDraftNow().catch((error) => {
     console.warn("Unable to sync prompt draft before switching session", error);
   });
@@ -2960,6 +3087,7 @@ async function pickChatSession(sessionId, projectPath) {
 // first prompt is sent.
 async function startNewChatForProject(projectPath) {
   if (!projectPath) return;
+  clearChatImages();
   await saveChatPromptDraftNow().catch((error) => {
     console.warn("Unable to sync prompt draft before starting new chat", error);
   });
@@ -3382,6 +3510,76 @@ async function applyTerminalSizePreference(syncServer = false) {
 // the user picked across refreshes.
 const CHAT_PROVIDERS_LOCAL = ["codex", "claude", "gemini"];
 
+function isPlainRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeChatMode(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  const aliases = {
+    accept: "accept-edits",
+    acceptedits: "accept-edits",
+    "plan-only": "plan",
+    "bypass-permissions": "bypass",
+    bypasspermissions: "bypass",
+  };
+  const resolved = aliases[normalized] || normalized;
+  return CHAT_MODES.has(resolved) ? resolved : "default";
+}
+
+function normalizeChatEffort(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^x[-_ ]high$/, "xhigh");
+  return CHAT_EFFORTS.has(normalized) ? normalized : "medium";
+}
+
+function normalizeChatThinking(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (value === 1) return true;
+  if (value === 0) return false;
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (["true", "yes", "on", "1"].includes(normalized)) return true;
+  if (["false", "no", "off", "0", ""].includes(normalized)) return false;
+  return fallback;
+}
+
+function ownSessionControl(raw, names) {
+  if (!isPlainRecord(raw)) return { found: false, value: undefined };
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(raw, name) && raw[name] !== null) {
+      return { found: true, value: raw[name] };
+    }
+  }
+  return { found: false, value: undefined };
+}
+
+function normalizeSessionControls(raw, local = false) {
+  const controls = {};
+  const provider = ownSessionControl(raw, local
+    ? ["cli", "provider", "chatProvider"]
+    : ["provider", "cli"]);
+  const model = ownSessionControl(raw, ["model", "chatModel"]);
+  const effort = ownSessionControl(raw, ["effort", "reasoningEffort", "reasoning_effort"]);
+  const mode = ownSessionControl(raw, ["mode", "permissionMode", "permission_mode"]);
+  const thinking = ownSessionControl(raw, ["thinking", "chatThinking"]);
+  if (provider.found) {
+    const value = String(provider.value ?? "").trim().toLowerCase();
+    controls.cli = CHAT_PROVIDERS_LOCAL.includes(value) ? value : "codex";
+  }
+  if (model.found) controls.model = String(model.value ?? "").trim();
+  if (effort.found) controls.effort = normalizeChatEffort(effort.value);
+  if (mode.found) controls.mode = normalizeChatMode(mode.value);
+  if (thinking.found) controls.thinking = normalizeChatThinking(thinking.value);
+  return controls;
+}
+
+function normalizeSessionOverrideEntry(entry) {
+  if (!isPlainRecord(entry)) return null;
+  return { ...entry, ...normalizeSessionControls(entry, true) };
+}
+
 function chatCliValue() {
   const v = state.preferences.chatCli || state.preferences.chatProvider;
   return CHAT_PROVIDERS_LOCAL.includes(v) ? v : "codex";
@@ -3400,19 +3598,21 @@ function shouldFetchTokenUsage(provider, model) {
 }
 
 function chatModelValue() {
-  return qs("#chat-model")?.value || state.preferences.chatModel || "";
+  const select = qs("#chat-model");
+  if (select) return String(select.value ?? "").trim();
+  return String(state.preferences.chatModel ?? "").trim();
 }
 
 function chatModeValue() {
-  return qs("#chat-mode")?.value || state.preferences.chatMode || "default";
+  return normalizeChatMode(qs("#chat-mode")?.value ?? state.preferences.chatMode);
 }
 
 function chatEffortValue() {
-  return qs("#chat-effort")?.value || state.preferences.chatEffort || "medium";
+  return normalizeChatEffort(qs("#chat-effort")?.value ?? state.preferences.chatEffort);
 }
 
 function chatThinkingValue() {
-  return Boolean(state.preferences.chatThinking);
+  return normalizeChatThinking(state.preferences.chatThinking);
 }
 
 async function loadChatModelsIntoSelect(provider) {
@@ -3436,11 +3636,17 @@ async function loadChatModelsIntoSelect(provider) {
     const entries = list
       .map((entry) => {
         if (entry === null || entry === undefined) return null;
-        if (typeof entry === "string") return { value: entry, label: entry };
+        if (typeof entry === "string") {
+          return { value: entry, label: entry || "CLI default" };
+        }
         if (typeof entry === "object") {
-          const value = entry.value ?? entry.id ?? entry.name ?? "";
-          if (!value) return null;
-          return { value: String(value), label: String(entry.label ?? value) };
+          const value = entry.value ?? entry.id ?? entry.name;
+          if (value === null || value === undefined) return null;
+          const normalizedValue = String(value);
+          return {
+            value: normalizedValue,
+            label: String(entry.label ?? (normalizedValue || "CLI default")),
+          };
         }
         return null;
       })
@@ -3450,13 +3656,11 @@ async function loadChatModelsIntoSelect(provider) {
       ? entries.map((m) => `<option value="${escapeHtml(m.value)}">${escapeHtml(m.label)}</option>`).join("")
       : `<option value="">No models available</option>`;
     const values = entries.map((m) => m.value);
-    if (current && values.includes(current)) select.value = current;
-    else if (state.preferences.chatModel && values.includes(state.preferences.chatModel)) {
-      select.value = state.preferences.chatModel;
-    } else if (values.length) {
-      select.value = values[0];
-    }
-    state.preferences.chatModel = select.value || "";
+    const preferred = String(state.preferences.chatModel ?? "").trim();
+    if (values.includes(preferred)) select.value = preferred;
+    else if (values.includes(current)) select.value = current;
+    else select.value = "";
+    state.preferences.chatModel = select.value;
     savePreferences();
   } catch (error) {
     console.warn("[io-workbench] could not load chat models", error);
@@ -3466,7 +3670,28 @@ async function loadChatModelsIntoSelect(provider) {
 }
 
 function readSessionOverrides() {
-  return (state.preferences && state.preferences.chatSessionOverrides) || {};
+  const raw = state.preferences?.chatSessionOverrides;
+  if (!isPlainRecord(raw)) {
+    state.preferences.chatSessionOverrides = {};
+    savePreferences();
+    return {};
+  }
+  const normalized = {};
+  let changed = false;
+  for (const [sessionId, entry] of Object.entries(raw)) {
+    const next = normalizeSessionOverrideEntry(entry);
+    if (!next) {
+      changed = true;
+      continue;
+    }
+    normalized[sessionId] = next;
+    if (JSON.stringify(next) !== JSON.stringify(entry)) changed = true;
+  }
+  if (changed) {
+    state.preferences.chatSessionOverrides = normalized;
+    savePreferences();
+  }
+  return normalized;
 }
 
 function writeSessionOverrides(next) {
@@ -3482,36 +3707,59 @@ function getSessionOverridesFor(sessionId) {
 function saveSessionOverrides(sessionId, patch) {
   if (!sessionId) return;
   const all = readSessionOverrides();
-  all[sessionId] = Object.assign({}, all[sessionId] || {}, patch);
+  all[sessionId] = normalizeSessionOverrideEntry(Object.assign({}, all[sessionId] || {}, patch)) || {};
   writeSessionOverrides(all);
 }
 
-function loadSessionOverridesIntoState(sessionId) {
-  const entry = getSessionOverridesFor(sessionId);
-  if (!entry) return;
-  if (entry.cli) {
-    state.preferences.chatCli = entry.cli;
-    state.preferences.chatProvider = entry.cli;
+function loadSessionOverridesIntoState(sessionId, session = null) {
+  const globalControls = normalizeSessionControls({
+    cli: state.preferences.chatCli || state.preferences.chatProvider,
+    model: state.preferences.chatModel,
+    effort: state.preferences.chatEffort,
+    mode: state.preferences.chatMode,
+    thinking: state.preferences.chatThinking,
+  }, true);
+  const localControls = normalizeSessionControls(getSessionOverridesFor(sessionId), true);
+  const sessionControls = normalizeSessionControls(session, false);
+  const next = {
+    cli: "codex",
+    model: "",
+    effort: "medium",
+    mode: "default",
+    thinking: false,
+    ...globalControls,
+    ...localControls,
+    ...sessionControls,
+  };
+  state.preferences.chatCli = next.cli;
+  state.preferences.chatProvider = next.cli;
+  state.preferences.chatModel = next.model;
+  state.preferences.chatEffort = next.effort;
+  state.preferences.chatMode = next.mode;
+  state.preferences.chatThinking = next.thinking;
+  const effortSelect = qs("#chat-effort");
+  if (effortSelect) effortSelect.value = next.effort;
+  const modeSelect = qs("#chat-mode");
+  if (modeSelect) modeSelect.value = next.mode;
+  const modelSelect = qs("#chat-model");
+  if (modelSelect) {
+    const hasModel = [...modelSelect.options].some((option) => option.value === next.model);
+    if (!hasModel) {
+      const option = document.createElement("option");
+      option.value = next.model;
+      option.textContent = next.model || "CLI default";
+      modelSelect.replaceChildren(option);
+    }
+    modelSelect.value = next.model;
   }
-  if (entry.model !== undefined) {
-    state.preferences.chatModel = entry.model;
-    const s = qs("#chat-model");
-    if (s) s.value = entry.model;
-  }
-  if (entry.effort !== undefined) {
-    state.preferences.chatEffort = entry.effort;
-    const s = qs("#chat-effort");
-    if (s) s.value = entry.effort;
-  }
-  if (entry.mode !== undefined) {
-    state.preferences.chatMode = entry.mode;
-    const s = qs("#chat-mode");
-    if (s) s.value = entry.mode;
-  }
-  if (entry.thinking !== undefined) {
-    state.preferences.chatThinking = entry.thinking;
+  if (sessionId && Object.keys(sessionControls).length) {
+    saveSessionOverrides(sessionId, sessionControls);
+  } else {
+    savePreferences();
   }
   renderChatProviderPicker();
+  loadChatModelsIntoSelect(next.cli).catch(() => {});
+  updateChatComposerState();
 }
 
 function savePreferencesToLocal() {
@@ -3544,6 +3792,11 @@ function renderChatFooter(meta) {
 }
 
 function applyPreferences() {
+  state.preferences.chatModel = String(state.preferences.chatModel ?? "").trim();
+  state.preferences.chatEffort = normalizeChatEffort(state.preferences.chatEffort);
+  state.preferences.chatMode = normalizeChatMode(state.preferences.chatMode);
+  state.preferences.chatThinking = normalizeChatThinking(state.preferences.chatThinking);
+  savePreferences();
   document.body.classList.toggle("compact", !!state.preferences.compact);
   document.body.classList.toggle("wrap-output", !!state.preferences.wrapOutput);
   qs("#pref-compact").checked = !!state.preferences.compact;
@@ -3551,8 +3804,8 @@ function applyPreferences() {
   applyTerminalSizeToInputs();
   applyChatProviderPreference();
   // Populate the chat-controls select widgets from current preferences.
-  if (qs("#chat-effort")) qs("#chat-effort").value = state.preferences.chatEffort || "medium";
-  if (qs("#chat-mode")) qs("#chat-mode").value = state.preferences.chatMode || "default";
+  if (qs("#chat-effort")) qs("#chat-effort").value = state.preferences.chatEffort;
+  if (qs("#chat-mode")) qs("#chat-mode").value = state.preferences.chatMode;
   if (qs("#chat-model")) {
     loadChatModelsIntoSelect(state.preferences.chatCli || state.preferences.chatProvider || "codex").catch(() => {});
   }
@@ -7911,9 +8164,10 @@ function connectWs() {
         const entry = {
           ...prev,
           cli: payload.provider || prev.cli,
-          model: payload.model || prev.model || state.preferences.chatModel || "",
-          effort: payload.effort || prev.effort || state.preferences.chatEffort || "",
-          mode: payload.mode || prev.mode || state.preferences.chatMode || "",
+          model: payload.model ?? prev.model ?? state.preferences.chatModel ?? "",
+          effort: payload.effort ?? prev.effort ?? state.preferences.chatEffort ?? "",
+          mode: payload.mode ?? prev.mode ?? state.preferences.chatMode ?? "",
+          thinking: payload.thinking ?? prev.thinking ?? state.preferences.chatThinking ?? false,
           receivedAt: formatReceivedDateTime(receivedAt),
           tokenUsage,
         };
@@ -9365,7 +9619,7 @@ function bindForms() {
   });
   qs("#chat-prompt").addEventListener("focus", autosizeChatPrompt);
   qs("#chat-prompt").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey) {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       qs("#chat-form")?.requestSubmit();
       return;
@@ -9539,6 +9793,7 @@ function bindForms() {
     }
     state.pendingChatSessionId = "";
     qs("#chat-prompt").value = "";
+    clearChatImages();
     autosizeChatPrompt();
     updateChatComposerState();
 

@@ -769,7 +769,8 @@ textarea {
   min-width: 0;
 }
 
-.project-drag-handle {
+.project-drag-handle,
+.pinned-session-drag-handle {
   display: inline-grid;
   grid-template-columns: auto auto;
   grid-template-rows: repeat(3, auto);
@@ -793,18 +794,23 @@ textarea {
 }
 
 .project-drag-handle:hover,
-.project-drag-handle:focus-visible {
+.project-drag-handle:focus-visible,
+.pinned-session-drag-handle:hover,
+.pinned-session-drag-handle:focus-visible {
   color: var(--accent, #0f766e);
   background: rgba(15, 118, 110, 0.08);
   outline: none;
 }
 
 .project-drag-handle:active,
-.project-sidebar-row.dragging .project-drag-handle {
+.project-sidebar-row.dragging .project-drag-handle,
+.pinned-session-drag-handle:active,
+.sidebar-history-item.pinned-reorderable.dragging .pinned-session-drag-handle {
   cursor: grabbing;
 }
 
-.project-drag-handle i {
+.project-drag-handle i,
+.pinned-session-drag-handle i {
   display: block;
   width: 2.25px;
   height: 2.25px;
@@ -879,7 +885,9 @@ textarea {
 }
 
 body.sidebar-project-dragging,
-body.sidebar-project-dragging * {
+body.sidebar-project-dragging *,
+body.sidebar-pinned-dragging,
+body.sidebar-pinned-dragging * {
   cursor: grabbing !important;
   user-select: none !important;
 }
@@ -6614,6 +6622,29 @@ th {
 
 .sidebar-history-item.pinned {
   border-color: color-mix(in srgb, var(--warn) 35%, var(--line));
+}
+
+.sidebar-history-item.pinned-reorderable {
+  grid-template-columns: minmax(0, 1fr) 14px 26px;
+  touch-action: pan-y;
+  user-select: none;
+}
+
+.sidebar-history-item.pinned-reorderable.dragging {
+  opacity: 0.55;
+  cursor: grabbing;
+}
+
+.sidebar-history-item.pinned-reorderable.drag-over {
+  border-color: var(--accent);
+}
+
+.sidebar-history-item.pinned-reorderable.drag-over-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.sidebar-history-item.pinned-reorderable.drag-over-after {
+  box-shadow: inset 0 -2px 0 var(--accent);
 }
 
 .sidebar-history-main {
