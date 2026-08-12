@@ -1,4 +1,4 @@
-const APP_VERSION = "20260811-02";
+const APP_VERSION = "20260812-06";
 const CACHE_NAME = `io-workbench-web-${APP_VERSION}`;
 const CORE_ASSETS = [
   "/",
@@ -6,7 +6,6 @@ const CORE_ASSETS = [
   `/styles.css?v=${APP_VERSION}`,
   `/app.js?v=${APP_VERSION}`,
   "/manifest.webmanifest",
-  "/openapi.json",
   "/icon.svg",
   "/icons/codex.svg",
   "/icons/codex-white.svg",
@@ -14,28 +13,7 @@ const CORE_ASSETS = [
   "/icons/claude-white.svg",
   "/icons/gemini-ai-icon.svg",
   "/icons/cursor.svg",
-  "/icons/cursor-white.svg",
-  "/api-docs.html",
-  "/clear-cache.html",
-  "/vendor/codemirror/codemirror.css",
-  "/vendor/codemirror/codemirror.js",
-  "/vendor/codemirror/addon/matchbrackets.js",
-  "/vendor/codemirror/addon/closebrackets.js",
-  "/vendor/codemirror/addon/simple.js",
-  "/vendor/codemirror/mode/css.js",
-  "/vendor/codemirror/mode/gfm.js",
-  "/vendor/codemirror/mode/htmlmixed.js",
-  "/vendor/codemirror/mode/javascript.js",
-  "/vendor/codemirror/mode/markdown.js",
-  "/vendor/codemirror/mode/python.js",
-  "/vendor/codemirror/mode/rust.js",
-  "/vendor/codemirror/mode/shell.js",
-  "/vendor/codemirror/mode/sql.js",
-  "/vendor/codemirror/mode/toml.js",
-  "/vendor/codemirror/mode/xml.js",
-  "/vendor/codemirror/mode/yaml.js",
-  "/vendor/xterm/xterm.css",
-  "/vendor/xterm/xterm.js"
+  "/icons/cursor-white.svg"
 ];
 
 self.addEventListener("install", (event) => {

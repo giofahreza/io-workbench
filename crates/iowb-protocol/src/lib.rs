@@ -329,6 +329,8 @@ pub struct SessionMetadata {
     pub mode: Option<SessionMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "lastMessageAt")]
     pub last_message_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "firstUserAt")]
@@ -371,6 +373,8 @@ pub struct SessionSummary {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -465,6 +469,28 @@ pub struct SessionDraftResponse {
 pub struct UpdateSessionDraftRequest {
     #[serde(default)]
     pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkSessionRequest {
+    #[serde(rename = "beforeMessageId")]
+    pub before_message_id: String,
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkSessionResponse {
+    #[serde(rename = "sourceSessionId")]
+    pub source_session_id: String,
+    #[serde(rename = "beforeMessageId")]
+    pub before_message_id: String,
+    pub session: SessionSummary,
+    pub draft: SessionDraftResponse,
+    #[serde(rename = "nativeForked")]
+    pub native_forked: bool,
+    #[serde(rename = "filesUnchanged")]
+    pub files_unchanged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1400,6 +1426,8 @@ pub enum WsClientCommand {
         mode: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast: Option<bool>,
     },
     AbortSession {
         provider: Provider,
@@ -1483,6 +1511,8 @@ pub enum WsServerEvent {
         mode: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thinking: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast: Option<bool>,
         #[serde(rename = "receivedAt")]
         received_at: DateTime<Utc>,
         #[serde(rename = "lastMessageAt", skip_serializing_if = "Option::is_none")]
@@ -1579,7 +1609,64 @@ fn default_terminal_rows() -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionMode, session_title_from_prompt};
+    use super::{SessionMode, SessionSummary, WsClientCommand, session_title_from_prompt};
+    use serde_json::json;
+
+    #[test]
+    fn start_session_fast_round_trips_and_defaults_to_unspecified() {
+        let enabled: WsClientCommand = serde_json::from_value(json!({
+            "type": "start_session",
+            "provider": "codex",
+            "projectPath": "/tmp/project",
+            "prompt": "ship it",
+            "fast": true
+        }))
+        .expect("deserialize fast start session");
+        match enabled {
+            WsClientCommand::StartSession { fast, .. } => assert_eq!(fast, Some(true)),
+            _ => panic!("expected start_session"),
+        }
+
+        let legacy: WsClientCommand = serde_json::from_value(json!({
+            "type": "start_session",
+            "provider": "codex",
+            "projectPath": "/tmp/project",
+            "prompt": "ship it"
+        }))
+        .expect("deserialize legacy start session");
+        match legacy {
+            WsClientCommand::StartSession { fast, .. } => assert_eq!(fast, None),
+            _ => panic!("expected start_session"),
+        }
+    }
+
+    #[test]
+    fn session_summary_serializes_explicit_fast_state() {
+        let enabled = SessionSummary {
+            fast: Some(true),
+            ..Default::default()
+        };
+        let disabled = SessionSummary {
+            fast: Some(false),
+            ..Default::default()
+        };
+        let unspecified = SessionSummary::default();
+
+        assert_eq!(
+            serde_json::to_value(enabled).expect("serialize enabled")["fast"],
+            true
+        );
+        assert_eq!(
+            serde_json::to_value(disabled).expect("serialize disabled")["fast"],
+            false
+        );
+        assert!(
+            serde_json::to_value(unspecified)
+                .expect("serialize unspecified")
+                .get("fast")
+                .is_none()
+        );
+    }
 
     #[test]
     fn session_mode_parse_accepts_bypass_permissions_alias() {

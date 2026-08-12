@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260811-02";
+const APP_VERSION = "20260812-06";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -82,6 +82,13 @@ const state = {
   gitCommitMessage: "",
   fileEntries: [],
   fileExpandedPaths: new Set(),
+  fileLoadedDirectoryPaths: new Set(),
+  fileLoadingDirectoryPaths: new Set(),
+  fileLoading: false,
+  fileLoadRequestId: 0,
+  fileContentRequestId: 0,
+  fileProjectPath: "",
+  fileRootPath: ".",
   fileSelectedPaths: new Set(),
   fileCreating: null,
   fileRenamingPath: "",
@@ -105,6 +112,12 @@ const state = {
   chatPromptHistoryHasOlder: false,
   chatPromptHistoryLoadScope: "",
   chatPromptHistoryPendingPreviousAfterLoad: false,
+  chatEditFromHere: {
+    armedUntil: 0,
+    pickerOpen: false,
+    items: [],
+    index: -1,
+  },
   chatProcessing: null,
   chatStoppingSessionId: "",
   chatResponseStateBySession: {},
@@ -165,6 +178,8 @@ const state = {
   gitActiveView: "changes",
   chatImages: [],
   codeEditor: null,
+  currentFileProjectPath: "",
+  fileEditorLineCount: 0,
   suppressEditorChange: false,
   shellTerm: null,
   sidebarSearch: "",
@@ -198,6 +213,51 @@ const state = {
 };
 
 const qs = (selector) => document.querySelector(selector);
+const assetLoadPromises = new Map();
+
+function versionedAssetUrl(path) {
+  const url = new URL(path, window.location.origin);
+  url.searchParams.set("v", APP_VERSION);
+  return `${url.pathname}${url.search}`;
+}
+
+function loadScriptOnce(path) {
+  const src = versionedAssetUrl(path);
+  if (assetLoadPromises.has(src)) return assetLoadPromises.get(src);
+  const promise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = src;
+    script.async = true;
+    script.dataset.iowbAsset = path;
+    script.addEventListener("load", () => resolve(script), { once: true });
+    script.addEventListener("error", () => reject(new Error(`Unable to load ${path}`)), { once: true });
+    document.head.appendChild(script);
+  }).catch((error) => {
+    assetLoadPromises.delete(src);
+    throw error;
+  });
+  assetLoadPromises.set(src, promise);
+  return promise;
+}
+
+function loadStylesheetOnce(path) {
+  const href = versionedAssetUrl(path);
+  if (assetLoadPromises.has(href)) return assetLoadPromises.get(href);
+  const promise = new Promise((resolve, reject) => {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = href;
+    link.dataset.iowbAsset = path;
+    link.addEventListener("load", () => resolve(link), { once: true });
+    link.addEventListener("error", () => reject(new Error(`Unable to load ${path}`)), { once: true });
+    document.head.appendChild(link);
+  }).catch((error) => {
+    assetLoadPromises.delete(href);
+    throw error;
+  });
+  assetLoadPromises.set(href, promise);
+  return promise;
+}
 
 const AUTH_PROTECTED_SELECTORS = [
   ".sidebar",
@@ -368,12 +428,14 @@ function setChatProvider(provider) {
   if (modelSelect) {
     modelSelect.disabled = true;
     modelSelect.innerHTML = canLoadProtectedData()
-      ? `<option value="">Loading models...</option>`
+      ? `<option value="">Open prompt config to load models</option>`
       : `<option value="">Sign in to load models</option>`;
   }
   savePreferences();
   renderChatProviderPicker();
-  if (canLoadProtectedData()) loadChatModelsIntoSelect(value).catch(() => {});
+  if (!qs("#prompt-config-panel")?.classList.contains("hidden")) {
+    loadChatModelsIntoSelect(value).catch(() => {});
+  }
 }
 
 function orderedProjects() {
@@ -630,6 +692,8 @@ function renderProjects() {
   renderProjectOptions();
   renderSidebarProjects();
   renderSidebarSessions();
+  updateChatEmptyState();
+  updateChatComposerState();
 }
 
 function renderProjectOptions() {
@@ -643,13 +707,39 @@ function renderProjectOptions() {
     if (!select) return;
     const previous = select.value;
     select.innerHTML = options;
-    if (previous) select.value = previous;
+    const desired = state.projects.some((project) => project.path === previous)
+      ? previous
+      : state.activeProjectPath;
+    if (desired) select.value = desired;
   });
   updateMainHeader();
 }
 
 function setActiveProject(projectPath) {
-  state.activeProjectPath = projectPath || "";
+  const nextProjectPath = projectPath || "";
+  const projectChanged = nextProjectPath !== state.activeProjectPath;
+  if (projectChanged) {
+    state.fileLoadRequestId += 1;
+    state.fileLoading = false;
+    state.fileProjectPath = "";
+    state.fileEntries = [];
+    state.fileExpandedPaths.clear();
+    state.fileLoadedDirectoryPaths.clear();
+    state.fileLoadingDirectoryPaths.clear();
+    state.fileSelectedPaths.clear();
+    const openFilePath = qs("#file-editor-path")?.value.trim() || "";
+    if (openFilePath && !state.currentFileDirty) {
+      closeFileEditor({ skipDirtyCheck: true, focusFiles: false });
+    } else if (
+      openFilePath
+      && state.currentFileProjectPath !== nextProjectPath
+      && activeView() === "files"
+    ) {
+      showToast("Unsaved file remains open from the previous project", "ok");
+      updateEditorChrome();
+    }
+  }
+  state.activeProjectPath = nextProjectPath;
   window.localStorage.setItem("iowb.activeProjectPath", state.activeProjectPath);
   ["#active-project"].forEach((selector) => {
     const select = qs(selector);
@@ -657,6 +747,9 @@ function setActiveProject(projectPath) {
   });
   updateMainHeader();
   renderSidebarProjects();
+  if (qs("#file-editor-path")?.value.trim()) updateEditorChrome();
+  updateChatEmptyState();
+  updateChatComposerState();
 }
 
 function sidebarFilterText() {
@@ -1227,6 +1320,7 @@ function deleteSessionOverride(sessionId) {
 
 function clearSelectedChatSession(sessionId) {
   if (state.chatSessionId !== sessionId && state.pendingChatSessionId !== sessionId) return;
+  closeChatEditFromHerePicker();
   state.chatSessionId = "";
   state.pendingChatSessionId = "";
   state.chatPromptDraftSessionId = "";
@@ -1290,6 +1384,7 @@ function updatePendingChatProvider(provider) {
     effort: chatEffortValue(),
     mode: chatModeValue(),
     thinking: chatThinkingValue(),
+    fast: chatFastValue(),
   });
   renderSidebarProjects();
 }
@@ -1305,6 +1400,7 @@ function renderChatProviderPicker() {
   document.querySelectorAll(".chat-config-provider-picker").forEach((picker) => {
     picker.classList.toggle("hidden", !selectedChatIsFreshDraft());
   });
+  updateChatFastControl();
 }
 
 function chatPromptHistoryScope(sessionId = state.chatSessionId) {
@@ -1586,6 +1682,188 @@ function navigateChatPromptHistory(direction) {
   scheduleChatPromptDraftSave();
 }
 
+function chatEditFromHereItems() {
+  const items = [];
+  const seen = new Set();
+  const add = (entry) => {
+    const id = persistedChatMessageId(entry);
+    const content = String(entry?.content || "").trim();
+    if (!id || !content || seen.has(id)) return;
+    seen.add(id);
+    items.push({ id, content, timestamp: entry?.timestamp || "" });
+  };
+  (state.chatPromptHistory || []).forEach((entry) => {
+    if (!entry?.local) add(entry);
+  });
+  if (chatHistoryWindow.sessionId === state.chatSessionId) {
+    (chatHistoryWindow.messages || []).forEach((message) => {
+      if (String(message?.role || "").toLowerCase() === "user") add(message);
+    });
+  }
+  return items.sort((left, right) => {
+    const leftTime = new Date(left.timestamp || 0).getTime() || 0;
+    const rightTime = new Date(right.timestamp || 0).getTime() || 0;
+    return leftTime - rightTime;
+  });
+}
+
+function closeChatEditFromHerePicker() {
+  state.chatEditFromHere.pickerOpen = false;
+  state.chatEditFromHere.items = [];
+  state.chatEditFromHere.index = -1;
+  state.chatEditFromHere.armedUntil = 0;
+  qs("#chat-edit-from-here-picker")?.remove();
+}
+
+function renderChatEditFromHerePicker() {
+  qs("#chat-edit-from-here-picker")?.remove();
+  if (!state.chatEditFromHere.pickerOpen) return;
+  const selected = state.chatEditFromHere.items[state.chatEditFromHere.index];
+  if (!selected) return;
+  const root = document.createElement("section");
+  root.id = "chat-edit-from-here-picker";
+  root.className = "chat-edit-from-here-picker";
+  root.setAttribute("role", "dialog");
+  root.setAttribute("aria-modal", "false");
+  root.setAttribute("aria-label", "Choose a prompt to edit from here");
+  root.innerHTML = `
+    <div class="chat-edit-from-here-picker-header">
+      <div class="chat-edit-from-here-picker-title">Edit from here</div>
+      <div class="chat-edit-from-here-picker-count">${state.chatEditFromHere.index + 1} of ${state.chatEditFromHere.items.length}</div>
+    </div>
+    <div class="chat-edit-from-here-picker-preview">${escapeHtml(selected.content)}</div>
+    <div class="chat-edit-from-here-picker-hint">↑/↓ choose · Enter confirm · Esc cancel</div>
+  `;
+  document.body.appendChild(root);
+}
+
+function openChatEditFromHerePicker() {
+  const items = chatEditFromHereItems();
+  if (!items.length) {
+    showToast("No persisted prompts are available", "danger");
+    state.chatEditFromHere.armedUntil = 0;
+    return false;
+  }
+  state.chatEditFromHere.items = items;
+  state.chatEditFromHere.index = items.length - 1;
+  state.chatEditFromHere.pickerOpen = true;
+  state.chatEditFromHere.armedUntil = 0;
+  renderChatEditFromHerePicker();
+  return true;
+}
+
+function moveChatEditFromHerePicker(direction) {
+  const { items } = state.chatEditFromHere;
+  if (!items.length) return;
+  state.chatEditFromHere.index = Math.max(
+    0,
+    Math.min(items.length - 1, state.chatEditFromHere.index + direction),
+  );
+  renderChatEditFromHerePicker();
+}
+
+function chatEditFromHereRequestId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+async function editChatFromHere(messageId, button = null) {
+  const sourceSessionId = String(state.chatSessionId || "").trim();
+  if (!sourceSessionId) throw new Error("Open a persisted chat session first.");
+  if (selectedRunningChatSession() || findChatSession(sourceSessionId)?.active) {
+    throw new Error("Stop the current response before editing from here.");
+  }
+  if (!window.confirm(
+    "Create a new chat before this prompt?\n\nThe original chat and current files will remain unchanged.",
+  )) {
+    return;
+  }
+  const response = await withButtonLoading(button, () => api(
+    `/api/sessions/${encodeURIComponent(sourceSessionId)}/fork`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        beforeMessageId: messageId,
+        requestId: chatEditFromHereRequestId(),
+      }),
+    },
+  ));
+  closeChatEditFromHerePicker();
+  await loadProjects().catch(() => {});
+  const destination = response?.session;
+  if (!destination?.id) throw new Error("The server did not return the new chat session.");
+  if (!findChatSession(destination.id)) {
+    state.sessions = (state.sessions || []).concat(destination);
+  }
+  await pickChatSession(destination.id, destination.projectPath || activeProjectPath());
+  const draft = String(response?.draft?.content || "");
+  setChatPromptValue(draft);
+  writeLocalChatPromptDraft(draft, destination.id);
+  qs("#chat-prompt")?.focus();
+  showToast("New chat created; current files were not changed", "ok");
+}
+
+function handleChatEditFromHereKeydown(event) {
+  if (activeView() !== "chat") return false;
+  if (state.folderBrowser.open || state.commandPalette.open || qs("#chat-session-config-modal")) {
+    return false;
+  }
+  if (state.chatEditFromHere.pickerOpen) {
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      event.stopPropagation();
+      moveChatEditFromHerePicker(-1);
+      return true;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      event.stopPropagation();
+      moveChatEditFromHerePicker(1);
+      return true;
+    }
+    if (event.key === "Enter" && !event.isComposing) {
+      event.preventDefault();
+      event.stopPropagation();
+      const selected = state.chatEditFromHere.items[state.chatEditFromHere.index];
+      if (selected) editChatFromHere(selected.id).catch(showError);
+      return true;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeChatEditFromHerePicker();
+      return true;
+    }
+    return false;
+  }
+  if (event.key !== "Escape") {
+    state.chatEditFromHere.armedUntil = 0;
+    return false;
+  }
+  const selectedRun = selectedRunningChatSession();
+  if (selectedRun) {
+    event.preventDefault();
+    event.stopPropagation();
+    requestAbortSelectedChatSession();
+    return true;
+  }
+  const prompt = qs("#chat-prompt");
+  if (!prompt || prompt.value.trim() || event.repeat || !currentChatDraftSessionId()) {
+    state.chatEditFromHere.armedUntil = 0;
+    return false;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  const now = Date.now();
+  if (now <= state.chatEditFromHere.armedUntil) {
+    openChatEditFromHerePicker();
+  } else {
+    state.chatEditFromHere.armedUntil = now + 1600;
+    showToast("Press Esc again to edit an earlier prompt", "ok");
+  }
+  return true;
+}
+
 function togglePromptConfigPanel(force) {
   const panel = qs("#prompt-config-panel");
   const toggle = qs("#prompt-config-toggle");
@@ -1594,6 +1872,9 @@ function togglePromptConfigPanel(force) {
   panel.classList.toggle("hidden", !open);
   toggle.classList.toggle("active", open);
   toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) {
+    loadChatModelsIntoSelect(chatCliValue()).catch(() => {});
+  }
 }
 
 function closeChatSessionConfigModal() {
@@ -1601,8 +1882,11 @@ function closeChatSessionConfigModal() {
 }
 
 function showChatSessionConfigModal() {
+  closeChatEditFromHerePicker();
   closeChatSessionConfigModal();
   const settings = chatDisplaySettings();
+  const fastRequested = chatFastValue();
+  const fastAvailable = chatCliValue() === "codex";
   document.body.insertAdjacentHTML("beforeend", `<div id="chat-session-config-modal" class="chat-session-config-modal">
     <section class="chat-session-config-dialog" role="dialog" aria-modal="true" aria-labelledby="chat-session-config-title">
       <header>
@@ -1611,6 +1895,14 @@ function showChatSessionConfigModal() {
       </header>
       <div class="chat-session-config-body">
         <p class="chat-session-config-scope">${escapeHtml(chatDisplaySettingsScopeLabel())}</p>
+        <label class="chat-session-config-fast${fastRequested ? " active" : ""}" title="${fastAvailable ? "Request Fast priority processing for Codex; the service decides the tier actually used" : "Fast priority requests are available only for Codex"}">
+          <input type="checkbox" data-chat-fast-setting${fastRequested ? " checked" : ""}${fastAvailable ? "" : " disabled"} />
+          <span class="chat-session-config-fast-copy">
+            <strong>Fast priority</strong>
+            <small>Request lower latency; actual availability may vary.</small>
+          </span>
+          <span class="chat-session-config-fast-status" data-chat-fast-setting-status>${fastAvailable ? (fastRequested ? "Requested" : "Off") : "Codex only"}</span>
+        </label>
         <label><input type="checkbox" data-chat-display-setting="expandThinking"${settings.expandThinking ? " checked" : ""} /> Auto expand thinking</label>
         <label><input type="checkbox" data-chat-display-setting="expandParameters"${settings.expandParameters ? " checked" : ""} /> Auto expand parameters</label>
         <label><input type="checkbox" data-chat-display-setting="autoScrollToBottom"${settings.autoScrollToBottom ? " checked" : ""} /> Auto scroll to bottom</label>
@@ -1635,6 +1927,10 @@ function showChatSessionConfigModal() {
       updateChatJumpToLatestButton();
     });
   });
+  modal?.querySelector("[data-chat-fast-setting]")?.addEventListener("change", (event) => {
+    setChatFastRequested(event.currentTarget.checked);
+  });
+  updateChatFastControl();
 }
 
 function chatOutputIsEmpty() {
@@ -1785,8 +2081,20 @@ function updateChatEmptyState() {
   const emptyState = qs("#chat-empty-state");
   if (!emptyState) return;
   const shouldShow = activeView() === "chat" && chatOutputIsEmpty() && selectedChatIsFreshDraft();
+  const hasProject = Boolean(activeProjectPath());
   emptyState.classList.toggle("hidden", !shouldShow);
+  qs("#chat-empty-add-project")?.classList.toggle("hidden", hasProject);
+  emptyState.querySelector(".chat-provider-picker")?.classList.toggle("hidden", !hasProject);
+  const title = qs("#chat-empty-title");
+  const description = qs("#chat-empty-description");
+  if (title) title.textContent = hasProject ? "Start a new conversation" : "Add your first project";
+  if (description) {
+    description.textContent = hasProject
+      ? "Choose an agent, then describe what you want to build or change."
+      : "Choose a folder to give agents a safe workspace for files, commands, and chat sessions.";
+  }
   renderChatProviderPicker();
+  updateChatComposerState();
   updateChatJumpToLatestButton();
 }
 
@@ -2248,6 +2556,7 @@ function rememberBackgroundChatOutput(payload = {}) {
   if (!cached && !session) return false;
   const previous = state.chatOutputBuffersBySession[sessionId] || "";
   const nextBuffer = `${previous}${payload.content || ""}`.slice(-CHAT_LIVE_RENDER_MAX_CHARS);
+  const sessionControls = getSessionOverridesFor(sessionId) || {};
   let messages = Array.isArray(cached?.messages) ? cached.messages.slice() : [];
   if (nextBuffer.trim()) {
     const streamingId = `local-stream-${sessionId}`;
@@ -2262,6 +2571,7 @@ function rememberBackgroundChatOutput(payload = {}) {
         model: state.preferences.chatModel || "",
         effort: state.preferences.chatEffort || "",
         mode: state.preferences.chatMode || "",
+        fast: sessionControls.fast ?? state.preferences.chatFast ?? false,
       },
     };
     if (existingIndex >= 0) messages[existingIndex] = message;
@@ -2494,6 +2804,25 @@ function selectedRunningChatSession() {
   return null;
 }
 
+function requestAbortSelectedChatSession(selectedRun = selectedRunningChatSession()) {
+  if (!selectedRun) return false;
+  if (state.ws?.readyState !== WebSocket.OPEN) {
+    showError(new Error("Chat connection is not ready."));
+    return false;
+  }
+  state.chatStoppingSessionId = selectedRun.sessionId;
+  updateProcessingLabel("Stopping");
+  rememberCurrentChatSession({ sessionId: selectedRun.sessionId, live: true, status: "running" });
+  state.ws.send(JSON.stringify({
+    type: "abort_session",
+    provider: selectedRun.provider,
+    sessionId: selectedRun.sessionId,
+  }));
+  updateChatComposerState();
+  scheduleChatReconciliation(selectedRun.sessionId, { delayMs: CHAT_ACTIVE_POLL_INTERVAL_MS });
+  return true;
+}
+
 function sessionMetaForStatus(payload = {}) {
   const sid = payload.sessionId || state.chatSessionId || state.pendingChatSessionId;
   const persisted = getSessionOverridesFor(sid) || {};
@@ -2505,6 +2834,7 @@ function sessionMetaForStatus(payload = {}) {
     mode: normalized.mode || state.preferences.chatMode || "",
     effort: normalized.effort || state.preferences.chatEffort || "",
     thinking: normalized.thinking ?? state.preferences.chatThinking,
+    fast: normalized.fast ?? state.preferences.chatFast ?? false,
   };
 }
 
@@ -2612,6 +2942,7 @@ function renderChatLineFooter(footer, meta) {
     items.push(`<span>Effort: <strong>${escapeHtml(meta.effort)}</strong></span>`);
   }
   if (meta.thinking) items.push(`<span>Thinking on</span>`);
+  if (meta.fast) items.push(`<span>Fast priority requested</span>`);
   // Token usage is intentionally hidden from the per-turn footer; the mobile
   // app and web UI both keep the chat transcript focused on the actual
   // response, not on internal accounting metrics.
@@ -2639,11 +2970,47 @@ function clearChatLineMetadata() {
   renderChatFooter(null);
 }
 
-function replayUserPromptLine(prompt) {
+function persistedChatMessageId(message) {
+  const id = String(message?.id || "").trim();
+  if (!id || id.startsWith("local-") || id.startsWith("local:")) return "";
+  return id;
+}
+
+function attachEditFromHereAction(node, message) {
+  const messageId = persistedChatMessageId(message);
+  if (!messageId) return;
+  const actions = document.createElement("div");
+  actions.className = "chat-line-actions";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "chat-message-edit icon-button";
+  button.dataset.symbol = "pencil";
+  button.setAttribute("aria-label", "Edit from here");
+  button.title = "Edit from here";
+  const session = findChatSession(state.chatSessionId);
+  if (session?.active || selectedRunningChatSession()) {
+    button.disabled = true;
+    button.title = "Stop the current response before editing from here";
+  }
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    editChatFromHere(messageId, button).catch(showError);
+  });
+  actions.appendChild(button);
+  const footer = node.querySelector(":scope > .chat-line-footer");
+  if (footer) {
+    node.insertBefore(actions, footer);
+  } else {
+    node.appendChild(actions);
+  }
+}
+
+function replayUserPromptLine(message) {
   const output = chatOutputRoot();
   if (!output) return;
   const { node, text, footer } = buildChatLineNode("user");
-  text.textContent = String(prompt);
+  text.textContent = String(message?.content || "");
+  attachEditFromHereAction(node, message);
   renderChatLineFooter(footer, null);
   output.appendChild(node);
 }
@@ -2793,7 +3160,7 @@ function replayChatMessages(messages) {
       : null;
     if (role === "user") {
       previousPrompt = content;
-      replayUserPromptLine(content);
+      replayUserPromptLine(raw);
     } else if (role === "assistant") {
       const displayContent = assistantResponseContent(content, raw.provider || persistedMeta.provider, previousPrompt);
       if (displayContent) replayAssistantLine(displayContent, meta);
@@ -2971,7 +3338,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       const meta = role === "assistant" && index === latestAssistantIndex
         ? replayMeta(raw, role)
         : null;
-      if (role === "user") replayUserPromptLine(content);
+      if (role === "user") replayUserPromptLine(raw);
       else if (role === "assistant") replayAssistantLine(content, meta);
       else if (role === "tool") replayToolLine(content);
       else if (role === "system") {
@@ -3061,6 +3428,7 @@ function startChatActivityPoll() {
 async function pickChatSession(sessionId, projectPath) {
   const id = (sessionId || "").trim();
   if (!id) return;
+  closeChatEditFromHerePicker();
   clearChatImages();
   await saveChatPromptDraftNow().catch((error) => {
     console.warn("Unable to sync prompt draft before switching session", error);
@@ -3100,6 +3468,7 @@ async function pickChatSession(sessionId, projectPath) {
 // first prompt is sent.
 async function startNewChatForProject(projectPath) {
   if (!projectPath) return;
+  closeChatEditFromHerePicker();
   clearChatImages();
   await saveChatPromptDraftNow().catch((error) => {
     console.warn("Unable to sync prompt draft before starting new chat", error);
@@ -3558,6 +3927,16 @@ function normalizeChatThinking(value, fallback = false) {
   return fallback;
 }
 
+function normalizeChatFast(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (value === 1) return true;
+  if (value === 0) return false;
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (["true", "yes", "on", "1", "fast", "priority"].includes(normalized)) return true;
+  if (["false", "no", "off", "0", "", "default", "standard"].includes(normalized)) return false;
+  return fallback;
+}
+
 function ownSessionControl(raw, names) {
   if (!isPlainRecord(raw)) return { found: false, value: undefined };
   for (const name of names) {
@@ -3577,6 +3956,7 @@ function normalizeSessionControls(raw, local = false) {
   const effort = ownSessionControl(raw, ["effort", "reasoningEffort", "reasoning_effort"]);
   const mode = ownSessionControl(raw, ["mode", "permissionMode", "permission_mode"]);
   const thinking = ownSessionControl(raw, ["thinking", "chatThinking"]);
+  const fast = ownSessionControl(raw, ["fast", "fastMode", "fast_mode"]);
   if (provider.found) {
     const value = String(provider.value ?? "").trim().toLowerCase();
     controls.cli = CHAT_PROVIDERS_LOCAL.includes(value) ? value : "codex";
@@ -3585,6 +3965,7 @@ function normalizeSessionControls(raw, local = false) {
   if (effort.found) controls.effort = normalizeChatEffort(effort.value);
   if (mode.found) controls.mode = normalizeChatMode(mode.value);
   if (thinking.found) controls.thinking = normalizeChatThinking(thinking.value);
+  if (fast.found) controls.fast = normalizeChatFast(fast.value);
   return controls;
 }
 
@@ -3626,6 +4007,44 @@ function chatEffortValue() {
 
 function chatThinkingValue() {
   return normalizeChatThinking(state.preferences.chatThinking);
+}
+
+function chatFastValue() {
+  return chatCliValue() === "codex" && normalizeChatFast(state.preferences.chatFast);
+}
+
+function setChatFastRequested(requested) {
+  const next = chatCliValue() === "codex" && normalizeChatFast(requested);
+  state.preferences.chatFast = next;
+  savePreferences();
+  const sid = state.chatSessionId || state.pendingChatSessionId || state.preferences.lastChatSessionId;
+  if (sid) saveSessionOverrides(sid, { fast: next });
+  updatePendingChatProvider(chatCliValue());
+  updateChatComposerState();
+}
+
+function updateChatFastControl() {
+  const isCodex = chatCliValue() === "codex";
+  const requested = isCodex && normalizeChatFast(state.preferences.chatFast);
+  const label = !isCodex
+    ? "Fast priority requests are available only for Codex"
+    : requested
+      ? "Disable Fast priority request"
+      : "Enable Fast priority request";
+  document.querySelectorAll("#chat-fast-toggle, [data-chat-fast-setting]").forEach((toggle) => {
+    toggle.checked = requested;
+    toggle.disabled = !isCodex;
+    toggle.setAttribute("aria-label", label);
+    const control = toggle.closest(".chat-fast-control, .chat-session-config-fast");
+    control?.classList.toggle("active", requested);
+    control?.setAttribute("title", `${label}; the service decides the tier actually used`);
+  });
+  const statusText = isCodex ? (requested ? "Requested" : "Off") : "Codex only";
+  const inlineStatus = qs("#chat-fast-status");
+  if (inlineStatus) inlineStatus.textContent = statusText;
+  document.querySelectorAll("[data-chat-fast-setting-status]").forEach((status) => {
+    status.textContent = statusText;
+  });
 }
 
 async function loadChatModelsIntoSelect(provider) {
@@ -3677,6 +4096,10 @@ async function loadChatModelsIntoSelect(provider) {
     savePreferences();
   } catch (error) {
     console.warn("[io-workbench] could not load chat models", error);
+    if (select.dataset.modelProvider === targetProvider) {
+      select.innerHTML = `<option value="">CLI default</option>`;
+      select.value = "";
+    }
   } finally {
     if (select.dataset.modelProvider === targetProvider) select.disabled = false;
   }
@@ -3731,6 +4154,7 @@ function loadSessionOverridesIntoState(sessionId, session = null) {
     effort: state.preferences.chatEffort,
     mode: state.preferences.chatMode,
     thinking: state.preferences.chatThinking,
+    fast: state.preferences.chatFast,
   }, true);
   const localControls = normalizeSessionControls(getSessionOverridesFor(sessionId), true);
   const sessionControls = normalizeSessionControls(session, false);
@@ -3740,6 +4164,7 @@ function loadSessionOverridesIntoState(sessionId, session = null) {
     effort: "medium",
     mode: "default",
     thinking: false,
+    fast: false,
     ...globalControls,
     ...localControls,
     ...sessionControls,
@@ -3750,6 +4175,7 @@ function loadSessionOverridesIntoState(sessionId, session = null) {
   state.preferences.chatEffort = next.effort;
   state.preferences.chatMode = next.mode;
   state.preferences.chatThinking = next.thinking;
+  state.preferences.chatFast = next.fast;
   const effortSelect = qs("#chat-effort");
   if (effortSelect) effortSelect.value = next.effort;
   const modeSelect = qs("#chat-mode");
@@ -3771,7 +4197,9 @@ function loadSessionOverridesIntoState(sessionId, session = null) {
     savePreferences();
   }
   renderChatProviderPicker();
-  loadChatModelsIntoSelect(next.cli).catch(() => {});
+  if (!qs("#prompt-config-panel")?.classList.contains("hidden")) {
+    loadChatModelsIntoSelect(next.cli).catch(() => {});
+  }
   updateChatComposerState();
 }
 
@@ -3809,6 +4237,7 @@ function applyPreferences() {
   state.preferences.chatEffort = normalizeChatEffort(state.preferences.chatEffort);
   state.preferences.chatMode = normalizeChatMode(state.preferences.chatMode);
   state.preferences.chatThinking = normalizeChatThinking(state.preferences.chatThinking);
+  state.preferences.chatFast = normalizeChatFast(state.preferences.chatFast);
   savePreferences();
   document.body.classList.toggle("compact", !!state.preferences.compact);
   document.body.classList.toggle("wrap-output", !!state.preferences.wrapOutput);
@@ -3819,8 +4248,13 @@ function applyPreferences() {
   // Populate the chat-controls select widgets from current preferences.
   if (qs("#chat-effort")) qs("#chat-effort").value = state.preferences.chatEffort;
   if (qs("#chat-mode")) qs("#chat-mode").value = state.preferences.chatMode;
-  if (qs("#chat-model")) {
-    loadChatModelsIntoSelect(state.preferences.chatCli || state.preferences.chatProvider || "codex").catch(() => {});
+  updateChatFastControl();
+  const modelSelect = qs("#chat-model");
+  if (modelSelect && !modelSelect.options.length) {
+    modelSelect.disabled = true;
+    modelSelect.innerHTML = canLoadProtectedData()
+      ? `<option value="">Open prompt config to load models</option>`
+      : `<option value="">Sign in to load models</option>`;
   }
   if (state.codeEditor) {
     state.codeEditor.setOption("lineWrapping", !!state.preferences.wrapOutput);
@@ -3933,8 +4367,7 @@ async function loadProjects() {
   syncProjectOrder();
   const activeExists = state.projects.some((project) => project.path === state.activeProjectPath);
   if (!activeExists) {
-    state.activeProjectPath = state.projects[0]?.path || "";
-    window.localStorage.setItem("iowb.activeProjectPath", state.activeProjectPath);
+    setActiveProject(state.projects[0]?.path || "");
   }
   renderProjects();
 }
@@ -3951,24 +4384,132 @@ async function loadMetrics() {
 
 async function loadFiles() {
   const project = activeProjectName();
-  if (!project) return;
-  const path = qs("#files-path").value.trim() || ".";
-  const body = await api(`/api/projects/${encodeURIComponent(project)}/files?path=${encodeURIComponent(path)}`);
-  state.fileEntries = Array.isArray(body) ? body : body.entries || [];
-  state.fileSelectedPaths = new Set([...state.fileSelectedPaths].filter((selectedPath) => findFileEntryByPath(state.fileEntries, selectedPath)));
+  if (!project) {
+    state.fileLoadRequestId += 1;
+    state.fileLoading = false;
+    state.fileProjectPath = "";
+    state.fileEntries = [];
+    state.fileExpandedPaths.clear();
+    state.fileLoadedDirectoryPaths.clear();
+    state.fileLoadingDirectoryPaths.clear();
+    state.fileSelectedPaths.clear();
+    renderFileEntries();
+    return;
+  }
+  const projectPath = activeProjectPath();
+  const path = normalizeProjectPath(qs("#files-path").value.trim() || ".");
+  const requestId = ++state.fileLoadRequestId;
+  const contextChanged = state.fileProjectPath !== projectPath || state.fileRootPath !== path;
+  const expandedPaths = contextChanged
+    ? []
+    : [...state.fileExpandedPaths].sort((left, right) => left.split("/").length - right.split("/").length);
+  state.fileLoading = true;
+  if (contextChanged) {
+    state.fileEntries = [];
+    state.fileExpandedPaths.clear();
+    state.fileLoadedDirectoryPaths.clear();
+    state.fileLoadingDirectoryPaths.clear();
+    state.fileSelectedPaths.clear();
+    state.fileCreating = null;
+    state.fileRenamingPath = "";
+  }
   renderFileEntries();
+  try {
+    const body = await api(`/api/projects/${encodeURIComponent(project)}/files?path=${encodeURIComponent(path)}&maxDepth=1`);
+    if (
+      requestId !== state.fileLoadRequestId
+      || projectPath !== activeProjectPath()
+      || path !== normalizeProjectPath(qs("#files-path").value.trim() || ".")
+    ) return;
+    state.fileProjectPath = projectPath;
+    state.fileRootPath = path;
+    state.fileEntries = Array.isArray(body) ? body : body.entries || [];
+    state.fileLoadedDirectoryPaths = new Set([path]);
+    markLoadedFileDirectories(state.fileEntries);
+    state.fileExpandedPaths.clear();
+    for (const expandedPath of expandedPaths) {
+      if (!findFileEntryByPath(state.fileEntries, expandedPath)) continue;
+      state.fileExpandedPaths.add(expandedPath);
+      await loadFileDirectory(expandedPath);
+      if (requestId !== state.fileLoadRequestId || projectPath !== activeProjectPath()) return;
+    }
+    state.fileSelectedPaths = new Set(
+      [...state.fileSelectedPaths].filter((selectedPath) => findFileEntryByPath(state.fileEntries, selectedPath)),
+    );
+    renderFileBreadcrumbs(path);
+  } finally {
+    if (requestId === state.fileLoadRequestId) {
+      state.fileLoading = false;
+      renderFileEntries();
+    }
+  }
+}
+
+function markLoadedFileDirectories(entries) {
+  for (const entry of entries || []) {
+    if (entry.type !== "directory") continue;
+    state.fileLoadedDirectoryPaths.add(entry.path);
+  }
+}
+
+function replaceFileEntryChildren(entries, path, children) {
+  let replaced = false;
+  const nextEntries = (entries || []).map((entry) => {
+    if (entry.path === path) {
+      replaced = true;
+      return { ...entry, children };
+    }
+    const previousChildren = entry.children || [];
+    const nextChildren = replaceFileEntryChildren(previousChildren, path, children);
+    if (nextChildren !== previousChildren) {
+      replaced = true;
+      return { ...entry, children: nextChildren };
+    }
+    return entry;
+  });
+  return replaced ? nextEntries : entries;
+}
+
+async function loadFileDirectory(path) {
+  const normalizedPath = normalizeProjectPath(path);
+  if (
+    state.fileLoadedDirectoryPaths.has(normalizedPath)
+    || state.fileLoadingDirectoryPaths.has(normalizedPath)
+  ) return;
+  const project = activeProjectName();
+  const projectPath = activeProjectPath();
+  const requestId = state.fileLoadRequestId;
+  if (!project || !findFileEntryByPath(state.fileEntries, normalizedPath)) return;
+  state.fileLoadingDirectoryPaths.add(normalizedPath);
+  renderFileEntries();
+  try {
+    const body = await api(`/api/projects/${encodeURIComponent(project)}/files?path=${encodeURIComponent(normalizedPath)}&maxDepth=1`);
+    if (requestId !== state.fileLoadRequestId || projectPath !== activeProjectPath()) return;
+    const children = Array.isArray(body) ? body : body.entries || [];
+    state.fileEntries = replaceFileEntryChildren(state.fileEntries, normalizedPath, children);
+    state.fileLoadedDirectoryPaths.add(normalizedPath);
+    markLoadedFileDirectories(children);
+  } catch (error) {
+    state.fileExpandedPaths.delete(normalizedPath);
+    throw error;
+  } finally {
+    state.fileLoadingDirectoryPaths.delete(normalizedPath);
+    if (requestId === state.fileLoadRequestId) renderFileEntries();
+  }
 }
 
 function renderFileEntries(entries = state.fileEntries) {
   const target = qs("#files-tree");
+  if (!target) return;
   const filter = qs("#files-filter")?.value.trim().toLowerCase() || "";
   const visibleEntries = filterFileEntries(entries, filter);
+  target.setAttribute("aria-busy", state.fileLoading ? "true" : "false");
   renderFileToolbar(visibleEntries, filter);
   if (!visibleEntries.length) {
     target.innerHTML = `<div class="file-tree-empty">
       <span class="file-tree-empty-icon" aria-hidden="true"></span>
-      <strong>${filter ? "No matches found" : "No files found"}</strong>
-      <span>${filter ? "Try a different search." : "Check the selected project path."}</span>
+      <strong>${state.fileLoading ? "Loading files" : (filter ? "No matches found" : "No files found")}</strong>
+      <span>${state.fileLoading ? "Reading the selected project…" : (filter ? "Try a different search or expand more folders." : "Check the selected project path.")}</span>
     </div>`;
     return;
   }
@@ -4007,25 +4548,18 @@ function renderFileEntries(entries = state.fileEntries) {
     });
   });
 
-  target.querySelectorAll("[data-file-row-path]").forEach((row) => {
-    const activate = () => {
-      const path = row.dataset.fileRowPath;
+  target.querySelectorAll("[data-file-open]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const path = button.dataset.fileOpen;
       if (!path) return;
-      if (row.dataset.kind === "directory") {
-        toggleFileDirectory(path);
-        return;
+      if (button.dataset.kind === "directory") {
+        toggleFileDirectory(path).catch(showError);
+      } else {
+        openFile(path).catch(showError);
       }
-      openFile(path).catch(showError);
-    };
-    row.addEventListener("click", (event) => {
-      if (event.target.closest("input, button")) return;
-      activate();
     });
-    row.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      activate();
-    });
+  });
+  target.querySelectorAll("[data-file-row-path]").forEach((row) => {
     row.addEventListener("contextmenu", (event) => {
       event.preventDefault();
       const entry = findFileEntryByPath(state.fileEntries, row.dataset.fileRowPath);
@@ -4160,28 +4694,19 @@ function renderFolderBrowser() {
     ? `${entries.length} folder${entries.length === 1 ? "" : "s"}${!browser.showHidden && hiddenCount ? ` · ${hiddenCount} hidden` : ""}`
     : "No folders found.";
   list.innerHTML = entries.map((entry) => `
-    <article class="folder-row" data-folder-open-card="${escapeHtml(entry.path)}" tabindex="0" role="button" aria-label="Open ${escapeHtml(entry.name || entry.path)}">
-      <div class="folder-info">
+    <article class="folder-row">
+      <button type="button" class="folder-info" data-folder-open-card="${escapeHtml(entry.path)}" aria-label="Open ${escapeHtml(entry.name || entry.path)}">
         <strong>${escapeHtml(entry.name || entry.path)}</strong>
         <span>${escapeHtml(entry.path)}</span>
-      </div>
+      </button>
       <div class="folder-row-actions">
         <button type="button" class="icon-button" data-folder-open="${escapeHtml(entry.path)}" aria-label="Open folder" title="Open folder" data-symbol="open"></button>
         <button type="button" class="icon-button secondary-action" data-folder-select="${escapeHtml(entry.path)}" aria-label="${selectLabel}" title="${selectLabel}" data-symbol="${selectIcon}"></button>
       </div>
     </article>
   `).join("");
-  list.querySelectorAll("[data-folder-open-card]").forEach((card) => {
-    const open = () => loadFolderBrowser(card.dataset.folderOpenCard).catch(showError);
-    card.addEventListener("click", (event) => {
-      if (event.target.closest("button")) return;
-      open();
-    });
-    card.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      open();
-    });
+  list.querySelectorAll("[data-folder-open-card]").forEach((button) => {
+    button.addEventListener("click", () => loadFolderBrowser(button.dataset.folderOpenCard).catch(showError));
   });
   list.querySelectorAll("[data-folder-open]").forEach((button) => {
     button.addEventListener("click", () => loadFolderBrowser(button.dataset.folderOpen).catch(showError));
@@ -4332,13 +4857,15 @@ function renderFileToolbar(visibleEntries, filter) {
   });
 }
 
-function toggleFileDirectory(path) {
+async function toggleFileDirectory(path) {
   if (state.fileExpandedPaths.has(path)) {
     state.fileExpandedPaths.delete(path);
-  } else {
-    state.fileExpandedPaths.add(path);
+    renderFileEntries();
+    return;
   }
+  state.fileExpandedPaths.add(path);
   renderFileEntries();
+  await loadFileDirectory(path);
 }
 
 function toggleAllVisibleFilesSelection() {
@@ -4359,10 +4886,12 @@ function fileCreateRowHtml(createState, depth) {
   const iconKind = createState.directory ? "folder" : "file";
   return `<article class="file-tree-row creating file-tree-row-${escapeHtml(state.fileViewMode)}" data-file-inline-row="create" data-kind="${createState.directory ? "directory" : "file"}">
     <div class="file-tree-name" style="--file-depth:${depth}">
-      <span></span>
-      <span class="file-disclosure file" aria-hidden="true"></span>
-      <span class="file-icon file-icon-${iconKind}" aria-hidden="true"></span>
-      <input class="file-inline-input" data-file-create-input value="${name}" aria-label="${createState.directory ? "New folder name" : "New file name"}" />
+      <span class="file-tree-checkbox-spacer" aria-hidden="true"></span>
+      <span class="file-entry-edit">
+        <span class="file-disclosure file" aria-hidden="true"></span>
+        <span class="file-icon file-icon-${iconKind}" aria-hidden="true"></span>
+        <input class="file-inline-input" data-file-create-input value="${name}" aria-label="${createState.directory ? "New folder name" : "New file name"}" />
+      </span>
     </div>
     <span class="file-tree-size"></span>
     <span class="file-tree-modified"></span>
@@ -4504,6 +5033,7 @@ function fileEntryHtml(entry, depth) {
   const name = escapeHtml(entry.name);
   const isDirectory = entry.type === "directory";
   const expanded = isDirectory && state.fileExpandedPaths.has(entry.path);
+  const loading = isDirectory && state.fileLoadingDirectoryPaths.has(entry.path);
   const renaming = state.fileRenamingPath === entry.path;
   const checked = state.fileSelectedPaths.has(entry.path) ? " checked" : "";
   const iconKind = isDirectory ? (expanded ? "folder-open" : "folder") : fileIconKind(entry.name);
@@ -4511,14 +5041,13 @@ function fileEntryHtml(entry, depth) {
   const modified = escapeHtml(formatRelativeTime(entry.modified));
   const permissions = escapeHtml(filePermissions(entry));
   const rowMode = escapeHtml(state.fileViewMode);
+  const disclosure = `<span class="file-disclosure${expanded ? " open" : ""}${loading ? " loading" : ""}${isDirectory ? "" : " file"}" aria-hidden="true"></span>`;
   const displayName = renaming
-    ? `<input class="file-inline-input" data-file-rename-input="${path}" value="${name}" aria-label="Rename ${name}" />`
-    : `<span class="file-name">${name}</span>`;
-  return `<article class="file-tree-row${renaming ? " renaming" : ""} file-tree-row-${rowMode}" data-kind="${isDirectory ? "directory" : "file"}" data-file-row-path="${path}" role="button" tabindex="0" aria-label="${isDirectory ? "Open" : "Open file"} ${name}"${isDirectory ? ` aria-expanded="${expanded ? "true" : "false"}"` : ""}>
+    ? `<span class="file-entry-edit">${disclosure}<span class="file-icon file-icon-${iconKind}" aria-hidden="true"></span><input class="file-inline-input" data-file-rename-input="${path}" value="${name}" aria-label="Rename ${name}" /></span>`
+    : `<button type="button" class="file-entry-open" data-file-open="${path}" data-kind="${isDirectory ? "directory" : "file"}" aria-label="${isDirectory ? (expanded ? "Collapse" : "Expand") : "Open file"} ${name}"${isDirectory ? ` aria-expanded="${expanded ? "true" : "false"}"` : ""}>${disclosure}<span class="file-icon file-icon-${iconKind}" aria-hidden="true"></span><span class="file-name">${name}</span></button>`;
+  return `<article class="file-tree-row${renaming ? " renaming" : ""} file-tree-row-${rowMode}" data-kind="${isDirectory ? "directory" : "file"}" data-file-row-path="${path}">
     <div class="file-tree-name" style="--file-depth:${depth}">
       <input class="file-tree-checkbox" type="checkbox" data-file-select="${path}" aria-label="Select ${name}"${checked} />
-      <span class="file-disclosure${expanded ? " open" : ""}${isDirectory ? "" : " file"}" aria-hidden="true"></span>
-      <span class="file-icon file-icon-${iconKind}" aria-hidden="true"></span>
       ${displayName}
       <span class="file-tree-actions">
         <button type="button" class="icon-button" data-file-menu="${path}" aria-label="File actions" title="File actions" data-symbol="dots-vertical"></button>
@@ -4572,7 +5101,7 @@ async function handleFileContextAction(action, path) {
   closeFileContextMenu();
   if (!entry && !["copy-path"].includes(action)) return;
   if (action === "open") {
-    if (entry.type === "directory") toggleFileDirectory(path);
+    if (entry.type === "directory") await toggleFileDirectory(path);
     else await openFile(path);
   } else if (action === "new-file") {
     startCreateFileTreePath(false, path);
@@ -4654,6 +5183,63 @@ function editorModeForPath(filePath) {
   return null;
 }
 
+function editorModeAssetPaths(filePath) {
+  const mode = editorModeForPath(filePath);
+  const assets = {
+    css: ["/vendor/codemirror/mode/css.js"],
+    gfm: [
+      "/vendor/codemirror/mode/xml.js",
+      "/vendor/codemirror/mode/markdown.js",
+      "/vendor/codemirror/addon/mode/overlay.js",
+      "/vendor/codemirror/mode/gfm.js",
+    ],
+    htmlmixed: [
+      "/vendor/codemirror/mode/xml.js",
+      "/vendor/codemirror/mode/javascript.js",
+      "/vendor/codemirror/mode/css.js",
+      "/vendor/codemirror/mode/htmlmixed.js",
+    ],
+    javascript: ["/vendor/codemirror/mode/javascript.js"],
+    python: ["/vendor/codemirror/mode/python.js"],
+    rust: [
+      "/vendor/codemirror/addon/simple.js",
+      "/vendor/codemirror/mode/rust.js",
+    ],
+    shell: ["/vendor/codemirror/mode/shell.js"],
+    sql: ["/vendor/codemirror/mode/sql.js"],
+    toml: ["/vendor/codemirror/mode/toml.js"],
+    xml: ["/vendor/codemirror/mode/xml.js"],
+    yaml: ["/vendor/codemirror/mode/yaml.js"],
+  };
+  return assets[mode] || [];
+}
+
+async function ensureCodeEditor(filePath) {
+  try {
+    await Promise.all([
+      loadStylesheetOnce("/vendor/codemirror/codemirror.css"),
+      loadScriptOnce("/vendor/codemirror/codemirror.js"),
+    ]);
+    await Promise.all([
+      loadScriptOnce("/vendor/codemirror/addon/matchbrackets.js"),
+      loadScriptOnce("/vendor/codemirror/addon/closebrackets.js"),
+    ]);
+    initCodeEditor();
+  } catch (error) {
+    console.warn("[io-workbench] advanced editor unavailable; using textarea", error);
+    return false;
+  }
+
+  try {
+    for (const path of editorModeAssetPaths(filePath)) {
+      await loadScriptOnce(path);
+    }
+  } catch (error) {
+    console.warn("[io-workbench] syntax highlighting unavailable for file", filePath, error);
+  }
+  return Boolean(state.codeEditor);
+}
+
 function refreshEditorWidget(filePath = qs("#file-editor-path").value.trim()) {
   if (!state.codeEditor) return;
   state.codeEditor.setOption("mode", editorModeForPath(filePath));
@@ -4667,19 +5253,58 @@ async function openFile(filePath) {
 
 async function loadFileContent(filePath, options = {}) {
   const project = activeProjectName();
+  const projectPath = activeProjectPath();
   if (!project) return;
   if (!options.skipDirtyCheck && !confirmDiscardDirtyFile()) return;
-  const body = await api(`/api/projects/${encodeURIComponent(project)}/files/content?path=${encodeURIComponent(filePath)}`);
-  qs("#file-editor-path").value = body.path;
-  setEditorText(body.content || "");
-  refreshEditorWidget(body.path);
-  resetEditorSearch();
+  const requestId = ++state.fileContentRequestId;
+  const form = qs("#file-editor-form");
+  form?.setAttribute("aria-busy", "true");
+  qs("#file-editor-status").textContent = `Loading ${filePath}…`;
+  try {
+    const body = await api(`/api/projects/${encodeURIComponent(project)}/files/content?path=${encodeURIComponent(filePath)}`);
+    if (requestId !== state.fileContentRequestId || projectPath !== activeProjectPath()) return;
+    qs("#file-editor-path").value = body.path;
+    state.currentFileProjectPath = projectPath;
+    state.currentFileDirty = false;
+    setEditorText(body.content || "");
+    resetEditorSearch();
+    updateEditorChrome();
+    await ensureCodeEditor(body.path);
+    if (requestId === state.fileContentRequestId) refreshEditorWidget(body.path);
+  } finally {
+    if (requestId === state.fileContentRequestId) form?.setAttribute("aria-busy", "false");
+  }
+}
+
+function currentFileProjectMatches() {
+  return !state.currentFileProjectPath || state.currentFileProjectPath === activeProjectPath();
+}
+
+function requireCurrentFileProject() {
+  if (currentFileProjectMatches()) return;
+  const project = state.projects.find((item) => item.path === state.currentFileProjectPath);
+  throw new Error(`This file belongs to ${projectDisplayName(project || { path: state.currentFileProjectPath, name: state.currentFileProjectPath })}. Switch back to that project before changing it.`);
+}
+
+function closeFileEditor(options = {}) {
+  if (!options.skipDirtyCheck && !confirmDiscardDirtyFile()) return false;
+  state.fileContentRequestId += 1;
   state.currentFileDirty = false;
+  state.currentFileProjectPath = "";
+  qs("#file-editor-path").value = "";
+  qs("#file-editor-form")?.setAttribute("aria-busy", "false");
+  setEditorText("");
+  resetEditorSearch();
   updateEditorChrome();
+  if (options.focusFiles !== false) {
+    window.requestAnimationFrame(() => qs("#files-filter")?.focus());
+  }
+  return true;
 }
 
 async function saveFile(event) {
   event.preventDefault();
+  requireCurrentFileProject();
   const project = activeProjectName();
   const filePath = qs("#file-editor-path").value.trim();
   if (!project || !filePath) return;
@@ -4697,6 +5322,7 @@ async function saveFile(event) {
 }
 
 async function createPath(directory) {
+  requireCurrentFileProject();
   const project = activeProjectName();
   const filePath = qs("#file-editor-path").value.trim();
   if (!project || !filePath) return;
@@ -4713,6 +5339,7 @@ async function createPath(directory) {
 }
 
 async function deletePath() {
+  requireCurrentFileProject();
   const filePath = qs("#file-editor-path").value.trim();
   if (!filePath) return;
   if (!window.confirm(`Delete ${filePath}?`)) return;
@@ -4726,17 +5353,18 @@ async function deleteFilePath(filePath) {
     method: "DELETE",
     body: JSON.stringify({ filePath }),
   });
-  if (qs("#file-editor-path").value.trim() === filePath) {
-    qs("#file-editor-path").value = "";
-    setEditorText("");
-    state.currentFileDirty = false;
-    updateEditorChrome();
+  if (
+    qs("#file-editor-path").value.trim() === filePath
+    && state.currentFileProjectPath === activeProjectPath()
+  ) {
+    closeFileEditor({ skipDirtyCheck: true, focusFiles: false });
   }
   await loadFiles();
   showToast(`Deleted ${filePath}`, "ok");
 }
 
 async function renamePath() {
+  requireCurrentFileProject();
   const oldPath = qs("#file-editor-path").value.trim();
   const newPath = qs("#file-rename-path").value.trim();
   await renameFilePath(oldPath, newPath);
@@ -4750,7 +5378,10 @@ async function renameFilePath(oldPath, newPath) {
     method: "PUT",
     body: JSON.stringify({ oldPath, newPath }),
   });
-  if (qs("#file-editor-path").value.trim() === oldPath) {
+  if (
+    qs("#file-editor-path").value.trim() === oldPath
+    && state.currentFileProjectPath === activeProjectPath()
+  ) {
     qs("#file-editor-path").value = newPath;
     refreshEditorWidget(newPath);
     updateEditorChrome();
@@ -4767,10 +5398,7 @@ async function uploadProjectFiles() {
   const formData = new FormData();
   formData.append("targetPath", state.fileUploadTargetPath || qs("#files-path").value.trim() || ".");
   files.forEach((file) => formData.append("files", file));
-  const body = await apiUpload(`/api/projects/${encodeURIComponent(project)}/files/upload`, formData);
-  setEditorText(JSON.stringify(body, null, 2));
-  state.currentFileDirty = false;
-  updateEditorChrome();
+  await apiUpload(`/api/projects/${encodeURIComponent(project)}/files/upload`, formData);
   qs("#file-upload-input").value = "";
   state.fileUploadTargetPath = "";
   await loadFiles();
@@ -4786,11 +5414,8 @@ async function uploadProjectFolder() {
   formData.append("targetPath", qs("#files-path").value.trim() || ".");
   formData.append("relativePaths", JSON.stringify(relativePaths));
   files.forEach((file) => formData.append("files", file));
-  const body = await apiUpload(`/api/projects/${encodeURIComponent(project)}/files/upload`, formData);
-  setEditorText(JSON.stringify(body, null, 2));
+  await apiUpload(`/api/projects/${encodeURIComponent(project)}/files/upload`, formData);
   qs("#folder-upload-input").value = "";
-  state.currentFileDirty = false;
-  updateEditorChrome();
   await loadFiles();
   showToast(`Uploaded ${files.length} folder file${files.length === 1 ? "" : "s"}`, "ok");
 }
@@ -4823,6 +5448,7 @@ async function downloadFilePath(filePath) {
 }
 
 async function reloadCurrentFile() {
+  requireCurrentFileProject();
   const filePath = qs("#file-editor-path").value.trim();
   if (!filePath || !confirmDiscardDirtyFile()) return;
   await loadFileContent(filePath, { skipDirtyCheck: true });
@@ -4847,18 +5473,35 @@ function confirmDiscardDirtyFile() {
 }
 
 function updateEditorChrome() {
-  const value = editorText();
-  const lineCount = Math.max(1, value.split("\n").length);
-  qs("#file-editor-lines").textContent = Array.from({ length: lineCount }, (_, index) => index + 1).join("\n");
-  const beforeCursor = value.slice(0, editorCursorIndex());
-  const line = beforeCursor.split("\n").length;
-  const col = beforeCursor.length - beforeCursor.lastIndexOf("\n");
+  let line;
+  let col;
+  if (state.codeEditor) {
+    const cursor = state.codeEditor.getCursor();
+    line = cursor.line + 1;
+    col = cursor.ch + 1;
+  } else {
+    const value = editorText();
+    const lineCount = Math.max(1, value.split("\n").length);
+    if (lineCount !== state.fileEditorLineCount) {
+      qs("#file-editor-lines").textContent = Array.from({ length: lineCount }, (_, index) => index + 1).join("\n");
+      state.fileEditorLineCount = lineCount;
+    }
+    const beforeCursor = value.slice(0, editorCursorIndex());
+    line = beforeCursor.split("\n").length;
+    col = beforeCursor.length - beforeCursor.lastIndexOf("\n");
+  }
   const filePath = qs("#file-editor-path").value.trim();
+  const projectMismatch = Boolean(filePath && !currentFileProjectMatches());
   document.body.classList.toggle("files-editor-open", !!filePath);
   qs("#file-editor-position").textContent = `Ln ${line}, Col ${col}`;
   qs("#file-editor-status").textContent = filePath
-    ? `${state.currentFileDirty ? "Unsaved" : "Saved"} · ${filePath}`
+    ? `${projectMismatch ? "Previous project" : (state.currentFileDirty ? "Unsaved" : "Saved")} · ${filePath}`
     : "No file loaded";
+  qs("#file-editor-status")?.classList.toggle("warn", projectMismatch);
+  ["#file-editor-form button[type='submit']", "#delete-file", "#reload-file", "#rename-file"].forEach((selector) => {
+    const control = qs(selector);
+    if (control) control.disabled = !filePath || projectMismatch;
+  });
   updateEditorSearchStatus();
 }
 
@@ -5525,9 +6168,18 @@ function updateChatComposerState() {
   const submit = qs("#chat-submit");
   const thinking = qs("#chat-thinking-toggle");
   const hasPrompt = Boolean(input?.value.trim());
+  const hasProject = Boolean(activeProjectPath());
   const canSubmit = hasPrompt || state.chatImages.length > 0;
   const stopping = selectedChatIsStopping();
   const busy = Boolean(selectedRunningChatSession() || state.chatProcessing || stopping);
+
+  if (input) {
+    input.disabled = !hasProject;
+    input.placeholder = hasProject ? "Ask the agent" : "Add a project to start chatting";
+  }
+  qs("#chat-form")?.classList.toggle("no-project", !hasProject);
+  const promptConfigToggle = qs("#prompt-config-toggle");
+  if (promptConfigToggle) promptConfigToggle.disabled = !hasProject;
 
   if (clear) {
     clear.classList.toggle("is-empty", !hasPrompt);
@@ -5541,8 +6193,9 @@ function updateChatComposerState() {
     thinking.setAttribute("aria-label", enabled ? "Disable thinking" : "Enable thinking");
     thinking.title = enabled ? "Disable thinking" : "Enable thinking";
   }
+  updateChatFastControl();
   if (submit) {
-    submit.disabled = stopping || (!busy && !canSubmit);
+    submit.disabled = stopping || (!busy && (!hasProject || !canSubmit));
     submit.dataset.symbol = busy ? "stop" : "send";
     submit.setAttribute("aria-label", stopping ? "Stopping" : (busy ? "Abort chat" : "Send"));
     submit.title = stopping ? "Stopping" : (busy ? "Abort chat" : "Send");
@@ -8070,6 +8723,7 @@ function connectWs() {
           model: state.preferences.chatModel || "",
           effort: state.preferences.chatEffort || "",
           mode: state.preferences.chatMode || "",
+          fast: state.preferences.chatFast ?? false,
           receivedAt: formatReceivedDateTime(receivedAt),
         };
         const finalizeBubble = (entry) => {
@@ -8088,6 +8742,7 @@ function connectWs() {
             model: prev.model || state.preferences.chatModel || "",
             effort: prev.effort || state.preferences.chatEffort || "",
             mode: prev.mode || state.preferences.chatMode || "",
+            fast: prev.fast ?? state.preferences.chatFast ?? false,
             receivedAt: formatReceivedDateTime(receivedAt),
           };
           if (prev.sentAt) provisional.elapsed = formatElapsed(prev.sentAt, receivedAt);
@@ -8109,6 +8764,7 @@ function connectWs() {
                 model: prev2.model || state.preferences.chatModel || "",
                 effort: prev2.effort || state.preferences.chatEffort || "",
                 mode: prev2.mode || state.preferences.chatMode || "",
+                fast: prev2.fast ?? state.preferences.chatFast ?? false,
                 receivedAt: formatReceivedDateTime(receivedAt),
                 tokenUsage,
               };
@@ -8183,6 +8839,7 @@ function connectWs() {
           effort: payload.effort ?? prev.effort ?? state.preferences.chatEffort ?? "",
           mode: payload.mode ?? prev.mode ?? state.preferences.chatMode ?? "",
           thinking: payload.thinking ?? prev.thinking ?? state.preferences.chatThinking ?? false,
+          fast: payload.fast ?? prev.fast ?? state.preferences.chatFast ?? false,
           receivedAt: formatReceivedDateTime(receivedAt),
           tokenUsage,
         };
@@ -8371,6 +9028,7 @@ async function switchView(view) {
   if (activeView() === "files" && view !== "files" && !confirmDiscardDirtyFile()) {
     return false;
   }
+  if (view !== "chat") closeChatEditFromHerePicker();
   document.querySelectorAll("button[data-view]").forEach((item) => item.classList.remove("active"));
   document.querySelectorAll(".view").forEach((item) => {
     item.classList.remove("active");
@@ -8389,7 +9047,11 @@ async function switchView(view) {
   closeMoreSheet();
   closeSidebar();
   window.localStorage.setItem("iowb.lastView", view);
-  await loadView(view);
+  if (view === "shell") {
+    await Promise.all([ensureXterm(), loadView(view)]);
+  } else {
+    await loadView(view);
+  }
   if (!panel.isConnected) return false;
   updateMainHeader(view);
   if (view === "shell") {
@@ -8970,18 +9632,7 @@ function commandPaletteCommands() {
       disabled: () => !selectedRunningChatSession(),
       run: async () => {
         const selectedRun = selectedRunningChatSession();
-        if (await switchView("chat") && selectedRun && state.ws?.readyState === WebSocket.OPEN) {
-          state.chatStoppingSessionId = selectedRun.sessionId;
-          updateProcessingLabel("Stopping");
-          rememberCurrentChatSession({ sessionId: selectedRun.sessionId, live: true, status: "running" });
-          state.ws.send(JSON.stringify({
-            type: "abort_session",
-            provider: selectedRun.provider,
-            sessionId: selectedRun.sessionId,
-          }));
-          updateChatComposerState();
-          scheduleChatReconciliation(selectedRun.sessionId, { delayMs: CHAT_ACTIVE_POLL_INTERVAL_MS });
-        }
+        if (await switchView("chat")) requestAbortSelectedChatSession(selectedRun);
       },
     },
     {
@@ -9097,6 +9748,7 @@ function isCommandDisabled(command) {
 }
 
 function openCommandPalette() {
+  closeChatEditFromHerePicker();
   state.commandPalette.open = true;
   state.commandPalette.query = "";
   state.commandPalette.selectedIndex = 0;
@@ -9350,6 +10002,7 @@ function bindForms() {
   });
   qs("#sidebar-new-project")?.addEventListener("click", openAddProjectFolderBrowser);
   qs("#sidebar-manage-projects")?.addEventListener("click", openAddProjectFolderBrowser);
+  qs("#chat-empty-add-project")?.addEventListener("click", openAddProjectFolderBrowser);
   qs("#sidebar-refresh")?.addEventListener("click", (event) => {
     withButtonLoading(event.currentTarget, async () => {
       await Promise.all([
@@ -9523,6 +10176,7 @@ function bindForms() {
     goToEditorLine();
   });
   qs("#file-editor-form").addEventListener("submit", (event) => saveFile(event).catch(showError));
+  qs("#editor-close")?.addEventListener("click", () => closeFileEditor());
   qs("#create-file").addEventListener("click", () => startCreateFileTreePath(false, qs("#files-path")?.value || "."));
   qs("#create-directory").addEventListener("click", () => startCreateFileTreePath(true, qs("#files-path")?.value || "."));
   qs("#editor-create-file")?.addEventListener("click", () => startCreateFileTreePath(false, qs("#files-path")?.value || "."));
@@ -9619,6 +10273,9 @@ function bindForms() {
     updatePendingChatProvider(chatCliValue());
     updateChatComposerState();
   });
+  qs("#chat-fast-toggle")?.addEventListener("change", (event) => {
+    setChatFastRequested(event.currentTarget.checked);
+  });
   qs("#reload-chat-session")?.addEventListener("click", (event) => {
     const sessionId = state.chatSessionId || state.preferences.lastChatSessionId || "";
     if (!sessionId) return;
@@ -9634,6 +10291,7 @@ function bindForms() {
   });
   qs("#chat-prompt").addEventListener("focus", autosizeChatPrompt);
   qs("#chat-prompt").addEventListener("keydown", (event) => {
+    if (handleChatEditFromHereKeydown(event)) return;
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       qs("#chat-form")?.requestSubmit();
@@ -9725,20 +10383,7 @@ function bindForms() {
     if (selectedChatIsStopping()) return;
     const selectedRun = selectedRunningChatSession();
     if (selectedRun) {
-      if (state.ws?.readyState !== WebSocket.OPEN) {
-        showError(new Error("Chat connection is not ready."));
-        return;
-      }
-      state.chatStoppingSessionId = selectedRun.sessionId;
-      updateProcessingLabel("Stopping");
-      rememberCurrentChatSession({ sessionId: selectedRun.sessionId, live: true, status: "running" });
-      state.ws.send(JSON.stringify({
-        type: "abort_session",
-        provider: selectedRun.provider,
-        sessionId: selectedRun.sessionId,
-      }));
-      updateChatComposerState();
-      scheduleChatReconciliation(selectedRun.sessionId, { delayMs: CHAT_ACTIVE_POLL_INTERVAL_MS });
+      requestAbortSelectedChatSession(selectedRun);
       return;
     }
     const projectPath = activeProjectPath();
@@ -9766,11 +10411,13 @@ function bindForms() {
     const effort = chatEffortValue();
     const mode = chatModeValue();
     const thinking = chatThinkingValue();
+    const fast = chatFastValue();
     state.preferences.chatCli = cli;
     state.preferences.chatModel = model;
     state.preferences.chatEffort = effort;
     state.preferences.chatMode = mode;
     state.preferences.chatThinking = thinking;
+    state.preferences.chatFast = fast;
     savePreferences();
 
     const startedAt = new Date().toISOString();
@@ -9783,7 +10430,7 @@ function bindForms() {
     ensureChatPromptHistoryScope(sessionId);
     rememberChatPrompt(qs("#chat-prompt").value.trim());
     if (sessionId) {
-      saveSessionOverrides(sessionId, { cli, model, effort, mode, thinking, sentAt: startedAt });
+      saveSessionOverrides(sessionId, { cli, model, effort, mode, thinking, fast, sentAt: startedAt });
       rememberSidebarSessionStatus({ sessionId, provider: cli, status: "starting" });
     }
     const message = {
@@ -9795,6 +10442,7 @@ function bindForms() {
       effort,
       mode,
       thinking: thinking || undefined,
+      fast,
     };
     if (sessionId) message.sessionId = sessionId;
     state.ws.send(JSON.stringify(message));
@@ -9815,7 +10463,7 @@ function bindForms() {
     // Show the user prompt in the chat with right-aligned styling, plus the
     // current overrides footer so the data below the prompt is visible.
     appendUserPromptToChat(prompt, {
-      cli, model, effort, mode, thinking, sentAt: startedAt,
+      cli, model, effort, mode, thinking, fast, sentAt: startedAt,
     });
     const currentMessages = chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.messages : [];
     const nextMessages = currentMessages.concat({
@@ -9823,7 +10471,7 @@ function bindForms() {
       role: "user",
       content: prompt,
       timestamp: startedAt,
-      metadata: { cli, model, effort, mode, thinking, sentAt: startedAt },
+      metadata: { cli, model, effort, mode, thinking, fast, sentAt: startedAt },
     });
     chatHistoryWindow = {
       sessionId,
@@ -9892,11 +10540,6 @@ async function bootstrapProtected() {
   await loadSidebarState().catch(() => {});
   await loadSharedPinnedChatSessions().catch(() => {});
   await loadProjects().catch(showError);
-  await Promise.allSettled([
-    loadSettings().catch(showError),
-    loadMetrics().catch(showError),
-    loadDbConnections().catch(showError),
-  ]);
   applyPreferences();
   // Re-apply the most recently persisted chat session overrides so the
   // chat-controls row reflects what was used for the last conversation.
@@ -10164,8 +10807,28 @@ function initCodeEditor() {
     updateEditorChrome();
   });
   state.codeEditor.on("cursorActivity", updateEditorChrome);
-  state.codeEditor.on("scroll", updateEditorChrome);
   refreshEditorWidget();
+}
+
+async function ensureXterm() {
+  if (state.shellTerm) return true;
+  const output = qs("#shell-output");
+  output?.setAttribute("aria-busy", "true");
+  try {
+    await Promise.all([
+      loadStylesheetOnce("/vendor/xterm/xterm.css"),
+      loadScriptOnce("/vendor/xterm/xterm.js"),
+    ]);
+    initXterm();
+    renderShell();
+    return Boolean(state.shellTerm);
+  } catch (error) {
+    console.warn("[io-workbench] enhanced terminal unavailable; using text fallback", error);
+    renderShell();
+    return false;
+  } finally {
+    output?.setAttribute("aria-busy", "false");
+  }
 }
 
 function initXterm() {
@@ -10202,8 +10865,6 @@ bindCommandPalette();
 bindForms();
 applyPreferences();
 setSettingsTab(state.activeSettingsTab);
-initCodeEditor();
-initXterm();
 registerServiceWorker();
 syncNavigationState();
 updateEditorChrome();

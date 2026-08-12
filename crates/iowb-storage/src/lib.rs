@@ -110,6 +110,8 @@ pub struct StoredDurableChatRun {
     pub user_id: Option<String>,
     pub session_id: String,
     pub native_session_id: Option<String>,
+    pub user_message_id: Option<String>,
+    pub native_before_turn_id: Option<String>,
     pub provider: String,
     pub prompt: String,
     pub project_path: String,
@@ -117,6 +119,7 @@ pub struct StoredDurableChatRun {
     pub effort: Option<String>,
     pub mode: Option<String>,
     pub thinking: Option<bool>,
+    pub fast: Option<bool>,
     pub status: String,
     pub auto_resume: bool,
     pub resume_attempts: u32,
@@ -142,6 +145,8 @@ impl StoredDurableChatRun {
             user_id,
             session_id: session_id.into(),
             native_session_id: None,
+            user_message_id: None,
+            native_before_turn_id: None,
             provider: provider.into(),
             prompt: prompt.into(),
             project_path: project_path.into(),
@@ -149,6 +154,7 @@ impl StoredDurableChatRun {
             effort: None,
             mode: None,
             thinking: None,
+            fast: None,
             status: "running".to_string(),
             auto_resume: true,
             resume_attempts: 0,
@@ -159,6 +165,19 @@ impl StoredDurableChatRun {
             completed_at: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateSessionForkOutcome {
+    Created,
+    Existing(StoredSessionFork),
+    SourceActive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSessionFork {
+    pub before_message_id: String,
+    pub destination_session_id: String,
 }
 
 impl Storage {
@@ -346,6 +365,7 @@ impl Storage {
                     effort TEXT,
                     mode TEXT,
                     thinking INTEGER,
+                    fast INTEGER,
                     status TEXT NOT NULL,
                     auto_resume INTEGER NOT NULL DEFAULT 1,
                     resume_attempts INTEGER NOT NULL DEFAULT 0,
@@ -353,7 +373,9 @@ impl Storage {
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     recovered_at TEXT,
-                    completed_at TEXT
+                    completed_at TEXT,
+                    user_message_id TEXT,
+                    native_before_turn_id TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_durable_chat_runs_recoverable
@@ -374,6 +396,20 @@ impl Storage {
 
                 CREATE INDEX IF NOT EXISTS idx_session_drafts_session
                     ON session_drafts(session_id, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS session_forks (
+                    user_id TEXT NOT NULL,
+                    source_session_id TEXT NOT NULL,
+                    before_message_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    destination_session_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id, source_session_id, request_id),
+                    FOREIGN KEY(destination_session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_forks_destination
+                    ON session_forks(destination_session_id);
 
                 CREATE TABLE IF NOT EXISTS fcm_device_tokens (
                     token TEXT PRIMARY KEY,
@@ -408,8 +444,51 @@ impl Storage {
                 )?;
             }
 
+            for column in ["user_message_id", "native_before_turn_id"] {
+                let present: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('durable_chat_runs') WHERE name = ?1",
+                    params![column],
+                    |row| row.get(0),
+                )?;
+                if present == 0 {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE durable_chat_runs ADD COLUMN {column} TEXT;"
+                    ))?;
+                }
+            }
+
+            let has_fast: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('durable_chat_runs') WHERE name = 'fast'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_fast == 0 {
+                conn.execute_batch("ALTER TABLE durable_chat_runs ADD COLUMN fast INTEGER;")?;
+            }
+
+            conn.execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_durable_chat_runs_user_message
+                    ON durable_chat_runs(session_id, user_message_id);
+
+                CREATE TABLE IF NOT EXISTS session_forks (
+                    user_id TEXT NOT NULL,
+                    source_session_id TEXT NOT NULL,
+                    before_message_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    destination_session_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(user_id, source_session_id, request_id),
+                    FOREIGN KEY(destination_session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_forks_destination
+                    ON session_forks(destination_session_id);
+                "#,
+            )?;
+
             conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '1')",
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '3')",
                 [],
             )?;
 
@@ -765,38 +844,7 @@ impl Storage {
     }
 
     pub fn upsert_session(&self, session: &SessionSummary) -> Result<()> {
-        self.with_connection(|conn| {
-            let metadata_blob = serialize_session_metadata(session);
-            conn.execute(
-                r#"
-                INSERT INTO sessions (
-                    id, provider, project_path, title, message_count, last_activity, active, model, metadata
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                ON CONFLICT(id) DO UPDATE SET
-                    provider = excluded.provider,
-                    project_path = excluded.project_path,
-                    title = excluded.title,
-                    message_count = excluded.message_count,
-                    last_activity = excluded.last_activity,
-                    active = excluded.active,
-                    model = excluded.model,
-                    metadata = excluded.metadata
-                "#,
-                params![
-                    session.id,
-                    session.provider.as_str(),
-                    session.project_path,
-                    session.title,
-                    session.message_count as i64,
-                    session.last_activity.to_rfc3339(),
-                    if session.active { 1 } else { 0 },
-                    session.model,
-                    metadata_blob,
-                ],
-            )?;
-            Ok(())
-        })
+        self.with_connection(|conn| upsert_session_conn(conn, session))
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
@@ -957,41 +1005,21 @@ impl Storage {
     /// construct the value with [`StoredDurableChatRun::new`], which starts it
     /// in the `running` state with recovery enabled.
     pub fn create_durable_chat_run(&self, run: &StoredDurableChatRun) -> Result<()> {
+        self.with_connection(|conn| insert_durable_chat_run_conn(conn, run))
+    }
+
+    pub fn create_durable_chat_turn(
+        &self,
+        session: &SessionSummary,
+        message: &ChatMessage,
+        run: &StoredDurableChatRun,
+    ) -> Result<()> {
         self.with_connection(|conn| {
-            conn.execute(
-                r#"
-                INSERT INTO durable_chat_runs (
-                    id, user_id, session_id, native_session_id, provider, prompt,
-                    project_path, model, effort, mode, thinking, status, auto_resume,
-                    resume_attempts, last_error, created_at, updated_at, recovered_at,
-                    completed_at
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?19
-                )
-                "#,
-                params![
-                    run.id,
-                    run.user_id,
-                    run.session_id,
-                    run.native_session_id,
-                    run.provider,
-                    run.prompt,
-                    run.project_path,
-                    run.model,
-                    run.effort,
-                    run.mode,
-                    run.thinking.map(i64::from),
-                    run.status,
-                    i64::from(run.auto_resume),
-                    i64::from(run.resume_attempts),
-                    run.last_error,
-                    run.created_at.to_rfc3339(),
-                    run.updated_at.to_rfc3339(),
-                    run.recovered_at.map(|time| time.to_rfc3339()),
-                    run.completed_at.map(|time| time.to_rfc3339()),
-                ],
-            )?;
+            let transaction = conn.unchecked_transaction()?;
+            upsert_session_conn(&transaction, session)?;
+            insert_message_conn(&transaction, &session.id, message)?;
+            insert_durable_chat_run_conn(&transaction, run)?;
+            transaction.commit()?;
             Ok(())
         })
     }
@@ -1003,7 +1031,7 @@ impl Storage {
                 SELECT id, user_id, session_id, native_session_id, provider, prompt,
                        project_path, model, effort, mode, thinking, status, auto_resume,
                        resume_attempts, last_error, created_at, updated_at, recovered_at,
-                       completed_at
+                       completed_at, user_message_id, native_before_turn_id, fast
                 FROM durable_chat_runs
                 WHERE id = ?1
                 "#,
@@ -1049,7 +1077,7 @@ impl Storage {
                 SELECT id, user_id, session_id, native_session_id, provider, prompt,
                        project_path, model, effort, mode, thinking, status, auto_resume,
                        resume_attempts, last_error, created_at, updated_at, recovered_at,
-                       completed_at
+                       completed_at, user_message_id, native_before_turn_id, fast
                 FROM durable_chat_runs
                 WHERE status IN ('running', 'recovering')
                   AND auto_resume = 1
@@ -1080,7 +1108,7 @@ impl Storage {
                 SELECT id, user_id, session_id, native_session_id, provider, prompt,
                        project_path, model, effort, mode, thinking, status, auto_resume,
                        resume_attempts, last_error, created_at, updated_at, recovered_at,
-                       completed_at
+                       completed_at, user_message_id, native_before_turn_id, fast
                 FROM durable_chat_runs
                 WHERE status IN ('running', 'recovering')
                 ORDER BY created_at ASC, id ASC
@@ -1120,7 +1148,7 @@ impl Storage {
                 RETURNING id, user_id, session_id, native_session_id, provider, prompt,
                           project_path, model, effort, mode, thinking, status, auto_resume,
                           resume_attempts, last_error, created_at, updated_at, recovered_at,
-                          completed_at
+                          completed_at, user_message_id, native_before_turn_id, fast
                 "#,
                 params![now, run_id, i64::from(max_resume_attempts)],
                 map_durable_chat_run_row,
@@ -1172,23 +1200,7 @@ impl Storage {
     }
 
     pub fn append_message(&self, session_id: &str, message: &ChatMessage) -> Result<()> {
-        self.with_connection(|conn| {
-            conn.execute(
-                r#"
-                INSERT INTO messages (id, session_id, role, content, timestamp, metadata)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                "#,
-                params![
-                    message.id,
-                    session_id,
-                    role_to_str(message.role),
-                    message.content,
-                    message.timestamp.to_rfc3339(),
-                    serde_json::to_string(&message.metadata)?,
-                ],
-            )?;
-            Ok(())
-        })
+        self.with_connection(|conn| insert_message_conn(conn, session_id, message))
     }
 
     /// Patch the JSON metadata column for an existing message. Pass `Value::Null`
@@ -1210,6 +1222,42 @@ impl Storage {
                 WHERE session_id = ?2 AND id = ?3
                 "#,
                 params![serde_json::to_string(&metadata)?, session_id, message_id,],
+            )?;
+            Ok(updated > 0)
+        })
+    }
+
+    pub fn merge_message_metadata(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        metadata: Value,
+    ) -> Result<bool> {
+        self.with_connection(|conn| {
+            let current = conn
+                .query_row(
+                    r#"
+                    SELECT metadata
+                    FROM messages
+                    WHERE session_id = ?1 AND id = ?2
+                    "#,
+                    params![session_id, message_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(current) = current else {
+                return Ok(false);
+            };
+            let mut merged = serde_json::from_str::<Value>(&current)
+                .unwrap_or_else(|_| Value::Object(Default::default()));
+            merge_metadata_patch(&mut merged, metadata);
+            let updated = conn.execute(
+                r#"
+                UPDATE messages
+                SET metadata = ?1
+                WHERE session_id = ?2 AND id = ?3
+                "#,
+                params![serde_json::to_string(&merged)?, session_id, message_id],
             )?;
             Ok(updated > 0)
         })
@@ -1437,7 +1485,7 @@ impl Storage {
                 SELECT id, user_id, session_id, native_session_id, provider, prompt,
                        project_path, model, effort, mode, thinking, status, auto_resume,
                        resume_attempts, last_error, created_at, updated_at, recovered_at,
-                       completed_at
+                       completed_at, user_message_id, native_before_turn_id, fast
                 FROM durable_chat_runs
                 WHERE session_id = ?1
                 ORDER BY created_at DESC, id DESC
@@ -1448,6 +1496,137 @@ impl Storage {
             )
             .optional()
             .map_err(StorageError::from)
+        })
+    }
+
+    pub fn durable_chat_run_for_user_message(
+        &self,
+        session_id: &str,
+        user_message_id: &str,
+    ) -> Result<Option<StoredDurableChatRun>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT id, user_id, session_id, native_session_id, provider, prompt,
+                       project_path, model, effort, mode, thinking, status, auto_resume,
+                       resume_attempts, last_error, created_at, updated_at, recovered_at,
+                       completed_at, user_message_id, native_before_turn_id, fast
+                FROM durable_chat_runs
+                WHERE session_id = ?1 AND user_message_id = ?2
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                "#,
+                params![session_id, user_message_id],
+                map_durable_chat_run_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    pub fn get_session_fork(
+        &self,
+        user_id: &str,
+        source_session_id: &str,
+        request_id: &str,
+    ) -> Result<Option<StoredSessionFork>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT before_message_id, destination_session_id
+                FROM session_forks
+                WHERE user_id = ?1 AND source_session_id = ?2 AND request_id = ?3
+                "#,
+                params![user_id, source_session_id, request_id],
+                |row| {
+                    Ok(StoredSessionFork {
+                        before_message_id: row.get(0)?,
+                        destination_session_id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_fork(
+        &self,
+        user_id: &str,
+        source_session_id: &str,
+        before_message_id: &str,
+        request_id: &str,
+        destination: &SessionSummary,
+        messages: &[ChatMessage],
+        draft: &str,
+        require_source_inactive: bool,
+    ) -> Result<CreateSessionForkOutcome> {
+        self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let existing = transaction
+                .query_row(
+                    r#"
+                    SELECT before_message_id, destination_session_id
+                    FROM session_forks
+                    WHERE user_id = ?1 AND source_session_id = ?2 AND request_id = ?3
+                    "#,
+                    params![user_id, source_session_id, request_id],
+                    |row| {
+                        Ok(StoredSessionFork {
+                            before_message_id: row.get(0)?,
+                            destination_session_id: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                return Ok(CreateSessionForkOutcome::Existing(existing));
+            }
+
+            if require_source_inactive {
+                let source_active = transaction
+                    .query_row(
+                        "SELECT active FROM sessions WHERE id = ?1",
+                        params![source_session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                if source_active == Some(1) {
+                    return Ok(CreateSessionForkOutcome::SourceActive);
+                }
+            }
+
+            upsert_session_conn(&transaction, destination)?;
+            for message in messages {
+                insert_message_conn(&transaction, &destination.id, message)?;
+            }
+            let now = Utc::now().to_rfc3339();
+            transaction.execute(
+                r#"
+                INSERT INTO session_drafts (user_id, session_id, content, updated_at)
+                VALUES (?1, ?2, ?3, ?4)
+                "#,
+                params![user_id, destination.id, draft, now],
+            )?;
+            transaction.execute(
+                r#"
+                INSERT INTO session_forks (
+                    user_id, source_session_id, before_message_id, request_id,
+                    destination_session_id, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                params![
+                    user_id,
+                    source_session_id,
+                    before_message_id,
+                    request_id,
+                    destination.id,
+                    now,
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(CreateSessionForkOutcome::Created)
         })
     }
 
@@ -2366,8 +2545,101 @@ fn parse_time_sql(raw: String) -> rusqlite::Result<DateTime<Utc>> {
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
 }
 
+fn upsert_session_conn(conn: &Connection, session: &SessionSummary) -> Result<()> {
+    let metadata_blob = serialize_session_metadata(session);
+    conn.execute(
+        r#"
+        INSERT INTO sessions (
+            id, provider, project_path, title, message_count, last_activity, active, model, metadata
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(id) DO UPDATE SET
+            provider = excluded.provider,
+            project_path = excluded.project_path,
+            title = excluded.title,
+            message_count = excluded.message_count,
+            last_activity = excluded.last_activity,
+            active = excluded.active,
+            model = excluded.model,
+            metadata = excluded.metadata
+        "#,
+        params![
+            session.id,
+            session.provider.as_str(),
+            session.project_path,
+            session.title,
+            session.message_count as i64,
+            session.last_activity.to_rfc3339(),
+            if session.active { 1 } else { 0 },
+            session.model,
+            metadata_blob,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_message_conn(conn: &Connection, session_id: &str, message: &ChatMessage) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO messages (id, session_id, role, content, timestamp, metadata)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+        params![
+            message.id,
+            session_id,
+            role_to_str(message.role),
+            message.content,
+            message.timestamp.to_rfc3339(),
+            serde_json::to_string(&message.metadata)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_durable_chat_run_conn(conn: &Connection, run: &StoredDurableChatRun) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO durable_chat_runs (
+            id, user_id, session_id, native_session_id, provider, prompt,
+            project_path, model, effort, mode, thinking, status, auto_resume,
+            resume_attempts, last_error, created_at, updated_at, recovered_at,
+            completed_at, user_message_id, native_before_turn_id, fast
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+        )
+        "#,
+        params![
+            run.id,
+            run.user_id,
+            run.session_id,
+            run.native_session_id,
+            run.provider,
+            run.prompt,
+            run.project_path,
+            run.model,
+            run.effort,
+            run.mode,
+            run.thinking.map(i64::from),
+            run.status,
+            i64::from(run.auto_resume),
+            i64::from(run.resume_attempts),
+            run.last_error,
+            run.created_at.to_rfc3339(),
+            run.updated_at.to_rfc3339(),
+            run.recovered_at.map(|time| time.to_rfc3339()),
+            run.completed_at.map(|time| time.to_rfc3339()),
+            run.user_message_id,
+            run.native_before_turn_id,
+            run.fast.map(i64::from),
+        ],
+    )?;
+    Ok(())
+}
+
 fn map_durable_chat_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDurableChatRun> {
     let thinking = row.get::<_, Option<i64>>(10)?.map(|value| value != 0);
+    let fast = row.get::<_, Option<i64>>(21)?.map(|value| value != 0);
     let resume_attempts_raw = row.get::<_, i64>(13)?;
     let resume_attempts = u32::try_from(resume_attempts_raw).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -2390,6 +2662,8 @@ fn map_durable_chat_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredD
         user_id: row.get(1)?,
         session_id: row.get(2)?,
         native_session_id: row.get(3)?,
+        user_message_id: row.get(19)?,
+        native_before_turn_id: row.get(20)?,
         provider: row.get(4)?,
         prompt: row.get(5)?,
         project_path: row.get(6)?,
@@ -2397,6 +2671,7 @@ fn map_durable_chat_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredD
         effort: row.get(8)?,
         mode: row.get(9)?,
         thinking,
+        fast,
         status: row.get(11)?,
         auto_resume: row.get::<_, i64>(12)? != 0,
         resume_attempts,
@@ -2469,6 +2744,9 @@ fn serialize_session_metadata(session: &SessionSummary) -> String {
     if let Some(thinking) = session.thinking {
         value.insert("thinking".into(), json!(thinking));
     }
+    if let Some(fast) = session.fast {
+        value.insert("fast".into(), json!(fast));
+    }
     if let Some(at) = session.last_message_at {
         value.insert("lastMessageAt".into(), json!(at));
     }
@@ -2489,6 +2767,15 @@ fn serialize_session_metadata(session: &SessionSummary) -> String {
 
 fn deserialize_session_metadata(raw: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(raw).ok()
+}
+
+fn merge_metadata_patch(target: &mut serde_json::Value, patch: serde_json::Value) {
+    match (target, patch) {
+        (serde_json::Value::Object(target), serde_json::Value::Object(patch)) => {
+            target.extend(patch);
+        }
+        (target, patch) => *target = patch,
+    }
 }
 
 fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
@@ -2516,6 +2803,9 @@ fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
     }
     if let Some(v) = value.get("thinking").and_then(Value::as_bool) {
         session.thinking = Some(v);
+    }
+    if let Some(v) = value.get("fast").and_then(Value::as_bool) {
+        session.fast = Some(v);
     }
     if let Some(v) = value.get("lastMessageAt").and_then(Value::as_str) {
         if let Ok(ts) = parse_time(v) {
@@ -2674,7 +2964,7 @@ fn parse_role(raw: &str) -> MessageRole {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iowb_protocol::ChatRuntime;
+    use iowb_protocol::{ChatRuntime, SessionTokenUsage};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_storage(label: &str) -> (Storage, PathBuf) {
@@ -2688,6 +2978,340 @@ mod tests {
         ));
         let storage = Storage::open(root.join("test.db")).expect("storage");
         (storage, root)
+    }
+
+    fn test_session(id: &str, active: bool) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            provider: Provider::Codex,
+            project_path: "/tmp/project".to_string(),
+            title: "Test session".to_string(),
+            last_activity: Utc::now(),
+            active,
+            ..Default::default()
+        }
+    }
+
+    fn test_message(id: &str, role: MessageRole, content: &str, seconds: i64) -> ChatMessage {
+        ChatMessage {
+            id: id.to_string(),
+            role,
+            content: content.to_string(),
+            timestamp: Utc::now() + chrono::Duration::seconds(seconds),
+            metadata: Value::Null,
+        }
+    }
+
+    #[test]
+    fn legacy_durable_chat_runs_schema_migrates_missing_turn_columns() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "iowb-storage-legacy-durable-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let database = root.join("test.db");
+
+        {
+            let conn = Connection::open(&database).expect("legacy connection");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE durable_chat_runs (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    session_id TEXT NOT NULL,
+                    native_session_id TEXT,
+                    provider TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    project_path TEXT NOT NULL,
+                    model TEXT,
+                    effort TEXT,
+                    mode TEXT,
+                    thinking INTEGER,
+                    status TEXT NOT NULL,
+                    auto_resume INTEGER NOT NULL DEFAULT 1,
+                    resume_attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    recovered_at TEXT,
+                    completed_at TEXT
+                );
+
+                CREATE INDEX idx_durable_chat_runs_recoverable
+                    ON durable_chat_runs(status, auto_resume, resume_attempts, updated_at);
+
+                CREATE INDEX idx_durable_chat_runs_session
+                    ON durable_chat_runs(session_id, created_at DESC);
+                "#,
+            )
+            .expect("create legacy schema");
+        }
+
+        let storage = Storage::open(&database).expect("migrate legacy durable schema");
+        storage
+            .with_connection(|conn| {
+                for column in ["user_message_id", "native_before_turn_id", "fast"] {
+                    let present: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('durable_chat_runs') WHERE name = ?1",
+                        params![column],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(present, 1, "missing migrated column {column}");
+                }
+
+                let index_present: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list('durable_chat_runs') WHERE name = 'idx_durable_chat_runs_user_message'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(index_present, 1);
+                Ok(())
+            })
+            .expect("inspect migrated schema");
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn durable_chat_turn_is_atomic_and_indexes_native_identity() {
+        let (storage, root) = temporary_storage("durable-turn-atomic");
+        let mut session = test_session("session-turn", true);
+        let message = test_message("message-turn", MessageRole::User, "prompt", 0);
+        session.message_count = 1;
+        let mut run = StoredDurableChatRun::new(
+            "run-turn",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            message.content.clone(),
+            session.project_path.clone(),
+        );
+        run.user_message_id = Some(message.id.clone());
+        run.native_before_turn_id = Some("native-turn-before".to_string());
+
+        storage
+            .create_durable_chat_turn(&session, &message, &run)
+            .expect("create durable turn");
+        let stored_messages = storage.list_messages(&session.id).expect("messages");
+        assert_eq!(stored_messages.len(), 1);
+        assert_eq!(stored_messages[0].id, message.id);
+        assert_eq!(stored_messages[0].role, MessageRole::User);
+        assert_eq!(stored_messages[0].content, "prompt");
+        let restored = storage
+            .durable_chat_run_for_user_message(&session.id, "message-turn")
+            .expect("durable lookup")
+            .expect("durable run");
+        assert_eq!(restored.id, "run-turn");
+        assert_eq!(
+            restored.native_before_turn_id.as_deref(),
+            Some("native-turn-before")
+        );
+
+        let duplicate = test_message("message-turn", MessageRole::User, "duplicate", 1);
+        let mut failed_session = test_session("session-rolled-back", true);
+        failed_session.message_count = 1;
+        let mut failed_run = StoredDurableChatRun::new(
+            "run-rolled-back",
+            None,
+            failed_session.id.clone(),
+            "codex",
+            duplicate.content.clone(),
+            failed_session.project_path.clone(),
+        );
+        failed_run.user_message_id = Some(duplicate.id.clone());
+        assert!(
+            storage
+                .create_durable_chat_turn(&failed_session, &duplicate, &failed_run)
+                .is_err()
+        );
+        assert!(
+            storage
+                .get_session(&failed_session.id)
+                .expect("rolled-back session lookup")
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_durable_chat_run(&failed_run.id)
+                .expect("rolled-back run lookup")
+                .is_none()
+        );
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn session_fork_transaction_preserves_prefix_draft_and_idempotency() {
+        let (storage, root) = temporary_storage("session-fork");
+        storage
+            .create_user("user-1", "user-1", "test-hash")
+            .expect("create user");
+        let source = test_session("session-source", false);
+        storage.upsert_session(&source).expect("source session");
+        let source_messages = [
+            test_message("source-1", MessageRole::User, "first prompt", 0),
+            test_message("source-2", MessageRole::Assistant, "first answer", 1),
+            test_message("source-3", MessageRole::User, "second prompt", 2),
+            test_message("source-4", MessageRole::Assistant, "second answer", 3),
+        ];
+        for message in &source_messages {
+            storage
+                .append_message(&source.id, message)
+                .expect("source message");
+        }
+
+        let mut destination = test_session("session-destination", false);
+        destination.title = "Second prompt".to_string();
+        destination.message_count = 2;
+        let cloned = [
+            ChatMessage {
+                id: "cloned-1".to_string(),
+                metadata: serde_json::json!({
+                    "forkedFromSessionId": source.id,
+                    "forkedFromMessageId": source_messages[0].id,
+                }),
+                ..source_messages[0].clone()
+            },
+            ChatMessage {
+                id: "cloned-2".to_string(),
+                metadata: serde_json::json!({
+                    "forkedFromSessionId": source.id,
+                    "forkedFromMessageId": source_messages[1].id,
+                }),
+                ..source_messages[1].clone()
+            },
+        ];
+        assert_eq!(
+            storage
+                .create_session_fork(
+                    "user-1",
+                    &source.id,
+                    "source-3",
+                    "request-1",
+                    &destination,
+                    &cloned,
+                    "second prompt",
+                    true,
+                )
+                .expect("create fork"),
+            CreateSessionForkOutcome::Created
+        );
+
+        let restored_source = storage.list_messages(&source.id).expect("source messages");
+        assert_eq!(restored_source.len(), source_messages.len());
+        assert_eq!(
+            restored_source
+                .iter()
+                .map(|message| (message.id.as_str(), message.role, message.content.as_str()))
+                .collect::<Vec<_>>(),
+            source_messages
+                .iter()
+                .map(|message| (message.id.as_str(), message.role, message.content.as_str()))
+                .collect::<Vec<_>>()
+        );
+        let destination_messages = storage
+            .list_messages(&destination.id)
+            .expect("destination messages");
+        assert_eq!(destination_messages.len(), 2);
+        assert_eq!(destination_messages[0].id, "cloned-1");
+        assert_eq!(
+            destination_messages[0].metadata["forkedFromMessageId"],
+            "source-1"
+        );
+        assert_eq!(
+            storage
+                .get_session_draft("user-1", &destination.id)
+                .expect("destination draft")
+                .content,
+            "second prompt"
+        );
+        assert_eq!(
+            storage
+                .get_session_fork("user-1", &source.id, "request-1")
+                .expect("fork lookup")
+                .expect("stored fork"),
+            StoredSessionFork {
+                before_message_id: "source-3".to_string(),
+                destination_session_id: destination.id.clone(),
+            }
+        );
+
+        let other_destination = test_session("session-other", false);
+        assert_eq!(
+            storage
+                .create_session_fork(
+                    "user-1",
+                    &source.id,
+                    "source-1",
+                    "request-1",
+                    &other_destination,
+                    &[],
+                    "different prompt",
+                    true,
+                )
+                .expect("idempotent retry"),
+            CreateSessionForkOutcome::Existing(StoredSessionFork {
+                before_message_id: "source-3".to_string(),
+                destination_session_id: destination.id.clone(),
+            })
+        );
+        assert!(
+            storage
+                .get_session(&other_destination.id)
+                .expect("other destination lookup")
+                .is_none()
+        );
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn session_fork_rejects_active_source_without_partial_writes() {
+        let (storage, root) = temporary_storage("session-fork-active");
+        storage
+            .create_user("user-1", "user-1", "test-hash")
+            .expect("create user");
+        let source = test_session("session-active", true);
+        storage.upsert_session(&source).expect("source session");
+        let destination = test_session("session-blocked", false);
+
+        assert_eq!(
+            storage
+                .create_session_fork(
+                    "user-1",
+                    &source.id,
+                    "source-message",
+                    "request-active",
+                    &destination,
+                    &[],
+                    "prompt",
+                    true,
+                )
+                .expect("active outcome"),
+            CreateSessionForkOutcome::SourceActive
+        );
+        assert!(
+            storage
+                .get_session(&destination.id)
+                .expect("destination lookup")
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_session_fork("user-1", &source.id, "request-active")
+                .expect("fork lookup")
+                .is_none()
+        );
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -2711,6 +3335,15 @@ mod tests {
             native_session_id: Some("22222222-2222-4222-8222-222222222222".to_string()),
             title_source: Some(SessionTitleSource::Manual),
             runtime: Some(ChatRuntime::IoGateway),
+            fast: Some(true),
+            token_usage: Some(SessionTokenUsage {
+                used: 4_321,
+                input: 1_500,
+                output: 2_700,
+                cache_creation: 0,
+                cache_read: 121,
+                cost_usd: 0.0,
+            }),
             ..Default::default()
         };
 
@@ -2722,6 +3355,15 @@ mod tests {
         assert_eq!(restored.native_session_id, session.native_session_id);
         assert_eq!(restored.title_source, session.title_source);
         assert_eq!(restored.runtime, Some(ChatRuntime::IoGateway));
+        assert_eq!(restored.fast, Some(true));
+        let usage = restored.token_usage.as_ref().expect("token usage");
+        assert_eq!(usage.used, 4_321);
+        assert_eq!(usage.input, 1_500);
+        assert_eq!(usage.output, 2_700);
+        assert_eq!(usage.cache_read, 121);
+        let api_value = serde_json::to_value(&restored).expect("serialize session");
+        assert_eq!(api_value["token_usage"]["used"], 4_321);
+        assert_eq!(api_value["fast"], true);
 
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");
@@ -2981,6 +3623,7 @@ mod tests {
         run.effort = Some("high".to_string());
         run.mode = Some("agent".to_string());
         run.thinking = Some(true);
+        run.fast = Some(true);
 
         storage
             .create_durable_chat_run(&run)
@@ -3039,6 +3682,7 @@ mod tests {
         eligible.created_at = base_time;
         eligible.updated_at = base_time;
         eligible.last_error = Some("server stopped".to_string());
+        eligible.fast = Some(true);
 
         let mut recovering = StoredDurableChatRun::new(
             "recovering",
@@ -3105,6 +3749,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["eligible", "recovering"]
         );
+        assert_eq!(recoverable[0].fast, Some(true));
         assert_eq!(
             storage
                 .list_recoverable_durable_chat_runs(2, 1)
@@ -3128,6 +3773,7 @@ mod tests {
         assert_eq!(claimed.status, "recovering");
         assert_eq!(claimed.resume_attempts, 1);
         assert_eq!(claimed.last_error, None);
+        assert_eq!(claimed.fast, Some(true));
         assert!(claimed.recovered_at.is_some());
 
         let claimed_again = storage
@@ -3135,6 +3781,7 @@ mod tests {
             .expect("claim second recovery")
             .expect("eligible second claim");
         assert_eq!(claimed_again.resume_attempts, 2);
+        assert_eq!(claimed_again.fast, Some(true));
         assert!(
             storage
                 .mark_durable_chat_run_recovering("eligible", 2)

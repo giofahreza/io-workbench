@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+mod codex_app_server;
 mod external_sessions;
 
 use bcrypt::{DEFAULT_COST, hash, verify};
@@ -24,11 +25,12 @@ use iowb_fs::{FileService, WorkspacePathValidator};
 use iowb_process::ProcessManager;
 use iowb_protocol::{
     AuthStatusResponse, AuthTokenResponse, CONFIG_DIR_NAME, ChatMessage, ChatRuntime,
-    DATABASE_FILE_NAME, MessageRole, PRODUCT_NAME, ProjectSummary, PromptHistoryCursor,
-    PromptHistoryEntry, Provider, ServerStatusResponse, SessionSummary, SessionTitleSource,
-    UserProfile, WsServerEvent, new_id, session_title_from_prompt,
+    DATABASE_FILE_NAME, ForkSessionResponse, MessageRole, PRODUCT_NAME, ProjectSummary,
+    PromptHistoryCursor, PromptHistoryEntry, Provider, ServerStatusResponse, SessionDraftResponse,
+    SessionSummary, SessionTitleSource, SessionTokenUsage, UserProfile, WsServerEvent, new_id,
+    session_title_from_prompt,
 };
-use iowb_storage::{Storage, StoredDurableChatRun};
+use iowb_storage::{CreateSessionForkOutcome, Storage, StoredDurableChatRun};
 use serde_json::Value;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -41,9 +43,10 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use codex_app_server::{CodexAppServerClient, CodexThreadSnapshot};
 use external_sessions::{
     ExternalSessionRecord, discover_external_sessions, load_external_messages,
-    looks_like_codex_live_transcript, same_project_path,
+    looks_like_codex_live_transcript, same_project_path, visible_user_text,
 };
 
 type HmacSha1 = Hmac<Sha1>;
@@ -190,6 +193,7 @@ pub struct AppState {
     pub path_validator: WorkspacePathValidator,
     pub watch: WatchManager,
     pub ws_hub: WsHub,
+    codex_app_server: CodexAppServerClient,
 }
 
 impl AppState {
@@ -215,6 +219,16 @@ impl AppState {
             path_validator,
             watch: WatchManager::new(),
             ws_hub: WsHub::new(),
+            codex_app_server: CodexAppServerClient::new(
+                configured_codex_command(),
+                Duration::from_secs(
+                    env::var("IO_WORKBENCH_CODEX_APP_SERVER_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(15)
+                        .clamp(1, 120),
+                ),
+            ),
         };
 
         info!(
@@ -237,6 +251,7 @@ impl AppState {
         effort: Option<String>,
         mode: Option<String>,
         thinking: Option<bool>,
+        fast: Option<bool>,
         runtime: ChatRuntime,
         direct_ai_config: Option<DirectAiRuntimeConfig>,
         user_id: Option<String>,
@@ -290,6 +305,26 @@ impl AppState {
             (false, None)
         };
 
+        let native_before_turn_id = if provider == Provider::Codex {
+            if let Some(native_session_id) = native_resume_session_id.as_deref() {
+                match self.codex_app_server.read_thread(native_session_id).await {
+                    Ok(snapshot) => snapshot.latest_forkable_turn_id().map(str::to_string),
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            native_session_id,
+                            "failed to capture Codex turn boundary before starting prompt"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let mut session = self
             .sessions
             .create_or_update(
@@ -302,57 +337,9 @@ impl AppState {
                 effort.clone(),
                 mode.clone(),
                 thinking,
+                fast,
             )
             .await?;
-        if !prompt.trim().is_empty() {
-            // Stamp the user-prompt row with the override footer used for this
-            // turn so the chat-line footer survives a refresh / session
-            // switch. Earlier turns are unaffected because each row carries
-            // its own metadata.
-            let now = Utc::now();
-            let user_metadata = serde_json::json!({
-                "cli": provider.as_str(),
-                "model": model.clone().unwrap_or_default(),
-                "runtime": runtime,
-                "effort": effort.clone().unwrap_or_default(),
-                "mode": mode.clone().unwrap_or_default(),
-                "thinking": thinking.unwrap_or(false),
-                "sentAt": now.to_rfc3339(),
-            });
-            self.sessions
-                .append_message_with_metadata(
-                    &session.id,
-                    MessageRole::User,
-                    prompt.clone(),
-                    Some(user_metadata),
-                )
-                .await?;
-            // Stamp first-user-at timestamp so the UI can show "sent at".
-            // The session map entry is updated in place so subsequent turns
-            // keep the original "first sent" timestamp instead of clobbering
-            // it with the new prompt's now.
-            {
-                let mut sessions = self.sessions.sessions.write().await;
-                if let Some(existing) = sessions.get_mut(&session.id) {
-                    existing.first_user_at.get_or_insert(now);
-                    if let Err(error) = self.storage.upsert_session(existing) {
-                        warn!(error = %error, session_id = %session.id, "failed to persist first_user_at");
-                    }
-                } else {
-                    let mut cloned = session.clone();
-                    cloned.first_user_at.get_or_insert(now);
-                    self.storage.upsert_session(&cloned)?;
-                }
-            }
-            session = self.sessions.get(&session.id).await?;
-        }
-
-        let direct_ai_messages = if should_use_direct_ai_gateway_runtime(provider, model.as_deref())
-        {
-            direct_ai_conversation_messages(self.sessions.messages(&session.id)?, prompt.as_str())
-        } else {
-            Vec::new()
-        };
 
         // The durable row is committed before the provider starts. If the
         // server is killed at any point after this write, startup recovery has
@@ -382,10 +369,60 @@ impl AppState {
         durable_run.effort = effort.clone();
         durable_run.mode = mode.clone();
         durable_run.thinking = thinking;
-        if let Err(error) = self.storage.create_durable_chat_run(&durable_run) {
+        durable_run.fast = fast;
+        durable_run.native_before_turn_id = native_before_turn_id.clone();
+        if !prompt.trim().is_empty() {
+            let now = Utc::now();
+            let user_message_id = new_id("msg");
+            durable_run.user_message_id = Some(user_message_id.clone());
+            let mut user_metadata = serde_json::json!({
+                "cli": provider.as_str(),
+                "durableRunId": durable_run_id,
+                "model": model.clone().unwrap_or_default(),
+                "runtime": runtime,
+                "effort": effort.clone().unwrap_or_default(),
+                "mode": mode.clone().unwrap_or_default(),
+                "thinking": thinking.unwrap_or(false),
+                "fast": fast.unwrap_or(false),
+                "sentAt": now.to_rfc3339(),
+            });
+            if let Some(native_before_turn_id) = native_before_turn_id.as_deref()
+                && let Some(metadata) = user_metadata.as_object_mut()
+            {
+                metadata.insert(
+                    "nativeBeforeTurnId".to_string(),
+                    Value::String(native_before_turn_id.to_string()),
+                );
+            }
+            let message = ChatMessage {
+                id: user_message_id,
+                role: MessageRole::User,
+                content: prompt.clone(),
+                timestamp: now,
+                metadata: user_metadata,
+            };
+            match self
+                .sessions
+                .append_user_message_with_durable_run(&session.id, message, &durable_run)
+                .await
+            {
+                Ok(updated) => session = updated,
+                Err(error) => {
+                    let _ = self.sessions.set_active(&session.id, false).await;
+                    return Err(error);
+                }
+            }
+        } else if let Err(error) = self.storage.create_durable_chat_run(&durable_run) {
             let _ = self.sessions.set_active(&session.id, false).await;
             return Err(error.into());
         }
+
+        let direct_ai_messages = if should_use_direct_ai_gateway_runtime(provider, model.as_deref())
+        {
+            direct_ai_conversation_messages(self.sessions.messages(&session.id)?, prompt.as_str())
+        } else {
+            Vec::new()
+        };
 
         let start_result = self
             .agents
@@ -402,6 +439,7 @@ impl AppState {
                 effort: effort.clone(),
                 mode: mode.clone(),
                 thinking,
+                fast,
                 native_resume_session_id,
                 direct_ai_config,
                 direct_ai_messages,
@@ -424,6 +462,328 @@ impl AppState {
         });
 
         Ok(session)
+    }
+
+    pub async fn fork_session_before_message(
+        &self,
+        user_id: &str,
+        source_session_id: &str,
+        before_message_id: &str,
+        request_id: &str,
+    ) -> Result<ForkSessionResponse> {
+        if let Some(existing) =
+            self.storage
+                .get_session_fork(user_id, source_session_id, request_id)?
+        {
+            return self
+                .existing_fork_response(
+                    user_id,
+                    source_session_id,
+                    &existing.before_message_id,
+                    &existing.destination_session_id,
+                )
+                .await;
+        }
+
+        let source = self.sessions.get(source_session_id).await?;
+        if source.active {
+            return Err(CoreError::Conflict(
+                "session_active: stop the current response before editing from here".to_string(),
+            ));
+        }
+        let source_is_stored = self.storage.get_session(source_session_id)?.is_some();
+        let source_messages = self
+            .sessions
+            .messages_including_external(source_session_id)
+            .await?;
+        let target_index = source_messages
+            .iter()
+            .position(|message| message.id == before_message_id)
+            .ok_or_else(|| {
+                CoreError::InvalidInput(format!(
+                    "message {before_message_id} was not found in session {source_session_id}"
+                ))
+            })?;
+        let target = &source_messages[target_index];
+        if target.role != MessageRole::User {
+            return Err(CoreError::InvalidInput(
+                "Edit from here requires a user prompt".to_string(),
+            ));
+        }
+        let prefix = &source_messages[..target_index];
+        let has_prior_user_turn = prefix
+            .iter()
+            .any(|message| message.role == MessageRole::User);
+
+        let mut native_forked_thread_id = None;
+        if has_prior_user_turn {
+            if source.provider == Provider::Codex {
+                let native_session_id = if source.external {
+                    Some(source.id.clone())
+                } else if source.native_session_id.is_some() {
+                    source.native_session_id.clone()
+                } else {
+                    self.sessions
+                        .infer_native_session_id(
+                            source_session_id,
+                            source.provider,
+                            &source.project_path,
+                        )
+                        .await?
+                }
+                .ok_or_else(|| {
+                    CoreError::Conflict(
+                        "codex_native_session_unavailable: this chat is not linked to a Codex thread"
+                            .to_string(),
+                    )
+                })?;
+                let snapshot = self
+                    .codex_app_server
+                    .read_thread(&native_session_id)
+                    .await?;
+                if snapshot.id != native_session_id {
+                    warn!(
+                        requested_thread_id = %native_session_id,
+                        returned_thread_id = %snapshot.id,
+                        "Codex thread/read returned a different thread id"
+                    );
+                }
+                let last_turn_id = self.resolve_codex_fork_boundary(
+                    source_session_id,
+                    target,
+                    &source_messages,
+                    &snapshot,
+                )?;
+                native_forked_thread_id = Some(
+                    self.codex_app_server
+                        .fork_thread(&native_session_id, &last_turn_id)
+                        .await?,
+                );
+            } else if !should_use_direct_ai_gateway_runtime(
+                source.provider,
+                source.model.as_deref(),
+            ) {
+                return Err(CoreError::InvalidInput(format!(
+                    "Edit from here is not yet available for native {} sessions with earlier turns",
+                    source.provider.as_str()
+                )));
+            }
+        }
+
+        let now = Utc::now();
+        let destination_id = new_id("session");
+        let cloned_messages = prefix
+            .iter()
+            .map(|message| clone_forked_message(source_session_id, message))
+            .collect::<Vec<_>>();
+        let destination = SessionSummary {
+            id: destination_id,
+            provider: source.provider,
+            external: false,
+            native_session_id: native_forked_thread_id.clone(),
+            title_source: Some(SessionTitleSource::Prompt),
+            project_path: source.project_path.clone(),
+            title: session_title_from_prompt(&target.content)
+                .unwrap_or_else(|| "New Session".to_string()),
+            message_count: cloned_messages.len(),
+            last_activity: now,
+            active: false,
+            model: source.model.clone(),
+            runtime: source.runtime,
+            effort: source.effort.clone(),
+            mode: source.mode.clone(),
+            thinking: source.thinking,
+            fast: source.fast,
+            last_message_at: cloned_messages.last().map(|message| message.timestamp),
+            first_user_at: cloned_messages
+                .iter()
+                .find(|message| message.role == MessageRole::User)
+                .map(|message| message.timestamp),
+            received_at: cloned_messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::Assistant)
+                .map(|message| message.timestamp),
+            token_usage: None,
+        };
+
+        let outcome = self.storage.create_session_fork(
+            user_id,
+            source_session_id,
+            before_message_id,
+            request_id,
+            &destination,
+            &cloned_messages,
+            &target.content,
+            source_is_stored,
+        );
+        match outcome {
+            Ok(CreateSessionForkOutcome::Created) => {
+                self.sessions
+                    .remember_persisted_session(destination.clone())
+                    .await?;
+                Ok(ForkSessionResponse {
+                    source_session_id: source_session_id.to_string(),
+                    before_message_id: before_message_id.to_string(),
+                    session: destination.clone(),
+                    draft: SessionDraftResponse {
+                        session_id: destination.id,
+                        content: target.content.clone(),
+                        updated_at: Some(now),
+                    },
+                    native_forked: native_forked_thread_id.is_some(),
+                    files_unchanged: true,
+                })
+            }
+            Ok(CreateSessionForkOutcome::Existing(existing)) => {
+                self.delete_compensating_codex_fork(native_forked_thread_id.as_deref())
+                    .await;
+                self.existing_fork_response(
+                    user_id,
+                    source_session_id,
+                    &existing.before_message_id,
+                    &existing.destination_session_id,
+                )
+                .await
+            }
+            Ok(CreateSessionForkOutcome::SourceActive) => {
+                self.delete_compensating_codex_fork(native_forked_thread_id.as_deref())
+                    .await;
+                Err(CoreError::Conflict(
+                    "session_active: stop the current response before editing from here"
+                        .to_string(),
+                ))
+            }
+            Err(error) => {
+                self.delete_compensating_codex_fork(native_forked_thread_id.as_deref())
+                    .await;
+                Err(error.into())
+            }
+        }
+    }
+
+    async fn existing_fork_response(
+        &self,
+        user_id: &str,
+        source_session_id: &str,
+        before_message_id: &str,
+        destination_session_id: &str,
+    ) -> Result<ForkSessionResponse> {
+        let session = self.sessions.get(destination_session_id).await?;
+        let draft = self
+            .storage
+            .get_session_draft(user_id, destination_session_id)?;
+        Ok(ForkSessionResponse {
+            source_session_id: source_session_id.to_string(),
+            before_message_id: before_message_id.to_string(),
+            native_forked: session.native_session_id.is_some(),
+            files_unchanged: true,
+            session,
+            draft,
+        })
+    }
+
+    fn resolve_codex_fork_boundary(
+        &self,
+        source_session_id: &str,
+        target: &ChatMessage,
+        messages: &[ChatMessage],
+        snapshot: &CodexThreadSnapshot,
+    ) -> Result<String> {
+        if let Some(boundary) = target
+            .metadata
+            .get("nativeBeforeTurnId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Ok(boundary.to_string());
+        }
+        if let Some(boundary) = self
+            .storage
+            .durable_chat_run_for_user_message(source_session_id, &target.id)?
+            .and_then(|run| run.native_before_turn_id)
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Ok(boundary);
+        }
+        if let Some(native_message_id) = target
+            .metadata
+            .get("nativeMessageId")
+            .and_then(Value::as_str)
+            && let Some(turn_index) = snapshot.turns.iter().position(|turn| {
+                turn.user_item_ids
+                    .iter()
+                    .any(|item_id| item_id == native_message_id)
+            })
+            && let Some(previous) = turn_index
+                .checked_sub(1)
+                .and_then(|index| snapshot.turns.get(index))
+        {
+            return Ok(previous.id.clone());
+        }
+
+        let local_users = messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .collect::<Vec<_>>();
+        let target_user_index = local_users
+            .iter()
+            .position(|message| message.id == target.id)
+            .ok_or_else(|| {
+                CoreError::InvalidInput(
+                    "selected prompt was not present in user history".to_string(),
+                )
+            })?;
+        let native_user_turns = snapshot
+            .turns
+            .iter()
+            .enumerate()
+            .filter(|(_, turn)| !turn.user_text.trim().is_empty())
+            .collect::<Vec<_>>();
+        let local_text = local_users
+            .iter()
+            .map(|message| normalized_fork_prompt(&message.content))
+            .collect::<Vec<_>>();
+        let native_text = native_user_turns
+            .iter()
+            .map(|(_, turn)| normalized_fork_prompt(&turn.user_text))
+            .collect::<Vec<_>>();
+        let matches = ordered_text_matches(&local_text, &native_text);
+        let native_user_index = matches
+            .iter()
+            .find_map(|(local_index, native_index)| {
+                (*local_index == target_user_index).then_some(*native_index)
+            })
+            .ok_or_else(|| {
+                CoreError::Conflict(
+                    "codex_turn_boundary_unresolved: refresh the session and try again".to_string(),
+                )
+            })?;
+        let native_turn_index = native_user_turns[native_user_index].0;
+        snapshot
+            .turns
+            .get(native_turn_index.saturating_sub(1))
+            .filter(|_| native_turn_index > 0)
+            .map(|turn| turn.id.clone())
+            .ok_or_else(|| {
+                CoreError::Conflict(
+                    "codex_turn_boundary_unresolved: selected prompt has no prior native turn"
+                        .to_string(),
+                )
+            })
+    }
+
+    async fn delete_compensating_codex_fork(&self, thread_id: Option<&str>) {
+        let Some(thread_id) = thread_id else {
+            return;
+        };
+        if let Err(error) = self.codex_app_server.delete_thread(thread_id).await {
+            warn!(
+                error = %error,
+                thread_id,
+                "failed to delete uncommitted Codex fork"
+            );
+        }
     }
 
     /// Continue a durable run that was left active when the Rust server
@@ -539,6 +899,7 @@ impl AppState {
                 effort: run.effort.clone(),
                 mode: run.mode.clone(),
                 thinking: run.thinking,
+                fast: run.fast,
                 native_resume_session_id,
                 direct_ai_config,
                 direct_ai_messages,
@@ -911,6 +1272,7 @@ impl SessionManager {
         effort: Option<String>,
         mode: Option<String>,
         thinking: Option<bool>,
+        fast: Option<bool>,
     ) -> Result<SessionSummary> {
         let id = session_id.unwrap_or_else(|| new_id("session"));
         let now = Utc::now();
@@ -931,6 +1293,7 @@ impl SessionManager {
                 effort: effort.clone(),
                 mode: mode.clone(),
                 thinking,
+                fast,
                 last_message_at: None,
                 first_user_at: None,
                 received_at: None,
@@ -956,8 +1319,12 @@ impl SessionManager {
         if let Some(thinking) = thinking {
             session.thinking = Some(thinking);
         }
+        if let Some(fast) = fast {
+            session.fast = Some(fast);
+        }
         session.last_activity = now;
         session.active = true;
+        session.token_usage = None;
 
         self.storage.upsert_session(session)?;
         let updated = session.clone();
@@ -1012,6 +1379,51 @@ impl SessionManager {
         Ok(message)
     }
 
+    pub async fn append_user_message_with_durable_run(
+        &self,
+        session_id: &str,
+        message: ChatMessage,
+        run: &StoredDurableChatRun,
+    ) -> Result<SessionSummary> {
+        if message.role != MessageRole::User {
+            return Err(CoreError::InvalidInput(
+                "durable chat turn message must have the user role".to_string(),
+            ));
+        }
+        if run.session_id != session_id || run.user_message_id.as_deref() != Some(&message.id) {
+            return Err(CoreError::InvalidInput(
+                "durable chat turn identity does not match its user message".to_string(),
+            ));
+        }
+
+        let mut sessions = self.sessions.write().await;
+        if !sessions.contains_key(session_id)
+            && let Some(stored) = self.storage.get_session(session_id)?
+        {
+            sessions.insert(session_id.to_string(), stored);
+        }
+        let current = sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
+        let mut updated = current;
+        updated.message_count = updated.message_count.saturating_add(1);
+        updated.last_activity = message.timestamp;
+        updated.first_user_at.get_or_insert(message.timestamp);
+        if updated.title_source != Some(SessionTitleSource::Manual)
+            && let Some(title) = session_title_from_prompt(&message.content)
+        {
+            updated.title = title;
+            updated.title_source = Some(SessionTitleSource::Prompt);
+        }
+
+        self.storage
+            .create_durable_chat_turn(&updated, &message, run)?;
+        sessions.insert(session_id.to_string(), updated.clone());
+        self.evict_if_needed(&mut sessions)?;
+        Ok(updated)
+    }
+
     /// Patch the stored metadata for an existing message id. Returns
     /// `true` when the row was updated.
     pub fn update_message_metadata(
@@ -1043,7 +1455,20 @@ impl SessionManager {
         let Some(id) = id else { return Ok(false) };
         Ok(self
             .storage
-            .update_message_metadata(session_id, &id, metadata)?)
+            .merge_message_metadata(session_id, &id, metadata)?)
+    }
+
+    pub async fn set_token_usage(
+        &self,
+        session_id: &str,
+        token_usage: SessionTokenUsage,
+    ) -> Result<SessionSummary> {
+        let fallback = self.get(session_id).await?;
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.entry(session_id.to_string()).or_insert(fallback);
+        session.token_usage = Some(token_usage);
+        self.storage.upsert_session(session)?;
+        Ok(session.clone())
     }
 
     pub async fn set_active(&self, session_id: &str, active: bool) -> Result<SessionSummary> {
@@ -1185,6 +1610,7 @@ impl SessionManager {
                     let effort = existing.effort.clone();
                     let mode = existing.mode.clone();
                     let thinking = existing.thinking;
+                    let token_usage = existing.token_usage.clone();
                     *existing = record.summary;
                     existing.active = active;
                     if preserve_local_title {
@@ -1195,6 +1621,7 @@ impl SessionManager {
                     existing.effort = effort;
                     existing.mode = mode;
                     existing.thinking = thinking;
+                    existing.token_usage = token_usage;
                 }
             } else {
                 sessions.push(record.summary);
@@ -1374,6 +1801,12 @@ impl SessionManager {
             .await
             .map(|record| record.summary)
             .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))
+    }
+
+    pub async fn remember_persisted_session(&self, session: SessionSummary) -> Result<()> {
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(session.id.clone(), session);
+        self.evict_if_needed(&mut sessions)
     }
 
     fn get_stored(&self, session_id: &str) -> Option<SessionSummary> {
@@ -1670,15 +2103,13 @@ fn merge_mapped_external_messages(
     mut external: Vec<ChatMessage>,
 ) -> Vec<ChatMessage> {
     let mut matched_stored = vec![false; stored.len()];
-    for external_message in &mut external {
-        let Some((index, stored_message)) = stored.iter().enumerate().find(|(index, message)| {
-            !matched_stored[*index]
-                && message.role == external_message.role
-                && message.content.trim() == external_message.content.trim()
-        }) else {
-            continue;
-        };
-        matched_stored[index] = true;
+    let stored_keys = stored.iter().map(message_match_key).collect::<Vec<_>>();
+    let external_keys = external.iter().map(message_match_key).collect::<Vec<_>>();
+    for (stored_index, external_index) in ordered_text_matches(&stored_keys, &external_keys) {
+        let stored_message = &stored[stored_index];
+        let external_message = &mut external[external_index];
+        matched_stored[stored_index] = true;
+        external_message.id = stored_message.id.clone();
         if let (Some(external_metadata), Some(stored_metadata)) = (
             external_message.metadata.as_object_mut(),
             stored_message.metadata.as_object(),
@@ -1699,6 +2130,73 @@ fn merge_mapped_external_messages(
     );
     external.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
     external
+}
+
+fn message_match_key(message: &ChatMessage) -> String {
+    let role = match message.role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+    };
+    format!("{role}\0{}", message.content.trim())
+}
+
+fn clone_forked_message(source_session_id: &str, source: &ChatMessage) -> ChatMessage {
+    let mut metadata = source.metadata.as_object().cloned().unwrap_or_default();
+    metadata.insert(
+        "forkedFromSessionId".to_string(),
+        Value::String(source_session_id.to_string()),
+    );
+    metadata.insert(
+        "forkedFromMessageId".to_string(),
+        Value::String(source.id.clone()),
+    );
+    ChatMessage {
+        id: new_id("msg"),
+        role: source.role,
+        content: source.content.clone(),
+        timestamp: source.timestamp,
+        metadata: Value::Object(metadata),
+    }
+}
+
+fn normalized_fork_prompt(value: &str) -> String {
+    let visible = visible_user_text(value);
+    let selected = if visible.trim().is_empty() {
+        value.trim()
+    } else {
+        visible.trim()
+    };
+    selected.replace("\r\n", "\n")
+}
+
+fn ordered_text_matches(left: &[String], right: &[String]) -> Vec<(usize, usize)> {
+    let mut lengths = vec![vec![0usize; right.len() + 1]; left.len() + 1];
+    for left_index in (0..left.len()).rev() {
+        for right_index in (0..right.len()).rev() {
+            lengths[left_index][right_index] = if left[left_index] == right[right_index] {
+                lengths[left_index + 1][right_index + 1] + 1
+            } else {
+                lengths[left_index + 1][right_index].max(lengths[left_index][right_index + 1])
+            };
+        }
+    }
+
+    let mut matches = Vec::new();
+    let (mut left_index, mut right_index) = (0usize, 0usize);
+    while left_index < left.len() && right_index < right.len() {
+        if left[left_index] == right[right_index] {
+            matches.push((left_index, right_index));
+            left_index += 1;
+            right_index += 1;
+        } else if lengths[left_index + 1][right_index] >= lengths[left_index][right_index + 1] {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+    matches
 }
 
 #[derive(Clone)]
@@ -1729,6 +2227,7 @@ struct AgentStartContext {
     effort: Option<String>,
     mode: Option<String>,
     thinking: Option<bool>,
+    fast: Option<bool>,
     native_resume_session_id: Option<String>,
     direct_ai_config: Option<DirectAiRuntimeConfig>,
     direct_ai_messages: Vec<DirectAiConversationMessage>,
@@ -1823,6 +2322,7 @@ impl AgentRuntimeManager {
             context.effort.as_deref(),
             context.mode.as_deref(),
             context.thinking,
+            context.fast,
             context.native_resume_session_id.as_deref(),
             context.runtime,
         ) {
@@ -2440,6 +2940,7 @@ impl AgentRuntimeManager {
                 "effort": context.effort.clone().unwrap_or_default(),
                 "mode": context.mode.clone().unwrap_or_default(),
                 "thinking": context.thinking.unwrap_or(false),
+                "fast": context.fast.unwrap_or(false),
                 "receivedAt": received_at.to_rfc3339(),
                 "sentAt": sent_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
                 "elapsedMs": elapsed_ms,
@@ -2469,6 +2970,7 @@ impl AgentRuntimeManager {
                         "effort": context.effort.clone().unwrap_or_default(),
                         "mode": context.mode.clone().unwrap_or_default(),
                         "thinking": context.thinking.unwrap_or(false),
+                        "fast": context.fast.unwrap_or(false),
                         "receivedAt": received_at.to_rfc3339(),
                         "sentAt": sent_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
                         "elapsedMs": elapsed_ms,
@@ -2549,6 +3051,7 @@ impl AgentRuntimeManager {
             session.effort = context.effort.clone().or(session.effort);
             session.mode = context.mode.clone().or(session.mode);
             session.thinking = context.thinking.or(session.thinking);
+            session.fast = context.fast.or(session.fast);
             let snapshot = session.clone();
             if let Err(error) = context.storage.upsert_session(&session) {
                 warn!(error = %error, session_id = %context.session_id, "failed to persist session metadata");
@@ -2564,6 +3067,7 @@ impl AgentRuntimeManager {
                     effort: snapshot.effort,
                     mode: snapshot.mode,
                     thinking: snapshot.thinking,
+                    fast: snapshot.fast,
                     received_at,
                     last_message_at: snapshot.last_message_at,
                     first_user_at: snapshot.first_user_at,
@@ -3602,6 +4106,7 @@ fn resolve_agent_command(
     effort: Option<&str>,
     mode: Option<&str>,
     thinking: Option<bool>,
+    fast: Option<bool>,
     native_resume_session_id: Option<&str>,
     runtime: ChatRuntime,
 ) -> Result<AgentCommandSpec> {
@@ -3651,6 +4156,7 @@ fn resolve_agent_command(
             mode,
             effort,
             thinking,
+            fast,
             model,
             native_resume_session_id,
             runtime,
@@ -3901,6 +4407,14 @@ fn default_agent_command(provider: Provider) -> String {
     preferred_user_command(command).unwrap_or_else(|| command.to_string())
 }
 
+fn configured_codex_command() -> String {
+    env::var("IO_WORKBENCH_CODEX_COMMAND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_agent_command(Provider::Codex))
+}
+
 fn preferred_user_command(command: &str) -> Option<String> {
     let home = env::var_os("HOME").map(PathBuf::from)?;
     let candidate = home.join(".local").join("bin").join(command);
@@ -3978,7 +4492,7 @@ fn default_agent_args_with(
         ChatRuntime::NativeCli
     };
     default_agent_args_with_resume(
-        provider, prompt, mode, effort, thinking, model, None, runtime,
+        provider, prompt, mode, effort, thinking, None, model, None, runtime,
     )
 }
 
@@ -3989,6 +4503,7 @@ fn default_agent_args_with_resume(
     mode: Option<&str>,
     effort: Option<&str>,
     thinking: Option<bool>,
+    fast: Option<bool>,
     model: Option<&str>,
     resume_session_id: Option<&str>,
     runtime: ChatRuntime,
@@ -4112,6 +4627,14 @@ fn default_agent_args_with_resume(
                 &mut args,
                 "model_reasoning_effort",
                 &format!("\"{reasoning_effort}\""),
+            );
+        }
+        if let Some(fast) = fast {
+            push_codex_config_override(&mut args, "features.fast_mode", "true");
+            push_codex_config_override(
+                &mut args,
+                "service_tier",
+                if fast { "\"fast\"" } else { "\"default\"" },
             );
         }
     } else if let Some(effort) = effort
@@ -5990,6 +6513,275 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::time::{Duration, sleep, timeout};
 
+    async fn temporary_app_state(label: &str) -> (AppState, PathBuf, PathBuf) {
+        let root = env::temp_dir().join(format!("iowb-{label}-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let state = AppState::initialize(AppConfig {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+        state
+            .storage
+            .create_user("user-1", "user-1", "test-hash")
+            .expect("test user");
+        (state, root, project)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn edit_from_here_first_prompt_creates_empty_fork_with_unsent_draft() {
+        let (state, root, project) = temporary_app_state("fork-first-prompt").await;
+        let source = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                None,
+                false,
+                Some("gpt-5.4".to_string()),
+                Some(ChatRuntime::NativeCli),
+                Some("high".to_string()),
+                Some("default".to_string()),
+                Some(true),
+                None,
+            )
+            .await
+            .expect("source session");
+        let target = state
+            .sessions
+            .append_message(
+                &source.id,
+                MessageRole::User,
+                "Rewrite the authentication flow",
+            )
+            .await
+            .expect("target prompt");
+        state
+            .sessions
+            .append_message(&source.id, MessageRole::Assistant, "Original answer")
+            .await
+            .expect("later answer");
+        state
+            .sessions
+            .set_active(&source.id, false)
+            .await
+            .expect("source inactive");
+
+        let response = state
+            .fork_session_before_message("user-1", &source.id, &target.id, "request-first")
+            .await
+            .expect("fork first prompt");
+        assert_eq!(response.source_session_id, source.id);
+        assert_eq!(response.before_message_id, target.id);
+        assert_eq!(response.session.title, "Rewrite the authentication flow");
+        assert_eq!(response.session.message_count, 0);
+        assert_eq!(response.session.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(response.session.effort.as_deref(), Some("high"));
+        assert_eq!(response.session.thinking, Some(true));
+        assert_eq!(response.draft.content, "Rewrite the authentication flow");
+        assert!(!response.native_forked);
+        assert!(response.files_unchanged);
+        assert!(
+            state
+                .sessions
+                .messages(&response.session.id)
+                .expect("destination messages")
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .sessions
+                .messages(&source.id)
+                .expect("source messages")
+                .len(),
+            2
+        );
+
+        let retry = state
+            .fork_session_before_message(
+                "user-1",
+                &source.id,
+                "different-message-id",
+                "request-first",
+            )
+            .await
+            .expect("idempotent retry");
+        assert_eq!(retry.session.id, response.session.id);
+        assert_eq!(retry.before_message_id, target.id);
+        assert_eq!(retry.draft.content, response.draft.content);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn edit_from_here_direct_ai_fork_clones_only_prior_messages_with_provenance() {
+        let (state, root, project) = temporary_app_state("fork-direct-ai").await;
+        let source = state
+            .sessions
+            .create_or_update(
+                Provider::Gemini,
+                project.display().to_string(),
+                None,
+                false,
+                Some("gem:gemini-2.5-pro".to_string()),
+                Some(ChatRuntime::IoGateway),
+                Some("medium".to_string()),
+                Some("default".to_string()),
+                Some(false),
+                None,
+            )
+            .await
+            .expect("source session");
+        let first_user = state
+            .sessions
+            .append_message(&source.id, MessageRole::User, "same prompt")
+            .await
+            .expect("first prompt");
+        let first_assistant = state
+            .sessions
+            .append_message(&source.id, MessageRole::Assistant, "first answer")
+            .await
+            .expect("first answer");
+        let target = state
+            .sessions
+            .append_message(&source.id, MessageRole::User, "same prompt")
+            .await
+            .expect("target prompt");
+        state
+            .sessions
+            .append_message(&source.id, MessageRole::Assistant, "later answer")
+            .await
+            .expect("later answer");
+        state
+            .sessions
+            .set_active(&source.id, false)
+            .await
+            .expect("source inactive");
+
+        let response = state
+            .fork_session_before_message("user-1", &source.id, &target.id, "request-middle")
+            .await
+            .expect("fork middle prompt");
+        let cloned = state
+            .sessions
+            .messages(&response.session.id)
+            .expect("cloned messages");
+        assert_eq!(cloned.len(), 2);
+        assert_eq!(cloned[0].role, MessageRole::User);
+        assert_eq!(cloned[0].content, "same prompt");
+        assert_eq!(cloned[1].role, MessageRole::Assistant);
+        assert_eq!(cloned[1].content, "first answer");
+        assert_ne!(cloned[0].id, first_user.id);
+        assert_ne!(cloned[1].id, first_assistant.id);
+        assert_eq!(cloned[0].metadata["forkedFromSessionId"], source.id);
+        assert_eq!(cloned[0].metadata["forkedFromMessageId"], first_user.id);
+        assert_eq!(
+            cloned[1].metadata["forkedFromMessageId"],
+            first_assistant.id
+        );
+        assert_eq!(response.session.message_count, 2);
+        assert_eq!(response.draft.content, "same prompt");
+        assert!(!response.native_forked);
+        assert_eq!(
+            state
+                .sessions
+                .messages(&source.id)
+                .expect("original messages")
+                .len(),
+            4
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_fork_boundary_resolves_duplicate_prompts_in_order() {
+        let (state, root, _) = temporary_app_state("fork-boundary").await;
+        let now = Utc::now();
+        let messages = vec![
+            ChatMessage {
+                id: "local-user-1".to_string(),
+                role: MessageRole::User,
+                content: "repeat".to_string(),
+                timestamp: now,
+                metadata: Value::Null,
+            },
+            ChatMessage {
+                id: "local-assistant-1".to_string(),
+                role: MessageRole::Assistant,
+                content: "answer".to_string(),
+                timestamp: now,
+                metadata: Value::Null,
+            },
+            ChatMessage {
+                id: "local-user-2".to_string(),
+                role: MessageRole::User,
+                content: "repeat".to_string(),
+                timestamp: now,
+                metadata: Value::Null,
+            },
+        ];
+        let snapshot = CodexThreadSnapshot {
+            id: "thread-1".to_string(),
+            turns: vec![
+                codex_app_server::CodexThreadTurn {
+                    id: "turn-1".to_string(),
+                    status: "failed".to_string(),
+                    user_item_ids: vec!["native-user-1".to_string()],
+                    user_text: "repeat".to_string(),
+                },
+                codex_app_server::CodexThreadTurn {
+                    id: "turn-2".to_string(),
+                    status: "completed".to_string(),
+                    user_item_ids: vec!["native-user-2".to_string()],
+                    user_text: "repeat".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            state
+                .resolve_codex_fork_boundary(
+                    "session-without-durable-runs",
+                    &messages[2],
+                    &messages,
+                    &snapshot,
+                )
+                .expect("duplicate prompt boundary"),
+            "turn-1"
+        );
+
+        let target_with_metadata = ChatMessage {
+            metadata: serde_json::json!({"nativeBeforeTurnId": "turn-failed"}),
+            ..messages[2].clone()
+        };
+        assert_eq!(
+            state
+                .resolve_codex_fork_boundary(
+                    "session-without-durable-runs",
+                    &target_with_metadata,
+                    &messages,
+                    &snapshot,
+                )
+                .expect("metadata boundary"),
+            "turn-failed"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn abort_terminates_descendants_that_keep_agent_output_open() {
@@ -6155,6 +6947,7 @@ mod tests {
                 root.display().to_string(),
                 Some("session-title-test".to_string()),
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -6817,6 +7610,92 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn token_usage_persists_and_clears_when_the_next_turn_starts() {
+        let root = std::env::temp_dir().join(format!("iowb-token-usage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("root");
+        let storage = Storage::open(root.join("test.db")).expect("storage");
+        let sessions = SessionManager::load(storage.clone(), 10).expect("sessions");
+        let session = sessions
+            .create_or_update(
+                Provider::Codex,
+                root.display().to_string(),
+                None,
+                false,
+                Some("gpt-test".to_string()),
+                Some(ChatRuntime::NativeCli),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create session");
+
+        sessions
+            .set_token_usage(
+                &session.id,
+                SessionTokenUsage {
+                    used: 4_321,
+                    input: 1_500,
+                    output: 2_700,
+                    cache_creation: 0,
+                    cache_read: 121,
+                    cost_usd: 0.0,
+                },
+            )
+            .await
+            .expect("store token usage");
+
+        let restored = storage
+            .get_session(&session.id)
+            .expect("stored session")
+            .expect("session exists");
+        assert_eq!(
+            restored.token_usage.as_ref().map(|usage| usage.used),
+            Some(4_321)
+        );
+        assert_eq!(
+            sessions
+                .get(&session.id)
+                .await
+                .expect("cached session")
+                .token_usage
+                .as_ref()
+                .map(|usage| usage.cache_read),
+            Some(121),
+        );
+
+        let restarted = sessions
+            .create_or_update(
+                Provider::Codex,
+                root.display().to_string(),
+                Some(session.id.clone()),
+                false,
+                None,
+                Some(ChatRuntime::NativeCli),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("restart session");
+        assert!(restarted.token_usage.is_none());
+        assert!(
+            storage
+                .get_session(&session.id)
+                .expect("stored session")
+                .expect("session exists")
+                .token_usage
+                .is_none()
+        );
+
+        drop(sessions);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn loading_preserves_active_sessions_until_startup_reconciliation() {
         let root = std::env::temp_dir().join(format!("iowb-stale-session-{}", Uuid::new_v4()));
         let config_dir = root.join("config");
@@ -6837,6 +7716,7 @@ mod tests {
             effort: Some("medium".to_string()),
             mode: Some("default".to_string()),
             thinking: Some(false),
+            fast: Some(false),
             last_message_at: Some(now),
             first_user_at: Some(now),
             received_at: None,
@@ -6960,6 +7840,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("internal session");
@@ -7062,6 +7943,7 @@ mod tests {
         let args = default_agent_args_with_resume(
             Provider::Codex,
             "second prompt",
+            None,
             None,
             None,
             None,
@@ -7227,6 +8109,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("internal session");
@@ -7336,6 +8219,7 @@ mod tests {
                 project.display().to_string(),
                 Some("workbench-session-existing-final".to_string()),
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -7460,6 +8344,7 @@ mod tests {
                 Some("ultra".to_string()),
                 Some("ultra".to_string()),
                 Some(true),
+                None,
             )
             .await
             .expect("internal session");
@@ -7585,6 +8470,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 ChatRuntime::NativeCli,
                 None,
                 None,
@@ -7663,6 +8549,8 @@ mod tests {
         assert_eq!(assistant_after.metadata["tokenUsage"]["input"], 1500);
         assert_eq!(assistant_after.metadata["tokenUsage"]["output"], 2700);
         assert_eq!(assistant_after.metadata["tokenUsage"]["cacheRead"], 121);
+        assert_eq!(assistant_after.metadata["cli"], "codex");
+        assert!(assistant_after.metadata["receivedAt"].as_str().is_some());
 
         let _ = std::fs::remove_dir_all(root);
 
@@ -7699,6 +8587,7 @@ mod tests {
                 project.display().to_string(),
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -8056,6 +8945,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 ChatRuntime::NativeCli,
                 Some(DirectAiRuntimeConfig {
                     base_url: format!("http://{gateway_addr}"),
@@ -8179,6 +9069,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("existing session");
@@ -8204,6 +9095,7 @@ mod tests {
                 "reply ok",
                 Some(existing_session.id.clone()),
                 Some(model.to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -8307,6 +9199,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(session_id),
             ChatRuntime::NativeCli,
         );
@@ -8351,6 +9244,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(session_id),
             ChatRuntime::NativeCli,
         );
@@ -8362,6 +9256,7 @@ mod tests {
         let gemini = default_agent_args_with_resume(
             Provider::Gemini,
             "continue",
+            None,
             None,
             None,
             None,
@@ -8616,6 +9511,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("gpt-custom"),
             None,
             ChatRuntime::IoGateway,
@@ -8634,12 +9530,46 @@ mod tests {
     }
 
     #[test]
+    fn codex_gateway_unprefixed_sol_keeps_gateway_provider_and_fast_tier() {
+        let mut args = default_agent_args_with_resume(
+            Provider::Codex,
+            "hi",
+            None,
+            Some("medium"),
+            None,
+            Some(true),
+            Some("gpt-5.6-sol"),
+            None,
+            ChatRuntime::IoGateway,
+        );
+        apply_codex_cli_io_gateway_args(&mut args, "https://ai.qif.us/codex");
+
+        let model_index = args
+            .iter()
+            .position(|arg| arg == "--model")
+            .expect("model flag");
+        assert_eq!(
+            args.get(model_index + 1).map(String::as_str),
+            Some("gpt-5.6-sol")
+        );
+        for expected in [
+            "model_provider=iowb_gateway",
+            "model_providers.iowb_gateway.base_url=\"https://ai.qif.us/codex\"",
+            "features.fast_mode=true",
+            "service_tier=\"fast\"",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "args: {args:?}");
+        }
+    }
+
+    #[test]
     fn codex_gateway_provider_config_precedes_resume_positional() {
         let mut args = default_agent_args_with_resume(
             Provider::Codex,
             "continue",
             Some("bypass"),
             Some("medium"),
+            None,
             None,
             Some("min:MiniMax-M3"),
             Some("native-session-id"),
@@ -8671,10 +9601,71 @@ mod tests {
     }
 
     #[test]
+    fn codex_fast_setting_selects_fast_or_standard_before_resume() {
+        for (fast, expected_tier) in [(true, "\"fast\""), (false, "\"default\"")] {
+            let args = default_agent_args_with_resume(
+                Provider::Codex,
+                "continue",
+                None,
+                Some("medium"),
+                None,
+                Some(fast),
+                Some("cod:gpt-5.6-sol"),
+                Some("native-session-id"),
+                ChatRuntime::IoGateway,
+            );
+
+            let resume_index = args
+                .iter()
+                .position(|arg| arg == "resume")
+                .expect("resume positional");
+            let fast_feature_index = args
+                .iter()
+                .position(|arg| arg == "features.fast_mode=true")
+                .unwrap_or_else(|| panic!("missing Fast feature override in {args:?}"));
+            let tier = format!("service_tier={expected_tier}");
+            let tier_index = args
+                .iter()
+                .position(|arg| arg == &tier)
+                .unwrap_or_else(|| panic!("missing {tier} in {args:?}"));
+
+            assert!(fast_feature_index < resume_index, "args: {args:?}");
+            assert!(tier_index < resume_index, "args: {args:?}");
+            assert_eq!(
+                &args[resume_index..resume_index + 3],
+                ["resume", "native-session-id", "continue"]
+            );
+        }
+    }
+
+    #[test]
+    fn codex_unspecified_fast_setting_inherits_cli_configuration() {
+        let args = default_agent_args_with_resume(
+            Provider::Codex,
+            "hi",
+            None,
+            None,
+            None,
+            None,
+            Some("gpt-5.6-sol"),
+            None,
+            ChatRuntime::NativeCli,
+        );
+
+        assert!(!args.iter().any(|arg| arg.starts_with("service_tier=")));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("features.fast_mode="))
+        );
+    }
+
+    #[test]
     fn native_runtime_does_not_override_codex_provider() {
         let args = default_agent_args_with_resume(
             Provider::Codex,
             "hi",
+            None,
             None,
             None,
             None,

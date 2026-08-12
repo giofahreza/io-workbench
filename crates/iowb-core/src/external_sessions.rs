@@ -1177,7 +1177,7 @@ fn extract_text(value: Option<&Value>) -> String {
     }
 }
 
-fn visible_user_text(text: &str) -> String {
+pub(crate) fn visible_user_text(text: &str) -> String {
     let mut candidate = text.trim();
     loop {
         let Some(tag) = ["system-reminder", "environment_context"]

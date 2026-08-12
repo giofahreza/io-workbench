@@ -7,12 +7,7 @@
     <meta name="theme-color" content="#0f766e" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;500;700&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/vendor/codemirror/codemirror.css" />
-    <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260811-02" />
+    <link rel="stylesheet" href="/styles.css?v=20260812-06" />
   </head>
   <body class="auth-pending">
     <aside class="sidebar">
@@ -28,9 +23,9 @@
       </div>
       <section class="sidebar-context" aria-label="Projects">
         <div class="sidebar-tools">
-          <input id="sidebar-search" type="search" placeholder="Search projects" />
+          <input id="sidebar-search" type="search" aria-label="Search projects" placeholder="Search projects" />
           <div class="sidebar-tool-actions">
-            <button id="sidebar-new-project" type="button" title="Add project">+</button>
+            <button id="sidebar-new-project" class="icon-button" type="button" aria-label="Add project" title="Add project" data-symbol="plus"></button>
             <button id="sidebar-refresh" class="icon-button" type="button" aria-label="Refresh workspace" title="Refresh workspace" data-symbol="refresh"></button>
           </div>
         </div>
@@ -105,9 +100,9 @@
       <section id="files-view" class="panel view workbench-panel files-panel">
         <div class="files-workbench">
           <section class="files-sidebar" aria-label="Project files">
-            <input id="files-path" name="path" type="hidden" value="." />
-            <input id="file-upload-input" type="file" multiple hidden />
-            <input id="folder-upload-input" type="file" multiple webkitdirectory directory hidden />
+            <input id="files-path" name="path" type="hidden" value="." aria-label="Current files path" />
+            <input id="file-upload-input" type="file" multiple hidden aria-label="Upload files" />
+            <input id="folder-upload-input" type="file" multiple webkitdirectory directory hidden aria-label="Upload folder" />
             <div class="files-tree-header">
               <div class="files-title-row">
                 <h3>Files</h3>
@@ -144,6 +139,7 @@
           </section>
           <form id="file-editor-form" class="file-editor-pane">
             <div class="editor-topbar">
+              <button id="editor-close" class="icon-button editor-close" type="button" aria-label="Back to files" title="Back to files" data-symbol="arrow-left"></button>
               <label class="editor-path-field">
                 <span>File</span>
                 <input id="file-editor-path" name="filePath" />
@@ -187,7 +183,7 @@
             </div>
             <div class="editor-shell">
               <pre id="file-editor-lines" aria-hidden="true">1</pre>
-              <textarea id="file-editor-content" rows="18" spellcheck="false"></textarea>
+              <textarea id="file-editor-content" rows="18" spellcheck="false" aria-label="File contents"></textarea>
             </div>
             <div class="file-ops-strip">
               <button id="delete-file" class="icon-button" type="button" aria-label="Delete path" title="Delete path" data-symbol="trash"></button>
@@ -207,20 +203,26 @@
         <div class="chat-workbench">
           <div class="chat-body">
             <div id="chat-output" class="chat-transcript" aria-live="polite"></div>
-            <div id="chat-empty-state" class="chat-empty-state hidden" aria-label="Choose CLI for new chat">
-              <div class="chat-provider-picker" role="group" aria-label="CLI">
-                <button type="button" class="chat-provider-option" data-chat-provider-option="codex" aria-label="Use Codex" title="Codex">
-                  <img src="/icons/codex-white.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
-                  <span>Codex</span>
-                </button>
-                <button type="button" class="chat-provider-option" data-chat-provider-option="claude" aria-label="Use Claude" title="Claude">
-                  <img src="/icons/claude-white.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
-                  <span>Claude</span>
-                </button>
-                <button type="button" class="chat-provider-option" data-chat-provider-option="gemini" aria-label="Use Gemini" title="Gemini">
-                  <img src="/icons/gemini-ai-icon.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
-                  <span>Gemini</span>
-                </button>
+            <div id="chat-empty-state" class="chat-empty-state hidden" aria-labelledby="chat-empty-title">
+              <div class="chat-empty-card">
+                <span class="chat-empty-icon" aria-hidden="true"></span>
+                <h2 id="chat-empty-title">Start a new conversation</h2>
+                <p id="chat-empty-description">Choose an agent, then describe what you want to build or change.</p>
+                <button id="chat-empty-add-project" class="primary-action hidden" type="button" data-symbol="folder-plus">Add a project</button>
+                <div class="chat-provider-picker" role="group" aria-label="Choose an agent">
+                  <button type="button" class="chat-provider-option" data-chat-provider-option="codex" aria-label="Use Codex" title="Codex">
+                    <img src="/icons/codex-white.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                    <span>Codex</span>
+                  </button>
+                  <button type="button" class="chat-provider-option" data-chat-provider-option="claude" aria-label="Use Claude" title="Claude">
+                    <img src="/icons/claude-white.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                    <span>Claude</span>
+                  </button>
+                  <button type="button" class="chat-provider-option" data-chat-provider-option="gemini" aria-label="Use Gemini" title="Gemini">
+                    <img src="/icons/gemini-ai-icon.svg" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                    <span>Gemini</span>
+                  </button>
+                </div>
               </div>
             </div>
             <button id="chat-jump-latest" class="chat-jump-latest icon-button" type="button" aria-label="Go to latest message" title="Go to latest message" data-symbol="arrow-down"></button>
@@ -267,6 +269,17 @@
                   </select>
                 </label>
               </div>
+              <div class="chat-fast-control-row">
+                <label class="chat-fast-control" title="Request Fast priority processing for Codex; the service decides the tier actually used">
+                  <input id="chat-fast-toggle" type="checkbox" />
+                  <span class="chat-fast-switch" aria-hidden="true"><span></span></span>
+                  <span class="chat-fast-copy">
+                    <strong>Fast priority</strong>
+                    <small id="chat-fast-status">Off</small>
+                  </span>
+                </label>
+                <span class="chat-fast-hint">Requested tier; actual availability may vary.</span>
+              </div>
               <div class="prompt-config-actions" aria-label="Prompt tools">
                 <button id="chat-upload-images" class="icon-button" type="button" aria-label="Attach images" title="Attach images" data-symbol="image-plus"></button>
                 <span id="chat-image-count" class="prompt-image-count" aria-live="polite">0</span>
@@ -287,7 +300,7 @@
             <div class="composer-tools">
               <label class="file-input-field">
                 <span>Images</span>
-                <input id="chat-image-input" type="file" accept="image/*" multiple />
+                <input id="chat-image-input" type="file" accept="image/*" multiple hidden />
               </label>
             </div>
             <div id="chat-image-preview" class="image-preview-list"></div>
@@ -948,23 +961,6 @@
     </nav>
     <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
-    <script src="/vendor/codemirror/codemirror.js"></script>
-    <script src="/vendor/codemirror/addon/matchbrackets.js"></script>
-    <script src="/vendor/codemirror/addon/closebrackets.js"></script>
-    <script src="/vendor/codemirror/addon/simple.js"></script>
-    <script src="/vendor/codemirror/mode/javascript.js"></script>
-    <script src="/vendor/codemirror/mode/xml.js"></script>
-    <script src="/vendor/codemirror/mode/css.js"></script>
-    <script src="/vendor/codemirror/mode/htmlmixed.js"></script>
-    <script src="/vendor/codemirror/mode/markdown.js"></script>
-    <script src="/vendor/codemirror/mode/gfm.js"></script>
-    <script src="/vendor/codemirror/mode/rust.js"></script>
-    <script src="/vendor/codemirror/mode/shell.js"></script>
-    <script src="/vendor/codemirror/mode/python.js"></script>
-    <script src="/vendor/codemirror/mode/sql.js"></script>
-    <script src="/vendor/codemirror/mode/yaml.js"></script>
-    <script src="/vendor/codemirror/mode/toml.js"></script>
-    <script src="/vendor/xterm/xterm.js"></script>
-    <script src="/app.js?v=20260811-02" type="module"></script>
+    <script src="/app.js?v=20260812-06" type="module"></script>
   </body>
 </html>

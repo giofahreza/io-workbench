@@ -94,6 +94,10 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/vendor/codemirror/addon/simple.js"),
         }),
+        "vendor/codemirror/addon/mode/overlay.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/vendor/codemirror/addon/mode/overlay.js"),
+        }),
         "vendor/codemirror/mode/css.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/vendor/codemirror/mode/css.js"),
@@ -208,7 +212,7 @@ mod tests {
     fn chat_history_treats_agent_content_as_sanitized_markdown_and_uses_snapshot() {
         let source = asset_text("app.js");
         assert!(source.contains("text.innerHTML = renderChatBubbleHtml(String(content));"));
-        assert!(source.contains("text.textContent = String(prompt)"));
+        assert!(source.contains("text.textContent = String(message?.content || \"\")"));
         assert!(!source.contains("text.innerHTML = content"));
         assert!(!source.contains("text.innerHTML = prompt"));
         assert!(source.contains("/snapshot?${query}"));
@@ -231,6 +235,24 @@ mod tests {
             select_option_values(html, "chat-effort"),
             vec!["low", "medium", "high", "xhigh", "max", "ultra"]
         );
+    }
+
+    #[test]
+    fn chat_fast_controls_share_the_session_aware_setter() {
+        let html = asset_text("index.html");
+        let source = asset_text("app.js");
+
+        assert!(html.contains(r#"id="chat-fast-toggle""#));
+        assert!(source.contains(r#"data-chat-fast-setting"#));
+        assert!(source.contains("function setChatFastRequested(requested)"));
+        assert!(source.contains("saveSessionOverrides(sid, { fast: next });"));
+        assert_eq!(
+            source
+                .matches("setChatFastRequested(event.currentTarget.checked);")
+                .count(),
+            2
+        );
+        assert!(source.contains(r#"fast: chatFastValue(),"#));
     }
 
     #[test]

@@ -44,13 +44,14 @@ use iowb_protocol::{
     ApiErrorBody, AuthStatusResponse, BatchCopyFileRequest, BatchDeleteFileRequest,
     BatchRenameFileRequest, BrowseFilesystemResponse, ChatMessage, ChatRuntime, CopyFileRequest,
     CreateFileRequest, CreateProjectRequest, CreateWorkspaceRequest, DeleteFcmTokenRequest,
-    DeleteFileRequest, FcmTokenResponse, FileContentResponse, FileEntry, HealthResponse,
-    HealthStatus, LoginRequest, MessageRole, MessagesResponse, PRODUCT_NAME, PlaceholderResponse,
-    ProcessInputRequest, ProcessResizeRequest, ProcessStartRequest, ProcessStartResponse,
-    ProjectListResponse, ProjectSummary, PromptHistoryCursor, PromptHistoryResponse, Provider,
-    RegisterFcmTokenRequest, RenameFileRequest, ServerStatusResponse, SessionDraftResponse,
-    SessionSnapshotResponse, SessionSummary, UpdateSessionDraftRequest,
-    WS_COMMAND_CHANNEL_CAPACITY, WorkspaceType, WsClientCommand, WsServerEvent, new_id,
+    DeleteFileRequest, FcmTokenResponse, FileContentResponse, FileEntry, ForkSessionRequest,
+    ForkSessionResponse, HealthResponse, HealthStatus, LoginRequest, MessageRole, MessagesResponse,
+    PRODUCT_NAME, PlaceholderResponse, ProcessInputRequest, ProcessResizeRequest,
+    ProcessStartRequest, ProcessStartResponse, ProjectListResponse, ProjectSummary,
+    PromptHistoryCursor, PromptHistoryResponse, Provider, RegisterFcmTokenRequest,
+    RenameFileRequest, ServerStatusResponse, SessionDraftResponse, SessionSnapshotResponse,
+    SessionSummary, SessionTokenUsage, UpdateSessionDraftRequest, WS_COMMAND_CHANNEL_CAPACITY,
+    WorkspaceType, WsClientCommand, WsServerEvent, new_id,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -360,6 +361,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/sessions/{session_id}/messages", get(session_messages))
         .route("/api/sessions/{session_id}/prompts", get(session_prompts))
         .route("/api/sessions/{session_id}/snapshot", get(session_snapshot))
+        .route("/api/sessions/{session_id}/fork", post(fork_session))
         .route(
             "/api/sessions/{session_id}/draft",
             get(get_session_draft)
@@ -3047,6 +3049,12 @@ struct ChatModelsQuery {
     provider: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayChatModel {
+    value: String,
+    label: String,
+}
+
 /// Per-provider model catalog used by the chat UI's model picker. Native CLI
 /// mode reads local/fallback models, while IO Gateway mode reads the
 /// configured gateway catalog without failing the picker when unavailable.
@@ -3062,13 +3070,17 @@ async fn chat_provider_models(
     let runtime = configured_chat_runtime(&state, &user.0.id);
     let mut models: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
+    let mut gateway_labels = std::collections::BTreeMap::new();
     let mut gateway_available = true;
 
     if runtime == ChatRuntime::IoGateway && matches!(provider, Provider::Codex | Provider::Claude) {
         if let Some(gateway_models) = direct_ai_models_for_user(&state, &user.0.id, provider).await
         {
             for model in gateway_models {
-                push_chat_model(&mut models, &mut seen, model);
+                gateway_labels
+                    .entry(model.value.trim().to_ascii_lowercase())
+                    .or_insert(model.label);
+                push_chat_model(&mut models, &mut seen, model.value);
             }
         } else {
             gateway_available = false;
@@ -3102,9 +3114,13 @@ async fn chat_provider_models(
         }));
     }
     model_values.extend(models.into_iter().map(|value| {
+        let label = gateway_labels
+            .get(&value.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| value.clone());
         serde_json::json!({
             "value": value,
-            "label": value,
+            "label": label,
         })
     }));
 
@@ -3213,16 +3229,16 @@ async fn direct_ai_models_for_user(
     state: &AppState,
     user_id: &str,
     provider: Provider,
-) -> Option<Vec<String>> {
+) -> Option<Vec<GatewayChatModel>> {
     let config = chat_ai_config_for_user(state, user_id, provider);
     let raw = fetch_direct_ai_models(&config).await.unwrap_or_default();
     if raw.is_empty() {
         return None;
     }
-    let ids: Vec<String> = raw
+    let ids: Vec<GatewayChatModel> = raw
         .into_iter()
         .filter_map(|model| {
-            model
+            let value = model
                 .get("value")
                 .and_then(Value::as_str)
                 .map(str::to_string)
@@ -3231,7 +3247,13 @@ async fn direct_ai_models_for_user(
                         .get("label")
                         .and_then(Value::as_str)
                         .map(str::to_string)
-                })
+                })?;
+            let label = model
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| value.clone());
+            Some(GatewayChatModel { value, label })
         })
         .collect();
     if ids.is_empty() { None } else { Some(ids) }
@@ -3363,21 +3385,6 @@ fn apply_io_gateway_config(config: &mut Value, provider: Provider) {
     };
     obj.insert("mode".to_string(), Value::String("aiproxy".to_string()));
     obj.remove("base_url");
-    let gateway_root = obj
-        .get("gatewayUrl")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_end_matches('/').to_string())
-        .or_else(|| {
-            obj.get("baseUrl")
-                .and_then(Value::as_str)
-                .and_then(url_origin)
-        })
-        .unwrap_or_else(|| {
-            url_origin(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL)
-                .unwrap_or_else(|| DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string())
-        });
     let endpoint_key = if provider == Provider::Codex {
         "codexEndpoint"
     } else {
@@ -3394,18 +3401,70 @@ fn apply_io_gateway_config(config: &mut Value, provider: Provider) {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(default_endpoint);
-    let base_url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.trim_end_matches('/').to_string()
-    } else {
-        format!(
-            "{}/{}",
-            gateway_root.trim_end_matches('/'),
-            endpoint.trim_matches('/')
-        )
-    };
+    let gateway_root = obj
+        .get("gatewayUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .or_else(|| {
+            obj.get("baseUrl")
+                .and_then(Value::as_str)
+                .and_then(|value| {
+                    let value = value.trim().trim_end_matches('/');
+                    if io_gateway_url_has_endpoint_path(value, endpoint) {
+                        Some(value.to_string())
+                    } else {
+                        url_origin(value)
+                    }
+                })
+        })
+        .unwrap_or_else(|| {
+            url_origin(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL)
+                .unwrap_or_else(|| DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string())
+        });
+    let base_url = join_io_gateway_endpoint_url(&gateway_root, endpoint);
     obj.insert("baseUrl".to_string(), Value::String(base_url));
     obj.remove("api_key_env");
     obj.remove("apiKeyEnv");
+}
+
+pub(crate) fn join_io_gateway_endpoint_url(gateway_root: &str, endpoint: &str) -> String {
+    let gateway_root = gateway_root.trim().trim_end_matches('/');
+    let endpoint = endpoint.trim();
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        return endpoint.trim_end_matches('/').to_string();
+    }
+    let endpoint = endpoint.trim_matches('/');
+    if endpoint.is_empty() || io_gateway_url_has_endpoint_path(gateway_root, endpoint) {
+        gateway_root.to_string()
+    } else {
+        format!("{gateway_root}/{endpoint}")
+    }
+}
+
+fn io_gateway_url_has_endpoint_path(url: &str, endpoint: &str) -> bool {
+    let without_fragment = url.split_once('#').map_or(url, |(value, _)| value);
+    let without_suffix = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(value, _)| value);
+    let path = without_suffix
+        .split_once("://")
+        .map_or(without_suffix, |(_, remainder)| {
+            remainder
+                .find('/')
+                .map_or("", |path_start| &remainder[path_start + 1..])
+        });
+    let path_segments: Vec<_> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let endpoint_segments: Vec<_> = endpoint
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    !endpoint_segments.is_empty() && path_segments.ends_with(&endpoint_segments)
 }
 
 fn direct_ai_secret_configured(config: &Value, key: &str) -> bool {
@@ -4251,6 +4310,39 @@ async fn session_snapshot(
     }))
 }
 
+async fn fork_session(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<ForkSessionRequest>,
+) -> Result<Json<ForkSessionResponse>> {
+    validate_session_id(&session_id)?;
+    let before_message_id = request.before_message_id.trim();
+    if before_message_id.is_empty() || before_message_id.len() > 1_000 {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "beforeMessageId must be a non-empty message id",
+        ));
+    }
+    let request_id = request.request_id.trim();
+    if request_id.is_empty()
+        || request_id.len() > 200
+        || !request_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "requestId must be a non-empty stable identifier",
+        ));
+    }
+    let response = state
+        .fork_session_before_message(&user.0.id, &session_id, before_message_id, request_id)
+        .await?;
+    publish_projects(&state).await;
+    Ok(Json(response))
+}
+
 async fn get_session_draft(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -4462,68 +4554,60 @@ struct TokenUsageQuery {
     provider: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct TokenUsageSnapshot {
+    usage: SessionTokenUsage,
+    total: u64,
+}
+
 async fn session_token_usage(
     State(state): State<AppState>,
-    AxumPath((project_name, session_id)): AxumPath<(String, String)>,
+    AxumPath((_project_name, session_id)): AxumPath<(String, String)>,
     Query(query): Query<TokenUsageQuery>,
 ) -> Result<Json<Value>> {
     validate_session_id(&session_id)?;
+    let session = state.sessions.get(&session_id).await?;
     let provider = query
         .provider
         .as_deref()
         .map(parse_provider_param)
         .transpose()?
-        .unwrap_or(Provider::Claude);
+        .unwrap_or(session.provider);
 
-    let usage = match provider {
-        Provider::Gemini => serde_json::json!({
+    if provider == Provider::Gemini {
+        return Ok(Json(serde_json::json!({
             "used": 0,
             "total": 0,
             "breakdown": { "input": 0, "output": 0, "cacheCreation": 0, "cacheRead": 0 },
             "unsupported": true,
             "message": "Token usage tracking not available for Gemini sessions",
-        }),
-        Provider::Codex => codex_token_usage(&session_id).await?,
-        Provider::Claude => {
-            let project = state.projects.find_by_name(&project_name)?;
-            claude_token_usage(&project.path, &session_id).await?
-        }
-    };
-
-    // Stamp token usage onto the latest assistant message so the per-turn
-    // footer persists across page refreshes (the UI otherwise has to fetch
-    // it on every load). Skip providers that explicitly report "unsupported".
-    let unsupported = usage
-        .get("unsupported")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if !unsupported {
-        let breakdown = usage.get("breakdown").cloned().unwrap_or_else(|| {
-            serde_json::json!({
-                "input": 0,
-                "output": 0,
-                "cacheCreation": 0,
-                "cacheRead": 0,
-            })
-        });
-        let token_payload = serde_json::json!({
-            "used": usage.get("used").cloned().unwrap_or_else(|| serde_json::json!(0)),
-            "input": breakdown.get("input").cloned().unwrap_or_else(|| serde_json::json!(0)),
-            "output": breakdown.get("output").cloned().unwrap_or_else(|| serde_json::json!(0)),
-            "cacheCreation": breakdown.get("cacheCreation").cloned().unwrap_or_else(|| serde_json::json!(0)),
-            "cacheRead": breakdown.get("cacheRead").cloned().unwrap_or_else(|| serde_json::json!(0)),
-        });
-        let stamp = serde_json::json!({ "tokenUsage": token_payload });
-        if let Err(error) =
-            state
-                .sessions
-                .stamp_latest_message_metadata(&session_id, MessageRole::Assistant, stamp)
-        {
-            warn!(error = %error, session_id = %session_id, "failed to stamp token usage on assistant message");
-        }
+        })));
     }
 
-    Ok(Json(usage))
+    let native_session_id = session
+        .native_session_id
+        .as_deref()
+        .unwrap_or(session.id.as_str());
+    let snapshot = match provider {
+        Provider::Codex => codex_token_usage(native_session_id).await?,
+        Provider::Claude => claude_token_usage(&session.project_path, native_session_id).await?,
+        Provider::Gemini => unreachable!(),
+    };
+
+    state
+        .sessions
+        .set_token_usage(&session_id, snapshot.usage.clone())
+        .await?;
+    let stamp = serde_json::json!({ "tokenUsage": &snapshot.usage });
+    if let Err(error) =
+        state
+            .sessions
+            .stamp_latest_message_metadata(&session_id, MessageRole::Assistant, stamp)
+    {
+        warn!(error = %error, session_id = %session_id, "failed to stamp token usage on assistant message");
+    }
+
+    Ok(Json(token_usage_response(&snapshot)))
 }
 
 async fn list_processes(State(state): State<AppState>) -> Json<Vec<iowb_protocol::ProcessInfo>> {
@@ -4713,6 +4797,7 @@ async fn handle_ws_command(
             effort,
             mode,
             thinking,
+            fast,
         } => {
             let runtime = resolve_session_chat_runtime(
                 state,
@@ -4741,6 +4826,7 @@ async fn handle_ws_command(
                     effort,
                     mode,
                     thinking,
+                    fast,
                     runtime,
                     direct_ai_config,
                     Some(user.id.clone()),
@@ -6019,6 +6105,13 @@ async fn fetch_direct_ai_models(config: &Value) -> std::result::Result<Vec<Value
         let mapped: Vec<Value> = raw_models
             .into_iter()
             .filter_map(|model| {
+                if model
+                    .get("visibility")
+                    .and_then(Value::as_str)
+                    .is_some_and(|visibility| visibility.eq_ignore_ascii_case("hide"))
+                {
+                    return None;
+                }
                 let value = model
                     .as_str()
                     .map(str::to_string)
@@ -6031,13 +6124,26 @@ async fn fetch_direct_ai_models(config: &Value) -> std::result::Result<Vec<Value
                     })
                     .or_else(|| {
                         model
+                            .get("slug")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .or_else(|| {
+                        model
                             .get("name")
                             .and_then(Value::as_str)
                             .map(str::to_string)
                     })?;
+                let label = model
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .or_else(|| model.get("label").and_then(Value::as_str))
+                    .or_else(|| model.get("name").and_then(Value::as_str))
+                    .unwrap_or(&value)
+                    .to_string();
                 Some(serde_json::json!({
                     "value": value,
-                    "label": value,
+                    "label": label,
                 }))
             })
             .collect();
@@ -6423,7 +6529,7 @@ fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
 
-async fn claude_token_usage(project_path: &str, session_id: &str) -> Result<Value> {
+async fn claude_token_usage(project_path: &str, session_id: &str) -> Result<TokenUsageSnapshot> {
     let home = home_dir()
         .ok_or_else(|| ServerError::new(StatusCode::NOT_FOUND, "home directory not found"))?;
     let encoded_project = encode_claude_project_path(project_path);
@@ -6451,25 +6557,18 @@ async fn claude_token_usage(project_path: &str, session_id: &str) -> Result<Valu
             }
         })?;
 
-    let (input, cache_creation, cache_read) = parse_claude_usage(&content);
-    let used = input + cache_creation + cache_read;
     let total = env::var("CONTEXT_WINDOW")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(160_000);
 
-    Ok(serde_json::json!({
-        "used": used,
-        "total": total,
-        "breakdown": {
-            "input": input,
-            "cacheCreation": cache_creation,
-            "cacheRead": cache_read,
-        },
-    }))
+    Ok(TokenUsageSnapshot {
+        usage: parse_claude_usage(&content),
+        total,
+    })
 }
 
-async fn codex_token_usage(session_id: &str) -> Result<Value> {
+async fn codex_token_usage(session_id: &str) -> Result<TokenUsageSnapshot> {
     let home = home_dir()
         .ok_or_else(|| ServerError::new(StatusCode::NOT_FOUND, "home directory not found"))?;
     let sessions_dir = home.join(".codex").join("sessions");
@@ -6515,11 +6614,21 @@ async fn codex_token_usage(session_id: &str) -> Result<Value> {
             }
         })?;
 
-    let (used, total) = parse_codex_usage(&content);
-    Ok(serde_json::json!({
-        "used": used,
-        "total": total,
-    }))
+    Ok(parse_codex_usage(&content))
+}
+
+fn token_usage_response(snapshot: &TokenUsageSnapshot) -> Value {
+    serde_json::json!({
+        "used": snapshot.usage.used,
+        "total": snapshot.total,
+        "breakdown": {
+            "input": snapshot.usage.input,
+            "output": snapshot.usage.output,
+            "cacheCreation": snapshot.usage.cache_creation,
+            "cacheRead": snapshot.usage.cache_read,
+        },
+        "costUsd": snapshot.usage.cost_usd,
+    })
 }
 
 fn encode_claude_project_path(project_path: &str) -> String {
@@ -6535,39 +6644,77 @@ fn encode_claude_project_path(project_path: &str) -> String {
         .collect()
 }
 
-fn parse_claude_usage(content: &str) -> (u64, u64, u64) {
-    for line in content.lines().rev() {
+fn parse_claude_usage(content: &str) -> SessionTokenUsage {
+    let mut usage_by_message = HashMap::new();
+    for (line_index, line) in content.lines().enumerate() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         if value.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        let Some(usage) = value
-            .get("message")
-            .and_then(|message| message.get("usage"))
-        else {
+        let Some(message) = value.get("message") else {
             continue;
         };
-        return (
-            usage
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            usage
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            usage
-                .get("cache_read_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+        let Some(usage) = message.get("usage") else {
+            continue;
+        };
+        let input = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output = usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_creation = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_read = usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let key = message
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("line-{line_index}"));
+        usage_by_message.insert(
+            key,
+            SessionTokenUsage {
+                used: input
+                    .saturating_add(output)
+                    .saturating_add(cache_creation)
+                    .saturating_add(cache_read),
+                input,
+                output,
+                cache_creation,
+                cache_read,
+                cost_usd: usage
+                    .get("cost_usd")
+                    .or_else(|| usage.get("costUsd"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+            },
         );
     }
-    (0, 0, 0)
+
+    usage_by_message
+        .into_values()
+        .fold(SessionTokenUsage::default(), |mut total, usage| {
+            total.used = total.used.saturating_add(usage.used);
+            total.input = total.input.saturating_add(usage.input);
+            total.output = total.output.saturating_add(usage.output);
+            total.cache_creation = total.cache_creation.saturating_add(usage.cache_creation);
+            total.cache_read = total.cache_read.saturating_add(usage.cache_read);
+            total.cost_usd += usage.cost_usd;
+            total
+        })
 }
 
-fn parse_codex_usage(content: &str) -> (u64, u64) {
+fn parse_codex_usage(content: &str) -> TokenUsageSnapshot {
     for line in content.lines().rev() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -6584,18 +6731,48 @@ fn parse_codex_usage(content: &str) -> (u64, u64) {
             continue;
         };
 
-        let used = info
-            .get("total_token_usage")
-            .and_then(|usage| usage.get("total_tokens"))
+        let usage = info.get("total_token_usage").unwrap_or(info);
+        let input = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output = usage
+            .get("output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let total = info
             .get("model_context_window")
             .and_then(Value::as_u64)
             .unwrap_or(200_000);
-        return (used, total);
+        return TokenUsageSnapshot {
+            usage: SessionTokenUsage {
+                used: usage
+                    .get("total_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| input.saturating_add(output)),
+                input,
+                output,
+                cache_creation: usage
+                    .get("cache_write_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                cache_read: usage
+                    .get("cached_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                cost_usd: usage
+                    .get("cost_usd")
+                    .or_else(|| usage.get("costUsd"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+            },
+            total,
+        };
     }
-    (0, 200_000)
+    TokenUsageSnapshot {
+        usage: SessionTokenUsage::default(),
+        total: 200_000,
+    }
 }
 
 async fn static_asset(uri: Uri) -> Response {
@@ -7560,6 +7737,64 @@ mod tests {
     }
 
     #[test]
+    fn io_gateway_config_does_not_duplicate_endpoint_inclusive_urls() {
+        let mut codex = serde_json::json!({
+            "gatewayUrl": "https://ai.qif.us/codex/",
+        });
+        apply_io_gateway_config(&mut codex, Provider::Codex);
+        assert_eq!(
+            codex.get("baseUrl").and_then(Value::as_str),
+            Some("https://ai.qif.us/codex")
+        );
+
+        let mut claude = serde_json::json!({
+            "gatewayUrl": "https://ai.qif.us/claude",
+        });
+        apply_io_gateway_config(&mut claude, Provider::Claude);
+        assert_eq!(
+            claude.get("baseUrl").and_then(Value::as_str),
+            Some("https://ai.qif.us/claude")
+        );
+
+        let mut legacy_base = serde_json::json!({
+            "baseUrl": "https://gateway.example.com/api/codex/",
+        });
+        apply_io_gateway_config(&mut legacy_base, Provider::Codex);
+        assert_eq!(
+            legacy_base.get("baseUrl").and_then(Value::as_str),
+            Some("https://gateway.example.com/api/codex")
+        );
+    }
+
+    #[test]
+    fn io_gateway_config_preserves_custom_and_absolute_endpoint_overrides() {
+        let mut relative = serde_json::json!({
+            "gatewayUrl": "https://gateway.example.com/root",
+            "codexEndpoint": "api/codex",
+        });
+        apply_io_gateway_config(&mut relative, Provider::Codex);
+        assert_eq!(
+            relative.get("baseUrl").and_then(Value::as_str),
+            Some("https://gateway.example.com/root/api/codex")
+        );
+
+        let mut absolute = serde_json::json!({
+            "gatewayUrl": "https://gateway.example.com/root",
+            "codexEndpoint": "https://codex.example.com/custom/",
+        });
+        apply_io_gateway_config(&mut absolute, Provider::Codex);
+        assert_eq!(
+            absolute.get("baseUrl").and_then(Value::as_str),
+            Some("https://codex.example.com/custom")
+        );
+
+        assert_eq!(
+            join_io_gateway_endpoint_url("https://gateway.example.com/mycodex", "codex"),
+            "https://gateway.example.com/mycodex/codex"
+        );
+    }
+
+    #[test]
     fn io_gateway_runtime_does_not_fall_back_to_environment_credentials() {
         let config = serde_json::json!({
             "mode": "aiproxy",
@@ -7655,6 +7890,114 @@ mod tests {
             Some(0)
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn io_gateway_codex_chat_models_preserve_slug_ids_and_prefixed_aliases() {
+        async fn models(headers: HeaderMap) -> impl IntoResponse {
+            let bearer = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+            let api_key = headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok());
+            if bearer != Some("Bearer stored-key") || api_key != Some("stored-key") {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            Json(serde_json::json!({
+                "models": [
+                    {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol"},
+                    {"slug": "cod:gpt-5.6-sol", "display_name": "GPT-5.6-Sol (alias)"},
+                    {
+                        "slug": "gpt-5.6-sol-wm",
+                        "display_name": "GPT-5.6-Sol-WM",
+                        "visibility": "hide"
+                    }
+                ]
+            }))
+            .into_response()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/codex/models", get(models))).await
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "iowb-server-codex-chat-models-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).expect("config directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+        let user_id = "codex-model-test-user";
+        state
+            .storage
+            .set_setting(
+                &user_setting_key(user_id, "direct-ai"),
+                &serde_json::json!({
+                    "chatRuntime": "io_gateway",
+                    "mode": "aiproxy",
+                    "gatewayUrl": format!("http://{address}"),
+                    "gatewayApiKey": "stored-key",
+                }),
+            )
+            .expect("setting");
+
+        let Json(body) = chat_provider_models(
+            State(state),
+            Extension(AuthenticatedUser(iowb_protocol::UserProfile {
+                id: user_id.to_string(),
+                username: "codex-model-test".to_string(),
+                email: None,
+                created_at: chrono::Utc::now(),
+            })),
+            Query(ChatModelsQuery {
+                provider: Some("codex".to_string()),
+            }),
+        )
+        .await
+        .expect("models response");
+
+        let model_values: Vec<_> = body
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|model| {
+                Some((model.get("value")?.as_str()?, model.get("label")?.as_str()?))
+            })
+            .collect();
+        assert_eq!(
+            model_values,
+            [
+                ("gpt-5.6-sol", "GPT-5.6-Sol"),
+                ("cod:gpt-5.6-sol", "GPT-5.6-Sol (alias)"),
+            ],
+            "gateway model ids must remain byte-for-byte selectable"
+        );
+        assert_eq!(
+            body.get("gatewayAvailable").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        server.abort();
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -7847,23 +8190,35 @@ mod tests {
     }
 
     #[test]
-    fn parses_latest_claude_usage() {
+    fn parses_total_claude_usage_without_double_counting_stream_updates() {
         let content = r#"
-{"type":"assistant","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}
-{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30}}}
+{"type":"assistant","message":{"id":"msg-1","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}
+{"type":"assistant","message":{"id":"msg-1","usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}}}
+{"type":"assistant","message":{"id":"msg-2","usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4}}}
 "#;
 
-        assert_eq!(parse_claude_usage(content), (10, 20, 30));
+        let usage = parse_claude_usage(content);
+        assert_eq!(usage.used, 110);
+        assert_eq!(usage.input, 11);
+        assert_eq!(usage.output, 44);
+        assert_eq!(usage.cache_creation, 22);
+        assert_eq!(usage.cache_read, 33);
     }
 
     #[test]
     fn parses_latest_codex_usage() {
         let content = r#"
-{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":12},"model_context_window":1000}}}
-{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":42},"model_context_window":2000}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":4,"cache_write_input_tokens":2,"output_tokens":2,"total_tokens":12},"model_context_window":1000}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"cached_input_tokens":12,"cache_write_input_tokens":3,"output_tokens":12,"total_tokens":42},"model_context_window":2000}}}
 "#;
 
-        assert_eq!(parse_codex_usage(content), (42, 2000));
+        let snapshot = parse_codex_usage(content);
+        assert_eq!(snapshot.usage.used, 42);
+        assert_eq!(snapshot.usage.input, 30);
+        assert_eq!(snapshot.usage.output, 12);
+        assert_eq!(snapshot.usage.cache_creation, 3);
+        assert_eq!(snapshot.usage.cache_read, 12);
+        assert_eq!(snapshot.total, 2000);
     }
 
     #[test]
@@ -7933,6 +8288,7 @@ mod tests {
                 project.display().to_string(),
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -8018,6 +8374,7 @@ mod tests {
                 project.display().to_string(),
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,

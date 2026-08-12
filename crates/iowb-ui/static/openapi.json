@@ -99,6 +99,63 @@
     "/api/sessions/{session_id}/messages": {
       "get": { "tags": ["Sessions"], "summary": "Read session messages" }
     },
+    "/api/sessions/{session_id}/fork": {
+      "post": {
+        "tags": ["Sessions"],
+        "summary": "Create a non-destructive chat fork before a user prompt",
+        "description": "Creates a new inactive session containing only messages strictly before the selected persisted user message. The selected prompt is saved as the destination draft and is not sent automatically. The source session and project files remain unchanged. Reusing requestId for the same source session returns the original fork.",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "minLength": 1 }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ForkSessionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The created or previously created idempotent fork",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ForkSessionResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid message, request identifier, or unsupported exact native-runtime fork",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          },
+          "404": {
+            "description": "Source session or selected message was not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          },
+          "409": {
+            "description": "The source session became active or a Codex native boundary could not be resolved",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/sessions/{session_id}/model": {
       "get": { "tags": ["Sessions"], "summary": "Read a session model override" },
       "put": { "tags": ["Sessions"], "summary": "Update a session model override" }
@@ -399,6 +456,89 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "ApiError": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string" },
+          "details": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "ForkSessionRequest": {
+        "type": "object",
+        "required": ["beforeMessageId", "requestId"],
+        "properties": {
+          "beforeMessageId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Persisted user-message ID to exclude from the destination history and restore as its draft."
+          },
+          "requestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9_.:-]+$",
+            "description": "Client-generated idempotency identifier scoped to the user and source session."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SessionDraftResponse": {
+        "type": "object",
+        "required": ["session_id", "content"],
+        "properties": {
+          "session_id": { "type": "string" },
+          "content": { "type": "string" },
+          "updated_at": { "type": ["string", "null"], "format": "date-time" }
+        }
+      },
+      "SessionSummary": {
+        "type": "object",
+        "required": ["id", "provider", "projectPath", "title", "messageCount", "lastActivity", "active"],
+        "properties": {
+          "id": { "type": "string" },
+          "provider": { "type": "string", "enum": ["claude", "codex", "gemini"] },
+          "external": { "type": "boolean", "default": false },
+          "projectPath": { "type": "string" },
+          "title": { "type": "string" },
+          "messageCount": { "type": "integer", "minimum": 0 },
+          "lastActivity": { "type": "string", "format": "date-time" },
+          "active": { "type": "boolean" },
+          "model": { "type": ["string", "null"] },
+          "runtime": { "type": ["string", "null"], "enum": ["native_cli", "io_gateway", null] },
+          "effort": { "type": ["string", "null"] },
+          "mode": { "type": ["string", "null"] },
+          "thinking": { "type": ["boolean", "null"] },
+          "fast": {
+            "type": ["boolean", "null"],
+            "description": "Whether Codex Fast priority processing was requested for the session."
+          },
+          "lastMessageAt": { "type": ["string", "null"], "format": "date-time" },
+          "firstUserAt": { "type": ["string", "null"], "format": "date-time" },
+          "receivedAt": { "type": ["string", "null"], "format": "date-time" },
+          "token_usage": { "type": ["object", "null"], "additionalProperties": true }
+        },
+        "additionalProperties": true
+      },
+      "ForkSessionResponse": {
+        "type": "object",
+        "required": ["sourceSessionId", "beforeMessageId", "session", "draft", "nativeForked", "filesUnchanged"],
+        "properties": {
+          "sourceSessionId": { "type": "string" },
+          "beforeMessageId": { "type": "string" },
+          "session": { "$ref": "#/components/schemas/SessionSummary" },
+          "draft": { "$ref": "#/components/schemas/SessionDraftResponse" },
+          "nativeForked": {
+            "type": "boolean",
+            "description": "True when a native Codex thread was forked at the exact prior turn."
+          },
+          "filesUnchanged": { "type": "boolean", "const": true }
+        },
+        "additionalProperties": false
       }
     }
   }

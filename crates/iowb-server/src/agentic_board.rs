@@ -3,7 +3,10 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -15,6 +18,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use iowb_core::{AppState, DirectAiRuntimeConfig, augmented_user_path};
+use iowb_fs::FsError;
 use iowb_protocol::{ChatRuntime, MessageRole, Provider, SessionSummary};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,7 +31,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::{
-    AuthenticatedUser, Result, ServerError,
+    AuthenticatedUser, Result, ServerError, join_io_gateway_endpoint_url,
     rag_client::{
         ProjectIndexRequest, PromotionApproveRequest, PromotionCandidatesRequest, RagClient,
         RagQueryRequest, TaskResultIngestRequest, ValidationErrorIngestRequest, error_record,
@@ -59,6 +63,7 @@ const DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL: &str = "http://141.144.197.96:8319/cla
 const IO_GATEWAY_API_KEY_CREDENTIAL: &str = "io-workbench-io-gateway-api-key";
 const IO_GATEWAY_API_KEY_CREDENTIAL_TYPE: &str = "io_gateway_api_key";
 static AUTO_RETRY_POLLER_STARTED: AtomicBool = AtomicBool::new(false);
+static BOARD_RUN_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -481,6 +486,8 @@ struct BoardRun {
     #[serde(default)]
     logs: Vec<String>,
     #[serde(default)]
+    next_task_sequence: u64,
+    #[serde(default)]
     tasks: Vec<BoardTask>,
     #[serde(default)]
     requirement_matrix: Vec<Value>,
@@ -675,10 +682,8 @@ impl BoardRun {
         let provider = normalize_provider(request.provider.as_deref())?;
         let model = trim_string(request.model).unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let now = Utc::now();
-        let scheduled_start_at = request
-            .scheduled_start_at
-            .as_deref()
-            .and_then(parse_rfc3339_utc);
+        let scheduled_start_at =
+            parse_optional_scheduled_start(request.scheduled_start_at.as_deref())?;
         let should_schedule = scheduled_start_at.is_some_and(|time| time > now);
         let mut run = Self {
             id: Uuid::new_v4().to_string(),
@@ -747,6 +752,7 @@ impl BoardRun {
                 "updatedAt": now,
             }),
             logs: vec!["Created agentic board".to_string()],
+            next_task_sequence: 0,
             tasks: Vec::new(),
             requirement_matrix: Vec::new(),
             requirement_baseline: Vec::new(),
@@ -786,7 +792,7 @@ impl BoardRun {
             final_review: None,
         };
         let task = BoardTask::manual(
-            &run,
+            &mut run,
             TaskRequest {
                 prompt: Some(prompt),
                 command: None,
@@ -969,20 +975,20 @@ impl BoardRun {
 }
 
 impl BoardTask {
-    fn manual(run: &BoardRun, request: TaskRequest) -> Result<Self> {
+    fn manual(run: &mut BoardRun, request: TaskRequest) -> Result<Self> {
         let prompt = trim_string(request.prompt.or(request.command)).unwrap_or_default();
         let title = trim_string(request.title)
             .or_else(|| title_from_prompt(&prompt))
             .ok_or_else(|| bad_request("Manual task title or prompt is required."))?;
         let details =
             trim_string(request.details.or(request.description)).unwrap_or_else(|| prompt.clone());
-        let status = trim_string(request.status).unwrap_or_else(|| "backlog".to_string());
+        let status = normalize_task_status(request.status.as_deref(), "backlog")?;
         let references = [request.references, request.files, request.paths]
             .into_iter()
             .flat_map(value_to_strings)
             .collect();
         Ok(Self {
-            id: next_task_id(run),
+            id: allocate_task_id(run),
             title,
             status,
             summary: String::new(),
@@ -1043,9 +1049,9 @@ impl BoardTask {
         })
     }
 
-    fn draft(run: &BoardRun, title: String, details: String) -> Self {
+    fn draft(run: &mut BoardRun, title: String, details: String) -> Self {
         Self {
-            id: next_task_id(run),
+            id: allocate_task_id(run),
             title,
             status: "backlog".to_string(),
             summary: String::new(),
@@ -1105,109 +1111,113 @@ impl BoardTask {
 async fn create_run(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
-    Json(request): Json<CreateRunRequest>,
+    Json(mut request): Json<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<Value>)> {
-    let scheduled_start_at = request
-        .scheduled_start_at
-        .as_deref()
-        .and_then(parse_rfc3339_utc);
+    let project_path = trim_string(request.project_path.clone())
+        .ok_or_else(|| bad_request("Project path is required"))?;
+    let project_path = state
+        .path_validator
+        .validate_path(PathBuf::from(project_path), false)
+        .await?;
+    let metadata = tokio::fs::metadata(&project_path)
+        .await
+        .map_err(FsError::Io)?;
+    if !metadata.is_dir() {
+        return Err(bad_request("Project path must be a directory"));
+    }
+    request.project_path = Some(project_path.display().to_string());
+
+    let scheduled_start_at = parse_optional_scheduled_start(request.scheduled_start_at.as_deref())?;
     let should_schedule = scheduled_start_at.is_some_and(|time| time > Utc::now());
-    if request.force_new_run != Some(true) {
-        if let Some(project_path) = trim_string(request.project_path.clone()) {
-            if let Some(mut latest) = latest_run_for_project(&state, &user.0.id, &project_path)? {
-                if should_schedule
-                    && (latest.run.loop_started
-                        || latest.run.active
-                        || latest.run.status == "running")
-                {
-                    return Err(ServerError::new(
-                        StatusCode::CONFLICT,
-                        "Pause the active agentic board before scheduling a future start.",
-                    ));
-                }
-                apply_run_options(&mut latest.run, &request)?;
-                let task = BoardTask::manual(
-                    &latest.run,
-                    TaskRequest {
-                        prompt: request.command.clone().or(request.prompt.clone()),
-                        command: None,
-                        title: request.title.clone(),
-                        details: request.details.clone(),
-                        description: request.description.clone(),
-                        acceptance_criteria: None,
-                        acceptance: None,
-                        criteria: None,
-                        references: None,
-                        files: None,
-                        paths: None,
-                        requirement_ids: None,
-                        requirements: None,
-                        priority: None,
-                        depends_on: None,
-                        dependencies: None,
-                        status: Some("pending".to_string()),
-                    },
-                )?;
-                latest.run.tasks.push(task);
-                latest.run.status = if should_schedule {
-                    "scheduled".to_string()
-                } else {
-                    "paused".to_string()
-                };
-                latest.run.active = false;
-                latest.run.scheduled_start_at = scheduled_start_at;
-                latest.run.paused_at = if should_schedule {
-                    None
-                } else {
-                    Some(Utc::now())
-                };
-                latest.run.pause_reason = if should_schedule {
-                    None
-                } else {
-                    Some("New task added to existing board.".to_string())
-                };
-                latest
-                    .run
-                    .append_log("Reused existing board and added a task from start request");
-                latest.run.touch();
-                let run_id = latest.run.id.clone();
-                save_run(&state, &latest.run)?;
-                let latest = if should_schedule {
-                    load_user_run(&state, &user.0.id, &run_id)?
-                } else {
-                    begin_run(&state, &user.0.id, &run_id)?
-                };
-                return Ok((
-                    if should_schedule {
-                        StatusCode::ACCEPTED
-                    } else {
-                        StatusCode::OK
-                    },
-                    Json(
-                        json!({ "success": true, "reused": true, "run": latest.run.detail_json(Some(latest.path.display().to_string())) }),
-                    ),
+    let (run_id, reused) = {
+        let _guard = board_run_mutation_lock();
+        let mut reused_run_id = None;
+        if request.force_new_run != Some(true)
+            && let Some(project_path) = trim_string(request.project_path.clone())
+            && let Some(mut latest) = latest_run_for_project(&state, &user.0.id, &project_path)?
+        {
+            if should_schedule
+                && (latest.run.loop_started || latest.run.active || latest.run.status == "running")
+            {
+                return Err(ServerError::new(
+                    StatusCode::CONFLICT,
+                    "Pause the active agentic board before scheduling a future start.",
                 ));
             }
+            apply_run_options(&mut latest.run, &request)?;
+            let task = BoardTask::manual(
+                &mut latest.run,
+                TaskRequest {
+                    prompt: request.command.clone().or(request.prompt.clone()),
+                    command: None,
+                    title: request.title.clone(),
+                    details: request.details.clone(),
+                    description: request.description.clone(),
+                    acceptance_criteria: None,
+                    acceptance: None,
+                    criteria: None,
+                    references: None,
+                    files: None,
+                    paths: None,
+                    requirement_ids: None,
+                    requirements: None,
+                    priority: None,
+                    depends_on: None,
+                    dependencies: None,
+                    status: Some("pending".to_string()),
+                },
+            )?;
+            latest.run.tasks.push(task);
+            latest.run.status = if should_schedule {
+                "scheduled".to_string()
+            } else {
+                "paused".to_string()
+            };
+            latest.run.active = false;
+            latest.run.scheduled_start_at = scheduled_start_at;
+            latest.run.paused_at = if should_schedule {
+                None
+            } else {
+                Some(Utc::now())
+            };
+            latest.run.pause_reason = if should_schedule {
+                None
+            } else {
+                Some("New task added to existing board.".to_string())
+            };
+            latest
+                .run
+                .append_log("Reused existing board and added a task from start request");
+            latest.run.touch();
+            let run_id = latest.run.id.clone();
+            save_run(&state, &latest.run)?;
+            reused_run_id = Some(run_id);
         }
-    }
 
-    let run = BoardRun::new(Some(user.0.id.clone()), request)?;
-    let run_id = run.id.clone();
-    let should_schedule = run.status == "scheduled";
-    save_run(&state, &run)?;
-    let run = if should_schedule {
-        load_user_run(&state, &user.0.id, &run_id)?.run
+        if let Some(run_id) = reused_run_id {
+            (run_id, true)
+        } else {
+            let run = BoardRun::new(Some(user.0.id.clone()), request)?;
+            let run_id = run.id.clone();
+            save_run(&state, &run)?;
+            (run_id, false)
+        }
+    };
+    let stored = if should_schedule {
+        load_user_run(&state, &user.0.id, &run_id)?
     } else {
-        begin_run(&state, &user.0.id, &run_id)?.run
+        begin_run(&state, &user.0.id, &run_id)?
     };
     Ok((
         if should_schedule {
             StatusCode::ACCEPTED
+        } else if reused {
+            StatusCode::OK
         } else {
             StatusCode::CREATED
         },
         Json(
-            json!({ "success": true, "run": run.detail_json(Some(run_file_path(&state, &run.id).display().to_string())) }),
+            json!({ "success": true, "reused": reused, "run": stored.run.detail_json(Some(stored.path.display().to_string())) }),
         ),
     ))
 }
@@ -1563,8 +1573,9 @@ async fn add_task(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<TaskRequest>,
 ) -> Result<(StatusCode, Json<Value>)> {
+    let _guard = board_run_mutation_lock();
     let mut stored = load_user_run(&state, &user.0.id, &id)?;
-    let task = BoardTask::manual(&stored.run, request)?;
+    let task = BoardTask::manual(&mut stored.run, request)?;
     stored.run.tasks.push(task);
     stored.run.append_log("Added manual board task");
     stored.run.touch();
@@ -1585,7 +1596,8 @@ async fn draft_tasks(
 ) -> Result<Json<Value>> {
     let stored = load_user_run(&state, &user.0.id, &id)?;
     let prompt = trim_string(request.prompt).ok_or_else(|| bad_request("Prompt is required"))?;
-    let tasks = prompt_to_task_drafts(&stored.run, &prompt);
+    let mut run = stored.run;
+    let tasks = prompt_to_task_drafts(&mut run, &prompt);
     Ok(Json(
         json!({ "success": true, "tasks": tasks, "warning": null }),
     ))
@@ -1598,8 +1610,9 @@ async fn backlog_from_prompt(
     Json(request): Json<PromptRequest>,
 ) -> Result<(StatusCode, Json<Value>)> {
     let prompt = trim_string(request.prompt).ok_or_else(|| bad_request("Prompt is required"))?;
+    let _guard = board_run_mutation_lock();
     let mut stored = load_user_run(&state, &user.0.id, &id)?;
-    let tasks = prompt_to_task_drafts(&stored.run, &prompt);
+    let tasks = prompt_to_task_drafts(&mut stored.run, &prompt);
     stored.run.tasks.extend(tasks);
     stored
         .run
@@ -1663,12 +1676,9 @@ async fn delete_task(
     Extension(user): Extension<AuthenticatedUser>,
     AxumPath((id, task_id)): AxumPath<(String, String)>,
 ) -> Result<Json<Value>> {
+    let _guard = board_run_mutation_lock();
     let mut stored = load_user_run(&state, &user.0.id, &id)?;
-    let before = stored.run.tasks.len();
-    stored.run.tasks.retain(|task| task.id != task_id);
-    if stored.run.tasks.len() == before {
-        return Err(not_found("Danger run or backlog task not found"));
-    }
+    delete_board_task(&mut stored.run, &task_id)?;
     stored.run.append_log("Deleted board task");
     stored.run.touch();
     save_run(&state, &stored.run)?;
@@ -1677,14 +1687,37 @@ async fn delete_task(
     ))
 }
 
+fn delete_board_task(run: &mut BoardRun, task_id: &str) -> Result<()> {
+    if run.current_task_id.as_deref() == Some(task_id) {
+        return Err(ServerError::new(
+            StatusCode::CONFLICT,
+            "The currently executing task cannot be deleted.",
+        ));
+    }
+    let before = run.tasks.len();
+    run.tasks.retain(|task| task.id != task_id);
+    if run.tasks.len() == before {
+        return Err(not_found("Danger run or backlog task not found"));
+    }
+    for task in &mut run.tasks {
+        task.depends_on.retain(|dependency| dependency != task_id);
+        if task.source_task_id.as_deref() == Some(task_id) {
+            task.source_task_id = None;
+        }
+        if task.source_qa_task_id.as_deref() == Some(task_id) {
+            task.source_qa_task_id = None;
+        }
+    }
+    Ok(())
+}
+
 async fn update_task(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     AxumPath((id, task_id)): AxumPath<(String, String)>,
     Json(request): Json<UpdateTaskRequest>,
 ) -> Result<Json<Value>> {
-    let status =
-        trim_string(request.status).ok_or_else(|| bad_request("Task status is required"))?;
+    let status = normalize_task_status(request.status.as_deref(), "")?;
     let _ = update_task_status(&state, &user.0.id, &id, &[task_id], &status)?;
     if status == "pending" {
         let stored = begin_run(&state, &user.0.id, &id)?;
@@ -1705,6 +1738,8 @@ fn update_task_status(
     task_ids: &[String],
     status: &str,
 ) -> Result<Json<Value>> {
+    let status = normalize_task_status(Some(status), "")?;
+    let _guard = board_run_mutation_lock();
     let mut stored = load_user_run(state, user_id, run_id)?;
     let mut updated = 0usize;
     let update_all_attention = task_ids.is_empty() && status == "pending";
@@ -1716,7 +1751,7 @@ fn update_task_status(
                     "blocked" | "failed" | "backlog_failed"
                 ));
         if matches {
-            task.status = status.to_string();
+            task.status = status.clone();
             task.error = None;
             updated += 1;
         }
@@ -1740,6 +1775,7 @@ fn mutate_run(
     id: &str,
     mutate: impl FnOnce(&mut BoardRun) -> Result<()>,
 ) -> Result<Json<Value>> {
+    let _guard = board_run_mutation_lock();
     let mut stored = load_user_run(state, user_id, id)?;
     mutate(&mut stored.run)?;
     stored.run.touch();
@@ -1750,23 +1786,27 @@ fn mutate_run(
 }
 
 fn begin_run(state: &AppState, user_id: &str, id: &str) -> Result<StoredRun> {
-    let mut stored = load_user_run(state, user_id, id)?;
-    let should_spawn = !stored.run.loop_started || !stored.run.active;
-    stored.run.status = "running".to_string();
-    stored.run.scheduled_start_at = None;
-    stored.run.active = true;
-    stored.run.loop_started = true;
-    stored.run.auto_run_enabled = true;
-    stored.run.pause_requested = false;
-    stored.run.paused_at = None;
-    stored.run.pause_reason = None;
-    stored.run.cancellation_reason = None;
-    stored.run.current_phase = Some("task_execution".to_string());
-    stored.run.phase_started_at = Some(Utc::now());
-    stored.run.phase_details = Some(json!({ "source": "kanban_board" }));
-    stored.run.append_log("Agentic board execution started");
-    stored.run.touch();
-    save_run(state, &stored.run)?;
+    let (should_spawn, stored) = {
+        let _guard = board_run_mutation_lock();
+        let mut stored = load_user_run(state, user_id, id)?;
+        let should_spawn = !stored.run.loop_started || !stored.run.active;
+        stored.run.status = "running".to_string();
+        stored.run.scheduled_start_at = None;
+        stored.run.active = true;
+        stored.run.loop_started = true;
+        stored.run.auto_run_enabled = true;
+        stored.run.pause_requested = false;
+        stored.run.paused_at = None;
+        stored.run.pause_reason = None;
+        stored.run.cancellation_reason = None;
+        stored.run.current_phase = Some("task_execution".to_string());
+        stored.run.phase_started_at = Some(Utc::now());
+        stored.run.phase_details = Some(json!({ "source": "kanban_board" }));
+        stored.run.append_log("Agentic board execution started");
+        stored.run.touch();
+        save_run(state, &stored.run)?;
+        (should_spawn, stored)
+    };
 
     if should_spawn {
         let state = state.clone();
@@ -1779,7 +1819,7 @@ fn begin_run(state: &AppState, user_id: &str, id: &str) -> Result<StoredRun> {
         });
     }
 
-    load_user_run(state, user_id, id)
+    Ok(stored)
 }
 
 async fn run_board_loop(state: AppState, user_id: String, run_id: String) -> Result<()> {
@@ -5721,6 +5761,73 @@ struct SharedProviderTurnResult {
     summary: String,
 }
 
+#[derive(Debug, PartialEq)]
+struct BoardProviderControls {
+    effort: Option<String>,
+    thinking: Option<bool>,
+    fast: Option<bool>,
+}
+
+fn board_provider_controls(run: &BoardRun) -> BoardProviderControls {
+    let strategy = run.model_strategy.as_ref();
+    let effort = strategy
+        .and_then(|value| {
+            value
+                .get("reasoningEffort")
+                .or_else(|| value.get("reasoning_effort"))
+                .or_else(|| value.get("effort"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let thinking = strategy.and_then(|value| {
+        value
+            .get("thinking")
+            .or_else(|| value.get("enableThinking"))
+            .and_then(Value::as_bool)
+    });
+    let explicit_fast = strategy.and_then(|value| {
+        value
+            .get("fast")
+            .or_else(|| value.get("fastMode"))
+            .or_else(|| value.get("fast_mode"))
+            .and_then(value_as_bool)
+    });
+    let service_tier_fast = strategy
+        .and_then(|value| {
+            value
+                .get("serviceTier")
+                .or_else(|| value.get("service_tier"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("fast"));
+
+    BoardProviderControls {
+        effort,
+        thinking,
+        fast: explicit_fast.or(service_tier_fast.then_some(true)),
+    }
+}
+
+fn value_as_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(value) => value.as_u64().and_then(|value| match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }),
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" | "fast" | "priority" => Some(true),
+            "false" | "no" | "off" | "0" | "default" | "standard" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 async fn execute_shared_provider_turn(
     state: &AppState,
     run: &BoardRun,
@@ -5743,6 +5850,7 @@ async fn execute_shared_provider_turn(
     } else {
         None
     };
+    let controls = board_provider_controls(run);
     let session = state
         .start_agent_session(
             provider,
@@ -5750,9 +5858,10 @@ async fn execute_shared_provider_turn(
             prompt.to_string(),
             session_id.map(str::to_string),
             model.clone(),
-            None,
+            controls.effort,
             Some("bypass".to_string()),
-            None,
+            controls.thinking,
+            controls.fast,
             runtime,
             direct_ai_config,
             user_id,
@@ -5993,21 +6102,6 @@ fn agentic_apply_io_gateway_config(config: &mut Value, provider: Provider) {
     };
     obj.insert("mode".to_string(), Value::String("aiproxy".to_string()));
     obj.remove("base_url");
-    let gateway_root = obj
-        .get("gatewayUrl")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_end_matches('/').to_string())
-        .or_else(|| {
-            obj.get("baseUrl")
-                .and_then(Value::as_str)
-                .and_then(agentic_url_origin)
-        })
-        .unwrap_or_else(|| {
-            agentic_url_origin(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL)
-                .unwrap_or_else(|| DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string())
-        });
     let endpoint = obj
         .get(if provider == Provider::Codex {
             "codexEndpoint"
@@ -6022,15 +6116,29 @@ fn agentic_apply_io_gateway_config(config: &mut Value, provider: Provider) {
         } else {
             "claude"
         });
-    let base_url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.trim_end_matches('/').to_string()
-    } else {
-        format!(
-            "{}/{}",
-            gateway_root.trim_end_matches('/'),
-            endpoint.trim_matches('/')
-        )
-    };
+    let gateway_root = obj
+        .get("gatewayUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .or_else(|| {
+            obj.get("baseUrl")
+                .and_then(Value::as_str)
+                .and_then(|value| {
+                    let value = value.trim().trim_end_matches('/');
+                    if join_io_gateway_endpoint_url(value, endpoint) == value {
+                        Some(value.to_string())
+                    } else {
+                        agentic_url_origin(value)
+                    }
+                })
+        })
+        .unwrap_or_else(|| {
+            agentic_url_origin(DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL)
+                .unwrap_or_else(|| DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL.to_string())
+        });
+    let base_url = join_io_gateway_endpoint_url(&gateway_root, endpoint);
     obj.insert("baseUrl".to_string(), Value::String(base_url));
     obj.remove("api_key_env");
     obj.remove("apiKeyEnv");
@@ -8698,6 +8806,15 @@ fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+fn parse_optional_scheduled_start(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    parse_rfc3339_utc(value)
+        .map(Some)
+        .ok_or_else(|| bad_request("scheduledStartAt must be a valid RFC3339 timestamp"))
+}
+
 fn capture_workspace_snapshot(project_path: &str) -> Value {
     let output = std::process::Command::new("git")
         .arg("status")
@@ -9349,6 +9466,12 @@ fn save_run(state: &AppState, run: &BoardRun) -> Result<()> {
     Ok(())
 }
 
+fn board_run_mutation_lock() -> MutexGuard<'static, ()> {
+    BOARD_RUN_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn runs_dir(state: &AppState) -> PathBuf {
     state.config.config_dir.join(BOARD_RUNS_DIR)
 }
@@ -9357,7 +9480,7 @@ fn run_file_path(state: &AppState, id: &str) -> PathBuf {
     runs_dir(state).join(format!("{id}.json"))
 }
 
-fn prompt_to_task_drafts(run: &BoardRun, prompt: &str) -> Vec<BoardTask> {
+fn prompt_to_task_drafts(run: &mut BoardRun, prompt: &str) -> Vec<BoardTask> {
     let mut tasks = prompt
         .lines()
         .map(str::trim)
@@ -9383,14 +9506,36 @@ fn prompt_to_task_drafts(run: &BoardRun, prompt: &str) -> Vec<BoardTask> {
             prompt.to_string(),
         ));
     }
-    for (index, task) in tasks.iter_mut().enumerate() {
-        task.id = format!("task-{}", run.tasks.len() + index + 1);
-    }
     tasks
 }
 
+fn allocate_task_id(run: &mut BoardRun) -> String {
+    let max_existing_sequence = run
+        .tasks
+        .iter()
+        .filter_map(|task| numeric_task_sequence(&task.id))
+        .max()
+        .unwrap_or(0);
+    run.next_task_sequence = run.next_task_sequence.max(max_existing_sequence);
+    loop {
+        let Some(next_sequence) = run.next_task_sequence.checked_add(1) else {
+            return format!("task-{}", Uuid::new_v4());
+        };
+        run.next_task_sequence = next_sequence;
+        let candidate = format!("task-{next_sequence}");
+        if !run.tasks.iter().any(|task| task.id == candidate) {
+            return candidate;
+        }
+    }
+}
+
 fn next_task_id(run: &BoardRun) -> String {
-    format!("task-{}", run.tasks.len() + 1)
+    let mut run = run.clone();
+    allocate_task_id(&mut run)
+}
+
+fn numeric_task_sequence(task_id: &str) -> Option<u64> {
+    task_id.strip_prefix("task-")?.parse().ok()
 }
 
 fn title_from_prompt(prompt: &str) -> Option<String> {
@@ -9471,6 +9616,21 @@ fn normalize_optional_provider(provider: Option<&str>) -> Result<String> {
     match provider.map(str::trim).filter(|value| !value.is_empty()) {
         Some(value) => normalize_provider(Some(value)),
         None => Ok(String::new()),
+    }
+}
+
+fn normalize_task_status(status: Option<&str>, default: &str) -> Result<String> {
+    let status = status
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default);
+    match status {
+        "backlog" | "backlog_generating" | "backlog_failed" | "pending" | "planned" | "running"
+        | "in_progress" | "pausing" | "cancelling" | "qa" | "review" | "blocked" | "failed"
+        | "cancelled" | "completed" | "done" => Ok(status.to_string()),
+        _ => Err(bad_request(
+            "Task status must be one of: backlog, pending, planned, in_progress, qa, review, blocked, failed, cancelled, completed",
+        )),
     }
 }
 
@@ -9590,6 +9750,27 @@ mod tests {
     }
 
     #[test]
+    fn agentic_gateway_config_does_not_duplicate_endpoint_inclusive_urls() {
+        let mut codex = json!({
+            "gatewayUrl": "https://ai.qif.us/codex/",
+        });
+        agentic_apply_io_gateway_config(&mut codex, Provider::Codex);
+        assert_eq!(
+            codex.get("baseUrl").and_then(Value::as_str),
+            Some("https://ai.qif.us/codex")
+        );
+
+        let mut claude = json!({
+            "gatewayUrl": "https://ai.qif.us/claude",
+        });
+        agentic_apply_io_gateway_config(&mut claude, Provider::Claude);
+        assert_eq!(
+            claude.get("baseUrl").and_then(Value::as_str),
+            Some("https://ai.qif.us/claude")
+        );
+    }
+
+    #[test]
     fn new_run_preserves_every_mobile_configuration_field() {
         let run = board_run(json!({
             "command": "Implement feature",
@@ -9621,7 +9802,7 @@ mod tests {
 
     #[test]
     fn manual_task_preserves_all_rich_authoring_fields() {
-        let run = board_run(json!({
+        let mut run = board_run(json!({
             "command": "Implement feature",
             "projectPath": "/tmp/project"
         }));
@@ -9639,7 +9820,7 @@ mod tests {
         }))
         .unwrap();
 
-        let task = BoardTask::manual(&run, request).unwrap();
+        let task = BoardTask::manual(&mut run, request).unwrap();
 
         assert_eq!(task.title, "Rich task");
         assert_eq!(task.details, "Implement the feature");
@@ -9652,6 +9833,153 @@ mod tests {
         );
         assert_eq!(task.requirement_ids, vec!["REQ-1"]);
         assert_eq!(task.depends_on, vec!["task-0"]);
+    }
+
+    #[test]
+    fn manual_task_rejects_unknown_status() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project"
+        }));
+        let request = serde_json::from_value::<TaskRequest>(json!({
+            "title": "Invalid task",
+            "status": "banana"
+        }))
+        .unwrap();
+
+        let error = BoardTask::manual(&mut run, request).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.body.error.contains("Task status must be one of"));
+    }
+
+    #[test]
+    fn task_ids_remain_unique_after_deletion() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        for title in ["Second task", "Third task"] {
+            let request = serde_json::from_value::<TaskRequest>(json!({ "title": title })).unwrap();
+            let task = BoardTask::manual(&mut run, request).unwrap();
+            run.tasks.push(task);
+        }
+
+        delete_board_task(&mut run, "task-2").unwrap();
+        let request =
+            serde_json::from_value::<TaskRequest>(json!({ "title": "Fourth task" })).unwrap();
+        let task = BoardTask::manual(&mut run, request).unwrap();
+
+        assert_eq!(task.id, "task-4");
+        assert!(!run.tasks.iter().any(|existing| existing.id == task.id));
+    }
+
+    #[test]
+    fn legacy_task_sequence_migrates_from_existing_ids() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        run.tasks[0].id = "task-3".to_string();
+        run.next_task_sequence = 0;
+
+        assert_eq!(allocate_task_id(&mut run), "task-4");
+        assert_eq!(run.next_task_sequence, 4);
+    }
+
+    #[test]
+    fn prompt_drafts_allocate_unique_ids_after_gaps() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        run.tasks.push(BoardTask::draft(
+            &mut run.clone(),
+            "Third task".to_string(),
+            "Third task".to_string(),
+        ));
+        run.tasks[1].id = "task-3".to_string();
+        run.next_task_sequence = 0;
+
+        let drafts = prompt_to_task_drafts(&mut run, "One\nTwo\nThree");
+        let ids = drafts
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["task-4", "task-5", "task-6"]);
+    }
+
+    #[test]
+    fn deleting_task_cleans_dependency_and_source_references() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        let mut dependent =
+            BoardTask::draft(&mut run, "Dependent".to_string(), "Dependent".to_string());
+        dependent.depends_on = vec!["task-1".to_string(), "external".to_string()];
+        dependent.source_task_id = Some("task-1".to_string());
+        dependent.source_qa_task_id = Some("task-1".to_string());
+        run.tasks.push(dependent);
+
+        delete_board_task(&mut run, "task-1").unwrap();
+
+        assert_eq!(run.tasks[0].depends_on, vec!["external"]);
+        assert_eq!(run.tasks[0].source_task_id, None);
+        assert_eq!(run.tasks[0].source_qa_task_id, None);
+    }
+
+    #[test]
+    fn deleting_current_task_is_rejected() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        run.current_task_id = Some("task-1".to_string());
+
+        let error = delete_board_task(&mut run, "task-1").unwrap_err();
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(run.tasks.len(), 1);
+    }
+
+    #[test]
+    fn invalid_create_schedule_is_rejected() {
+        let request = serde_json::from_value::<CreateRunRequest>(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project",
+            "scheduledStartAt": "not-a-timestamp"
+        }))
+        .unwrap();
+
+        let error = BoardRun::new(None, request).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.body.error.contains("valid RFC3339"));
+    }
+
+    #[test]
+    fn board_strategy_enables_gpt_5_6_sol_fast_mode() {
+        let run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "modelStrategy": {
+                "reasoningEffort": "low",
+                "serviceTier": "fast"
+            }
+        }));
+
+        assert_eq!(
+            board_provider_controls(&run),
+            BoardProviderControls {
+                effort: Some("low".to_string()),
+                thinking: None,
+                fast: Some(true),
+            }
+        );
     }
 
     #[test]
