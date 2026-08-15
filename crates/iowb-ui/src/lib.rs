@@ -247,10 +247,6 @@ mod tests {
         assert!(source.contains(
             "const attemptIsCurrent = () => state.chatRecoveryBySession[sid] === recovery"
         ));
-        assert_eq!(
-            source.matches("if (!attemptIsCurrent()) return;").count(),
-            2
-        );
         assert!(source.contains("if (responseState === \"failed\") {"));
         assert!(source.contains("if (responseState !== \"starting\") {"));
         assert!(source.contains("scheduleCompletedChatReconciliation(sid);"));
@@ -258,9 +254,15 @@ mod tests {
             .split_once("async function compactAndRetryChatContext(sessionId, button = null) {")
             .map(|(_, rest)| rest)
             .expect("compact and retry handler")
-            .split_once("\n}\n\nfunction chatEventSessionIds()")
+            .split_once("\n}\n\nfunction renderChatManualCompactionCard")
             .map(|(body, _)| body)
             .expect("compact and retry handler end");
+        assert_eq!(
+            recovery_request
+                .matches("if (!attemptIsCurrent()) return;")
+                .count(),
+            2
+        );
         let starting_branch = recovery_request
             .split_once("if (responseState !== \"starting\") {")
             .map(|(_, rest)| rest)
@@ -269,7 +271,7 @@ mod tests {
             .map(|(_, tail)| tail)
             .expect("starting processing branch");
         assert!(starting_branch.contains("updateProcessingLabel(\"Compacting context\");"));
-        assert!(source.contains("Clean-context retry failed"));
+        assert!(source.contains("Clean-context compaction failed"));
         assert!(source.contains("Your original context mapping is still intact."));
         assert!(remember_recovery.contains("clearChatProcessing();"));
         assert!(remember_recovery.contains(
@@ -310,6 +312,43 @@ mod tests {
         assert!(source.contains("draftContent,"));
         assert!(source.contains("if (replacement.sourceHidden === true)"));
         assert!(!source.contains("Create a new chat before this prompt?"));
+    }
+
+    #[test]
+    fn active_chat_stream_is_cached_and_restored_across_session_switches() {
+        let source = asset_text("app.js");
+        let snapshot_loader = source
+            .split_once("async function loadChatHistoryForSession(sessionId, opts = {}) {")
+            .map(|(_, rest)| rest)
+            .expect("chat snapshot loader")
+            .split_once("\n}\n\nfunction scheduleChatReconciliation")
+            .map(|(body, _)| body)
+            .expect("chat snapshot loader end");
+        let session_picker = source
+            .split_once("async function pickChatSession(sessionId, projectPath, options = {}) {")
+            .map(|(_, rest)| rest)
+            .expect("chat session picker")
+            .split_once("\n}\n\n// Start a fresh chat for a project.")
+            .map(|(body, _)| body)
+            .expect("chat session picker end");
+
+        assert!(source.contains("function preserveActiveChatStreamSnapshot"));
+        assert!(source.contains("function restoreChatStreamSnapshot"));
+        assert!(source.contains("streamingBuffer: (patch.live ?? chatSessionIsLive(sessionId))"));
+        assert!(source.contains(
+            "if (sessionId) state.chatOutputBuffersBySession[sessionId] = state.chatBuffer;"
+        ));
+        assert!(
+            source.contains("opts.provider || state.currentSession?.provider || chatCliValue()")
+        );
+        assert!(source.contains("delete state.chatOutputBuffersBySession[sid];"));
+        assert!(session_picker.contains("preserveActiveChatStreamSnapshot();"));
+        assert!(
+            snapshot_loader
+                .contains("const preservedStream = preserveActiveChatStreamSnapshot(sessionId);")
+        );
+        assert!(snapshot_loader.contains("const replayMessages = split.messages;"));
+        assert!(snapshot_loader.contains("restoreChatStreamSnapshot(sessionId, streamSnapshot);"));
     }
 
     #[test]

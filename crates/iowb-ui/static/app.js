@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260814-08";
+const APP_VERSION = "20260815-01";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -2744,11 +2744,49 @@ function cachedChatSession(sessionId) {
   return chatCacheEntries().find((entry) => entry.key === key) || null;
 }
 
+function chatStreamingMessageId(sessionId) {
+  return `local-stream-${sessionId || ""}`;
+}
+
 function chatSessionIsLive(sessionId = state.chatSessionId) {
   const live = state.sessionStatusById?.[sessionId];
   return normalizeSidebarSessionStatus(live?.status) === "running"
     || Boolean(state.chatProcessing?.sessionId === sessionId)
     || Boolean(state.currentSession?.sessionId === sessionId);
+}
+
+function currentChatStreamSnapshot(sessionId = state.chatSessionId || state.pendingChatSessionId) {
+  const sid = String(sessionId || "").trim();
+  if (!sid) return null;
+  let buffer = String(state.chatOutputBuffersBySession[sid] || "");
+  if ((state.chatSessionId === sid || state.pendingChatSessionId === sid) && state.chatBuffer) {
+    buffer = String(state.chatBuffer || "");
+  }
+  if (!buffer.trim()) return null;
+  const session = findChatSession(sid) || cachedChatSession(sid)?.session || null;
+  const persisted = getSessionOverridesFor(sid) || {};
+  const provider = state.currentSession?.sessionId === sid
+    ? state.currentSession.provider
+    : (persisted.cli || persisted.provider || sessionProvider(session) || chatCliValue() || "");
+  return {
+    sessionId: sid,
+    buffer: buffer.slice(-CHAT_LIVE_RENDER_MAX_CHARS),
+    provider,
+  };
+}
+
+function splitCachedStreamingMessage(messages, sessionId) {
+  const streamingId = chatStreamingMessageId(sessionId);
+  let streamingBuffer = "";
+  const visibleMessages = [];
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message?.id === streamingId) {
+      streamingBuffer = String(message.content || "");
+      continue;
+    }
+    visibleMessages.push(message);
+  }
+  return { messages: visibleMessages, streamingBuffer };
 }
 
 function rememberCurrentChatSession(patch = {}) {
@@ -2763,23 +2801,57 @@ function rememberCurrentChatSession(patch = {}) {
   const messages = Array.isArray(patch.messages)
     ? patch.messages
     : (chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.messages : (cached?.messages || []));
+  const split = splitCachedStreamingMessage(messages, sessionId);
+  const streamingBuffer = typeof patch.streamingBuffer === "string"
+    ? patch.streamingBuffer
+    : (split.streamingBuffer || (patch.live ? currentChatStreamSnapshot(sessionId)?.buffer || "" : ""));
   const offset = Number(patch.offset ?? (chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.offset : cached?.offset || 0)) || 0;
-  const totalCount = Number(patch.totalCount ?? (chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.totalCount : cached?.totalCount || messages.length)) || messages.length;
+  const totalCount = Number(patch.totalCount ?? (chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.totalCount : cached?.totalCount || split.messages.length)) || split.messages.length;
   entries.push({
     key,
     sessionId,
     projectPath,
     session: boardSession && session ? { ...session, boardSession: true } : session,
     status: patch.status || (session ? sidebarSessionStatus(session) : "") || (chatSessionIsLive(sessionId) ? "running" : "completed"),
-    messages: messages.slice(-CHAT_HISTORY_PAGE_SIZE * 2),
-    offset: Math.max(0, offset + Math.max(0, messages.length - CHAT_HISTORY_PAGE_SIZE * 2)),
-    totalCount: Math.max(totalCount, messages.length),
+    messages: split.messages.slice(-CHAT_HISTORY_PAGE_SIZE * 2),
+    offset: Math.max(0, offset + Math.max(0, split.messages.length - CHAT_HISTORY_PAGE_SIZE * 2)),
+    totalCount: Math.max(totalCount, split.messages.length),
+    streamingBuffer: (patch.live ?? chatSessionIsLive(sessionId))
+      ? streamingBuffer.slice(-CHAT_LIVE_RENDER_MAX_CHARS)
+      : "",
     live: patch.live ?? chatSessionIsLive(sessionId),
     updatedAt: new Date().toISOString(),
   });
   state.chatTranscriptCache.entries = entries.slice(-MAX_CHAT_TRANSCRIPT_CACHE);
   persistChatTranscriptCache();
   if (boardSession) hideBoardChatSessionsFromLists();
+}
+
+function preserveActiveChatStreamSnapshot(sessionId = state.chatSessionId || state.pendingChatSessionId) {
+  const snapshot = currentChatStreamSnapshot(sessionId);
+  if (!snapshot) return null;
+  state.chatOutputBuffersBySession[snapshot.sessionId] = snapshot.buffer;
+  rememberCurrentChatSession({
+    sessionId: snapshot.sessionId,
+    live: true,
+    status: "running",
+    streamingBuffer: snapshot.buffer,
+  });
+  return snapshot;
+}
+
+function restoreChatStreamSnapshot(sessionId, snapshot = null) {
+  const sid = String(sessionId || "").trim();
+  if (!sid) return false;
+  const buffer = String(snapshot?.buffer || state.chatOutputBuffersBySession[sid] || "");
+  if (!buffer.trim()) return false;
+  state.chatOutputBuffersBySession[sid] = buffer.slice(-CHAT_LIVE_RENDER_MAX_CHARS);
+  state.chatBuffer = "";
+  appendChat(state.chatOutputBuffersBySession[sid], {
+    provider: snapshot?.provider || "",
+    sessionId: sid,
+  });
+  return true;
 }
 
 function renderCachedChatSession(sessionId) {
@@ -2789,7 +2861,9 @@ function renderCachedChatSession(sessionId) {
     state.boardChatSessionIds.add(sessionId);
     hideBoardChatSessionsFromLists();
   }
-  const messages = Array.isArray(cached.messages) ? cached.messages : [];
+  const split = splitCachedStreamingMessage(cached.messages, sessionId);
+  const messages = split.messages;
+  const streamingBuffer = String(cached.streamingBuffer || split.streamingBuffer || state.chatOutputBuffersBySession[sessionId] || "");
   state.chatSessionId = sessionId;
   state.pendingChatSessionId = "";
   chatHistoryWindow = {
@@ -2802,10 +2876,16 @@ function renderCachedChatSession(sessionId) {
   replayChatMessages(messages);
   scrollChatToBottom(true);
   if (cached.live || chatSessionIsLive(sessionId)) {
-    ensureChatProcessing({
-      sessionId,
+    const restored = restoreChatStreamSnapshot(sessionId, {
+      buffer: streamingBuffer,
       provider: sessionProvider(cached.session),
     });
+    if (!restored) {
+      ensureChatProcessing({
+        sessionId,
+        provider: sessionProvider(cached.session),
+      });
+    }
   }
   loadSessionOverridesIntoState(sessionId, cached.session);
   renderChatFooter(null);
@@ -3850,6 +3930,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
   if (!sessionId) return false;
   if (stagedChatEdit()?.sourceSessionId === sessionId) return true;
   try {
+    const preservedStream = preserveActiveChatStreamSnapshot(sessionId);
     const loadingOlder = opts.older === true && chatHistoryWindow.sessionId === sessionId;
     const previousOutput = chatOutputRoot();
     const previousHeight = previousOutput?.scrollHeight || 0;
@@ -3896,6 +3977,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     const totalCount = Number(body?.total_count ?? body?.totalCount ?? page.length) || page.length;
     const snapshotSession = body?.session || findChatSession(sessionId);
     const boardSession = isBoardChatSession(snapshotSession, sessionId);
+    const snapshotLive = Boolean(snapshotSession?.active);
     if (boardSession) {
       state.boardChatSessionIds.add(sessionId);
       if (snapshotSession?.id) state.boardChatSessionIds.add(snapshotSession.id);
@@ -3925,12 +4007,19 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     const messages = loadingOlder
       ? page.concat(chatHistoryWindow.messages)
       : page;
-    const latestAssistantIndex = latestRenderableAssistantIndex(messages);
+    const split = splitCachedStreamingMessage(messages, sessionId);
+    const replayMessages = split.messages;
+    const streamSnapshot = preservedStream || {
+      sessionId,
+      buffer: split.streamingBuffer || state.chatOutputBuffersBySession[sessionId] || "",
+      provider: sessionProvider(snapshotSession),
+    };
+    const latestAssistantIndex = latestRenderableAssistantIndex(replayMessages);
     const offset = loadingOlder
       ? requestedOffset
       : Math.max(0, totalCount - page.length);
-    chatHistoryWindow = { sessionId, offset, totalCount, messages };
-    syncChatPromptHistoryFromMessages(messages, sessionId);
+    chatHistoryWindow = { sessionId, offset, totalCount, messages: replayMessages };
+    syncChatPromptHistoryFromMessages(replayMessages, sessionId);
     resetChatOutputDom();
     const persisted = getSessionOverridesFor(sessionId) || {};
     const replayMeta = (msg, role) => {
@@ -3956,7 +4045,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       };
     };
     let previousPrompt = "";
-    messages.forEach((raw, index) => {
+    replayMessages.forEach((raw, index) => {
       if (!raw) return;
       const role = String(raw.role || "").toLowerCase();
       const content = raw.content == null ? "" : String(raw.content);
@@ -3988,6 +4077,15 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     });
     renderChatRecoveryCard(sessionId);
     renderChatManualCompactionCard(sessionId);
+    if (snapshotLive || chatSessionIsLive(sessionId)) {
+      const restored = restoreChatStreamSnapshot(sessionId, streamSnapshot);
+      if (!restored) {
+        ensureChatProcessing({
+          provider: sessionProvider(snapshotSession),
+          sessionId,
+        });
+      }
+    }
     const output = chatOutputRoot();
     if (loadingOlder && output) {
       output.scrollTop = Math.max(0, output.scrollHeight - previousHeight + previousTop);
@@ -4004,10 +4102,10 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     rememberCurrentChatSession({
       sessionId,
       session: snapshotSession,
-      messages,
+      messages: replayMessages,
       offset,
       totalCount,
-      live: Boolean(snapshotSession?.active),
+      live: snapshotLive,
       status: snapshotStatus,
     });
     if (!boardSession) {
@@ -4128,6 +4226,7 @@ async function pickChatSession(sessionId, projectPath, options = {}) {
   await saveChatPromptDraftNow().catch((error) => {
     console.warn("Unable to sync prompt draft before switching session", error);
   });
+  preserveActiveChatStreamSnapshot();
   state.chatEditFromHere.staged = null;
   if (options.boardSession === true) {
     state.boardChatSessionIds.add(id);
@@ -4183,6 +4282,7 @@ async function startNewChatForProject(projectPath) {
   await saveChatPromptDraftNow().catch((error) => {
     console.warn("Unable to sync prompt draft before starting new chat", error);
   });
+  preserveActiveChatStreamSnapshot();
   state.chatEditFromHere.staged = null;
   setBoardChatWsSubscription("");
   setActiveProject(projectPath);
@@ -9771,7 +9871,10 @@ function connectWs() {
         provider: payload.provider,
         sessionId: payload.sessionId,
       };
-      if (payload.content) appendChat(payload.content);
+      if (payload.content) appendChat(payload.content, {
+        provider: payload.provider || "",
+        sessionId: payload.sessionId || "",
+      });
       if (payload.done) {
         // Finalize the assistant stream node: store the received-at time,
         // capture token usage, and write the footer into the bubble so the
@@ -9878,6 +9981,7 @@ function connectWs() {
           };
           rememberSidebarSessionStatus({ sessionId: sid, provider: payload.provider || proj, status: "completed" });
           rememberCurrentChatSession({ sessionId: sid, messages, live: false, status: "completed" });
+          delete state.chatOutputBuffersBySession[sid];
           scheduleCompletedChatReconciliation(sid);
         }
       }
@@ -11958,11 +12062,13 @@ function lastChatUserPromptContent() {
   return "";
 }
 
-function appendChat(value) {
+function appendChat(value, opts = {}) {
   const output = chatOutputRoot();
   if (!output) return;
   if (typeof value !== "string") value = String(value);
   state.chatBuffer = `${state.chatBuffer}${value}`.slice(-CHAT_LIVE_RENDER_MAX_CHARS);
+  const sessionId = opts.sessionId || state.chatSessionId || state.pendingChatSessionId || state.currentSession?.sessionId || "";
+  if (sessionId) state.chatOutputBuffersBySession[sessionId] = state.chatBuffer;
   // Lazily spin up the assistant stream node the first time we receive
   // content after a reset / user prompt.
   if (!chatStream.node || chatStream.role !== "assistant") {
@@ -11976,7 +12082,7 @@ function appendChat(value) {
   // renderChatBubbleHtml keeps `textContent` safe by escaping every line.
   const displayContent = assistantResponseContent(
     state.chatBuffer,
-    state.currentSession?.provider || chatCliValue(),
+    opts.provider || state.currentSession?.provider || chatCliValue(),
     lastChatUserPromptContent(),
   );
   chatStream.text.innerHTML = renderChatBubbleHtml(displayContent);
