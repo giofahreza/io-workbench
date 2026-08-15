@@ -2487,6 +2487,37 @@ impl Storage {
         })
     }
 
+    pub fn replace_session_messages(
+        &self,
+        session_id: &str,
+        messages: &[ChatMessage],
+    ) -> Result<usize> {
+        self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute(
+                "DELETE FROM messages WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            let mut inserted = 0usize;
+            for message in messages {
+                insert_message_conn(&transaction, session_id, message)?;
+                inserted += 1;
+            }
+            transaction.execute(
+                r#"
+                UPDATE sessions
+                SET message_count = (
+                    SELECT COUNT(*) FROM messages WHERE session_id = ?1
+                )
+                WHERE id = ?1
+                "#,
+                params![session_id],
+            )?;
+            transaction.commit()?;
+            Ok(inserted)
+        })
+    }
+
     /// Patch the JSON metadata column for an existing message. Pass `Value::Null`
     /// to clear the metadata back to its default. Used by the chat session
     /// manager to stamp per-turn footer info (cli, model, sentAt, tokenUsage…)

@@ -89,6 +89,95 @@ impl CodexAppServerClient {
         Ok(())
     }
 
+    pub(crate) async fn compact_thread_and_wait(&self, thread_id: &str) -> Result<()> {
+        let thread_id = thread_id.trim().to_string();
+        if thread_id.is_empty() {
+            return Err(CoreError::InvalidInput(
+                "Codex thread id is required for compaction".to_string(),
+            ));
+        }
+        let command = self.command.clone();
+        let compact_timeout = self.request_timeout.max(Duration::from_secs(120));
+        timeout(compact_timeout, async move {
+            let mut child = Command::new(&command)
+                .arg("app-server")
+                .arg("--stdio")
+                .env("PATH", augmented_user_path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                CoreError::Io(std::io::Error::other(
+                    "Codex app-server stdin was unavailable",
+                ))
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                CoreError::Io(std::io::Error::other(
+                    "Codex app-server stdout was unavailable",
+                ))
+            })?;
+            let mut lines = BufReader::new(stdout).lines();
+
+            write_json_line(
+                &mut stdin,
+                &json!({
+                    "method": "initialize",
+                    "id": 1,
+                    "params": {
+                        "clientInfo": {
+                            "name": "io_workbench",
+                            "title": "io-workbench",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        },
+                        "capabilities": {
+                            "optOutNotificationMethods": ["thread/started", "item/agentMessage/delta"],
+                        },
+                    },
+                }),
+            )
+            .await?;
+            let _ = read_response(&mut lines, 1).await?;
+            write_json_line(&mut stdin, &json!({ "method": "initialized" })).await?;
+            write_json_line(
+                &mut stdin,
+                &json!({
+                    "method": "thread/resume",
+                    "id": 2,
+                    "params": { "threadId": &thread_id },
+                }),
+            )
+            .await?;
+            let _ = read_response(&mut lines, 2).await?;
+            write_json_line(
+                &mut stdin,
+                &json!({
+                    "method": "thread/compact/start",
+                    "id": 3,
+                    "params": { "threadId": &thread_id },
+                }),
+            )
+            .await?;
+            let _ = read_response(&mut lines, 3).await?;
+            let result = wait_for_context_compaction(&mut lines, &thread_id).await;
+            let _ = stdin.shutdown().await;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            result
+        })
+        .await
+        .map_err(|_| {
+            CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Codex app-server compaction timed out after {} ms",
+                    compact_timeout.as_millis()
+                ),
+            ))
+        })?
+    }
+
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let method = method.to_string();
         let command = self.command.clone();
@@ -168,6 +257,83 @@ async fn write_json_line(stdin: &mut tokio::process::ChildStdin, value: &Value) 
     stdin.write_all(&encoded).await?;
     stdin.flush().await?;
     Ok(())
+}
+
+async fn wait_for_context_compaction(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    thread_id: &str,
+) -> Result<()> {
+    while let Some(line) = lines.next_line().await? {
+        let value: Value = serde_json::from_str(&line)?;
+        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = value.get("params").unwrap_or(&Value::Null);
+        if !notification_matches_thread(params, thread_id) {
+            continue;
+        }
+        match method {
+            "item/completed" => {
+                let item = params.get("item").unwrap_or(params);
+                if item.get("type").and_then(Value::as_str) == Some("contextCompaction") {
+                    let status = item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed");
+                    if matches!(status, "failed" | "interrupted" | "declined") {
+                        return Err(CoreError::InvalidInput(format!(
+                            "Codex context compaction {status}"
+                        )));
+                    }
+                    return Ok(());
+                }
+            }
+            "turn/completed" => {
+                let turn = params.get("turn").unwrap_or(params);
+                match turn.get("status").and_then(Value::as_str) {
+                    Some("failed") | Some("interrupted") => {
+                        return Err(CoreError::InvalidInput(format!(
+                            "Codex context compaction {}{}",
+                            turn.get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("failed"),
+                            app_server_turn_error_suffix(turn)
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "Codex app-server closed before context compaction completed",
+    )))
+}
+
+fn notification_matches_thread(params: &Value, thread_id: &str) -> bool {
+    let Some(notification_thread_id) = params
+        .get("threadId")
+        .or_else(|| params.get("thread_id"))
+        .and_then(Value::as_str)
+    else {
+        return true;
+    };
+    notification_thread_id == thread_id
+}
+
+fn app_server_turn_error_suffix(turn: &Value) -> String {
+    let Some(error) = turn.get("error") else {
+        return String::new();
+    };
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown error");
+    if message.trim().is_empty() {
+        String::new()
+    } else {
+        format!(": {message}")
+    }
 }
 
 async fn read_response(
@@ -356,6 +522,51 @@ mod tests {
         assert!(requests.contains("\"method\":\"initialize\""));
         assert!(requests.contains("\"method\":\"initialized\""));
         assert!(requests.contains("\"method\":\"thread/read\""));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn waits_for_context_compaction_completion_notification() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("iowb-app-server-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let script = root.join("compact-codex.sh");
+        let log = root.join("requests.log");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 read first\nprintf '%s\\n' \"$first\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\"}}}}'\n\
+                 read second\nprintf '%s\\n' \"$second\" >> '{}'\n\
+                 read third\nprintf '%s\\n' \"$third\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-1\"}}}}}}'\n\
+                 read fourth\nprintf '%s\\n' \"$fourth\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":3,\"result\":{{}}}}'\n\
+                 printf '%s\\n' '{{\"method\":\"item/started\",\"params\":{{\"threadId\":\"thread-1\",\"item\":{{\"type\":\"contextCompaction\",\"id\":\"item-compact\"}}}}}}'\n\
+                 printf '%s\\n' '{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"thread-1\",\"item\":{{\"type\":\"contextCompaction\",\"id\":\"item-compact\"}}}}}}'\n",
+                log.display(),
+                log.display(),
+                log.display(),
+                log.display(),
+            ),
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("permissions");
+
+        let client = CodexAppServerClient::new(script.as_os_str(), Duration::from_secs(2));
+        client
+            .compact_thread_and_wait("thread-1")
+            .await
+            .expect("compact thread");
+        let requests = std::fs::read_to_string(log).expect("requests");
+        assert!(requests.contains("\"method\":\"initialize\""));
+        assert!(requests.contains("\"method\":\"thread/resume\""));
+        assert!(requests.contains("\"method\":\"thread/compact/start\""));
         let _ = std::fs::remove_dir_all(root);
     }
 
