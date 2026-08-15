@@ -167,6 +167,55 @@
         }
       }
     },
+    "/api/sessions/{session_id}/compact": {
+      "post": {
+        "tags": ["Sessions"],
+        "summary": "Compact a Codex chat into a clean native context",
+        "description": "Proactively prepares a clean native Codex context for future turns without sending a new user prompt. The visible session ID, URL, title, settings, project, and complete stored transcript remain unchanged. A bounded text-only handoff starts a new native Codex context; the native mapping changes only after the compaction run succeeds. Reusing requestId returns the original compaction attempt.",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "minLength": 1 }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ManualCompactSessionContextRequest" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "The clean-context compaction was accepted or returned idempotently",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CompactSessionContextResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request identifier, unsupported provider, or no retainable text messages",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          },
+          "409": {
+            "description": "The session is active or has a pending failed-turn recovery",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/sessions/{session_id}/compact-and-retry": {
       "post": {
         "tags": ["Sessions"],
@@ -571,6 +620,20 @@
             "type": "string",
             "minLength": 1,
             "description": "Persisted ID of the latest failed user message to retry without duplicating it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ManualCompactSessionContextRequest": {
+        "type": "object",
+        "required": ["requestId"],
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9_.:-]+$",
+            "description": "Client-generated idempotency identifier for one manual compaction attempt. Use a new value after a failed attempt."
           }
         },
         "additionalProperties": false

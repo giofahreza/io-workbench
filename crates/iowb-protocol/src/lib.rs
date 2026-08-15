@@ -558,6 +558,12 @@ pub struct CompactSessionContextRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualCompactSessionContextRequest {
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactSessionContextResponse {
     #[serde(rename = "sessionId")]
     pub session_id: String,

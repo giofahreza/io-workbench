@@ -48,13 +48,14 @@ use iowb_protocol::{
     CompactSessionContextRequest, CompactSessionContextResponse, CopyFileRequest,
     CreateFileRequest, CreateProjectRequest, CreateWorkspaceRequest, DeleteFcmTokenRequest,
     DeleteFileRequest, FcmTokenResponse, FileContentResponse, FileEntry, ForkSessionRequest,
-    ForkSessionResponse, HealthResponse, HealthStatus, LoginRequest, MessageRole, MessagesResponse,
-    PRODUCT_NAME, PlaceholderResponse, ProcessInputRequest, ProcessResizeRequest,
-    ProcessStartRequest, ProcessStartResponse, ProjectListResponse, ProjectSummary,
-    PromptHistoryCursor, PromptHistoryResponse, Provider, RegisterFcmTokenRequest,
-    RenameFileRequest, ServerStatusResponse, SessionDraftResponse, SessionSnapshotResponse,
-    SessionSummary, SessionTokenUsage, UpdateSessionDraftRequest, WS_COMMAND_CHANNEL_CAPACITY,
-    WorkspaceType, WsClientCommand, WsServerEvent, new_id,
+    ForkSessionResponse, HealthResponse, HealthStatus, LoginRequest,
+    ManualCompactSessionContextRequest, MessageRole, MessagesResponse, PRODUCT_NAME,
+    PlaceholderResponse, ProcessInputRequest, ProcessResizeRequest, ProcessStartRequest,
+    ProcessStartResponse, ProjectListResponse, ProjectSummary, PromptHistoryCursor,
+    PromptHistoryResponse, Provider, RegisterFcmTokenRequest, RenameFileRequest,
+    ServerStatusResponse, SessionDraftResponse, SessionSnapshotResponse, SessionSummary,
+    SessionTokenUsage, UpdateSessionDraftRequest, WS_COMMAND_CHANNEL_CAPACITY, WorkspaceType,
+    WsClientCommand, WsServerEvent, new_id,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -420,6 +421,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/sessions/{session_id}/prompts", get(session_prompts))
         .route("/api/sessions/{session_id}/snapshot", get(session_snapshot))
         .route("/api/sessions/{session_id}/fork", post(fork_session))
+        .route(
+            "/api/sessions/{session_id}/compact",
+            post(compact_session_context),
+        )
         .route(
             "/api/sessions/{session_id}/compact-and-retry",
             post(compact_and_retry_session_context),
@@ -4351,14 +4356,8 @@ async fn session_snapshot(
     }))
 }
 
-async fn compact_and_retry_session_context(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-    AxumPath(session_id): AxumPath<String>,
-    Json(request): Json<CompactSessionContextRequest>,
-) -> Result<(StatusCode, Json<CompactSessionContextResponse>)> {
-    validate_session_id(&session_id)?;
-    let request_id = request.request_id.trim();
+fn validate_context_compaction_request_id(value: &str) -> Result<&str> {
+    let request_id = value.trim();
     if request_id.is_empty()
         || request_id.len() > 200
         || !request_id
@@ -4370,6 +4369,39 @@ async fn compact_and_retry_session_context(
             "requestId must be a non-empty stable identifier",
         ));
     }
+    Ok(request_id)
+}
+
+async fn compact_session_context(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<ManualCompactSessionContextRequest>,
+) -> Result<(StatusCode, Json<CompactSessionContextResponse>)> {
+    validate_session_id(&session_id)?;
+    let request_id = validate_context_compaction_request_id(&request.request_id)?;
+    let session = state.sessions.get(&session_id).await?;
+    let runtime = session
+        .runtime
+        .unwrap_or_else(|| configured_chat_runtime(&state, &user.0.id));
+    let direct_ai_config = (runtime == ChatRuntime::IoGateway)
+        .then(|| direct_ai_runtime_config_for_user(&state, &user.0.id, Provider::Codex))
+        .flatten();
+    let response = state
+        .compact_session_context(&user.0.id, &session_id, request_id, direct_ai_config)
+        .await?;
+    publish_projects(&state).await;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn compact_and_retry_session_context(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<CompactSessionContextRequest>,
+) -> Result<(StatusCode, Json<CompactSessionContextResponse>)> {
+    validate_session_id(&session_id)?;
+    let request_id = validate_context_compaction_request_id(&request.request_id)?;
     let failed_message_id = request.failed_message_id.trim();
     if failed_message_id.is_empty() || failed_message_id.len() > 1_000 {
         return Err(ServerError::new(

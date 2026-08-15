@@ -130,6 +130,8 @@ const state = {
   chatStoppingSessionId: "",
   chatResponseStateBySession: {},
   chatRecoveryBySession: {},
+  chatManualCompactionBySession: {},
+  chatManualCompactionSuppressedResponsesBySession: {},
   chatOutputBuffersBySession: {},
   chatTranscriptCache: readJsonStorage(CHAT_TRANSCRIPT_CACHE_KEY, { version: CHAT_TRANSCRIPT_CACHE_VERSION, entries: [] }),
   chatReconcileTimers: {},
@@ -2977,6 +2979,10 @@ function chatRecoveryRequestId() {
   return `compact-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
+function chatManualCompactionIsStarting(compaction) {
+  return Boolean(compaction && (compaction.pending || compaction.state === "starting"));
+}
+
 function normalizeChatRecovery(recovery, sessionId = "") {
   if (!recovery || typeof recovery !== "object") return null;
   const failedMessageId = String(recovery.failedMessageId || recovery.failed_message_id || "").trim();
@@ -3021,6 +3027,7 @@ function rememberChatRecovery(sessionId, recovery) {
   }
   if (selected || chatHistoryWindow.sessionId === sid) {
     renderChatRecoveryCard(sid);
+    renderChatManualCompactionCard(sid);
     updateChatComposerState();
   }
 }
@@ -3116,6 +3123,130 @@ async function compactAndRetryChatContext(sessionId, button = null) {
   }
 }
 
+function renderChatManualCompactionCard(sessionId = state.chatSessionId) {
+  const output = chatOutputRoot();
+  if (!output) return;
+  output.querySelectorAll(".chat-manual-compaction").forEach((node) => node.remove());
+  const sid = String(sessionId || "").trim();
+  const compaction = state.chatManualCompactionBySession[sid];
+  if (!compaction || !isActiveChatSessionEvent({ sessionId: sid })) return;
+  const busy = chatManualCompactionIsStarting(compaction);
+  const card = document.createElement("section");
+  card.className = "chat-manual-compaction chat-line-system";
+  const title = busy ? "Compacting context" : "Manual compaction failed";
+  const message = busy
+    ? "Preparing a clean Codex context for future turns."
+    : (compaction.message || "The clean-context compaction failed. Your original context mapping was kept; you can try again.");
+  card.innerHTML = `<div class="chat-manual-compaction-copy">
+      <strong>${escapeHtml(title)}</strong>
+      <span>${escapeHtml(message)}</span>
+      <span>Your chat, URL, title, settings, draft, project, and visible messages stay unchanged.</span>
+    </div>
+    <div class="chat-manual-compaction-actions">
+      ${busy ? "" : `<button type="button" class="secondary-action" data-chat-manual-compact-dismiss>Dismiss</button>`}
+      <button type="button" class="primary-action" data-chat-manual-compact-retry${busy ? " disabled" : ""}>${busy ? "Compacting…" : "Try again"}</button>
+    </div>`;
+  output.appendChild(card);
+  card.querySelector("[data-chat-manual-compact-retry]")?.addEventListener("click", (event) => {
+    compactChatSessionContext(sid, event.currentTarget, { skipConfirm: true }).catch(showError);
+  });
+  card.querySelector("[data-chat-manual-compact-dismiss]")?.addEventListener("click", () => {
+    delete state.chatManualCompactionBySession[sid];
+    renderChatManualCompactionCard(sid);
+    updateChatComposerState();
+  });
+  scrollChatToBottom();
+}
+
+function selectedChatCanManualCompact() {
+  const sid = String(state.chatSessionId || "").trim();
+  if (!sid || sid.startsWith("local-") || !canLoadProtectedData()) return false;
+  const session = findChatSession(sid) || cachedChatSession(sid)?.session || {};
+  const provider = String(sessionProvider(session) || chatCliValue() || "").toLowerCase();
+  if (provider !== "codex") return false;
+  const recovery = state.chatRecoveryBySession[sid];
+  if (chatRecoveryBlocksNormalSend(recovery)) return false;
+  if (selectedRunningChatSession() || selectedChatIsStopping() || state.chatProcessing) return false;
+  const loadedCount = chatHistoryWindow.sessionId === sid ? chatHistoryWindow.messages.length : 0;
+  const storedCount = Number(session.messageCount ?? session.message_count ?? 0) || 0;
+  return loadedCount > 0 || storedCount > 0;
+}
+
+async function compactChatSessionContext(sessionId, button = null, opts = {}) {
+  const sid = String(sessionId || "").trim();
+  if (!sid) return;
+  if (!selectedChatCanManualCompact()) {
+    showToast("Open an idle Codex chat with messages before compacting context.", "danger");
+    return;
+  }
+  if (!opts.skipConfirm) {
+    const confirmed = window.confirm(
+      "Compact this chat into a clean Codex context? The visible chat stays unchanged.",
+    );
+    if (!confirmed) return;
+  }
+  const requestId = chatRecoveryRequestId();
+  const compaction = {
+    sessionId: sid,
+    requestId,
+    responseId: "",
+    state: "starting",
+    pending: true,
+    message: "Preparing a clean Codex context for future turns.",
+  };
+  state.chatManualCompactionBySession[sid] = compaction;
+  renderChatManualCompactionCard(sid);
+  updateChatComposerState();
+  ensureChatProcessing({ provider: "codex", sessionId: sid });
+  updateProcessingLabel("Compacting context");
+  const attemptIsCurrent = () => state.chatManualCompactionBySession[sid] === compaction
+    && compaction.requestId === requestId
+    && compaction.state === "starting";
+  if (button) button.disabled = true;
+  try {
+    const response = await api(`/api/sessions/${encodeURIComponent(sid)}/compact`, {
+      method: "POST",
+      body: JSON.stringify({ requestId }),
+    });
+    if (!attemptIsCurrent()) return;
+    compaction.pending = false;
+    const responseState = String(response?.state || "starting").toLowerCase();
+    compaction.state = responseState;
+    compaction.responseId = String(response?.responseId || response?.response_id || "").trim();
+    if (responseState === "failed") {
+      compaction.message = response?.message
+        || "The clean-context compaction failed. Your original context mapping was kept; you can try again.";
+      clearChatProcessing();
+      renderChatManualCompactionCard(sid);
+      updateChatComposerState();
+      return;
+    }
+    if (responseState !== "starting") {
+      delete state.chatManualCompactionBySession[sid];
+      clearChatProcessing();
+      renderChatManualCompactionCard(sid);
+      updateChatComposerState();
+      scheduleCompletedChatReconciliation(sid);
+      return;
+    }
+    renderChatManualCompactionCard(sid);
+    ensureChatProcessing({ provider: "codex", sessionId: sid });
+    updateProcessingLabel("Compacting context");
+  } catch (error) {
+    if (!attemptIsCurrent()) return;
+    compaction.pending = false;
+    compaction.state = "failed";
+    compaction.message = error?.message || String(error);
+    clearChatProcessing();
+    renderChatManualCompactionCard(sid);
+    updateChatComposerState();
+    throw error;
+  } finally {
+    if (button) button.disabled = false;
+    updateChatComposerState();
+  }
+}
+
 function chatEventSessionIds() {
   return new Set([
     state.chatSessionId,
@@ -3150,6 +3281,29 @@ function chatRecoveryMatchesResponse(recovery, payload = {}) {
   const expected = String(recovery?.responseId || "").trim();
   const observed = chatEventResponseId(payload);
   return Boolean(expected && observed && expected === observed);
+}
+
+function chatManualCompactionMatchesResponse(compaction, payload = {}) {
+  if (!compaction || compaction.state !== "starting") return false;
+  const expected = String(compaction.responseId || "").trim();
+  const observed = chatEventResponseId(payload);
+  return Boolean(
+    (expected && observed && expected === observed)
+    || (!expected && observed)
+  );
+}
+
+function rememberManualCompactionSuppression(sessionId, responseId) {
+  const sid = String(sessionId || "").trim();
+  const rid = String(responseId || "").trim();
+  if (!sid || !rid) return;
+  state.chatManualCompactionSuppressedResponsesBySession[sid] = rid;
+}
+
+function isSuppressedManualCompactionResponse(payload = {}) {
+  const sid = String(payload.sessionId || "").trim();
+  const rid = chatEventResponseId(payload);
+  return Boolean(sid && rid && state.chatManualCompactionSuppressedResponsesBySession[sid] === rid);
 }
 
 function chatResponseState(sessionId) {
@@ -3535,6 +3689,10 @@ function assistantResponseContent(value, provider, previousPrompt) {
       remainder = remainder.slice(prompt.length).trimStart();
     }
   }
+  const remainderLines = remainder.split("\n");
+  if (remainderLines.length > 1 && isChatAssistantBoundary(remainderLines[0])) {
+    remainder = remainderLines.slice(1).join("\n").trimStart();
+  }
   return chatTimelineDisplay(
     remainder
       .split("\n")
@@ -3552,14 +3710,41 @@ function assistantResponseContent(value, provider, previousPrompt) {
   );
 }
 
+function persistedChatMessageMeta(raw) {
+  if (raw?.metadata && typeof raw.metadata === "object") return raw.metadata;
+  if (raw?.meta && typeof raw.meta === "object") return raw.meta;
+  return {};
+}
+
+function chatMessageProvider(raw, persistedMeta = null, session = null) {
+  const meta = persistedMeta && typeof persistedMeta === "object"
+    ? persistedMeta
+    : persistedChatMessageMeta(raw);
+  return raw?.provider
+    || meta.provider
+    || meta.cli
+    || session?.provider
+    || session?.cli
+    || "";
+}
+
+function isTerminalStatusMessageMeta(meta) {
+  return String(meta?.kind || "").toLowerCase() === "terminal_status";
+}
+
+function latestRenderableAssistantIndex(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const raw = messages[index];
+    if (String(raw?.role || "").toLowerCase() !== "assistant") continue;
+    if (isTerminalStatusMessageMeta(persistedChatMessageMeta(raw))) continue;
+    return index;
+  }
+  return -1;
+}
+
 function replayChatMessages(messages) {
   syncChatPromptHistoryFromMessages(messages);
-  const latestAssistantIndex = (() => {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      if (String(messages[index]?.role || "").toLowerCase() === "assistant") return index;
-    }
-    return -1;
-  })();
+  const latestAssistantIndex = latestRenderableAssistantIndex(messages);
   let previousPrompt = "";
   messages.forEach((raw, index) => {
     if (!raw) return;
@@ -3568,9 +3753,7 @@ function replayChatMessages(messages) {
     // Per-turn metadata (cli / model / sentAt / receivedAt / tokenUsage /
     // elapsed) is stored on each message row in storage. Fall back to the
     // legacy `meta` alias in case older sessions used it.
-    const persistedMeta = raw.metadata && typeof raw.metadata === "object"
-      ? raw.metadata
-      : (raw.meta && typeof raw.meta === "object" ? raw.meta : {});
+    const persistedMeta = persistedChatMessageMeta(raw);
     const meta = role === "assistant" && index === latestAssistantIndex
       ? normalizeMessageMeta(persistedMeta)
       : null;
@@ -3578,7 +3761,12 @@ function replayChatMessages(messages) {
       previousPrompt = content;
       replayUserPromptLine(raw);
     } else if (role === "assistant") {
-      const displayContent = assistantResponseContent(content, raw.provider || persistedMeta.provider, previousPrompt);
+      if (isTerminalStatusMessageMeta(persistedMeta)) return;
+      const displayContent = assistantResponseContent(
+        content,
+        chatMessageProvider(raw, persistedMeta),
+        previousPrompt,
+      );
       if (displayContent) replayAssistantLine(displayContent, meta);
     } else if (role === "tool") replayToolLine(content);
     else if (role === "system") {
@@ -3737,12 +3925,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     const messages = loadingOlder
       ? page.concat(chatHistoryWindow.messages)
       : page;
-    const latestAssistantIndex = (() => {
-      for (let index = messages.length - 1; index >= 0; index -= 1) {
-        if (String(messages[index]?.role || "").toLowerCase() === "assistant") return index;
-      }
-      return -1;
-    })();
+    const latestAssistantIndex = latestRenderableAssistantIndex(messages);
     const offset = loadingOlder
       ? requestedOffset
       : Math.max(0, totalCount - page.length);
@@ -3754,9 +3937,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       // Prefer the per-message metadata persisted on the message row by the
       // server. Fall back to the legacy per-session override so older turns
       // still render something useful in the footer.
-      const stored = msg.metadata && typeof msg.metadata === "object"
-        ? msg.metadata
-        : (msg.meta && typeof msg.meta === "object" ? msg.meta : null);
+      const stored = persistedChatMessageMeta(msg);
       if (stored) {
         const normalized = normalizeMessageMeta(stored);
         if (Object.keys(normalized).length) return normalized;
@@ -3774,6 +3955,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
         elapsed: persisted.elapsed || "",
       };
     };
+    let previousPrompt = "";
     messages.forEach((raw, index) => {
       if (!raw) return;
       const role = String(raw.role || "").toLowerCase();
@@ -3781,8 +3963,19 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       const meta = role === "assistant" && index === latestAssistantIndex
         ? replayMeta(raw, role)
         : null;
-      if (role === "user") replayUserPromptLine(raw);
-      else if (role === "assistant") replayAssistantLine(content, meta);
+      if (role === "user") {
+        previousPrompt = content;
+        replayUserPromptLine(raw);
+      } else if (role === "assistant") {
+        const persistedMeta = persistedChatMessageMeta(raw);
+        if (isTerminalStatusMessageMeta(persistedMeta)) return;
+        const displayContent = assistantResponseContent(
+          content,
+          chatMessageProvider(raw, persistedMeta, snapshotSession),
+          previousPrompt,
+        );
+        if (displayContent) replayAssistantLine(displayContent, meta);
+      }
       else if (role === "tool") replayToolLine(content);
       else if (role === "system") {
         const output = chatOutputRoot();
@@ -3794,6 +3987,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       }
     });
     renderChatRecoveryCard(sessionId);
+    renderChatManualCompactionCard(sessionId);
     const output = chatOutputRoot();
     if (loadingOlder && output) {
       output.scrollTop = Math.max(0, output.scrollHeight - previousHeight + previousTop);
@@ -6729,6 +6923,7 @@ function updateChatComposerState() {
   const clear = qs("#clear-chat");
   const submit = qs("#chat-submit");
   const thinking = qs("#chat-thinking-toggle");
+  const manualCompact = qs("#compact-chat-session");
   const hasPrompt = Boolean(input?.value.trim());
   const hasProject = Boolean(activeProjectPath());
   const canSubmit = hasPrompt || state.chatImages.length > 0;
@@ -6762,6 +6957,15 @@ function updateChatComposerState() {
     thinking.dataset.symbol = enabled ? "thinking-on" : "thinking-off";
     thinking.setAttribute("aria-label", enabled ? "Disable thinking" : "Enable thinking");
     thinking.title = enabled ? "Disable thinking" : "Enable thinking";
+  }
+  if (manualCompact) {
+    const manualCompaction = state.chatManualCompactionBySession[state.chatSessionId || ""];
+    const manualStarting = chatManualCompactionIsStarting(manualCompaction);
+    manualCompact.disabled = !selectedChatCanManualCompact() || manualStarting;
+    manualCompact.classList.toggle("active", manualStarting);
+    const label = manualStarting ? "Compacting context" : "Compact context";
+    manualCompact.setAttribute("aria-label", label);
+    manualCompact.title = label;
   }
   updateChatFastControl();
   if (submit) {
@@ -9430,6 +9634,11 @@ function connectWs() {
         const responseId = chatEventResponseId(payload);
         if (responseId) sessionRecovery.responseId = responseId;
       }
+      const manualCompaction = state.chatManualCompactionBySession[payload.sessionId || ""];
+      if (statusRunning && manualCompaction?.state === "starting") {
+        const responseId = chatEventResponseId(payload);
+        if (responseId) manualCompaction.responseId = responseId;
+      }
       rememberOrderedChatResponseEvent(payload, { terminal: !statusRunning });
       rememberSidebarSessionStatus(payload);
       if (!isActiveChatSessionEvent(payload) && cachedChatSession(payload.sessionId || "")) {
@@ -9461,6 +9670,11 @@ function connectWs() {
           delete state.chatRecoveryBySession[payload.sessionId || ""];
           if (isActiveChatSessionEvent(payload)) renderChatRecoveryCard(payload.sessionId);
         }
+        if (manualCompaction?.state === "starting" && chatRecoveryMatchesResponse(manualCompaction, payload)) {
+          rememberManualCompactionSuppression(payload.sessionId, chatEventResponseId(payload));
+          delete state.chatManualCompactionBySession[payload.sessionId || ""];
+          if (isActiveChatSessionEvent(payload)) renderChatManualCompactionCard(payload.sessionId);
+        }
         if (isActiveChatSessionEvent(payload) && (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer)) {
           finishChatProcessing(payload);
         }
@@ -9485,6 +9699,16 @@ function connectWs() {
             recovery.message = "The clean-context compaction failed. Your original context mapping was kept; you can try again.";
             renderChatRecoveryCard(payload.sessionId);
           }
+          const compaction = state.chatManualCompactionBySession[payload.sessionId || ""];
+          if (compaction?.state === "starting" && chatRecoveryMatchesResponse(compaction, payload)) {
+            rememberManualCompactionSuppression(payload.sessionId, chatEventResponseId(payload));
+            compaction.pending = false;
+            compaction.state = "failed";
+            compaction.message = status === "aborted"
+              ? "The clean-context compaction was stopped. Your original context mapping was kept; you can try again."
+              : "The clean-context compaction failed. Your original context mapping was kept; you can try again.";
+            renderChatManualCompactionCard(payload.sessionId);
+          }
           if (state.chatStoppingSessionId === payload.sessionId) state.chatStoppingSessionId = "";
           rememberCurrentChatSession({ sessionId: payload.sessionId, live: false, status: "failed" });
           scheduleCompletedChatReconciliation(payload.sessionId);
@@ -9505,6 +9729,36 @@ function connectWs() {
         return;
       }
       rememberOrderedChatResponseEvent(payload, { terminal: payload.done === true });
+      if (isSuppressedManualCompactionResponse(payload)) {
+        if (payload.done && (!payload.sessionId || state.currentSession?.sessionId === payload.sessionId)) {
+          state.currentSession = null;
+          updateChatComposerState();
+        }
+        return;
+      }
+      const manualCompaction = state.chatManualCompactionBySession[payload.sessionId || ""];
+      if (chatManualCompactionMatchesResponse(manualCompaction, payload)) {
+        const responseId = chatEventResponseId(payload);
+        if (responseId) manualCompaction.responseId = responseId;
+        if (payload.done) {
+          rememberManualCompactionSuppression(payload.sessionId, responseId);
+          delete state.chatManualCompactionBySession[payload.sessionId || ""];
+          if (isActiveChatSessionEvent(payload)) {
+            renderChatManualCompactionCard(payload.sessionId);
+            finishChatProcessing(payload);
+            scheduleCompletedChatReconciliation(payload.sessionId);
+          }
+          if (!payload.sessionId || state.currentSession?.sessionId === payload.sessionId) {
+            state.currentSession = null;
+          }
+          updateChatComposerState();
+        } else if (isActiveChatSessionEvent(payload)) {
+          ensureChatProcessing(payload);
+          updateProcessingLabel("Compacting context");
+          updateChatComposerState();
+        }
+        return;
+      }
       if (!isActiveChatSessionEvent(payload)) {
         rememberBackgroundChatOutput(payload);
         if (payload.done && state.currentSession?.sessionId === payload.sessionId) {
@@ -11204,12 +11458,15 @@ function bindForms() {
   qs("#chat-fast-toggle")?.addEventListener("change", (event) => {
     setChatFastRequested(event.currentTarget.checked);
   });
-  qs("#reload-chat-session")?.addEventListener("click", (event) => {
-    const sessionId = state.chatSessionId || state.preferences.lastChatSessionId || "";
-    if (!sessionId) return;
-    withButtonLoading(event.currentTarget, () => loadChatHistoryForSession(sessionId)).catch(showError);
-  });
-  qs("#chat-session-config")?.addEventListener("click", showChatSessionConfigModal);
+	  qs("#reload-chat-session")?.addEventListener("click", (event) => {
+	    const sessionId = state.chatSessionId || state.preferences.lastChatSessionId || "";
+	    if (!sessionId) return;
+	    withButtonLoading(event.currentTarget, () => loadChatHistoryForSession(sessionId)).catch(showError);
+	  });
+	  qs("#compact-chat-session")?.addEventListener("click", (event) => {
+	    compactChatSessionContext(state.chatSessionId, event.currentTarget).catch(showError);
+	  });
+	  qs("#chat-session-config")?.addEventListener("click", showChatSessionConfigModal);
   qs("#chat-prompt").addEventListener("input", (event) => {
     const prompt = event.currentTarget;
     noteChatPromptUserEdit(prompt.value || "");

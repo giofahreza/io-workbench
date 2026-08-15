@@ -85,6 +85,8 @@ const DURABLE_CHAT_RUN_RECOVERY_PROMPT_LIMIT: usize = 6_000;
 const CODEX_GATEWAY_BODY_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 const CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES: u64 = 12 * 1024 * 1024;
 const CONTEXT_ROLLOVER_HANDOFF_MAX_BYTES: usize = 48 * 1024;
+const CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN: &str = "retry_failed_turn";
+const CONTEXT_ROLLOVER_KIND_MANUAL: &str = "manual";
 const EXTERNAL_MESSAGE_CACHE_MAX_ENTRIES: usize = 8;
 const EXTERNAL_MESSAGE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const EXTERNAL_MESSAGE_TAIL_CACHE_MAX_MESSAGES: usize = 500;
@@ -376,7 +378,7 @@ impl AppState {
 
         let (external, native_resume_session_id) = if let Some(session_id) = session_id.as_deref() {
             let stored_session = self.sessions.get_stored(session_id);
-            let has_context_rollover = self.storage.has_context_rollover(session_id)?;
+            let has_context_rollover = self.storage.has_active_context_rollover(session_id)?;
             let external = !has_context_rollover
                 && (self
                     .sessions
@@ -1215,6 +1217,12 @@ impl AppState {
             .storage
             .context_rollover_for_request(user_id, session_id, request_id)?
         {
+            if existing.kind != CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN {
+                return Err(CoreError::Conflict(
+                    "this compaction request id was already used for a different operation"
+                        .to_string(),
+                ));
+            }
             if existing.failed_message_id != failed_message_id {
                 return Err(CoreError::Conflict(
                     "this recovery request id was already used for a different failed message"
@@ -1284,6 +1292,7 @@ impl AppState {
             user_id: user_id.to_string(),
             session_id: session_id.to_string(),
             request_id: request_id.to_string(),
+            kind: CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN.to_string(),
             failed_message_id: failed_message_id.to_string(),
             trigger_run_id: failed_run.id.clone(),
             retry_run_id: compact_run_id.clone(),
@@ -1325,6 +1334,12 @@ impl AppState {
                 .ok_or_else(|| {
                     CoreError::Conflict("context rollover already exists".to_string())
                 })?;
+            if existing.kind != CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN {
+                return Err(CoreError::Conflict(
+                    "this compaction request id was already used for a different operation"
+                        .to_string(),
+                ));
+            }
             if existing.failed_message_id != failed_message_id {
                 return Err(CoreError::Conflict(
                     "this recovery request id was already used for a different failed message"
@@ -1400,8 +1415,195 @@ impl AppState {
         })
     }
 
+    pub async fn compact_session_context(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        request_id: &str,
+        direct_ai_config: Option<DirectAiRuntimeConfig>,
+    ) -> Result<CompactSessionContextResponse> {
+        if let Some(existing) = self
+            .storage
+            .context_rollover_for_request(user_id, session_id, request_id)?
+        {
+            if existing.kind != CONTEXT_ROLLOVER_KIND_MANUAL {
+                return Err(CoreError::Conflict(
+                    "this compaction request id was already used for a different operation"
+                        .to_string(),
+                ));
+            }
+            return Ok(CompactSessionContextResponse {
+                session_id: session_id.to_string(),
+                request_id: request_id.to_string(),
+                response_id: existing.retry_run_id,
+                state: existing.state,
+            });
+        }
+
+        let session = self.sessions.get(session_id).await?;
+        if session.provider != Provider::Codex {
+            return Err(CoreError::InvalidInput(
+                "manual context compaction is currently available only for Codex sessions"
+                    .to_string(),
+            ));
+        }
+        if session.active || self.agents.is_running(Provider::Codex, session_id).await {
+            return Err(CoreError::Conflict(
+                "stop the active response before compacting this chat".to_string(),
+            ));
+        }
+        if self.context_recovery(session_id).await?.is_some() {
+            return Err(CoreError::Conflict(
+                "use Compact & retry to recover the latest failed turn before manual compaction"
+                    .to_string(),
+            ));
+        }
+
+        let visible_messages = self
+            .sessions
+            .messages_including_external(session_id)
+            .await?;
+        if !context_handoff_has_retainable_text(&visible_messages) {
+            return Err(CoreError::InvalidInput(
+                "there are no text messages to compact in this chat".to_string(),
+            ));
+        }
+        let observed_bytes = self
+            .sessions
+            .native_rollout_size(session_id)
+            .await
+            .filter(|size| *size > 0);
+        let handoff = build_manual_context_compaction_handoff(visible_messages.clone());
+        let rollover_id = new_id("rollover");
+        let compact_run_id = new_id("run");
+        let now = Utc::now();
+        let rollover = StoredSessionContextRollover {
+            id: rollover_id.clone(),
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            kind: CONTEXT_ROLLOVER_KIND_MANUAL.to_string(),
+            failed_message_id: String::new(),
+            trigger_run_id: compact_run_id.clone(),
+            retry_run_id: compact_run_id.clone(),
+            from_native_session_id: session.native_session_id.clone(),
+            candidate_native_session_id: None,
+            state: "starting".to_string(),
+            handoff: handoff.clone(),
+            observed_bytes,
+            limit_bytes: CODEX_GATEWAY_BODY_LIMIT_BYTES,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            activated_at: None,
+        };
+        let mut compact_run = StoredDurableChatRun::new(
+            compact_run_id.clone(),
+            Some(user_id.to_string()),
+            session_id.to_string(),
+            Provider::Codex.as_str(),
+            handoff.clone(),
+            session.project_path.clone(),
+        );
+        compact_run.model = session.model.clone();
+        compact_run.effort = session.effort.clone();
+        compact_run.mode = session.mode.clone();
+        compact_run.thinking = session.thinking;
+        compact_run.fast = session.fast;
+        compact_run.native_session_id = None;
+
+        self.storage
+            .materialize_session_messages(session_id, &visible_messages)?;
+        if !self
+            .storage
+            .prepare_manual_context_rollover(&rollover, &compact_run)?
+        {
+            let existing = self
+                .storage
+                .context_rollover_for_request(user_id, session_id, request_id)?
+                .ok_or_else(|| {
+                    CoreError::Conflict("context rollover already exists".to_string())
+                })?;
+            if existing.kind != CONTEXT_ROLLOVER_KIND_MANUAL {
+                return Err(CoreError::Conflict(
+                    "this compaction request id was already used for a different operation"
+                        .to_string(),
+                ));
+            }
+            return Ok(CompactSessionContextResponse {
+                session_id: session_id.to_string(),
+                request_id: request_id.to_string(),
+                response_id: existing.retry_run_id,
+                state: existing.state,
+            });
+        }
+        self.sessions.set_active(session_id, true).await?;
+        let runtime = session.runtime.unwrap_or(ChatRuntime::NativeCli);
+        let attempt_id = new_id("attempt");
+        self.storage
+            .create_chat_run_attempt(&StoredChatRunAttempt::new(
+                attempt_id.clone(),
+                compact_run_id.clone(),
+                session_id.to_string(),
+                compact_run.user_message_id.clone(),
+                Provider::Codex.as_str(),
+                runtime_label(runtime),
+                compact_run.model.clone(),
+                None,
+            ))?;
+        let start_result = self
+            .agents
+            .start(AgentStartContext {
+                provider: Provider::Codex,
+                session_id: session_id.to_string(),
+                durable_run_id: Some(compact_run_id.clone()),
+                attempt_id: Some(attempt_id),
+                response_id: compact_run_id.clone(),
+                sequence: Arc::new(AtomicU64::new(0)),
+                project_path: PathBuf::from(&session.project_path),
+                prompt: handoff,
+                model: compact_run.model.clone(),
+                runtime,
+                effort: compact_run.effort.clone(),
+                mode: compact_run.mode.clone(),
+                thinking: compact_run.thinking,
+                fast: compact_run.fast,
+                native_resume_session_id: None,
+                context_rollover_id: Some(rollover_id.clone()),
+                direct_ai_config,
+                direct_ai_messages: Vec::new(),
+                sessions: self.sessions.clone(),
+                storage: self.storage.clone(),
+                hub: self.ws_hub.clone(),
+            })
+            .await;
+        if let Err(error) = start_result {
+            let message = error.to_string();
+            let _ = self.storage.fail_context_rollover(&rollover_id, &message);
+            let _ = self
+                .storage
+                .mark_durable_chat_run_failed(&compact_run_id, &message);
+            let _ = self.sessions.set_active(session_id, false).await;
+            return Err(error);
+        }
+
+        Ok(CompactSessionContextResponse {
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            response_id: compact_run_id,
+            state: self
+                .storage
+                .context_rollover_for_retry_run(&rollover.retry_run_id)?
+                .map(|stored| stored.state)
+                .unwrap_or_else(|| "starting".to_string()),
+        })
+    }
+
     pub async fn context_recovery(&self, session_id: &str) -> Result<Option<ChatContextRecovery>> {
         if let Some(rollover) = self.storage.latest_context_rollover(session_id)? {
+            if rollover.kind != CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN {
+                return Ok(None);
+            }
             match rollover.state.as_str() {
                 "starting" | "failed" => {
                     return Ok(Some(ChatContextRecovery {
@@ -2300,7 +2502,7 @@ impl SessionManager {
             }
         } else if session.provider == Provider::Codex
             && session.native_session_id.is_some()
-            && !self.storage.has_context_rollover(&session.id)?
+            && !self.storage.has_active_context_rollover(&session.id)?
         {
             if let Some(record) = self.external_record_for_messages(&session.id).await {
                 self.cached_external_record_message_count(&record)
@@ -2352,7 +2554,7 @@ impl SessionManager {
     }
 
     pub async fn messages_including_external(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
-        if self.storage.has_context_rollover(session_id)? {
+        if self.storage.has_active_context_rollover(session_id)? {
             return self.messages(session_id);
         }
         if let Some(messages) = self.external_messages_for_session(session_id).await? {
@@ -2453,7 +2655,7 @@ impl SessionManager {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ChatMessage>, usize)> {
-        if self.storage.has_context_rollover(session_id)? {
+        if self.storage.has_active_context_rollover(session_id)? {
             return self.messages_page(session_id, limit, offset);
         }
         if let Some(messages) = self.external_messages_for_session(session_id).await? {
@@ -2471,7 +2673,7 @@ impl SessionManager {
         limit: usize,
     ) -> Result<(Vec<ChatMessage>, usize)> {
         let limit = limit.clamp(1, 500);
-        if self.storage.has_context_rollover(session_id)? {
+        if self.storage.has_active_context_rollover(session_id)? {
             let (_, total) = self.messages_page(session_id, 1, 0)?;
             let start = total.saturating_sub(limit);
             return self.messages_page(session_id, limit, start);
@@ -2494,7 +2696,7 @@ impl SessionManager {
         before: Option<PromptHistoryCursor>,
     ) -> Result<(Vec<PromptHistoryEntry>, bool)> {
         let limit = limit.clamp(1, 500);
-        if self.storage.has_context_rollover(session_id)? {
+        if self.storage.has_active_context_rollover(session_id)? {
             return Ok(self
                 .storage
                 .list_user_prompts_page(session_id, limit, before.as_ref())?);
@@ -3237,7 +3439,24 @@ fn normalized_fork_prompt(value: &str) -> String {
 }
 
 fn build_context_rollover_handoff(messages: Vec<ChatMessage>, failed_prompt: &str) -> String {
-    let failed_prompt = sanitize_context_handoff_text(failed_prompt);
+    let history = build_context_handoff_history(messages, Some(failed_prompt));
+    format!(
+        "<system-reminder>\nThe visible io-workbench chat is being moved into a clean native Codex context because its previous history exceeded the gateway body-size limit. The same Workbench chat and full visible transcript remain available to the user. Use the bounded text handoff below only to re-establish context. Do not answer the failed user request yet; a subsequent message will contain that request after this clean context is activated. Do not claim that old tool outputs or inline image bytes are present. Reopen only specific local image paths when genuinely needed, one at a time. Inspect current files before changing them and preserve existing unrelated work. Reply exactly: Context ready.\n\nRecent text-only handoff:\n{history}\n</system-reminder>"
+    )
+}
+
+fn build_manual_context_compaction_handoff(messages: Vec<ChatMessage>) -> String {
+    let history = build_context_handoff_history(messages, None);
+    format!(
+        "<system-reminder>\nThe visible io-workbench chat is being moved into a clean native Codex context at the user's request. The same Workbench chat and full visible transcript remain available to the user. Use the bounded text handoff below only to re-establish context for future turns. Do not answer or continue any pending user request in this setup turn. Do not claim that old tool outputs or inline image bytes are present. Reopen only specific local image paths when genuinely needed, one at a time. Inspect current files before changing them and preserve existing unrelated work. Reply exactly: Context ready.\n\nRecent text-only handoff:\n{history}\n</system-reminder>"
+    )
+}
+
+fn build_context_handoff_history(
+    messages: Vec<ChatMessage>,
+    excluded_user_prompt: Option<&str>,
+) -> String {
+    let excluded_user_prompt = excluded_user_prompt.map(sanitize_context_handoff_text);
     let mut selected = Vec::<String>::new();
     let mut remaining = CONTEXT_ROLLOVER_HANDOFF_MAX_BYTES;
     for message in messages.into_iter().rev() {
@@ -3254,7 +3473,10 @@ fn build_context_rollover_handoff(messages: Vec<ChatMessage>, failed_prompt: &st
             continue;
         }
         let content = sanitize_context_handoff_text(&message.content);
-        if content.is_empty() || (message.role == MessageRole::User && content == failed_prompt) {
+        if content.is_empty()
+            || (message.role == MessageRole::User
+                && excluded_user_prompt.as_deref() == Some(content.as_str()))
+        {
             continue;
         }
         let role = if message.role == MessageRole::User {
@@ -3273,14 +3495,26 @@ fn build_context_rollover_handoff(messages: Vec<ChatMessage>, failed_prompt: &st
         }
     }
     selected.reverse();
-    let history = if selected.is_empty() {
+    if selected.is_empty() {
         "No earlier text messages were retained.".to_string()
     } else {
         selected.join("\n\n")
-    };
-    format!(
-        "<system-reminder>\nThe visible io-workbench chat is being moved into a clean native Codex context because its previous history exceeded the gateway body-size limit. The same Workbench chat and full visible transcript remain available to the user. Use the bounded text handoff below only to re-establish context. Do not answer the failed user request yet; a subsequent message will contain that request after this clean context is activated. Do not claim that old tool outputs or inline image bytes are present. Reopen only specific local image paths when genuinely needed, one at a time. Inspect current files before changing them and preserve existing unrelated work. Reply exactly: Context ready.\n\nRecent text-only handoff:\n{history}\n</system-reminder>"
-    )
+    }
+}
+
+fn context_handoff_has_retainable_text(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        if !matches!(message.role, MessageRole::User | MessageRole::Assistant) {
+            return false;
+        }
+        if message.role == MessageRole::Assistant
+            && (message.metadata.get("kind").and_then(Value::as_str) == Some("thinking")
+                || message.metadata.get("phase").and_then(Value::as_str) == Some("commentary"))
+        {
+            return false;
+        }
+        !sanitize_context_handoff_text(&message.content).is_empty()
+    })
 }
 
 fn sanitize_context_handoff_text(value: &str) -> String {
@@ -4292,7 +4526,7 @@ impl AgentRuntimeManager {
                 match activate_completed_context_rollover(context, rollover_id, received_at).await {
                     Ok(follow_up) => {
                         rollover_completed_atomically = true;
-                        rollover_follow_up = Some(follow_up);
+                        rollover_follow_up = follow_up;
                     }
                     Err(error) => {
                         let message = format!("failed to activate clean context: {error}");
@@ -6994,7 +7228,7 @@ async fn activate_completed_context_rollover(
     context: &AgentStartContext,
     rollover_id: &str,
     activated_at: DateTime<Utc>,
-) -> Result<ContextRolloverFollowUp> {
+) -> Result<Option<ContextRolloverFollowUp>> {
     let retry_run_id = context
         .durable_run_id
         .as_deref()
@@ -7043,6 +7277,7 @@ async fn activate_completed_context_rollover(
         timestamp: activated_at,
         metadata: serde_json::json!({
             "kind": "context_compaction",
+            "rolloverKind": rollover.kind.clone(),
             "rolloverId": rollover.id,
             "requestId": rollover.request_id,
             "failedMessageId": rollover.failed_message_id,
@@ -7052,6 +7287,41 @@ async fn activate_completed_context_rollover(
             "limitBytes": rollover.limit_bytes,
         }),
     };
+    if rollover.kind == CONTEXT_ROLLOVER_KIND_MANUAL {
+        if !context.storage.complete_context_rollover(
+            rollover_id,
+            retry_run_id,
+            &candidate,
+            &session,
+            &marker,
+            None,
+            None,
+        )? {
+            return Err(CoreError::Conflict(
+                "manual context compaction is no longer pending".to_string(),
+            ));
+        }
+        let persisted_session = context
+            .storage
+            .get_session_summary(&context.session_id)?
+            .ok_or_else(|| CoreError::SessionNotFound(context.session_id.clone()))?;
+        context
+            .sessions
+            .remember_persisted_session(persisted_session)
+            .await?;
+        info!(
+            session_id = %context.session_id,
+            rollover_id,
+            native_session_id = %candidate,
+            "activated manual clean native context"
+        );
+        return Ok(None);
+    }
+    if rollover.kind != CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN {
+        return Err(CoreError::InvalidInput(
+            "unknown context rollover kind".to_string(),
+        ));
+    }
     let failed_message = context
         .storage
         .message_by_id(&context.session_id, &rollover.failed_message_id)?
@@ -7099,7 +7369,7 @@ async fn activate_completed_context_rollover(
         native_session_id = %candidate,
         "activated clean native context and staged original prompt"
     );
-    Ok(ContextRolloverFollowUp { run: follow_up_run })
+    Ok(Some(ContextRolloverFollowUp { run: follow_up_run }))
 }
 
 fn human_byte_size(bytes: u64) -> String {
@@ -10386,6 +10656,7 @@ mod tests {
             user_id: "user-1".to_string(),
             session_id: session.id.clone(),
             request_id: "request-rollover-tool-rollback".to_string(),
+            kind: CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN.to_string(),
             failed_message_id: failed_message.id.clone(),
             trigger_run_id: trigger_run.id.clone(),
             retry_run_id: "run-rollover-tool-retry".to_string(),
@@ -11915,6 +12186,7 @@ mod tests {
             user_id: "user-rollover".to_string(),
             session_id: session.id.clone(),
             request_id: "request-rollover-recovery".to_string(),
+            kind: CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN.to_string(),
             failed_message_id: failed_message.id.clone(),
             trigger_run_id: trigger_run.id.clone(),
             retry_run_id: "run-rollover-retry".to_string(),
@@ -12127,6 +12399,7 @@ mod tests {
             user_id: "user-rollover".to_string(),
             session_id: session.id.clone(),
             request_id: "request-clean-candidate".to_string(),
+            kind: CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN.to_string(),
             failed_message_id: failed_message.id.clone(),
             trigger_run_id: trigger_run.id.clone(),
             retry_run_id: "run-clean-retry".to_string(),

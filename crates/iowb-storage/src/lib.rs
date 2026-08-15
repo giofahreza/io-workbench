@@ -272,6 +272,7 @@ pub struct StoredSessionContextRollover {
     pub user_id: String,
     pub session_id: String,
     pub request_id: String,
+    pub kind: String,
     pub failed_message_id: String,
     pub trigger_run_id: String,
     pub retry_run_id: String,
@@ -521,12 +522,13 @@ impl Storage {
 
                 CREATE TABLE IF NOT EXISTS session_context_rollovers (
                     id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    request_id TEXT NOT NULL,
-                    failed_message_id TEXT NOT NULL,
-                    trigger_run_id TEXT NOT NULL,
-                    retry_run_id TEXT NOT NULL,
+	                    user_id TEXT NOT NULL,
+	                    session_id TEXT NOT NULL,
+	                    request_id TEXT NOT NULL,
+	                    kind TEXT NOT NULL DEFAULT 'retry_failed_turn',
+	                    failed_message_id TEXT NOT NULL,
+	                    trigger_run_id TEXT NOT NULL,
+	                    retry_run_id TEXT NOT NULL,
                     from_native_session_id TEXT,
                     candidate_native_session_id TEXT,
                     state TEXT NOT NULL,
@@ -654,6 +656,17 @@ impl Storage {
                 conn.execute_batch("ALTER TABLE durable_chat_runs ADD COLUMN fast INTEGER;")?;
             }
 
+            let has_rollover_kind: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('session_context_rollovers') WHERE name = 'kind'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_rollover_kind == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE session_context_rollovers ADD COLUMN kind TEXT NOT NULL DEFAULT 'retry_failed_turn';",
+                )?;
+            }
+
             conn.execute_batch(
                 r#"
                 CREATE INDEX IF NOT EXISTS idx_durable_chat_runs_user_message
@@ -676,12 +689,13 @@ impl Storage {
 
                 CREATE TABLE IF NOT EXISTS session_context_rollovers (
                     id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    request_id TEXT NOT NULL,
-                    failed_message_id TEXT NOT NULL,
-                    trigger_run_id TEXT NOT NULL,
-                    retry_run_id TEXT NOT NULL,
+	                    user_id TEXT NOT NULL,
+	                    session_id TEXT NOT NULL,
+	                    request_id TEXT NOT NULL,
+	                    kind TEXT NOT NULL DEFAULT 'retry_failed_turn',
+	                    failed_message_id TEXT NOT NULL,
+	                    trigger_run_id TEXT NOT NULL,
+	                    retry_run_id TEXT NOT NULL,
                     from_native_session_id TEXT,
                     candidate_native_session_id TEXT,
                     state TEXT NOT NULL,
@@ -1563,10 +1577,10 @@ impl Storage {
         self.with_connection(|conn| {
             conn.query_row(
                 r#"
-                SELECT id, user_id, session_id, request_id, failed_message_id,
-                       trigger_run_id, retry_run_id, from_native_session_id,
-                       candidate_native_session_id, state, handoff, observed_bytes,
-                       limit_bytes, error, created_at, updated_at, activated_at
+	                SELECT id, user_id, session_id, request_id, kind, failed_message_id,
+	                       trigger_run_id, retry_run_id, from_native_session_id,
+	                       candidate_native_session_id, state, handoff, observed_bytes,
+	                       limit_bytes, error, created_at, updated_at, activated_at
                 FROM session_context_rollovers
                 WHERE session_id = ?1
                 ORDER BY created_at DESC, id DESC
@@ -1589,10 +1603,10 @@ impl Storage {
         self.with_connection(|conn| {
             conn.query_row(
                 r#"
-                SELECT id, user_id, session_id, request_id, failed_message_id,
-                       trigger_run_id, retry_run_id, from_native_session_id,
-                       candidate_native_session_id, state, handoff, observed_bytes,
-                       limit_bytes, error, created_at, updated_at, activated_at
+	                SELECT id, user_id, session_id, request_id, kind, failed_message_id,
+	                       trigger_run_id, retry_run_id, from_native_session_id,
+	                       candidate_native_session_id, state, handoff, observed_bytes,
+	                       limit_bytes, error, created_at, updated_at, activated_at
                 FROM session_context_rollovers
                 WHERE user_id = ?1 AND session_id = ?2 AND request_id = ?3
                 "#,
@@ -1611,10 +1625,10 @@ impl Storage {
         self.with_connection(|conn| {
             conn.query_row(
                 r#"
-                SELECT id, user_id, session_id, request_id, failed_message_id,
-                       trigger_run_id, retry_run_id, from_native_session_id,
-                       candidate_native_session_id, state, handoff, observed_bytes,
-                       limit_bytes, error, created_at, updated_at, activated_at
+	                SELECT id, user_id, session_id, request_id, kind, failed_message_id,
+	                       trigger_run_id, retry_run_id, from_native_session_id,
+	                       candidate_native_session_id, state, handoff, observed_bytes,
+	                       limit_bytes, error, created_at, updated_at, activated_at
                 FROM session_context_rollovers
                 WHERE retry_run_id = ?1
                 "#,
@@ -1630,6 +1644,17 @@ impl Storage {
         self.with_connection(|conn| {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM session_context_rollovers WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+    }
+
+    pub fn has_active_context_rollover(&self, session_id: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM session_context_rollovers WHERE session_id = ?1 AND state = 'active'",
                 params![session_id],
                 |row| row.get(0),
             )?;
@@ -1997,21 +2022,22 @@ impl Storage {
             let transaction = conn.unchecked_transaction()?;
             let inserted = transaction.execute(
                 r#"
-                INSERT OR IGNORE INTO session_context_rollovers (
-                    id, user_id, session_id, request_id, failed_message_id,
-                    trigger_run_id, retry_run_id, from_native_session_id,
-                    candidate_native_session_id, state, handoff, observed_bytes,
-                    limit_bytes, error, created_at, updated_at, activated_at
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17
-                )
-                "#,
+	                INSERT OR IGNORE INTO session_context_rollovers (
+	                    id, user_id, session_id, request_id, kind, failed_message_id,
+	                    trigger_run_id, retry_run_id, from_native_session_id,
+	                    candidate_native_session_id, state, handoff, observed_bytes,
+	                    limit_bytes, error, created_at, updated_at, activated_at
+	                ) VALUES (
+	                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+	                    ?13, ?14, ?15, ?16, ?17, ?18
+	                )
+	                "#,
                 params![
                     rollover.id,
                     rollover.user_id,
                     rollover.session_id,
                     rollover.request_id,
+                    rollover.kind,
                     rollover.failed_message_id,
                     rollover.trigger_run_id,
                     rollover.retry_run_id,
@@ -2044,6 +2070,55 @@ impl Storage {
                 return Ok(false);
             }
             insert_durable_chat_run_conn(&transaction, retry_run)?;
+            transaction.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn prepare_manual_context_rollover(
+        &self,
+        rollover: &StoredSessionContextRollover,
+        compact_run: &StoredDurableChatRun,
+    ) -> Result<bool> {
+        self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let inserted = transaction.execute(
+                r#"
+                INSERT OR IGNORE INTO session_context_rollovers (
+                    id, user_id, session_id, request_id, kind, failed_message_id,
+                    trigger_run_id, retry_run_id, from_native_session_id,
+                    candidate_native_session_id, state, handoff, observed_bytes,
+                    limit_bytes, error, created_at, updated_at, activated_at
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16, ?17, ?18
+                )
+                "#,
+                params![
+                    rollover.id,
+                    rollover.user_id,
+                    rollover.session_id,
+                    rollover.request_id,
+                    rollover.kind,
+                    rollover.failed_message_id,
+                    rollover.trigger_run_id,
+                    rollover.retry_run_id,
+                    rollover.from_native_session_id,
+                    rollover.candidate_native_session_id,
+                    rollover.state,
+                    rollover.handoff,
+                    rollover.observed_bytes.map(|value| value as i64),
+                    rollover.limit_bytes as i64,
+                    rollover.error,
+                    rollover.created_at.to_rfc3339(),
+                    rollover.updated_at.to_rfc3339(),
+                    rollover.activated_at.map(|time| time.to_rfc3339()),
+                ],
+            )?;
+            if inserted == 0 {
+                return Ok(false);
+            }
+            insert_durable_chat_run_conn(&transaction, compact_run)?;
             transaction.commit()?;
             Ok(true)
         })
@@ -4302,20 +4377,20 @@ fn map_session_context_rollover_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<StoredSessionContextRollover> {
     let observed_bytes = row
-        .get::<_, Option<i64>>(11)?
+        .get::<_, Option<i64>>(12)?
         .map(u64::try_from)
         .transpose()
         .map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                11,
+                12,
                 rusqlite::types::Type::Integer,
                 Box::new(error),
             )
         })?;
-    let limit_bytes_raw = row.get::<_, i64>(12)?;
+    let limit_bytes_raw = row.get::<_, i64>(13)?;
     let limit_bytes = u64::try_from(limit_bytes_raw).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
-            12,
+            13,
             rusqlite::types::Type::Integer,
             Box::new(error),
         )
@@ -4325,20 +4400,21 @@ fn map_session_context_rollover_row(
         user_id: row.get(1)?,
         session_id: row.get(2)?,
         request_id: row.get(3)?,
-        failed_message_id: row.get(4)?,
-        trigger_run_id: row.get(5)?,
-        retry_run_id: row.get(6)?,
-        from_native_session_id: row.get(7)?,
-        candidate_native_session_id: row.get(8)?,
-        state: row.get(9)?,
-        handoff: row.get(10)?,
+        kind: row.get(4)?,
+        failed_message_id: row.get(5)?,
+        trigger_run_id: row.get(6)?,
+        retry_run_id: row.get(7)?,
+        from_native_session_id: row.get(8)?,
+        candidate_native_session_id: row.get(9)?,
+        state: row.get(10)?,
+        handoff: row.get(11)?,
         observed_bytes,
         limit_bytes,
-        error: row.get(13)?,
-        created_at: parse_time_sql(row.get::<_, String>(14)?)?,
-        updated_at: parse_time_sql(row.get::<_, String>(15)?)?,
+        error: row.get(14)?,
+        created_at: parse_time_sql(row.get::<_, String>(15)?)?,
+        updated_at: parse_time_sql(row.get::<_, String>(16)?)?,
         activated_at: row
-            .get::<_, Option<String>>(16)?
+            .get::<_, Option<String>>(17)?
             .map(parse_time_sql)
             .transpose()?,
     })
@@ -4791,6 +4867,7 @@ mod tests {
             user_id: "user-1".to_string(),
             session_id: session_id.to_string(),
             request_id: request_id.to_string(),
+            kind: "retry_failed_turn".to_string(),
             failed_message_id: failed_message_id.to_string(),
             trigger_run_id: trigger_run_id.to_string(),
             retry_run_id: retry_run_id.to_string(),
@@ -5604,7 +5681,7 @@ mod tests {
                 assert_eq!(column_count, 1);
                 assert_eq!(index_count, 1);
                 assert_eq!(rollover_table_count, 1);
-                assert_eq!(rollover_column_count, 17);
+                assert_eq!(rollover_column_count, 18);
                 assert_eq!(rollover_session_index_count, 1);
                 assert_eq!(rollover_retry_index_count, 1);
                 assert_eq!(rollover_request_unique_count, 1);
@@ -5701,6 +5778,16 @@ mod tests {
                 .expect("prepare rollover")
         );
         assert!(
+            storage
+                .has_context_rollover(&session.id)
+                .expect("rollover bookkeeping exists")
+        );
+        assert!(
+            !storage
+                .has_active_context_rollover(&session.id)
+                .expect("prepared rollover is not active")
+        );
+        assert!(
             !storage
                 .prepare_context_rollover(&rollover, &retry_run)
                 .expect("repeat identical request")
@@ -5768,6 +5855,11 @@ mod tests {
             reopened
                 .has_context_rollover(&session.id)
                 .expect("rollover presence")
+        );
+        assert!(
+            !reopened
+                .has_active_context_rollover(&session.id)
+                .expect("prepared rollover is still inactive after restart")
         );
         assert_eq!(
             reopened
@@ -5872,6 +5964,11 @@ mod tests {
             storage
                 .fail_context_rollover(&first.id, "clean context launch failed")
                 .expect("fail first rollover")
+        );
+        assert!(
+            !storage
+                .has_active_context_rollover(&session.id)
+                .expect("failed rollover is not active")
         );
         assert!(
             storage
@@ -6227,6 +6324,11 @@ mod tests {
                     Some(&follow_up_run),
                 )
                 .expect("complete rollover")
+        );
+        assert!(
+            storage
+                .has_active_context_rollover(&session.id)
+                .expect("completed rollover is active")
         );
         let completed = storage
             .get_session(&session.id)
