@@ -3,11 +3,13 @@ members = [
     "crates/iowb-cli",
     "crates/iowb-core",
     "crates/iowb-fs",
+    "crates/iowb-rag-plugin-api",
     "crates/iowb-process",
     "crates/iowb-protocol",
     "crates/iowb-server",
     "crates/iowb-storage",
     "crates/iowb-ui",
+    "rag",
 ]
 resolver = "3"
 
@@ -35,6 +37,7 @@ futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
 jsonwebtoken = "9"
+libloading = "0.8"
 libc = "0.2"
 mime_guess = "2"
 notify = "8"
@@ -58,6 +61,7 @@ iowb-core = { path = "crates/iowb-core" }
 iowb-fs = { path = "crates/iowb-fs" }
 iowb-process = { path = "crates/iowb-process" }
 iowb-protocol = { path = "crates/iowb-protocol" }
+iowb-rag-plugin-api = { path = "crates/iowb-rag-plugin-api" }
 iowb-server = { path = "crates/iowb-server" }
 iowb-storage = { path = "crates/iowb-storage" }
 iowb-ui = { path = "crates/iowb-ui" }

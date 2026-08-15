@@ -97,13 +97,24 @@
       "delete": { "tags": ["Sessions"], "summary": "Delete a chat session and its messages" }
     },
     "/api/sessions/{session_id}/messages": {
-      "get": { "tags": ["Sessions"], "summary": "Read session messages" }
+      "get": {
+        "tags": ["Sessions"],
+        "summary": "Read session messages",
+        "description": "Directly addressable for ordinary and Kanban-owned sessions. Kanban-owned sessions are not returned by project session listings or conversation search."
+      }
+    },
+    "/api/sessions/{session_id}/snapshot": {
+      "get": {
+        "tags": ["Sessions"],
+        "summary": "Read an exact session snapshot",
+        "description": "Returns the directly addressed session and recent messages, including Kanban-owned sessions that are excluded from ordinary project/session discovery."
+      }
     },
     "/api/sessions/{session_id}/fork": {
       "post": {
         "tags": ["Sessions"],
-        "summary": "Create a non-destructive chat fork before a user prompt",
-        "description": "Creates a new inactive session containing only messages strictly before the selected persisted user message. The selected prompt is saved as the destination draft and is not sent automatically. The source session and project files remain unchanged. Reusing requestId for the same source session returns the original fork.",
+        "summary": "Fork or replace a chat branch before a user prompt",
+        "description": "Creates a new inactive session containing only messages strictly before the selected persisted user message. draftContent, when supplied, becomes the destination draft and title source; otherwise the selected prompt is used. The draft is not sent automatically. With replace=true, the source is hidden from normal session lists while the replacement exists, but its history remains recoverable and becomes visible again if the replacement is deleted. Project files remain unchanged. Reusing requestId for the same source session returns the original fork and its original replacement mode.",
         "parameters": [
           {
             "name": "session_id",
@@ -147,6 +158,55 @@
           },
           "409": {
             "description": "The source session became active or a Codex native boundary could not be resolved",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/compact-and-retry": {
+      "post": {
+        "tags": ["Sessions"],
+        "summary": "Continue the same visible chat in a clean native Codex context",
+        "description": "Retries the latest failed user turn without creating another Workbench session. The visible session ID, URL, title, settings, draft, files, and complete stored transcript remain unchanged. A bounded text-only handoff starts a new native Codex context; the native mapping changes only after a successful response. Reusing requestId returns the original rollover attempt.",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "minLength": 1 }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CompactSessionContextRequest" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "The clean-context retry was accepted or returned idempotently",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CompactSessionContextResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request identifier, message identifier, or unsupported provider",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiError" }
+              }
+            }
+          },
+          "409": {
+            "description": "The session is active or the selected message is not the latest failed turn",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/ApiError" }
@@ -325,8 +385,8 @@
       "put": { "tags": ["Settings"], "summary": "Save notification preferences" }
     },
     "/api/settings/sidebar-active-sessions": {
-      "get": { "tags": ["Settings"], "summary": "Read sidebar active sessions" },
-      "put": { "tags": ["Settings"], "summary": "Save sidebar active sessions" }
+      "get": { "tags": ["Settings"], "summary": "Read ordered pinned chat sessions and initialization state" },
+      "put": { "tags": ["Settings"], "summary": "Save the authoritative pinned chat session order" }
     },
     "/api/settings/direct-ai": {
       "get": { "tags": ["Settings"], "summary": "Read IO Gateway configuration" },
@@ -483,7 +543,46 @@
             "maxLength": 200,
             "pattern": "^[A-Za-z0-9_.:-]+$",
             "description": "Client-generated idempotency identifier scoped to the user and source session."
+          },
+          "replace": {
+            "type": "boolean",
+            "default": false,
+            "description": "Hide the source session from normal lists while this destination exists."
+          },
+          "draftContent": {
+            "type": "string",
+            "description": "Edited unsent prompt to store in the destination and use for its prompt-derived title."
           }
+        },
+        "additionalProperties": false
+      },
+      "CompactSessionContextRequest": {
+        "type": "object",
+        "required": ["requestId", "failedMessageId"],
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9_.:-]+$",
+            "description": "Client-generated idempotency identifier for one rollover attempt. Use a new value after a failed attempt."
+          },
+          "failedMessageId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Persisted ID of the latest failed user message to retry without duplicating it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "CompactSessionContextResponse": {
+        "type": "object",
+        "required": ["sessionId", "requestId", "responseId", "state"],
+        "properties": {
+          "sessionId": { "type": "string" },
+          "requestId": { "type": "string" },
+          "responseId": { "type": "string" },
+          "state": { "type": "string", "enum": ["starting", "active", "failed"] }
         },
         "additionalProperties": false
       },
@@ -503,6 +602,13 @@
           "id": { "type": "string" },
           "provider": { "type": "string", "enum": ["claude", "codex", "gemini"] },
           "external": { "type": "boolean", "default": false },
+          "boardSession": {
+            "type": "boolean",
+            "default": false,
+            "description": "True for a Kanban-owned chat. Board chats are directly addressable by session snapshot/message endpoints but are excluded from ordinary project/session discovery."
+          },
+          "boardRunId": { "type": ["string", "null"] },
+          "boardTaskId": { "type": ["string", "null"] },
           "projectPath": { "type": "string" },
           "title": { "type": "string" },
           "messageCount": { "type": "integer", "minimum": 0 },
@@ -526,7 +632,7 @@
       },
       "ForkSessionResponse": {
         "type": "object",
-        "required": ["sourceSessionId", "beforeMessageId", "session", "draft", "nativeForked", "filesUnchanged"],
+        "required": ["sourceSessionId", "beforeMessageId", "session", "draft", "nativeForked", "filesUnchanged", "sourceHidden"],
         "properties": {
           "sourceSessionId": { "type": "string" },
           "beforeMessageId": { "type": "string" },
@@ -536,7 +642,11 @@
             "type": "boolean",
             "description": "True when a native Codex thread was forked at the exact prior turn."
           },
-          "filesUnchanged": { "type": "boolean", "const": true }
+          "filesUnchanged": { "type": "boolean", "const": true },
+          "sourceHidden": {
+            "type": "boolean",
+            "description": "Whether this destination currently replaces and hides its source session."
+          }
         },
         "additionalProperties": false
       }

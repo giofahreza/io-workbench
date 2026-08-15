@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260812-06";
+const APP_VERSION = "20260814-08";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -72,6 +72,9 @@ const state = {
   lastToolRuns: null,
   lastSettingsRows: null,
   notificationPreferences: null,
+  ioGatewayStatus: null,
+  ioGatewayLoadPromise: null,
+  ioGatewayLoadGeneration: 0,
   gitStatus: null,
   gitBranches: null,
   gitCommits: null,
@@ -105,6 +108,9 @@ const state = {
   chatPromptDraftSessionId: "",
   chatPromptDraftSaveTimer: null,
   chatPromptDraftLoadingSessionId: "",
+  chatPromptDraftRevision: 0,
+  chatPromptDraftApplied: false,
+  chatPromptLastAppliedDraft: "",
   chatPromptHistory: [],
   chatPromptHistoryScope: "",
   chatPromptHistoryIndex: -1,
@@ -117,10 +123,13 @@ const state = {
     pickerOpen: false,
     items: [],
     index: -1,
+    staged: null,
+    submitting: false,
   },
   chatProcessing: null,
   chatStoppingSessionId: "",
   chatResponseStateBySession: {},
+  chatRecoveryBySession: {},
   chatOutputBuffersBySession: {},
   chatTranscriptCache: readJsonStorage(CHAT_TRANSCRIPT_CACHE_KEY, { version: CHAT_TRANSCRIPT_CACHE_VERSION, entries: [] }),
   chatReconcileTimers: {},
@@ -154,6 +163,10 @@ const state = {
   pinnedChatSessions: readJsonStorage(PINNED_CHAT_SESSIONS_KEY, []),
   legacySidebarPinnedChatSessions: [],
   pinnedChatSessionsPersistTimer: null,
+  pinnedChatSessionsRevision: 0,
+  pinnedChatSessionsDirty: false,
+  pinnedChatSessionsLoadGeneration: 0,
+  pinnedChatSessionsSaveChain: Promise.resolve(),
   activeProjectPath: window.localStorage.getItem("iowb.activeProjectPath") || "",
   expandedProjectPaths: new Set(readJsonStorage("iowb.expandedProjects", [])),
   limits: {
@@ -209,6 +222,8 @@ const state = {
   boardRuns: [],
   boardRun: null,
   boardSelectedRunId: window.localStorage.getItem("iowb.boardSelectedRunId") || "",
+  boardChatSessionIds: new Set(),
+  boardWsSessionId: "",
   boardLoading: false,
 };
 
@@ -357,7 +372,10 @@ async function api(path, options = {}) {
     if (response.status === 401) {
       showAuthPanel(authPanelMode());
     }
-    throw new Error(body?.details || body?.error || response.statusText);
+    const error = new Error(body?.details || body?.error || response.statusText);
+    error.status = response.status;
+    error.body = body;
+    throw error;
   }
   return body;
 }
@@ -776,40 +794,31 @@ function sessionMatchesSidebarSearch(session) {
 }
 
 function sidebarSessions() {
-  if (state.sessions.length) return state.sessions;
-  return state.projects.flatMap((project) => (project.sessions || []).map((session) => ({
-    ...session,
-    projectName: project.name,
-    projectPath: session.projectPath || project.path,
-  })));
-}
-
-function sidebarProjectSessions(project) {
-  const byId = new Map();
-  for (const session of project.sessions || []) {
-    if (!session?.id) continue;
-    byId.set(session.id, {
+  if (state.sessions.length) {
+    return state.sessions.filter((session) => !isBoardChatSession(session));
+  }
+  return state.projects.flatMap((project) => (project.sessions || [])
+    .filter((session) => !isBoardChatSession(session))
+    .map((session) => ({
       ...session,
       projectName: project.name,
       projectPath: session.projectPath || project.path,
-    });
-  }
-  for (const session of state.sessions || []) {
-    const path = session.projectPath || "";
-    const matchesPath = path && path === project.path;
-    const matchesName = session.projectName && session.projectName === project.name;
-    if (!session?.id || (!matchesPath && !matchesName)) continue;
-    byId.set(session.id, {
+    })));
+}
+
+function sidebarProjectSessions(project) {
+  return (project.sessions || [])
+    .filter((session) => session?.id && !isBoardChatSession(session))
+    .map((session) => ({
       ...session,
-      projectName: session.projectName || project.name,
+      projectName: project.name,
       projectPath: session.projectPath || project.path,
+    }))
+    .sort((a, b) => {
+      const aDate = new Date(a.lastActivity || a.lastMessageAt || a.updatedAt || a.updated_at || 0).getTime() || 0;
+      const bDate = new Date(b.lastActivity || b.lastMessageAt || b.updatedAt || b.updated_at || 0).getTime() || 0;
+      return bDate - aDate;
     });
-  }
-  return [...byId.values()].sort((a, b) => {
-    const aDate = new Date(a.updatedAt || a.updated_at || a.timestamp || 0).getTime() || 0;
-    const bDate = new Date(b.updatedAt || b.updated_at || b.timestamp || 0).getTime() || 0;
-    return bDate - aDate;
-  });
 }
 
 function pinnedChatKey(projectPath, sessionId, provider = "") {
@@ -843,8 +852,8 @@ function normalizePinnedChatSessions(entries) {
     .filter((entry) => {
       if (!entry?.sessionId) return false;
       entry.key = entry.key || pinnedChatKey(entry.projectPath, entry.sessionId, entry.provider);
-      if (seen.has(entry.key)) return false;
-      seen.add(entry.key);
+      if (seen.has(entry.sessionId)) return false;
+      seen.add(entry.sessionId);
       return true;
     });
 }
@@ -867,15 +876,21 @@ function sharedPinnedChatSessionsPayload(entries = state.pinnedChatSessions) {
 }
 
 async function saveSharedPinnedChatSessions(entries = state.pinnedChatSessions) {
-  state.pinnedChatSessions = sharedPinnedChatSessionsPayload(entries);
-  savePinnedChatSessionsLocal(state.pinnedChatSessions);
+  const pinnedSessions = sharedPinnedChatSessionsPayload(entries);
   return api("/api/settings/sidebar-active-sessions", {
     method: "PUT",
-    body: JSON.stringify({ pinnedSessions: state.pinnedChatSessions }),
+    body: JSON.stringify({ pinnedSessions }),
   });
 }
 
 async function loadSharedPinnedChatSessions() {
+  if (state.pinnedChatSessionsDirty) {
+    persistPinnedChatSessions();
+    return false;
+  }
+  const loadGeneration = ++state.pinnedChatSessionsLoadGeneration;
+  const localRevision = state.pinnedChatSessionsRevision;
+  const localDirty = state.pinnedChatSessionsDirty;
   const localPinned = normalizePinnedChatSessions([
     ...readJsonStorage(PINNED_CHAT_SESSIONS_KEY, []),
     ...state.legacySidebarPinnedChatSessions,
@@ -883,17 +898,37 @@ async function loadSharedPinnedChatSessions() {
   try {
     const response = await api("/api/settings/sidebar-active-sessions");
     const remotePinned = normalizePinnedChatSessions(response?.pinnedSessions || []);
-    if (remotePinned.length || !localPinned.length) {
+    const remoteInitialized = response?.initialized === true
+      || (response?.initialized == null && remotePinned.length > 0);
+    if (
+      loadGeneration !== state.pinnedChatSessionsLoadGeneration
+      || localRevision !== state.pinnedChatSessionsRevision
+      || localDirty
+      || state.pinnedChatSessionsDirty
+    ) {
+      return false;
+    }
+    if (remoteInitialized) {
       state.pinnedChatSessions = remotePinned;
       savePinnedChatSessionsLocal(remotePinned);
+      renderSidebarProjects();
       return true;
     }
     state.pinnedChatSessions = localPinned;
-    await saveSharedPinnedChatSessions(localPinned);
+    savePinnedChatSessionsLocal(localPinned);
+    renderSidebarProjects();
+    if (localPinned.length) {
+      persistPinnedChatSessions();
+    }
     return true;
   } catch (error) {
     console.debug("shared pinned chat load skipped", error);
-    if (localPinned.length) {
+    if (
+      loadGeneration === state.pinnedChatSessionsLoadGeneration
+      && localRevision === state.pinnedChatSessionsRevision
+      && !state.pinnedChatSessionsDirty
+      && localPinned.length
+    ) {
       state.pinnedChatSessions = localPinned;
       savePinnedChatSessionsLocal(localPinned);
     }
@@ -904,9 +939,22 @@ async function loadSharedPinnedChatSessions() {
 function persistPinnedChatSessions() {
   state.pinnedChatSessions = normalizePinnedChatSessions(state.pinnedChatSessions);
   savePinnedChatSessionsLocal(state.pinnedChatSessions);
+  const revision = ++state.pinnedChatSessionsRevision;
+  state.pinnedChatSessionsDirty = true;
+  state.pinnedChatSessionsLoadGeneration += 1;
   window.clearTimeout(state.pinnedChatSessionsPersistTimer);
   state.pinnedChatSessionsPersistTimer = window.setTimeout(() => {
-    saveSharedPinnedChatSessions(state.pinnedChatSessions).catch((error) => {
+    state.pinnedChatSessionsPersistTimer = null;
+    const pinnedSessions = sharedPinnedChatSessionsPayload(state.pinnedChatSessions);
+    const save = state.pinnedChatSessionsSaveChain
+      .catch(() => {})
+      .then(() => saveSharedPinnedChatSessions(pinnedSessions));
+    state.pinnedChatSessionsSaveChain = save;
+    save.then(() => {
+      if (revision === state.pinnedChatSessionsRevision) {
+        state.pinnedChatSessionsDirty = false;
+      }
+    }).catch((error) => {
       console.warn("Unable to sync pinned chat sessions", error);
     });
   }, 300);
@@ -940,8 +988,10 @@ function pinnedChatEntries() {
   const entries = [];
   const pinned = normalizePinnedChatSessions(state.pinnedChatSessions);
   for (const pin of pinned) {
+    if (state.boardChatSessionIds.has(pin.sessionId)) continue;
     const project = (state.projects || []).find((item) => item.path === pin.projectPath || item.name === pin.projectName);
     const session = findChatSession(pin.sessionId);
+    if (isBoardChatSession(session, pin.sessionId)) continue;
     const projectPath = pin.projectPath || sessionProjectPath(session, project?.path || "");
     if (!session) {
       entries.push({
@@ -968,7 +1018,7 @@ function pinnedChatEntries() {
 
 function togglePinnedChatSession(sessionId, projectPath = "", provider = "") {
   const session = findChatSession(sessionId);
-  if (!session) return;
+  if (!session || isBoardChatSession(session, sessionId)) return;
   const path = sessionProjectPath(session, projectPath);
   const project = (state.projects || []).find((item) => item.path === path || item.name === session.projectName);
   const normalizedProvider = provider || sessionProvider(session);
@@ -995,6 +1045,26 @@ function togglePinnedChatSession(sessionId, projectPath = "", provider = "") {
   hapticFeedback(10);
   persistPinnedChatSessions();
   renderSidebarProjects();
+}
+
+function transferPinnedChatSession(sourceSessionId, destination) {
+  if (!sourceSessionId || !destination?.id) return;
+  let changed = false;
+  state.pinnedChatSessions = normalizePinnedChatSessions(state.pinnedChatSessions).map((entry) => {
+    if (entry.sessionId !== sourceSessionId) return entry;
+    changed = true;
+    const projectPath = destination.projectPath || entry.projectPath || "";
+    const provider = sessionProvider(destination) || entry.provider || "";
+    return {
+      ...entry,
+      key: pinnedChatKey(projectPath, destination.id, provider),
+      sessionId: destination.id,
+      projectPath,
+      provider,
+      sessionName: destination.title || entry.sessionName || "",
+    };
+  });
+  if (changed) persistPinnedChatSessions();
 }
 
 function movePinnedChatOrder(sourceKey, targetKey, placement = "before") {
@@ -1222,11 +1292,15 @@ function rememberSidebarSessionStatus(payload = {}) {
   if (!sessionId) return;
   const status = normalizeSidebarSessionStatus(payload.status);
   if (!status) return;
+  if (state.boardChatSessionIds.has(sessionId) && !isActiveChatSessionEvent({ sessionId })) {
+    return;
+  }
   state.sessionStatusById[sessionId] = {
     status,
     provider: payload.provider || "",
     updatedAt: new Date().toISOString(),
   };
+  if (state.boardChatSessionIds.has(sessionId)) return;
   renderSidebarProjects();
   renderPinnedSidebarSessions();
 }
@@ -1247,6 +1321,7 @@ function sidebarSessionCardHtml(session, options = {}) {
   const messageCount = Number(session.messageCount || 0);
   const messageCountLabel = session.external ? "history" : String(messageCount);
   const messageCountTitle = session.external ? "External CLI history" : `${messageCount} messages`;
+  const lifetimeTokens = formatLifetimeTokenUsage(session.lifetimeTokenUsage);
   const pending = session.pending ? "true" : "false";
   const status = sidebarSessionStatus(session);
   const statusLabel = status === "running" ? "Running" : status === "completed" ? "Completed" : status === "failed" ? "Failed" : "";
@@ -1264,6 +1339,7 @@ function sidebarSessionCardHtml(session, options = {}) {
         <span class="meta-time">${escapeHtml(relative || "never")}</span>
         <span class="meta-right">
           <span class="meta-count" title="${escapeHtml(messageCountTitle)}">${escapeHtml(messageCountLabel)}</span>
+          ${lifetimeTokens ? `<span class="meta-count" title="Lifetime token usage">${escapeHtml(lifetimeTokens)}</span>` : ""}
           <span class="cli-badge ${escapeHtml(cli)}" aria-label="${escapeHtml(cliLabel)}" title="${escapeHtml(cliLabel)}">
             <img src="${escapeHtml(cliIcon)}" alt="" aria-hidden="true" loading="lazy" decoding="async" />
           </span>
@@ -1288,7 +1364,7 @@ function findChatSession(sessionId) {
 }
 
 function mergeSessionIntoProjects(session) {
-  if (!session?.id) return;
+  if (!session?.id || isBoardChatSession(session)) return;
   state.projects = (state.projects || []).map((project) => {
     const matchesProject = session.projectPath && project.path === session.projectPath;
     const hasSession = (project.sessions || []).some((item) => item.id === session.id);
@@ -1311,6 +1387,51 @@ function removeChatSessionFromState(sessionId) {
   persistChatTranscriptCache();
 }
 
+function hideChatSessionFromLists(sessionId) {
+  state.sessions = (state.sessions || []).filter((session) => session.id !== sessionId);
+  for (const project of state.projects || []) {
+    if (Array.isArray(project.sessions)) {
+      project.sessions = project.sessions.filter((session) => session.id !== sessionId);
+    }
+  }
+}
+
+function isBoardChatSession(session, sessionId = session?.id) {
+  const id = String(sessionId || "").trim();
+  return Boolean(
+    session?.boardSession
+    || session?.board_session
+    || session?.boardRunId
+    || session?.board_run_id
+    || session?.boardTaskId
+    || session?.board_task_id,
+  ) || Boolean(id && state.boardChatSessionIds.has(id));
+}
+
+function isSelectedBoardChatSession(sessionId = state.chatSessionId) {
+  return isBoardChatSession(
+    findChatSession(sessionId) || cachedChatSession(sessionId)?.session,
+    sessionId,
+  );
+}
+
+function hideBoardChatSessionsFromLists() {
+  for (const session of state.sessions || []) {
+    if (isBoardChatSession(session) && session?.id) state.boardChatSessionIds.add(session.id);
+  }
+  for (const project of state.projects || []) {
+    for (const session of project.sessions || []) {
+      if (isBoardChatSession(session) && session?.id) state.boardChatSessionIds.add(session.id);
+    }
+  }
+  state.sessions = (state.sessions || []).filter((session) => !isBoardChatSession(session));
+  for (const project of state.projects || []) {
+    if (Array.isArray(project.sessions)) {
+      project.sessions = project.sessions.filter((session) => !isBoardChatSession(session));
+    }
+  }
+}
+
 function deleteSessionOverride(sessionId) {
   const all = readSessionOverrides();
   if (!Object.prototype.hasOwnProperty.call(all, sessionId)) return;
@@ -1324,6 +1445,7 @@ function clearSelectedChatSession(sessionId) {
   state.chatSessionId = "";
   state.pendingChatSessionId = "";
   state.chatPromptDraftSessionId = "";
+  state.chatEditFromHere.staged = null;
   state.currentSession = null;
   if (state.preferences.lastChatSessionId === sessionId) {
     state.preferences.lastChatSessionId = "";
@@ -1333,12 +1455,17 @@ function clearSelectedChatSession(sessionId) {
   resetChatOutputDom();
   const prompt = qs("#chat-prompt");
   if (prompt) {
-    prompt.value = "";
+    setChatPromptValue("");
+    noteChatPromptUserEdit("");
     autosizeChatPrompt();
   }
 }
 
 async function deleteChatSession(sessionId, projectPath = "", button = null) {
+  if (state.chatEditFromHere.submitting) {
+    showToast("Wait for the replacement chat to finish creating", "ok");
+    return;
+  }
   const id = (sessionId || "").trim();
   if (!id) return;
   const session = findChatSession(id);
@@ -1669,14 +1796,17 @@ function navigateChatPromptHistory(direction) {
     }
     state.chatPromptHistoryIndex = Math.max(0, state.chatPromptHistoryIndex - 1);
     setChatPromptValue(history[state.chatPromptHistoryIndex]?.content || "");
+    noteChatPromptUserEdit();
     maybePrefetchOlderChatPromptHistory();
   } else {
     if (state.chatPromptHistoryIndex < history.length - 1) {
       state.chatPromptHistoryIndex += 1;
       setChatPromptValue(history[state.chatPromptHistoryIndex]?.content || "");
+      noteChatPromptUserEdit();
     } else {
       state.chatPromptHistoryIndex = history.length;
       setChatPromptValue(state.chatPromptHistoryScratch);
+      noteChatPromptUserEdit();
     }
   }
   scheduleChatPromptDraftSave();
@@ -1767,40 +1897,126 @@ function chatEditFromHereRequestId() {
   return `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
+function stagedChatEdit() {
+  const staged = state.chatEditFromHere.staged;
+  if (!staged || staged.sourceSessionId !== state.chatSessionId) return null;
+  return staged;
+}
+
+function renderStagedChatEdit(staged) {
+  chatHistoryWindow = {
+    sessionId: staged.sourceSessionId,
+    offset: 0,
+    totalCount: staged.prefixMessages.length,
+    messages: staged.prefixMessages.slice(),
+  };
+  resetChatOutputDom();
+  replayChatMessages(staged.prefixMessages);
+  state.chatImages = [];
+  renderChatImages();
+  setChatPromptValue(staged.draftContent);
+  noteChatPromptUserEdit(staged.draftContent);
+  qs("#chat-prompt")?.focus();
+}
+
+function cancelStagedChatEdit() {
+  if (state.chatEditFromHere.submitting) {
+    showToast("Wait for the replacement chat to finish creating", "ok");
+    return false;
+  }
+  const staged = stagedChatEdit();
+  if (!staged) {
+    state.chatEditFromHere.staged = null;
+    state.chatEditFromHere.submitting = false;
+    return false;
+  }
+  state.chatEditFromHere.staged = null;
+  state.chatEditFromHere.submitting = false;
+  chatHistoryWindow = {
+    ...staged.sourceHistory,
+    messages: staged.sourceHistory.messages.slice(),
+  };
+  resetChatOutputDom();
+  replayChatMessages(chatHistoryWindow.messages);
+  state.chatImages = staged.sourceImages.slice();
+  renderChatImages();
+  setChatPromptValue(staged.originalDraft);
+  noteChatPromptUserEdit(staged.originalDraft);
+  ensureChatPromptHistoryScope(staged.sourceSessionId);
+  showToast("Edit from here cancelled", "ok");
+  return true;
+}
+
+async function loadCompleteChatHistoryForEdit(sourceSessionId) {
+  if (chatHistoryWindow.sessionId !== sourceSessionId) {
+    const loaded = await loadChatHistoryForSession(sourceSessionId);
+    if (!loaded) throw new Error("Could not load this chat before editing it.");
+  }
+  while (chatHistoryWindow.offset > 0) {
+    const previousOffset = chatHistoryWindow.offset;
+    const loaded = await loadChatHistoryForSession(sourceSessionId, { older: true });
+    if (!loaded || chatHistoryWindow.offset >= previousOffset) {
+      throw new Error("Could not load the earlier chat history needed for this edit.");
+    }
+  }
+  return {
+    ...chatHistoryWindow,
+    messages: chatHistoryWindow.messages.slice(),
+  };
+}
+
 async function editChatFromHere(messageId, button = null) {
+  if (state.chatEditFromHere.submitting) return;
   const sourceSessionId = String(state.chatSessionId || "").trim();
   if (!sourceSessionId) throw new Error("Open a persisted chat session first.");
   if (selectedRunningChatSession() || findChatSession(sourceSessionId)?.active) {
     throw new Error("Stop the current response before editing from here.");
   }
-  if (!window.confirm(
-    "Create a new chat before this prompt?\n\nThe original chat and current files will remain unchanged.",
-  )) {
-    return;
-  }
-  const response = await withButtonLoading(button, () => api(
-    `/api/sessions/${encodeURIComponent(sourceSessionId)}/fork`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        beforeMessageId: messageId,
-        requestId: chatEditFromHereRequestId(),
-      }),
-    },
-  ));
-  closeChatEditFromHerePicker();
-  await loadProjects().catch(() => {});
-  const destination = response?.session;
-  if (!destination?.id) throw new Error("The server did not return the new chat session.");
-  if (!findChatSession(destination.id)) {
-    state.sessions = (state.sessions || []).concat(destination);
-  }
-  await pickChatSession(destination.id, destination.projectPath || activeProjectPath());
-  const draft = String(response?.draft?.content || "");
-  setChatPromptValue(draft);
-  writeLocalChatPromptDraft(draft, destination.id);
-  qs("#chat-prompt")?.focus();
-  showToast("New chat created; current files were not changed", "ok");
+  const persistedMessageId = String(messageId || "").trim();
+  if (!persistedMessageId) throw new Error("Select a persisted user prompt first.");
+  await withButtonLoading(button, async () => {
+    const existing = stagedChatEdit();
+    let sourceHistory;
+    let originalDraft;
+    let requestId;
+    if (existing) {
+      sourceHistory = existing.sourceHistory;
+      originalDraft = existing.originalDraft;
+      requestId = existing.beforeMessageId === persistedMessageId
+        ? existing.requestId
+        : chatEditFromHereRequestId();
+    } else {
+      await saveChatPromptDraftNow().catch((error) => {
+        console.warn("Unable to sync the current draft before editing from here", error);
+      });
+      sourceHistory = await loadCompleteChatHistoryForEdit(sourceSessionId);
+      originalDraft = qs("#chat-prompt")?.value || "";
+      requestId = chatEditFromHereRequestId();
+    }
+    const targetIndex = sourceHistory.messages.findIndex(
+      (message) => persistedChatMessageId(message) === persistedMessageId,
+    );
+    const target = sourceHistory.messages[targetIndex];
+    if (targetIndex < 0 || String(target?.role || "").toLowerCase() !== "user") {
+      throw new Error("The selected persisted prompt was not found in this chat.");
+    }
+    const staged = {
+      sourceSessionId,
+      beforeMessageId: persistedMessageId,
+      requestId,
+      projectPath: findChatSession(sourceSessionId)?.projectPath || activeProjectPath(),
+      originalDraft,
+      sourceImages: existing?.sourceImages || state.chatImages.slice(),
+      draftContent: String(target.content || ""),
+      prefixMessages: sourceHistory.messages.slice(0, targetIndex),
+      sourceHistory,
+    };
+    state.chatEditFromHere.staged = staged;
+    state.chatEditFromHere.submitting = false;
+    closeChatEditFromHerePicker();
+    renderStagedChatEdit(staged);
+    showToast("Edit the prompt, then send to replace this branch", "ok");
+  });
 }
 
 function handleChatEditFromHereKeydown(event) {
@@ -1835,6 +2051,12 @@ function handleChatEditFromHereKeydown(event) {
       return true;
     }
     return false;
+  }
+  if (event.key === "Escape" && stagedChatEdit()) {
+    event.preventDefault();
+    event.stopPropagation();
+    cancelStagedChatEdit();
+    return true;
   }
   if (event.key !== "Escape") {
     state.chatEditFromHere.armedUntil = 0;
@@ -1954,6 +2176,7 @@ function chatSessionIdForSubmit() {
 
 function currentChatDraftSessionId() {
   const id = state.chatSessionId || "";
+  if (stagedChatEdit()) return "";
   if (!id || state.pendingChatSessionId === id) return "";
   const session = findChatSession(id) || cachedChatSession(id)?.session;
   if (!session || session.pending) return "";
@@ -1987,10 +2210,21 @@ function writeLocalChatPromptDraft(content, sessionId = state.chatSessionId) {
   }
 }
 
-function setChatPromptValue(value) {
+function noteChatPromptUserEdit(value = qs("#chat-prompt")?.value || "") {
+  state.chatPromptDraftRevision += 1;
+  state.chatPromptDraftApplied = false;
+  state.chatPromptLastAppliedDraft = "";
+  state.chatPromptHistoryScratch = value || "";
+}
+
+function setChatPromptValue(value, options = {}) {
   const prompt = qs("#chat-prompt");
   if (!prompt) return;
   prompt.value = value || "";
+  if (options.draftApplied) {
+    state.chatPromptDraftApplied = true;
+    state.chatPromptLastAppliedDraft = prompt.value;
+  }
   autosizeChatPrompt();
   const length = prompt.value.length;
   try {
@@ -2001,17 +2235,39 @@ function setChatPromptValue(value) {
   updateChatComposerState();
 }
 
-async function loadChatPromptDraft(sessionId) {
+function applyLoadedChatPromptDraft(value, options = {}) {
+  const prompt = qs("#chat-prompt");
+  if (!prompt) return false;
+  const draft = value || "";
+  const force = options.force === true;
+  const startRevision = Number(options.startRevision);
+  const revisionChanged = Number.isFinite(startRevision)
+    && state.chatPromptDraftRevision !== startRevision;
+  const current = prompt.value || "";
+  const currentIsEmpty = !current.trim();
+  const currentIsAppliedDraft = state.chatPromptDraftApplied
+    && current === state.chatPromptLastAppliedDraft;
+  if (!force && (revisionChanged || (!currentIsEmpty && !currentIsAppliedDraft))) {
+    return false;
+  }
+  setChatPromptValue(draft, { draftApplied: true });
+  return true;
+}
+
+async function loadChatPromptDraft(sessionId, options = {}) {
   const id = (sessionId || "").trim();
+  if (stagedChatEdit()?.sourceSessionId === id) return;
+  const force = options.force === true || options.preserveUserInput !== true;
+  const startRevision = state.chatPromptDraftRevision;
   if (!id) {
     state.chatPromptDraftSessionId = "";
-    setChatPromptValue(readLocalChatPromptDraft(""));
+    applyLoadedChatPromptDraft(readLocalChatPromptDraft(""), { force, startRevision });
     return;
   }
   const session = findChatSession(id) || cachedChatSession(id)?.session;
   if (!session || session.pending || state.pendingChatSessionId === id) {
     state.chatPromptDraftSessionId = "";
-    setChatPromptValue(readLocalChatPromptDraft(id));
+    applyLoadedChatPromptDraft(readLocalChatPromptDraft(id), { force, startRevision });
     return;
   }
   state.chatPromptDraftLoadingSessionId = id;
@@ -2019,10 +2275,10 @@ async function loadChatPromptDraft(sessionId) {
     const body = await api(`/api/sessions/${encodeURIComponent(id)}/draft`);
     if (state.chatPromptDraftLoadingSessionId !== id || currentChatDraftSessionId() !== id) return;
     state.chatPromptDraftSessionId = id;
-    setChatPromptValue(body?.content || readLocalChatPromptDraft(id));
+    applyLoadedChatPromptDraft(body?.content || readLocalChatPromptDraft(id), { force, startRevision });
   } catch (error) {
     if (state.chatPromptDraftLoadingSessionId === id && currentChatDraftSessionId() === id) {
-      setChatPromptValue(readLocalChatPromptDraft(id));
+      applyLoadedChatPromptDraft(readLocalChatPromptDraft(id), { force, startRevision });
       console.warn("Could not load remote prompt draft", error);
     }
   } finally {
@@ -2037,6 +2293,7 @@ async function saveChatPromptDraftNow() {
     window.clearTimeout(state.chatPromptDraftSaveTimer);
     state.chatPromptDraftSaveTimer = null;
   }
+  if (stagedChatEdit()) return;
   const sessionId = currentChatDraftSessionId();
   const prompt = qs("#chat-prompt");
   if (!prompt) return;
@@ -2206,7 +2463,7 @@ function renderSidebarProjects() {
           <strong>New chat</strong>
         </button>
         ${sessions.length
-    ? sessions.slice(0, 12).map((session) => sidebarSessionCardHtml(session, {
+    ? sessions.map((session) => sidebarSessionCardHtml(session, {
       projectName: displayName,
       projectPath: project.path,
     })).join("")
@@ -2499,6 +2756,7 @@ function rememberCurrentChatSession(patch = {}) {
   const cached = cachedChatSession(sessionId);
   const entries = chatCacheEntries().filter((entry) => entry.key !== key);
   const session = patch.session || findChatSession(sessionId) || cached?.session || null;
+  const boardSession = isBoardChatSession(session, sessionId);
   const projectPath = patch.projectPath || sessionProjectPath(session, activeProjectPath());
   const messages = Array.isArray(patch.messages)
     ? patch.messages
@@ -2509,7 +2767,7 @@ function rememberCurrentChatSession(patch = {}) {
     key,
     sessionId,
     projectPath,
-    session,
+    session: boardSession && session ? { ...session, boardSession: true } : session,
     status: patch.status || (session ? sidebarSessionStatus(session) : "") || (chatSessionIsLive(sessionId) ? "running" : "completed"),
     messages: messages.slice(-CHAT_HISTORY_PAGE_SIZE * 2),
     offset: Math.max(0, offset + Math.max(0, messages.length - CHAT_HISTORY_PAGE_SIZE * 2)),
@@ -2519,11 +2777,16 @@ function rememberCurrentChatSession(patch = {}) {
   });
   state.chatTranscriptCache.entries = entries.slice(-MAX_CHAT_TRANSCRIPT_CACHE);
   persistChatTranscriptCache();
+  if (boardSession) hideBoardChatSessionsFromLists();
 }
 
 function renderCachedChatSession(sessionId) {
   const cached = cachedChatSession(sessionId);
   if (!cached) return false;
+  if (isBoardChatSession(cached.session, sessionId)) {
+    state.boardChatSessionIds.add(sessionId);
+    hideBoardChatSessionsFromLists();
+  }
   const messages = Array.isArray(cached.messages) ? cached.messages : [];
   state.chatSessionId = sessionId;
   state.pendingChatSessionId = "";
@@ -2551,6 +2814,7 @@ function renderCachedChatSession(sessionId) {
 function rememberBackgroundChatOutput(payload = {}) {
   const sessionId = (payload.sessionId || "").trim();
   if (!sessionId || isActiveChatSessionEvent(payload)) return false;
+  if (state.boardChatSessionIds.has(sessionId)) return false;
   const cached = cachedChatSession(sessionId);
   const session = findChatSession(sessionId) || cached?.session || null;
   if (!cached && !session) return false;
@@ -2708,6 +2972,150 @@ function buildChatLineNode(role) {
   return { node, text, footer };
 }
 
+function chatRecoveryRequestId() {
+  if (window.crypto?.randomUUID) return `compact-${window.crypto.randomUUID()}`;
+  return `compact-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function normalizeChatRecovery(recovery, sessionId = "") {
+  if (!recovery || typeof recovery !== "object") return null;
+  const failedMessageId = String(recovery.failedMessageId || recovery.failed_message_id || "").trim();
+  if (!failedMessageId) return null;
+  return {
+    ...recovery,
+    sessionId: String(sessionId || recovery.sessionId || "").trim(),
+    failedMessageId,
+    requestId: String(recovery.requestId || recovery.request_id || "").trim(),
+    state: String(recovery.state || "required").toLowerCase(),
+    pending: false,
+  };
+}
+
+function chatRecoveryBlocksNormalSend(recovery) {
+  return Boolean(recovery && ["required", "failed", "starting"].includes(recovery.state));
+}
+
+function chatRecoveryIsStarting(recovery) {
+  return Boolean(recovery && (recovery.pending || recovery.state === "starting"));
+}
+
+function rememberChatRecovery(sessionId, recovery) {
+  const sid = String(sessionId || "").trim();
+  if (!sid) return;
+  const normalized = normalizeChatRecovery(recovery, sid);
+  if (normalized) state.chatRecoveryBySession[sid] = normalized;
+  else delete state.chatRecoveryBySession[sid];
+  const selected = isActiveChatSessionEvent({ sessionId: sid });
+  if (normalized && ["required", "failed"].includes(normalized.state) && selected) {
+    if (!state.chatProcessing?.sessionId || state.chatProcessing.sessionId === sid) {
+      clearChatProcessing();
+    }
+    if (state.currentSession?.sessionId === sid) state.currentSession = null;
+    const session = findChatSession(sid);
+    rememberSidebarSessionStatus({
+      sessionId: sid,
+      provider: sessionProvider(session),
+      status: "failed",
+    });
+    rememberCurrentChatSession({ sessionId: sid, live: false, status: "failed" });
+  }
+  if (selected || chatHistoryWindow.sessionId === sid) {
+    renderChatRecoveryCard(sid);
+    updateChatComposerState();
+  }
+}
+
+function renderChatRecoveryCard(sessionId = state.chatSessionId) {
+  const output = chatOutputRoot();
+  if (!output) return;
+  output.querySelectorAll(".chat-context-recovery").forEach((node) => node.remove());
+  const recovery = state.chatRecoveryBySession[String(sessionId || "").trim()];
+  if (!recovery || !isActiveChatSessionEvent({ sessionId })) return;
+  const card = document.createElement("section");
+  card.className = "chat-context-recovery chat-line-system";
+  const busy = chatRecoveryIsStarting(recovery);
+  const title = busy
+    ? "Compacting context"
+    : recovery.state === "failed"
+    ? "Clean-context compaction failed"
+    : "This chat needs a clean context";
+  const continuity = recovery.state === "failed"
+    ? "Your original context mapping is still intact. Your chat, URL, title, settings, and visible messages remain unchanged."
+    : "Your chat, URL, title, settings, and all visible messages stay unchanged.";
+  const detail = recovery.observedBytes
+    ? ` Current native context: ${formatBytes(recovery.observedBytes)}; gateway limit: ${formatBytes(recovery.limitBytes || 0)}.`
+    : "";
+  card.innerHTML = `<div class="chat-context-recovery-copy">
+      <strong>${title}</strong>
+      <span>${escapeHtml(recovery.message || "The native Codex context is too large to continue safely.")}${escapeHtml(detail)}</span>
+      <span>${escapeHtml(continuity)}</span>
+    </div>
+    <button type="button" class="primary-action" data-chat-compact-retry${busy ? " disabled" : ""}>${busy ? "Compacting…" : "Compact & retry"}</button>`;
+  output.appendChild(card);
+  card.querySelector("[data-chat-compact-retry]")?.addEventListener("click", (event) => {
+    compactAndRetryChatContext(sessionId, event.currentTarget).catch(showError);
+  });
+  scrollChatToBottom();
+}
+
+async function compactAndRetryChatContext(sessionId, button = null) {
+  const sid = String(sessionId || "").trim();
+  const recovery = state.chatRecoveryBySession[sid];
+  if (!sid || !recovery || recovery.pending || recovery.state === "starting") return;
+  recovery.pending = true;
+  recovery.state = "starting";
+  const requestId = chatRecoveryRequestId();
+  recovery.requestId = requestId;
+  recovery.responseId = "";
+  const attemptIsCurrent = () => state.chatRecoveryBySession[sid] === recovery
+    && recovery.requestId === requestId
+    && recovery.pending
+    && recovery.state === "starting";
+  renderChatRecoveryCard(sid);
+  updateChatComposerState();
+  try {
+    const response = await api(`/api/sessions/${encodeURIComponent(sid)}/compact-and-retry`, {
+      method: "POST",
+      body: JSON.stringify({
+        requestId: recovery.requestId,
+        failedMessageId: recovery.failedMessageId,
+      }),
+    });
+    if (!attemptIsCurrent()) return;
+    recovery.pending = false;
+    const responseState = String(response?.state || "starting").toLowerCase();
+    recovery.state = responseState;
+    recovery.responseId = String(response?.responseId || response?.response_id || "").trim();
+    if (responseState === "failed") {
+      recovery.message = response?.message
+        || "The clean-context compaction failed. Your original context mapping was kept; you can try again.";
+      clearChatProcessing();
+      renderChatRecoveryCard(sid);
+      updateChatComposerState();
+      return;
+    }
+    if (responseState !== "starting") {
+      delete state.chatRecoveryBySession[sid];
+      clearChatProcessing();
+      renderChatRecoveryCard(sid);
+      updateChatComposerState();
+      scheduleCompletedChatReconciliation(sid);
+      return;
+    }
+    renderChatRecoveryCard(sid);
+    ensureChatProcessing({ provider: "codex", sessionId: sid });
+    updateProcessingLabel("Compacting context");
+  } catch (error) {
+    if (!attemptIsCurrent()) return;
+    recovery.pending = false;
+    recovery.state = "failed";
+    recovery.message = error?.message || String(error);
+    renderChatRecoveryCard(sid);
+    updateChatComposerState();
+    throw error;
+  }
+}
+
 function chatEventSessionIds() {
   return new Set([
     state.chatSessionId,
@@ -2736,6 +3144,12 @@ function chatEventSequence(payload = {}) {
   if (value == null || value === "") return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+function chatRecoveryMatchesResponse(recovery, payload = {}) {
+  const expected = String(recovery?.responseId || "").trim();
+  const observed = chatEventResponseId(payload);
+  return Boolean(expected && observed && expected === observed);
 }
 
 function chatResponseState(sessionId) {
@@ -2778,7 +3192,9 @@ function rememberOrderedChatResponseEvent(payload = {}, options = {}) {
   const sequence = chatEventSequence(payload);
   if (!sessionId || !responseId || sequence == null) return;
   const tracked = chatResponseState(sessionId);
-  tracked.sequence = Math.max(Number(tracked.sequence) || 0, sequence);
+  const responseChanged = tracked.activeResponseId !== responseId
+    && tracked.completedResponseId !== responseId;
+  tracked.sequence = responseChanged ? sequence : Math.max(Number(tracked.sequence) || 0, sequence);
   if (options.terminal === true) {
     tracked.activeResponseId = "";
     tracked.completedResponseId = responseId;
@@ -3191,6 +3607,26 @@ function formatTokenUsage(value) {
   return `${used} (in ${input} / out ${output})`;
 }
 
+function compactTokenCount(value) {
+  const count = Number(value) || 0;
+  if (count >= 1_000_000_000) return `${(count / 1_000_000_000).toFixed(count >= 10_000_000_000 ? 0 : 1)}B`;
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(count >= 10_000_000 ? 0 : 1)}M`;
+  if (count >= 1_000) return `${(count / 1_000).toFixed(count >= 10_000 ? 0 : 1)}K`;
+  return String(count);
+}
+
+function formatLifetimeTokenUsage(value) {
+  if (!value || typeof value !== "object") return "";
+  const total = Number(value.total) || 0;
+  const missing = Number(value.missingAttempts) || 0;
+  const partial = Number(value.partialAttempts) || 0;
+  const completeness = String(value.completeness || "").toLowerCase();
+  if (!total && (missing || completeness === "missing")) return "Unknown tokens";
+  if (!total) return "";
+  const prefix = missing || partial || completeness === "partial" ? ">=" : "";
+  return `${prefix}${compactTokenCount(total)} tokens`;
+}
+
 function normalizeMessageMeta(raw) {
   if (!raw || typeof raw !== "object") return {};
   const meta = { ...raw };
@@ -3224,6 +3660,7 @@ function normalizeMessageMeta(raw) {
 
 async function loadChatHistoryForSession(sessionId, opts = {}) {
   if (!sessionId) return false;
+  if (stagedChatEdit()?.sourceSessionId === sessionId) return true;
   try {
     const loadingOlder = opts.older === true && chatHistoryWindow.sessionId === sessionId;
     const previousOutput = chatOutputRoot();
@@ -3270,25 +3707,31 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     const page = Array.isArray(body) ? body : (body.messages || []);
     const totalCount = Number(body?.total_count ?? body?.totalCount ?? page.length) || page.length;
     const snapshotSession = body?.session || findChatSession(sessionId);
+    const boardSession = isBoardChatSession(snapshotSession, sessionId);
+    if (boardSession) {
+      state.boardChatSessionIds.add(sessionId);
+      if (snapshotSession?.id) state.boardChatSessionIds.add(snapshotSession.id);
+    }
+    if (!loadingOlder) rememberChatRecovery(sessionId, body?.recovery || null);
+    const recoveryState = state.chatRecoveryBySession[sessionId]?.state || "";
+    const snapshotStatus = snapshotSession?.active || recoveryState === "starting"
+      ? "running"
+      : (["required", "failed"].includes(recoveryState) ? "failed" : "completed");
     if (snapshotSession?.id) {
       if (snapshotSession.projectPath) {
         setActiveProject(snapshotSession.projectPath);
       }
-      state.sessions = (state.sessions || []).filter((session) => session?.id !== snapshotSession.id);
-      state.sessions.push(snapshotSession);
-      state.projects = (state.projects || []).map((project) => {
-        const matchesProject = snapshotSession.projectPath && project.path === snapshotSession.projectPath;
-        const hasSession = (project.sessions || []).some((session) => session.id === snapshotSession.id);
-        if (!matchesProject && !hasSession) return project;
-        const sessions = (project.sessions || [])
-          .filter((session) => session.id !== snapshotSession.id)
-          .concat({ ...snapshotSession, projectPath: snapshotSession.projectPath || project.path });
-        return { ...project, sessions };
-      });
+      if (boardSession) {
+        hideBoardChatSessionsFromLists();
+      } else {
+        state.sessions = (state.sessions || []).filter((session) => session?.id !== snapshotSession.id);
+        state.sessions.push(snapshotSession);
+        mergeSessionIntoProjects(snapshotSession);
+      }
       rememberSidebarSessionStatus({
         sessionId: snapshotSession.id,
         provider: snapshotSession.provider,
-        status: snapshotSession.active ? "running" : "completed",
+        status: snapshotStatus,
       });
     }
     const messages = loadingOlder
@@ -3350,6 +3793,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
         output.appendChild(node);
       }
     });
+    renderChatRecoveryCard(sessionId);
     const output = chatOutputRoot();
     if (loadingOlder && output) {
       output.scrollTop = Math.max(0, output.scrollHeight - previousHeight + previousTop);
@@ -3370,9 +3814,11 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       offset,
       totalCount,
       live: Boolean(snapshotSession?.active),
-      status: snapshotSession?.active ? "running" : "completed",
+      status: snapshotStatus,
     });
-    persistActiveChatSelection(sessionId, snapshotSession?.projectPath || activeProjectPath());
+    if (!boardSession) {
+      persistActiveChatSelection(sessionId, snapshotSession?.projectPath || activeProjectPath());
+    }
     updateChatEmptyState();
     return true;
   } catch (error) {
@@ -3384,6 +3830,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
 function scheduleChatReconciliation(sessionId = state.chatSessionId, opts = {}) {
   const id = (sessionId || "").trim();
   if (!id || !canLoadProtectedData()) return;
+  if (stagedChatEdit()?.sourceSessionId === id) return;
   if (state.chatReconcileTimers[id]) {
     window.clearTimeout(state.chatReconcileTimers[id]);
   }
@@ -3392,13 +3839,63 @@ function scheduleChatReconciliation(sessionId = state.chatSessionId, opts = {}) 
     if (state.chatSessionId !== id && state.pendingChatSessionId !== id) return;
     const ok = await loadChatHistoryForSession(id);
     if (ok) {
-      await loadChatPromptDraft(id).catch((error) => {
+      await loadChatPromptDraft(id, { preserveUserInput: true }).catch((error) => {
         console.warn("Unable to load prompt draft after chat reconciliation", error);
       });
     } else if (opts.reportFailure) {
       showToast("Could not reconcile chat session", "danger");
     }
   }, opts.delayMs ?? 0);
+}
+
+async function reconcileSelectedChatRecoverySnapshot(generation = state.wsGeneration) {
+  const sessionId = String(state.chatSessionId || state.pendingChatSessionId || "").trim();
+  if (!sessionId) return false;
+  const session = findChatSession(sessionId) || cachedChatSession(sessionId)?.session;
+  if (!session || session.pending || sessionId.startsWith("local-")) return false;
+  const recoveryBeforeRequest = state.chatRecoveryBySession[sessionId] || null;
+  const body = await api(`/api/sessions/${encodeURIComponent(sessionId)}/snapshot?limit=1`);
+  if (generation !== state.wsGeneration) return false;
+  if (state.chatSessionId !== sessionId && state.pendingChatSessionId !== sessionId) return false;
+  // A recovery event may have arrived while the snapshot was loading. Keep
+  // that newer state instead of replacing it with an older snapshot.
+  if ((state.chatRecoveryBySession[sessionId] || null) !== recoveryBeforeRequest) return false;
+  rememberChatRecovery(sessionId, body?.recovery || null);
+  return true;
+}
+
+function chatRecoveryHasOptimisticTimelineState(sessionId) {
+  const id = String(sessionId || "").trim();
+  if (!id || chatHistoryWindow.sessionId !== id) return false;
+  return chatHistoryWindow.messages.some((message) => (
+    /^local-(?:user|assistant|stream)-/.test(String(message?.id || ""))
+  ));
+}
+
+function handleChatRecoveryRequired(payload = {}) {
+  const sessionId = String(payload.sessionId || "").trim();
+  if (!sessionId) return;
+  const selected = isActiveChatSessionEvent({ sessionId });
+  const reconcileTimeline = selected && chatRecoveryHasOptimisticTimelineState(sessionId);
+  const rejectedPrompt = reconcileTimeline
+    ? [...chatHistoryWindow.messages].reverse().find((message) => (
+      /^local-user-/.test(String(message?.id || ""))
+    ))?.content || ""
+    : "";
+  rememberChatRecovery(sessionId, payload.recovery || payload);
+  if (!reconcileTimeline) return;
+  if (rejectedPrompt && !qs("#chat-prompt")?.value.trim()) {
+    setChatPromptValue(rejectedPrompt);
+    noteChatPromptUserEdit(rejectedPrompt);
+    writeLocalChatPromptDraft(rejectedPrompt, sessionId);
+    scheduleChatPromptDraftSave();
+  }
+  // The server snapshot is authoritative. Replaying it replaces optimistic
+  // local rows from the blocked send while leaving the visible Workbench
+  // session identity alone. The rejected text is restored as an unsent draft.
+  loadChatHistoryForSession(sessionId, { forceBottom: true }).catch((error) => {
+    console.warn("Unable to reconcile chat after recovery became required", error);
+  });
 }
 
 function scheduleCompletedChatReconciliation(sessionId) {
@@ -3425,31 +3922,45 @@ function startChatActivityPoll() {
   }, CHAT_ACTIVE_POLL_INTERVAL_MS);
 }
 
-async function pickChatSession(sessionId, projectPath) {
+async function pickChatSession(sessionId, projectPath, options = {}) {
   const id = (sessionId || "").trim();
   if (!id) return;
+  if (state.chatEditFromHere.submitting) {
+    showToast("Wait for the replacement chat to finish creating", "ok");
+    return;
+  }
   closeChatEditFromHerePicker();
   clearChatImages();
   await saveChatPromptDraftNow().catch((error) => {
     console.warn("Unable to sync prompt draft before switching session", error);
   });
+  state.chatEditFromHere.staged = null;
+  if (options.boardSession === true) {
+    state.boardChatSessionIds.add(id);
+    hideBoardChatSessionsFromLists();
+  }
+  setBoardChatWsSubscription(options.boardSession === true ? id : "");
   const session = findChatSession(id);
   state.pendingChatSessionId = id;
   state.chatSessionId = id;
   ensureChatPromptHistoryScope(id);
-  state.preferences.lastChatSessionId = id;
-  savePreferences();
+  if (options.boardSession !== true) {
+    state.preferences.lastChatSessionId = id;
+    savePreferences();
+  }
   if (projectPath) setActiveProject(projectPath);
   await switchView("chat");
   if (session?.pending) {
     resetChatOutputDom();
-    setChatPromptValue("");
+    setChatPromptValue("", { draftApplied: true });
     updateChatEmptyState();
     return;
   }
   state.pendingChatSessionId = "";
-  const renderedCached = renderCachedChatSession(id);
-  persistActiveChatSelection(id, projectPath || sessionProjectPath(session, activeProjectPath()));
+  const renderedCached = options.forceSnapshot === true ? false : renderCachedChatSession(id);
+  if (options.boardSession !== true) {
+    persistActiveChatSelection(id, projectPath || sessionProjectPath(session, activeProjectPath()));
+  }
   if (renderedCached) {
     scheduleChatReconciliation(id, { reportFailure: true });
     await loadChatPromptDraft(id).catch((error) => {
@@ -3459,6 +3970,7 @@ async function pickChatSession(sessionId, projectPath) {
     return;
   }
   await loadChatHistoryForSession(id, { forceBottom: true });
+  if (options.boardSession === true) hideBoardChatSessionsFromLists();
   await loadChatPromptDraft(id);
   await loadChatPromptHistory(id);
 }
@@ -3468,11 +3980,17 @@ async function pickChatSession(sessionId, projectPath) {
 // first prompt is sent.
 async function startNewChatForProject(projectPath) {
   if (!projectPath) return;
+  if (state.chatEditFromHere.submitting) {
+    showToast("Wait for the replacement chat to finish creating", "ok");
+    return;
+  }
   closeChatEditFromHerePicker();
   clearChatImages();
   await saveChatPromptDraftNow().catch((error) => {
     console.warn("Unable to sync prompt draft before starting new chat", error);
   });
+  state.chatEditFromHere.staged = null;
+  setBoardChatWsSubscription("");
   setActiveProject(projectPath);
   state.chatSessionId = "";
   state.pendingChatSessionId = "";
@@ -3494,10 +4012,9 @@ async function startNewChatForProject(projectPath) {
   updateChatEmptyState();
   const prompt = qs("#chat-prompt");
   if (prompt) {
-    prompt.value = readLocalChatPromptDraft("");
+    setChatPromptValue(readLocalChatPromptDraft(""), { draftApplied: true });
     state.chatPromptDraftSessionId = "";
     prompt.focus();
-    autosizeChatPrompt();
   }
 }
 
@@ -3507,15 +4024,19 @@ function pickDefaultChatSession() {
   // session across all projects.
   const allSessions = []
     .concat(
-      ...(state.projects || []).map((p) => (p.sessions || []).map((s) => ({ ...s, projectPath: p.path }))),
+      ...(state.projects || []).map((p) => (p.sessions || [])
+        .filter((s) => !isBoardChatSession(s))
+        .map((s) => ({ ...s, projectPath: p.path }))),
     )
-    .concat((state.sessions || []).map((s) => ({ ...s })));
+    .concat((state.sessions || []).filter((s) => !isBoardChatSession(s)).map((s) => ({ ...s })));
   if (!allSessions.length) return null;
   const activePath = activeProjectPath();
   const activeProject = activePath
     ? (state.projects || []).find((p) => p.path === activePath)
     : null;
-  const activeSessions = activeProject ? (activeProject.sessions || []) : [];
+  const activeSessions = activeProject
+    ? (activeProject.sessions || []).filter((session) => !isBoardChatSession(session))
+    : [];
   if (activeSessions.length) {
     return activeSessions
       .slice()
@@ -3524,11 +4045,13 @@ function pickDefaultChatSession() {
   // No active project (or no sessions in it): pick topmost project with the
   // most recent chat history.
   const projectsWithSessions = (state.projects || [])
-    .filter((p) => (p.sessions || []).length > 0);
+    .filter((p) => (p.sessions || []).some((session) => !isBoardChatSession(session)));
   if (!projectsWithSessions.length) return null;
   // Collect all sessions, attach their project path, and pick the newest.
   return projectsWithSessions
-    .flatMap((p) => (p.sessions || []).map((s) => ({ ...s, projectPath: p.path })))
+    .flatMap((p) => (p.sessions || [])
+      .filter((s) => !isBoardChatSession(s))
+      .map((s) => ({ ...s, projectPath: p.path })))
     .sort((a, b) => new Date(b.lastActivity || 0) - new Date(a.lastActivity || 0))[0];
 }
 
@@ -3549,6 +4072,7 @@ function activeProjectChatSessions() {
 
 function currentChatNavigationEntries() {
   const current = findChatSession(state.chatSessionId);
+  if (isSelectedBoardChatSession()) return [];
   if (current && isChatSessionPinned(current, sessionProjectPath(current, activeProjectPath()))) {
     return pinnedChatEntries();
   }
@@ -3656,6 +4180,7 @@ function renderSessions() {
   }
   const filter = qs("#sessions-filter")?.value.trim().toLowerCase() || "";
   const sessions = state.sessions.filter((session) => {
+    if (isBoardChatSession(session)) return false;
     const haystack = [
       session.id,
       session.title,
@@ -3673,15 +4198,21 @@ function renderSessions() {
 
   renderVirtualList(list, "sessions", sessions, {
     rowHeight: 104,
-    render: (session) => `<article class="row">
+    render: (session) => {
+      const lifetimeTokens = formatLifetimeTokenUsage(session.lifetimeTokenUsage);
+      return `<article class="row">
       <strong>${escapeHtml(session.title || session.id)}</strong>
       <span>${escapeHtml(session.provider)} · ${escapeHtml(session.projectPath)}</span>
-      <span class="meta">${session.external ? "External CLI history" : `${session.messageCount} messages`}</span>
+      <span class="meta">${escapeHtml([
+        session.external ? "External CLI history" : `${session.messageCount} messages`,
+        lifetimeTokens,
+      ].filter(Boolean).join(" · "))}</span>
       <div class="row-actions">
         <button type="button" data-session-use="${escapeHtml(session.id)}">Use</button>
         <button type="button" data-session-open="${escapeHtml(session.id)}">Messages</button>
       </div>
-    </article>`,
+    </article>`;
+    },
     bind: (root) => {
       root.querySelectorAll("[data-session-use]").forEach((button) => {
         button.addEventListener("click", () => {
@@ -3723,6 +4254,9 @@ function setSettingsTab(tab) {
   document.querySelectorAll("[data-settings-panel]").forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.settingsPanel === next);
   });
+  if (next === "direct-ai" && canLoadProtectedData() && !state.ioGatewayStatus) {
+    loadIoGatewayConfig().catch(showError);
+  }
 }
 
 function renderSettingsServerStatus(body) {
@@ -4364,6 +4898,7 @@ async function loadHealth() {
 async function loadProjects() {
   const body = await api("/api/projects?includeSessions=true");
   state.projects = body.projects || [];
+  hideBoardChatSessionsFromLists();
   syncProjectOrder();
   const activeExists = state.projects.some((project) => project.path === state.activeProjectPath);
   if (!activeExists) {
@@ -4374,6 +4909,7 @@ async function loadProjects() {
 
 async function loadSettings() {
   state.settings = await api("/api/settings/server-status");
+  if (state.activeSettingsTab === "direct-ai") state.ioGatewayStatus = null;
   renderSettings();
 }
 
@@ -6114,13 +6650,24 @@ async function uploadChatImages() {
   const formData = new FormData();
   files.forEach((file) => formData.append("images", file));
   const body = await apiUpload(`/api/projects/${encodeURIComponent(project)}/upload-images`, formData);
-  state.chatImages = [...state.chatImages, ...(body.images || [])].slice(-5);
+  const uploaded = (body.images || []).map((image, index) => ({
+    ...image,
+    previewUrl: files[index] ? URL.createObjectURL(files[index]) : "",
+  }));
+  const combined = [...state.chatImages, ...uploaded];
+  combined.slice(0, Math.max(0, combined.length - 5)).forEach((image) => {
+    if (image.previewUrl?.startsWith("blob:")) URL.revokeObjectURL(image.previewUrl);
+  });
+  state.chatImages = combined.slice(-5);
   qs("#chat-image-input").value = "";
   renderChatImages();
   showToast(`Attached ${files.length} image${files.length === 1 ? "" : "s"}`, "ok");
 }
 
 function clearChatImages() {
+  state.chatImages.forEach((image) => {
+    if (image.previewUrl?.startsWith("blob:")) URL.revokeObjectURL(image.previewUrl);
+  });
   state.chatImages = [];
   qs("#chat-image-input").value = "";
   renderChatImages();
@@ -6136,7 +6683,7 @@ function renderChatImages() {
   if (!target) return;
   target.innerHTML = state.chatImages.length
     ? state.chatImages.map((image) => `<article class="image-preview">
-      <img src="${escapeHtml(image.data)}" alt="${escapeHtml(image.name || "attached image")}" />
+      ${image.previewUrl ? `<img src="${escapeHtml(image.previewUrl)}" alt="${escapeHtml(image.name || "attached image")}" />` : ""}
       <span>${escapeHtml(image.name || "image")} · ${escapeHtml(formatBytes(image.size || 0))}</span>
     </article>`).join("")
     : "";
@@ -6146,7 +6693,7 @@ function renderChatImages() {
 function chatPromptWithImages(prompt) {
   if (!state.chatImages.length) return prompt;
   const imageMarkdown = state.chatImages
-    .map((image) => `![${image.name || "attached image"}](${image.data})`)
+    .map((image) => `Attached image file: \`${image.path}\` (${image.name || "image"}, ${image.mimeType || "image"})`)
     .join("\n");
   return `${prompt}\n\n${imageMarkdown}`;
 }
@@ -6154,12 +6701,27 @@ function chatPromptWithImages(prompt) {
 function autosizeChatPrompt() {
   const input = qs("#chat-prompt");
   if (!input) return;
-  input.style.height = "0px";
+  input.style.height = "auto";
   const styles = getComputedStyle(input);
   const maxHeight = Number.parseFloat(styles.maxHeight) || 180;
   const minHeight = Number.parseFloat(styles.minHeight) || 50;
   input.style.height = `${Math.min(maxHeight, Math.max(minHeight, input.scrollHeight))}px`;
+  if (!input.value) input.scrollTop = 0;
   updateChatComposerState();
+}
+
+function clearChatPromptInput() {
+  const input = qs("#chat-prompt");
+  if (!input) return;
+  input.style.transition = "none";
+  input.value = "";
+  noteChatPromptUserEdit("");
+  input.style.removeProperty("height");
+  input.scrollTop = 0;
+  void input.offsetHeight;
+  autosizeChatPrompt();
+  void input.offsetHeight;
+  input.style.removeProperty("transition");
 }
 
 function updateChatComposerState() {
@@ -6172,10 +6734,18 @@ function updateChatComposerState() {
   const canSubmit = hasPrompt || state.chatImages.length > 0;
   const stopping = selectedChatIsStopping();
   const busy = Boolean(selectedRunningChatSession() || state.chatProcessing || stopping);
+  const replacing = state.chatEditFromHere.submitting;
+  const recovery = state.chatRecoveryBySession[state.chatSessionId || ""];
+  const recoveryBlocksSend = chatRecoveryBlocksNormalSend(recovery);
+  const recoveringContext = chatRecoveryIsStarting(recovery);
 
   if (input) {
-    input.disabled = !hasProject;
-    input.placeholder = hasProject ? "Ask the agent" : "Add a project to start chatting";
+    input.disabled = !hasProject || replacing || recoveringContext;
+    input.placeholder = recoveringContext
+      ? "Compacting this chat's context"
+      : replacing
+      ? "Creating replacement chat"
+      : (hasProject ? "Ask the agent" : "Add a project to start chatting");
   }
   qs("#chat-form")?.classList.toggle("no-project", !hasProject);
   const promptConfigToggle = qs("#prompt-config-toggle");
@@ -6195,10 +6765,15 @@ function updateChatComposerState() {
   }
   updateChatFastControl();
   if (submit) {
-    submit.disabled = stopping || (!busy && (!hasProject || !canSubmit));
+    submit.disabled = recoveryBlocksSend || replacing || stopping || (!busy && (!hasProject || !canSubmit));
     submit.dataset.symbol = busy ? "stop" : "send";
-    submit.setAttribute("aria-label", stopping ? "Stopping" : (busy ? "Abort chat" : "Send"));
-    submit.title = stopping ? "Stopping" : (busy ? "Abort chat" : "Send");
+    const submitLabel = recoveringContext
+      ? "Compacting context"
+      : recoveryBlocksSend
+      ? "Compact & retry required"
+      : (stopping ? "Stopping" : (busy ? "Abort chat" : "Send"));
+    submit.setAttribute("aria-label", submitLabel);
+    submit.title = submitLabel;
     submit.classList.toggle("is-stop", busy);
   }
 }
@@ -6450,7 +7025,8 @@ async function loadProjectSessions() {
   const project = activeProjectName();
   if (!project) return;
   const body = await api(`/api/projects/${encodeURIComponent(project)}/sessions`);
-  state.sessions = Array.isArray(body) ? body : body.sessions || [];
+  state.sessions = (Array.isArray(body) ? body : body.sessions || [])
+    .filter((session) => !isBoardChatSession(session));
   renderSessions();
   renderJson("#sessions-output", { project, sessions: state.sessions });
 }
@@ -8234,8 +8810,228 @@ function renderSettingsResponse(body) {
     renderCreatedApiKey(body.apiKey);
     return;
   }
+  if (body?.config && body?.effective && Object.prototype.hasOwnProperty.call(body, "runtimeReady")) {
+    renderIoGatewayConfig(body);
+    return;
+  }
   state.lastSettingsRows = null;
   renderJson("#settings-json", body);
+}
+
+const IO_GATEWAY_API_PATH_SUFFIXES = [
+  "/v1",
+  "/codex",
+  "/claude",
+  "/agw",
+  "/gemini",
+  "/qwen",
+  "/deepseek",
+  "/grok",
+  "/minimax",
+  "/copilot",
+  "/glm",
+];
+
+function ioGatewayRootUrl(value) {
+  let root = String(value || "").trim().replace(/\/+$/, "");
+  while (root) {
+    const lower = root.toLowerCase();
+    const suffix = IO_GATEWAY_API_PATH_SUFFIXES.find((candidate) => lower.endsWith(candidate));
+    if (!suffix) return root;
+    root = root.slice(0, -suffix.length).replace(/\/+$/, "");
+  }
+  return root;
+}
+
+function normalizeIoGatewayUrl(value) {
+  const trimmed = String(value || "").trim().replace(/\/+$/, "");
+  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+    throw new Error("Gateway URL must start with http:// or https://.");
+  }
+  return ioGatewayRootUrl(trimmed);
+}
+
+function normalizeTotpSecret(value) {
+  const trimmed = String(value || "").trim();
+  let secret = trimmed;
+  if (trimmed.toLowerCase().startsWith("otpauth://")) {
+    try {
+      secret = new URL(trimmed).searchParams.get("secret") || "";
+    } catch {
+      secret = "";
+    }
+  }
+  return secret.replace(/[\s-]/g, "").toUpperCase();
+}
+
+function decodeBase32(value) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const normalized = String(value || "").replace(/=+$/, "");
+  const output = [];
+  let buffer = 0;
+  let bits = 0;
+  for (const character of normalized) {
+    const digit = alphabet.indexOf(character.toUpperCase());
+    if (digit < 0) throw new Error("Secret OTP must be valid Base32.");
+    buffer = (buffer << 5) | digit;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      output.push((buffer >> bits) & 0xff);
+      buffer &= bits ? (1 << bits) - 1 : 0;
+    }
+  }
+  return output;
+}
+
+function validateTotpSecret(secret) {
+  if (decodeBase32(secret).length < 10) {
+    throw new Error("Secret OTP must be a valid Base32 TOTP secret.");
+  }
+}
+
+function ioGatewayConfigured(status, key) {
+  const config = status?.config || {};
+  if (key === "gatewayApiKey") {
+    return status?.apiKeyConfigured === true || config.gatewayApiKeyConfigured === true;
+  }
+  return status?.gatewayOtpConfigured === true || config.gatewayOtpConfigured === true;
+}
+
+function ioGatewaySummaryRow(label, value, tone = "") {
+  const badge = tone ? ` class="badge ${tone}"` : "";
+  return `<div><dt>${escapeHtml(label)}</dt><dd${badge}>${escapeHtml(value)}</dd></div>`;
+}
+
+function renderIoGatewayConfig(status) {
+  state.ioGatewayStatus = status;
+  state.lastSettingsRows = null;
+  const config = status?.config || {};
+  const effective = status?.effective || {};
+  const gatewayUrl = firstDefined(config.gatewayUrl, ioGatewayRootUrl(effective.baseUrl), "unset");
+  const apiKeyConfigured = ioGatewayConfigured(status, "gatewayApiKey");
+  const otpConfigured = ioGatewayConfigured(status, "gatewayOtpSecret");
+  const runtimeReady = status?.runtimeReady === true;
+  const summary = qs("#io-gateway-summary");
+  if (summary) {
+    summary.innerHTML = [
+      ioGatewaySummaryRow("Chat runtime", effective.chatRuntime === "io_gateway" ? "IO Gateway" : "Native CLI"),
+      ioGatewaySummaryRow("Mode", effective.mode || "off"),
+      ioGatewaySummaryRow("Gateway URL", gatewayUrl),
+      ioGatewaySummaryRow("API Key", apiKeyConfigured ? "configured" : "missing", apiKeyConfigured ? "ok" : "warn"),
+      ioGatewaySummaryRow("Secret OTP", otpConfigured ? "configured" : "missing", otpConfigured ? "ok" : "warn"),
+      ioGatewaySummaryRow("Model", firstDefined(config.model, effective.model, "unset")),
+      ioGatewaySummaryRow("Runtime", runtimeReady ? "ready" : "not ready", runtimeReady ? "ok" : "warn"),
+    ].join("");
+  }
+  const enabled = qs("#io-gateway-enabled");
+  const url = qs("#io-gateway-url");
+  if (enabled) enabled.checked = effective.chatRuntime === "io_gateway";
+  if (url) url.value = gatewayUrl === "unset" ? "" : gatewayUrl;
+  const apiKey = qs("#io-gateway-api-key");
+  const otp = qs("#io-gateway-otp-secret");
+  if (apiKey && !apiKey.value) {
+    apiKey.placeholder = apiKeyConfigured ? "Configured — click Show to load" : "Gateway API key";
+  }
+  if (otp && !otp.value) {
+    otp.placeholder = otpConfigured ? "Configured — click Show to load" : "Base32 TOTP secret";
+  }
+  renderJson("#settings-json", status);
+}
+
+async function loadIoGatewayConfig(options = {}) {
+  if (state.ioGatewayLoadPromise && !options.force) return state.ioGatewayLoadPromise;
+  const generation = ++state.ioGatewayLoadGeneration;
+  const request = api("/api/settings/direct-ai")
+    .then((status) => {
+      if (generation === state.ioGatewayLoadGeneration) renderIoGatewayConfig(status);
+      return status;
+    })
+    .finally(() => {
+      if (state.ioGatewayLoadPromise === request) state.ioGatewayLoadPromise = null;
+    });
+  state.ioGatewayLoadPromise = request;
+  return request;
+}
+
+function ioGatewaySecretControl(secretKey) {
+  if (secretKey === "gatewayApiKey") {
+    return {
+      input: qs("#io-gateway-api-key"),
+      button: qs("#io-gateway-api-key-toggle"),
+      title: "API Key",
+    };
+  }
+  return {
+    input: qs("#io-gateway-otp-secret"),
+    button: qs("#io-gateway-otp-secret-toggle"),
+    title: "Secret OTP",
+  };
+}
+
+function setIoGatewaySecretVisibility(secretKey, visible) {
+  const { input, button, title } = ioGatewaySecretControl(secretKey);
+  if (!input || !button) return;
+  input.type = visible ? "text" : "password";
+  button.dataset.symbol = visible ? "eye-off" : "eye";
+  button.setAttribute("aria-label", `${visible ? "Hide" : "Show"} ${title}`);
+  button.title = `${visible ? "Hide" : "Show"} ${title}`;
+}
+
+async function toggleIoGatewaySecret(secretKey) {
+  const { input, button, title } = ioGatewaySecretControl(secretKey);
+  if (!input || !button) return;
+  if (input.value) {
+    setIoGatewaySecretVisibility(secretKey, input.type === "password");
+    input.focus();
+    return;
+  }
+  await withButtonLoading(button, async () => {
+    const body = await api("/api/settings/direct-ai?revealSecrets=true");
+    const secret = String(body?.secrets?.[secretKey] || "");
+    if (!secret) {
+      showToast(`${title} is not configured`, "warn");
+      return;
+    }
+    input.value = secret;
+    setIoGatewaySecretVisibility(secretKey, true);
+    input.focus();
+  });
+}
+
+async function saveIoGatewayConfig(event) {
+  event.preventDefault();
+  const normalizedUrl = normalizeIoGatewayUrl(qs("#io-gateway-url")?.value);
+  const key = qs("#io-gateway-api-key")?.value.trim() || "";
+  const secret = normalizeTotpSecret(qs("#io-gateway-otp-secret")?.value);
+  const useIoGateway = qs("#io-gateway-enabled")?.checked === true;
+  const serverApiKeyConfigured = ioGatewayConfigured(state.ioGatewayStatus, "gatewayApiKey");
+  if (useIoGateway && !key && !serverApiKeyConfigured) {
+    throw new Error("API key is required when IO Gateway is selected.");
+  }
+  if (secret) validateTotpSecret(secret);
+  const storedConfig = state.ioGatewayStatus?.config || {};
+  const payload = {
+    mode: "aiproxy",
+    chatRuntime: useIoGateway ? "io_gateway" : "native_cli",
+    baseUrl: `${normalizedUrl}/claude`,
+    model: storedConfig.model ?? null,
+    gatewayUrl: normalizedUrl,
+  };
+  if (key) payload.gatewayApiKey = key;
+  if (secret) payload.gatewayOtpSecret = secret;
+  await api("/api/settings/direct-ai", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+  if (qs("#io-gateway-url")) qs("#io-gateway-url").value = normalizedUrl;
+  if (qs("#io-gateway-api-key")) qs("#io-gateway-api-key").value = key;
+  if (qs("#io-gateway-otp-secret")) qs("#io-gateway-otp-secret").value = secret;
+  setIoGatewaySecretVisibility("gatewayApiKey", false);
+  setIoGatewaySecretVisibility("gatewayOtpSecret", false);
+  state.ioGatewayStatus = null;
+  await loadIoGatewayConfig({ force: true });
+  showToast("IO Gateway settings saved on server", "ok");
 }
 
 function defaultNotificationPreferences() {
@@ -8590,8 +9386,11 @@ function connectWs() {
     state.wsRetryAttempt = 0;
     setWsStatus("connected");
     ws.send(JSON.stringify({ type: "ping", nonce: String(Date.now()) }));
-    ws.send(JSON.stringify({ type: "subscribe", topics: ["sessions", "processes", "projects"] }));
+    sendWorkspaceSubscription();
     startChatActivityPoll();
+    reconcileSelectedChatRecoverySnapshot(generation).catch((error) => {
+      console.warn("Unable to refresh selected chat recovery after reconnect", error);
+    });
   });
 
   ws.addEventListener("message", (event) => {
@@ -8604,12 +9403,14 @@ function connectWs() {
     }
     if (payload.type === "projects_updated") {
       state.projects = payload.projects || [];
+      hideBoardChatSessionsFromLists();
       syncProjectOrder();
       renderProjects();
     }
     if (payload.type === "active_sessions") {
-      state.sessions = payload.sessions || [];
+      state.sessions = (payload.sessions || []).filter((session) => !isBoardChatSession(session));
       state.sessions.forEach(mergeSessionIntoProjects);
+      hideBoardChatSessionsFromLists();
       renderSidebarProjects();
       renderSessions();
     }
@@ -8623,6 +9424,11 @@ function connectWs() {
           || state.currentSession?.sessionId === payload.sessionId,
       })) {
         return;
+      }
+      const sessionRecovery = state.chatRecoveryBySession[payload.sessionId || ""];
+      if (statusRunning && sessionRecovery?.state === "starting") {
+        const responseId = chatEventResponseId(payload);
+        if (responseId) sessionRecovery.responseId = responseId;
       }
       rememberOrderedChatResponseEvent(payload, { terminal: !statusRunning });
       rememberSidebarSessionStatus(payload);
@@ -8651,6 +9457,10 @@ function connectWs() {
           }
         }
       } else if (status === "completed") {
+        if (sessionRecovery?.state === "starting" && chatRecoveryMatchesResponse(sessionRecovery, payload)) {
+          delete state.chatRecoveryBySession[payload.sessionId || ""];
+          if (isActiveChatSessionEvent(payload)) renderChatRecoveryCard(payload.sessionId);
+        }
         if (isActiveChatSessionEvent(payload) && (!chatStream.node || chatStream.role !== "assistant" || !state.chatBuffer)) {
           finishChatProcessing(payload);
         }
@@ -8668,6 +9478,13 @@ function connectWs() {
           finishChatProcessing(payload, label);
         }
         if (isActiveChatSessionEvent(payload)) {
+          const recovery = state.chatRecoveryBySession[payload.sessionId || ""];
+          if (recovery?.state === "starting" && chatRecoveryMatchesResponse(recovery, payload)) {
+            recovery.pending = false;
+            recovery.state = "failed";
+            recovery.message = "The clean-context compaction failed. Your original context mapping was kept; you can try again.";
+            renderChatRecoveryCard(payload.sessionId);
+          }
           if (state.chatStoppingSessionId === payload.sessionId) state.chatStoppingSessionId = "";
           rememberCurrentChatSession({ sessionId: payload.sessionId, live: false, status: "failed" });
           scheduleCompletedChatReconciliation(payload.sessionId);
@@ -8846,12 +9663,29 @@ function connectWs() {
         if (prev.sentAt) entry.elapsed = formatElapsed(prev.sentAt, receivedAt);
         all[sid] = entry;
         writeSessionOverrides(all);
+        if (payload.lifetimeTokenUsage) {
+          const patchSession = (session) => session?.id === sid
+            ? { ...session, lifetimeTokenUsage: payload.lifetimeTokenUsage }
+            : session;
+          state.sessions = (state.sessions || []).map(patchSession);
+          state.projects = (state.projects || []).map((project) => ({
+            ...project,
+            sessions: (project.sessions || []).map(patchSession),
+          }));
+          renderSidebarProjects();
+          renderSidebarSessions();
+          renderPinnedSidebarSessions();
+          if (activeView() === "sessions") renderSessions();
+        }
         if (state.chatSessionId === sid || state.pendingChatSessionId === sid) {
           if (chatStream.node && chatStream.role === "assistant") {
             renderChatLineFooter(chatStream.node.querySelector(".chat-line-footer"), entry);
           }
         }
       }
+    }
+    if (payload.type === "chat_recovery_required") {
+      handleChatRecoveryRequired(payload);
     }
     if (payload.type === "process_output") {
       appendShell(payload.data);
@@ -8866,6 +9700,7 @@ function connectWs() {
       }
     }
     if (payload.type === "error") {
+      if (payload.sessionId && !isActiveChatSessionEvent(payload)) return;
       appendChatLine(`[error] ${payload.message}${payload.details ? `: ${payload.details}` : ""}`);
     }
   });
@@ -8889,6 +9724,22 @@ function connectWs() {
     if (state.ws !== ws || ws._iowbGeneration !== state.wsGeneration) return;
     setWsStatus("error", "WebSocket error");
   });
+}
+
+function sendWorkspaceSubscription() {
+  if (state.ws?.readyState !== WebSocket.OPEN) return false;
+  const boardSessionId = String(state.boardWsSessionId || "").trim();
+  state.ws.send(JSON.stringify({
+    type: "subscribe",
+    topics: ["sessions", "processes", "projects"],
+    sessionIds: boardSessionId ? [boardSessionId] : [],
+  }));
+  return true;
+}
+
+function setBoardChatWsSubscription(sessionId = "") {
+  state.boardWsSessionId = String(sessionId || "").trim();
+  sendWorkspaceSubscription();
 }
 
 function bindNavigation() {
@@ -9029,6 +9880,7 @@ async function switchView(view) {
     return false;
   }
   if (view !== "chat") closeChatEditFromHerePicker();
+  if (view !== "chat" && state.boardWsSessionId) setBoardChatWsSubscription("");
   document.querySelectorAll("button[data-view]").forEach((item) => item.classList.remove("active"));
   document.querySelectorAll(".view").forEach((item) => {
     item.classList.remove("active");
@@ -9059,6 +9911,9 @@ async function switchView(view) {
     scheduleShellFit(true);
   }
   if (view === "chat") {
+    if (isSelectedBoardChatSession()) {
+      setBoardChatWsSubscription(state.chatSessionId);
+    }
     updateChatEmptyState();
   }
   return true;
@@ -9146,6 +10001,8 @@ async function loadBoard() {
       setBoardSelectedRunId(runId, projectPath);
     }
     state.boardRun = runId ? await loadBoardRunDetail(runId) : null;
+    rememberBoardChatSessionIds(state.boardRun);
+    hideBoardChatSessionsFromLists();
   } finally {
     state.boardLoading = false;
     renderBoard();
@@ -9155,6 +10012,13 @@ async function loadBoard() {
 async function loadBoardRunDetail(runId) {
   const body = await api(`/api/danger/runs/${encodeURIComponent(runId)}`);
   return body.run || null;
+}
+
+function rememberBoardChatSessionIds(run) {
+  for (const task of run?.tasks || []) {
+    const sessionId = boardTaskSessionId(task);
+    if (sessionId) state.boardChatSessionIds.add(sessionId);
+  }
 }
 
 function renderBoard() {
@@ -9298,6 +10162,40 @@ function renderBoardColumn(column, tasks) {
   `;
 }
 
+function boardTaskSessionId(task) {
+  return String(firstDefined(
+    task?.providerSessionId,
+    task?.provider_session_id,
+    task?.sessionId,
+    task?.session_id,
+    "",
+  ) || "").trim();
+}
+
+function boardTaskChatAvailable(task) {
+  const provider = String(task?.provider || state.boardRun?.provider || "").trim().toLowerCase();
+  return Boolean(boardTaskSessionId(task)) && provider !== "cursor";
+}
+
+async function openBoardTaskChat(taskId) {
+  const task = (state.boardRun?.tasks || []).find((item) => item.id === taskId);
+  if (!task) throw new Error("This board task is no longer available. Refresh the board and try again.");
+  const sessionId = boardTaskSessionId(task);
+  if (!boardTaskChatAvailable(task)) {
+    throw new Error(sessionId
+      ? "Cursor task chats are not available in the Workbench chat viewer yet."
+      : "This task does not have a chat session yet.");
+  }
+  state.boardChatSessionIds.add(sessionId);
+  hideBoardChatSessionsFromLists();
+  await pickChatSession(sessionId, state.boardRun?.projectPath || activeProjectPath(), {
+    boardSession: true,
+    forceSnapshot: true,
+  });
+  hideBoardChatSessionsFromLists();
+  renderProjects();
+}
+
 function renderBoardCard(task) {
   const status = String(task.status || "backlog");
   const details = task.details || task.description || task.prompt || "";
@@ -9308,6 +10206,7 @@ function renderBoardCard(task) {
   const qaCommands = Array.isArray(task.qaTestCommands) ? task.qaTestCommands : [];
   const baselinePassed = task.qaBaselineValidation?.passed;
   const tddPhase = task.tddPhase || "";
+  const taskSessionId = boardTaskSessionId(task);
   return `
     <article class="board-card" data-board-task-id="${escapeHtml(task.id)}">
       <div class="board-card-topline">
@@ -9326,6 +10225,7 @@ function renderBoardCard(task) {
       ${acceptance.length ? `<ul>${acceptance.slice(0, 3).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}
       ${references.length ? `<div class="board-card-meta">${references.slice(0, 3).map((item) => `<code>${escapeHtml(item)}</code>`).join("")}</div>` : ""}
       <div class="board-card-actions">
+        ${taskSessionId && boardTaskChatAvailable(task) ? `<button type="button" data-board-open-chat="${escapeHtml(task.id)}">Open chat</button>` : ""}
         ${boardMoveButton(task, "backlog", "Backlog")}
         ${boardMoveButton(task, "pending", "Todo")}
         ${boardMoveButton(task, "in_progress", "Progress")}
@@ -9778,13 +10678,22 @@ function openAddProjectFolderBrowser() {
 }
 
 function toggleSidebar() {
-  if (window.matchMedia("(max-width: 760px)").matches) {
+  const mobile = window.matchMedia("(max-width: 760px)").matches;
+  const opening = mobile
+    ? !document.body.classList.contains("sidebar-open")
+    : document.body.classList.contains("sidebar-collapsed");
+  if (mobile) {
     document.body.classList.toggle("sidebar-open");
     qs("#bottom-sidebar")?.classList.toggle("active", document.body.classList.contains("sidebar-open"));
-    return;
+  } else {
+    document.body.classList.toggle("sidebar-collapsed");
+    qs("#bottom-sidebar")?.classList.toggle("active", !document.body.classList.contains("sidebar-collapsed"));
   }
-  document.body.classList.toggle("sidebar-collapsed");
-  qs("#bottom-sidebar")?.classList.toggle("active", !document.body.classList.contains("sidebar-collapsed"));
+  if (opening) {
+    loadSharedPinnedChatSessions().catch((error) => {
+      console.debug("shared pinned chat refresh skipped", error);
+    });
+  }
 }
 
 function closeSidebar() {
@@ -10022,6 +10931,16 @@ function bindForms() {
     if (event.target.closest(".sidebar") || event.target.closest("#bottom-sidebar") || event.target.closest("#mobile-sidebar-fab")) return;
     closeSidebar();
   }, true);
+  document.addEventListener("visibilitychange", () => {
+    if (
+      document.visibilityState === "visible"
+      && !document.body.classList.contains("auth-active")
+    ) {
+      loadSharedPinnedChatSessions().catch((error) => {
+        console.debug("shared pinned chat refresh skipped", error);
+      });
+    }
+  });
   document.addEventListener("click", (event) => {
     if (state.fileContextMenu && !event.target.closest("#file-context-menu") && !event.target.closest("[data-file-menu]")) {
       closeFileContextMenu();
@@ -10070,6 +10989,11 @@ function bindForms() {
   qs("#board-start-form")?.addEventListener("submit", (event) => withButtonLoading(event.submitter, () => createBoard(event)).catch(showError));
   qs("#board-task-form")?.addEventListener("submit", (event) => withButtonLoading(event.submitter, () => addBoardTask(event)).catch(showError));
   qs("#board-columns")?.addEventListener("click", (event) => {
+    const openChatButton = event.target.closest("[data-board-open-chat]");
+    if (openChatButton) {
+      withButtonLoading(openChatButton, () => openBoardTaskChat(openChatButton.dataset.boardOpenChat)).catch(showError);
+      return;
+    }
     const moveButton = event.target.closest("[data-board-task-status]");
     if (moveButton) {
       withButtonLoading(moveButton, () => moveBoardTask(moveButton.dataset.boardTaskId, moveButton.dataset.boardTaskStatus)).catch(showError);
@@ -10256,7 +11180,11 @@ function bindForms() {
   qs("#notification-permission").addEventListener("click", () => requestNotificationPermission().catch(showError));
   qs("#notification-preview").addEventListener("click", () => previewBrowserNotification().catch(showError));
   qs("#notification-test-push").addEventListener("click", () => testPushNotificationCommand().catch(showError));
-  qs("#load-direct-ai").addEventListener("click", () => loadSettingsView("/api/settings/direct-ai").catch(showError));
+  qs("#io-gateway-form").addEventListener("submit", (event) => withButtonLoading("#save-direct-ai", () => saveIoGatewayConfig(event)).catch(showError));
+  document.querySelectorAll("[data-io-gateway-secret]").forEach((button) => {
+    button.addEventListener("click", () => toggleIoGatewaySecret(button.dataset.ioGatewaySecret).catch(showError));
+  });
+  qs("#load-direct-ai").addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => loadIoGatewayConfig({ force: true })).catch(showError));
   qs("#load-direct-ai-models").addEventListener("click", () => loadSettingsView("/api/settings/direct-ai/models").catch(showError));
   qs("#load-git-config").addEventListener("click", () => loadSettingsView("/api/user/git-config").catch(showError));
   qs("#prompt-config-toggle")?.addEventListener("click", () => togglePromptConfigPanel());
@@ -10282,12 +11210,18 @@ function bindForms() {
     withButtonLoading(event.currentTarget, () => loadChatHistoryForSession(sessionId)).catch(showError);
   });
   qs("#chat-session-config")?.addEventListener("click", showChatSessionConfigModal);
-  qs("#chat-prompt").addEventListener("input", () => {
+  qs("#chat-prompt").addEventListener("input", (event) => {
+    const prompt = event.currentTarget;
+    noteChatPromptUserEdit(prompt.value || "");
+    if (!stagedChatEdit()) {
+      const sessionId = currentChatDraftSessionId();
+      writeLocalChatPromptDraft(prompt.value || "", sessionId);
+      if (sessionId) state.chatPromptDraftSessionId = sessionId;
+    }
     autosizeChatPrompt();
     scheduleChatPromptDraftSave();
     ensureChatPromptHistoryScope();
     state.chatPromptHistoryIndex = (state.chatPromptHistory || []).length;
-    state.chatPromptHistoryScratch = qs("#chat-prompt").value || "";
   });
   qs("#chat-prompt").addEventListener("focus", autosizeChatPrompt);
   qs("#chat-prompt").addEventListener("keydown", (event) => {
@@ -10309,8 +11243,7 @@ function bindForms() {
   });
   qs("#clear-chat").addEventListener("click", () => {
     const prompt = qs("#chat-prompt");
-    prompt.value = "";
-    autosizeChatPrompt();
+    clearChatPromptInput();
     const sessionId = currentChatDraftSessionId();
     writeLocalChatPromptDraft("", sessionId);
     if (sessionId) clearRemoteChatPromptDraft(sessionId);
@@ -10378,8 +11311,14 @@ function bindForms() {
     showToast("Signed out", "ok");
   });
 
-  qs("#chat-form").addEventListener("submit", (event) => {
+  qs("#chat-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    const recovery = state.chatRecoveryBySession[state.chatSessionId || ""];
+    if (chatRecoveryBlocksNormalSend(recovery)) {
+      renderChatRecoveryCard(state.chatSessionId);
+      showToast("Compact & retry this chat before sending another message.", "danger");
+      return;
+    }
     if (selectedChatIsStopping()) return;
     const selectedRun = selectedRunningChatSession();
     if (selectedRun) {
@@ -10396,12 +11335,82 @@ function bindForms() {
       showError(new Error("Pick a CLI (Codex, Claude, or Gemini) before sending a prompt."));
       return;
     }
-    const prompt = chatPromptWithImages(qs("#chat-prompt").value.trim());
+    const draftContent = qs("#chat-prompt").value.trim();
+    const prompt = chatPromptWithImages(draftContent);
     if (!prompt) return;
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
       connectWs();
       showError(new Error("Chat connection is not ready. Reconnecting now."));
       return;
+    }
+    const stagedEdit = stagedChatEdit();
+    let replacement = null;
+    if (stagedEdit) {
+      if (state.chatEditFromHere.submitting) return;
+      state.chatEditFromHere.submitting = true;
+      updateChatComposerState();
+      try {
+        replacement = await api(
+          `/api/sessions/${encodeURIComponent(stagedEdit.sourceSessionId)}/fork`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              beforeMessageId: stagedEdit.beforeMessageId,
+              requestId: stagedEdit.requestId,
+              replace: true,
+              draftContent,
+            }),
+          },
+        );
+      } catch (error) {
+        state.chatEditFromHere.submitting = false;
+        updateChatComposerState();
+        showError(error);
+        qs("#chat-prompt")?.focus();
+        return;
+      }
+      const destination = replacement?.session;
+      if (!destination?.id) {
+        state.chatEditFromHere.submitting = false;
+        updateChatComposerState();
+        showError(new Error("The server did not return the replacement chat session."));
+        return;
+      }
+      const boardReplacement = isBoardChatSession(destination)
+        || state.boardChatSessionIds.has(stagedEdit.sourceSessionId);
+      if (boardReplacement) {
+        state.boardChatSessionIds.add(destination.id);
+        hideBoardChatSessionsFromLists();
+        setBoardChatWsSubscription(destination.id);
+      } else {
+        setBoardChatWsSubscription("");
+        state.sessions = (state.sessions || [])
+          .filter((session) => session?.id !== destination.id)
+          .concat(destination);
+        mergeSessionIntoProjects(destination);
+        transferPinnedChatSession(stagedEdit.sourceSessionId, destination);
+      }
+      if (replacement.sourceHidden === true) {
+        hideChatSessionFromLists(stagedEdit.sourceSessionId);
+      }
+      state.chatSessionId = destination.id;
+      state.pendingChatSessionId = "";
+      state.chatEditFromHere.staged = null;
+      state.chatEditFromHere.submitting = false;
+      chatHistoryWindow = {
+        sessionId: destination.id,
+        offset: 0,
+        totalCount: stagedEdit.prefixMessages.length,
+        messages: stagedEdit.prefixMessages.map((message, index) => ({
+          ...message,
+          id: `local-fork-prefix-${index}`,
+        })),
+      };
+      resetChatOutputDom();
+      replayChatMessages(chatHistoryWindow.messages);
+      renderProjects();
+      renderSidebarProjects();
+      renderSidebarSessions();
     }
     clearChatProcessing();
     chatStream = { role: null, node: null, text: null, buffer: "" };
@@ -10421,7 +11430,7 @@ function bindForms() {
     savePreferences();
 
     const startedAt = new Date().toISOString();
-    let sessionId = chatSessionIdForSubmit();
+    let sessionId = replacement?.session?.id || chatSessionIdForSubmit();
     if (!sessionId) {
       sessionId = `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       state.chatSessionId = sessionId;
@@ -10445,19 +11454,31 @@ function bindForms() {
       fast,
     };
     if (sessionId) message.sessionId = sessionId;
-    state.ws.send(JSON.stringify(message));
+    try {
+      state.ws.send(JSON.stringify(message));
+    } catch (error) {
+      if (replacement?.session?.id) {
+        setChatPromptValue(draftContent);
+        noteChatPromptUserEdit(draftContent);
+        writeLocalChatPromptDraft(draftContent, replacement.session.id);
+        rememberSidebarSessionStatus({ sessionId: replacement.session.id, provider: cli, status: "completed" });
+      }
+      showError(error);
+      return;
+    }
     renderChatProviderPicker();
     if (sessionId) {
       state.chatSessionId = sessionId;
-      state.preferences.lastChatSessionId = sessionId;
-      savePreferences();
+      if (!isSelectedBoardChatSession(sessionId)) {
+        state.preferences.lastChatSessionId = sessionId;
+        savePreferences();
+      }
       writeLocalChatPromptDraft("", sessionId);
       if (currentChatDraftSessionId() === sessionId) clearRemoteChatPromptDraft(sessionId);
     }
     state.pendingChatSessionId = "";
-    qs("#chat-prompt").value = "";
+    clearChatPromptInput();
     clearChatImages();
-    autosizeChatPrompt();
     updateChatComposerState();
 
     // Show the user prompt in the chat with right-aligned styling, plus the
@@ -10482,7 +11503,9 @@ function bindForms() {
       ),
       messages: nextMessages,
     };
-    persistActiveChatSelection(sessionId, projectPath);
+    if (!isSelectedBoardChatSession(sessionId)) {
+      persistActiveChatSelection(sessionId, projectPath);
+    }
     rememberCurrentChatSession({
       sessionId,
       projectPath,

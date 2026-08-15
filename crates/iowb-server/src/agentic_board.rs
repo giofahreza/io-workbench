@@ -19,11 +19,12 @@ use axum::{
 use chrono::{DateTime, Utc};
 use iowb_core::{AppState, DirectAiRuntimeConfig, augmented_user_path};
 use iowb_fs::FsError;
-use iowb_protocol::{ChatRuntime, MessageRole, Provider, SessionSummary};
+use iowb_protocol::{ChatRuntime, MessageRole, Provider, SessionSummary, new_id};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
+    io::AsyncReadExt,
     process::Command,
     time::{sleep, timeout},
 };
@@ -62,8 +63,10 @@ const MAX_TASK_ATTEMPTS: u32 = 2;
 const DEFAULT_IO_GATEWAY_CLAUDE_BASE_URL: &str = "http://141.144.197.96:8319/claude";
 const IO_GATEWAY_API_KEY_CREDENTIAL: &str = "io-workbench-io-gateway-api-key";
 const IO_GATEWAY_API_KEY_CREDENTIAL_TYPE: &str = "io_gateway_api_key";
+const CURSOR_CLI_COMMAND: &str = "cursor-agent";
 static AUTO_RETRY_POLLER_STARTED: AtomicBool = AtomicBool::new(false);
 static BOARD_RUN_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+static BOARD_RUN_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
@@ -171,6 +174,17 @@ pub(crate) fn recover_active_runs(state: &AppState) {
             }
         });
     }
+}
+
+/// Classify sessions written by older board versions before any ordinary
+/// project/session discovery or chat-run recovery can expose them. The lazy
+/// list/detail repair remains in place for snapshots copied in while the
+/// server is already running.
+pub(crate) async fn backfill_legacy_board_sessions(state: &AppState) -> Result<()> {
+    for mut stored in load_runs(state)? {
+        backfill_board_session_links(state, &mut stored.run).await?;
+    }
+    Ok(())
 }
 
 fn start_auto_retry_poller(handle: tokio::runtime::Handle, state: AppState) {
@@ -353,9 +367,12 @@ struct TaskRequest {
     status: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PromptRequest {
     prompt: Option<String>,
+    model: Option<String>,
+    run_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -451,6 +468,8 @@ struct BoardRun {
     loop_started: bool,
     #[serde(default)]
     auto_run_enabled: bool,
+    #[serde(default)]
+    control_revision: u64,
     #[serde(default)]
     pause_requested: bool,
     #[serde(default)]
@@ -697,8 +716,7 @@ impl BoardRun {
             last_effective_model: None,
             model_history: Vec::new(),
             model_strategy: request.model_strategy,
-            run_profile: trim_string(request.run_profile)
-                .unwrap_or_else(|| "complete_app".to_string()),
+            run_profile: normalize_run_profile(request.run_profile.as_deref()),
             task_model_overrides: request.task_model_overrides.unwrap_or_else(|| json!({})),
             session_policy: normalize_session_policy(request.session_policy.as_deref()),
             git_policy: normalize_git_policy(request.git_policy.as_deref()),
@@ -722,6 +740,7 @@ impl BoardRun {
             active: false,
             loop_started: false,
             auto_run_enabled: !should_schedule,
+            control_revision: 0,
             pause_requested: false,
             paused_at: if should_schedule { None } else { Some(now) },
             pause_reason: if should_schedule {
@@ -774,8 +793,8 @@ impl BoardRun {
             change_ledger: Vec::new(),
             git_ledger: Vec::new(),
             validation_runs: Vec::new(),
-            rag_enabled: env::var("IO_WORKBENCH_RAG_URL").is_ok(),
-            rag_service_url: env::var("IO_WORKBENCH_RAG_URL").ok(),
+            rag_enabled: RagClient::is_configured(),
+            rag_service_url: RagClient::configured_descriptor(),
             rag_queries: Vec::new(),
             rag_ingestions: Vec::new(),
             rag_trace_refs: Vec::new(),
@@ -831,7 +850,7 @@ impl BoardRun {
     }
 
     fn summary_json(&self, file_path: Option<String>) -> Value {
-        let task_counts = task_counts(&self.tasks);
+        let task_counts = task_counts(&self.tasks, self.orchestration_version);
         json!({
             "id": self.id,
             "orchestrationVersion": self.orchestration_version,
@@ -874,6 +893,7 @@ impl BoardRun {
             "active": self.active,
             "loopStarted": self.loop_started,
             "autoRunEnabled": self.auto_run_enabled,
+            "controlRevision": self.control_revision,
             "pauseRequested": self.pause_requested,
             "pausedAt": self.paused_at,
             "pauseReason": self.pause_reason,
@@ -901,7 +921,7 @@ impl BoardRun {
             "tddPolicy": self.tdd_policy,
             "qaArtifactCount": self.qa_artifacts.len(),
             "promotionCandidateCount": self.promotion_candidates.len(),
-            "resumable": true,
+            "resumable": is_resumable_run(self),
             "toolsSettings": self.tools_settings,
             "autoRetry": self.auto_retry,
             "filePath": file_path,
@@ -1008,7 +1028,7 @@ impl BoardTask {
             depends_on: value_to_strings(request.depends_on.or(request.dependencies)),
             manual_task: true,
             prompt_task: false,
-            task_origin: "manual".to_string(),
+            task_origin: "user_manual".to_string(),
             task_type: "implementation".to_string(),
             backlog_generation_task: false,
             qa_task: false,
@@ -1064,9 +1084,9 @@ impl BoardTask {
             requirement_ids: Vec::new(),
             priority: "medium".to_string(),
             depends_on: Vec::new(),
-            manual_task: true,
+            manual_task: false,
             prompt_task: true,
-            task_origin: "prompt_breakdown".to_string(),
+            task_origin: "user_prompt_generated".to_string(),
             task_type: "implementation".to_string(),
             backlog_generation_task: false,
             qa_task: false,
@@ -1145,7 +1165,7 @@ async fn create_run(
                 ));
             }
             apply_run_options(&mut latest.run, &request)?;
-            let task = BoardTask::manual(
+            let mut task = BoardTask::manual(
                 &mut latest.run,
                 TaskRequest {
                     prompt: request.command.clone().or(request.prompt.clone()),
@@ -1167,7 +1187,10 @@ async fn create_run(
                     status: Some("pending".to_string()),
                 },
             )?;
+            ensure_manual_task_requirements(&mut latest.run.requirement_matrix, &mut task);
+            mark_requirements_from_tasks(&mut latest.run, std::slice::from_ref(&task));
             latest.run.tasks.push(task);
+            reset_requirement_review_state(&mut latest.run);
             latest.run.status = if should_schedule {
                 "scheduled".to_string()
             } else {
@@ -1239,6 +1262,9 @@ async fn list_runs(
                 .is_none_or(|path| stored.run.project_path == path)
         })
         .collect::<Vec<_>>();
+    for stored in &mut runs {
+        backfill_board_session_links(&state, &mut stored.run).await?;
+    }
     runs.sort_by(|left, right| {
         right
             .run
@@ -1280,10 +1306,214 @@ async fn get_run(
     Extension(user): Extension<AuthenticatedUser>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>> {
-    let stored = load_user_run(&state, &user.0.id, &id)?;
+    let mut stored = load_user_run(&state, &user.0.id, &id)?;
+    backfill_board_session_links(&state, &mut stored.run).await?;
     Ok(Json(
         json!({ "run": stored.run.detail_json(Some(stored.path.display().to_string())) }),
     ))
+}
+
+/// Lazily classify sessions created before board-session metadata existed.
+/// This intentionally runs only while serving a board list/detail request;
+/// ordinary session reads remain read-only and never scan board snapshots.
+async fn backfill_board_session_links(state: &AppState, run: &mut BoardRun) -> Result<()> {
+    if run.provider == "cursor" {
+        // Cursor board turns are native Cursor CLI sessions, not Workbench
+        // sessions, and therefore cannot be opened through chat snapshots.
+        return Ok(());
+    }
+    let mut changed_run = false;
+    for (session_id, task_id) in known_board_session_refs(run) {
+        let Some(session) = state.storage.get_session_summary(&session_id)? else {
+            continue;
+        };
+        if session
+            .board_run_id
+            .as_deref()
+            .is_some_and(|id| id != run.id)
+        {
+            continue;
+        }
+        state
+            .sessions
+            .mark_board_session(&session_id, run.id.clone(), task_id.clone())
+            .await?;
+        if let Some(task_id) = task_id
+            && let Some(task) = run.tasks.iter_mut().find(|task| task.id == task_id)
+            && task.provider_session_id.as_deref() != Some(session_id.as_str())
+        {
+            task.provider_session_id = Some(session_id);
+            changed_run = true;
+        }
+    }
+
+    let window_start = run.created_at - chrono::Duration::minutes(2);
+    let window_end = run.updated_at + chrono::Duration::minutes(2);
+    let sessions = state
+        .storage
+        .list_sessions_including_board()?
+        .into_iter()
+        .filter(|session| session.project_path == run.project_path)
+        .filter(|session| {
+            session.last_activity >= window_start && session.last_activity <= window_end
+        })
+        .collect::<Vec<_>>();
+    for session in sessions {
+        if session
+            .board_run_id
+            .as_deref()
+            .is_some_and(|id| id != run.id)
+        {
+            continue;
+        }
+        let messages = state.storage.list_messages(&session.id)?;
+        let Some(first_user_message) = messages
+            .iter()
+            .find(|message| message.role == MessageRole::User)
+        else {
+            continue;
+        };
+        let prompt = first_user_message.content.as_str();
+        let explicit_run = prompt.contains(&format!("Board run id: {}", run.id));
+        let signature = legacy_board_prompt_signature(prompt);
+        if !explicit_run && !signature {
+            continue;
+        }
+        // Signature-only prompts (bootstrap/planning) do not carry a run id.
+        // Require proximity to one of this run's recorded provider calls so a
+        // normal chat quoting board terminology cannot be classified.
+        if !explicit_run && !legacy_prompt_matches_run_telemetry(run, first_user_message.timestamp)
+        {
+            continue;
+        }
+        let task_id = legacy_board_task_id(run, prompt);
+        if !session.board_session
+            || session.board_run_id.as_deref() != Some(run.id.as_str())
+            || (task_id.is_some() && session.board_task_id.as_deref() != task_id.as_deref())
+        {
+            state
+                .sessions
+                .mark_board_session(&session.id, run.id.clone(), task_id.clone())
+                .await?;
+        }
+        if let Some(task_id) = task_id
+            && let Some(task) = run.tasks.iter_mut().find(|task| task.id == task_id)
+            && task.provider_session_id.as_deref() != Some(session.id.as_str())
+        {
+            task.provider_session_id = Some(session.id.clone());
+            changed_run = true;
+        }
+    }
+    if changed_run {
+        // The lazy migration is a deliberate compatibility write. Avoid
+        // touching updated_at/control state so loading an old board does not
+        // appear as user activity.
+        save_run(state, run)?;
+    }
+    Ok(())
+}
+
+fn known_board_session_refs(run: &BoardRun) -> Vec<(String, Option<String>)> {
+    let mut refs = BTreeMap::<String, Option<String>>::new();
+    for session_id in [
+        run.session_id.as_deref(),
+        run.actual_session_id.as_deref(),
+        run.current_provider_session_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    {
+        refs.entry(session_id.to_string()).or_default();
+    }
+    for task in &run.tasks {
+        if let Some(session_id) = task
+            .provider_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            refs.insert(session_id.to_string(), Some(task.id.clone()));
+        }
+    }
+    for entry in &run.prompt_telemetry {
+        let Some(session_id) = entry
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let task_id = entry
+            .get("label")
+            .and_then(Value::as_str)
+            .and_then(|label| board_task_id_for_label(run, label));
+        refs.entry(session_id.to_string())
+            .and_modify(|existing| {
+                if existing.is_none() {
+                    *existing = task_id.clone();
+                }
+            })
+            .or_insert(task_id);
+    }
+    for artifact in &run.qa_artifacts {
+        let Some(session_id) = artifact
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let task_id = artifact
+            .get("taskId")
+            .and_then(Value::as_str)
+            .filter(|task_id| run.tasks.iter().any(|task| task.id == *task_id))
+            .map(str::to_string);
+        refs.insert(session_id.to_string(), task_id);
+    }
+    refs.into_iter().collect()
+}
+
+fn legacy_board_prompt_signature(prompt: &str) -> bool {
+    [
+        "autonomous Kanban agent",
+        "before Kanban planning",
+        "io-workbench Kanban board",
+        "io-workbench Kanban runner",
+        "agentic Kanban task result",
+        "RAG promotion candidates for io-workbench",
+        "autonomous Kanban run",
+    ]
+    .iter()
+    .any(|signature| prompt.contains(signature))
+}
+
+fn legacy_prompt_matches_run_telemetry(run: &BoardRun, timestamp: DateTime<Utc>) -> bool {
+    run.prompt_telemetry.iter().any(|entry| {
+        entry
+            .get("startedAt")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_utc)
+            .is_some_and(|started_at| (timestamp - started_at).num_seconds().unsigned_abs() <= 30)
+    })
+}
+
+fn legacy_board_task_id(run: &BoardRun, prompt: &str) -> Option<String> {
+    run.tasks
+        .iter()
+        .filter(|task| {
+            let marker = format!(": {}", task.id);
+            prompt
+                .lines()
+                .any(|line| line.trim_start().starts_with("Task ") && line.ends_with(&marker))
+                || prompt.contains(&format!("task result into the required JSON contract"))
+                    && prompt.contains(&format!("Task id: {}", task.id))
+        })
+        .max_by_key(|task| task.id.len())
+        .map(|task| task.id.clone())
 }
 
 async fn pause_run(
@@ -1296,13 +1526,7 @@ async fn pause_run(
         .map(|Json(request)| request)
         .unwrap_or(PauseRequest { reason: None });
     mutate_run(&state, &user.0.id, &id, |run| {
-        run.status = "paused".to_string();
-        run.active = false;
-        run.loop_started = false;
-        run.pause_requested = false;
-        run.paused_at = Some(Utc::now());
-        run.pause_reason = trim_string(request.reason).or_else(|| Some("user request".to_string()));
-        run.append_log("Board paused");
+        request_board_pause(run, trim_string(request.reason));
         Ok(())
     })
 }
@@ -1332,13 +1556,7 @@ async fn resume_run(
         if let Some(provider) = body.get("nextProvider").and_then(Value::as_str) {
             run.next_provider = normalize_optional_provider(Some(provider))?;
         }
-        run.status = "running".to_string();
-        run.scheduled_start_at = None;
-        run.active = true;
-        run.loop_started = false;
-        run.paused_at = None;
-        run.pause_reason = None;
-        run.append_log("Board resume requested");
+        prepare_board_resume(run);
         Ok(())
     })?;
     let stored = begin_run(&state, &user.0.id, &id)?;
@@ -1387,12 +1605,14 @@ async fn schedule_run(
         run.current_provider_session_id = None;
         run.provider_call_started_at = None;
         run.provider_call_label = None;
+        bump_control_revision(run);
         run.append_log(format!("Run scheduled to start at {scheduled_start_at}"));
         Ok(())
     })
 }
 
 fn clear_run_schedule(run: &mut BoardRun) {
+    bump_control_revision(run);
     run.scheduled_start_at = None;
     if run.status == "scheduled" {
         run.status = "paused".to_string();
@@ -1418,6 +1638,8 @@ async fn abort_run(
     let reason = trim_string(request.reason).unwrap_or_else(|| "user request".to_string());
     mutate_run(&state, &user.0.id, &id, |run| {
         let now = Utc::now();
+        bump_control_revision(run);
+        reset_in_flight_board_tasks(run, "Task returned to Todo because the board was aborted");
         run.status = "cancelled".to_string();
         run.active = false;
         run.loop_started = false;
@@ -1425,6 +1647,12 @@ async fn abort_run(
         run.abort_source = Some("Board".to_string());
         run.abort_requested_at = Some(now);
         run.canceled_at = Some(now);
+        run.current_task_id = None;
+        run.current_task_title.clear();
+        run.current_task_status.clear();
+        run.current_provider_session_id = None;
+        run.provider_call_started_at = None;
+        run.provider_call_label = None;
         run.append_log("Board aborted");
         Ok(())
     })
@@ -1474,7 +1702,7 @@ async fn update_model_strategy(
             .cloned()
             .or_else(|| Some(body.clone()));
         if let Some(profile) = body.get("runProfile").and_then(Value::as_str) {
-            run.run_profile = profile.trim().to_string();
+            run.run_profile = normalize_run_profile(Some(profile));
         }
         if let Some(overrides) = body.get("taskModelOverrides").cloned() {
             run.task_model_overrides = overrides;
@@ -1575,7 +1803,12 @@ async fn add_task(
 ) -> Result<(StatusCode, Json<Value>)> {
     let _guard = board_run_mutation_lock();
     let mut stored = load_user_run(&state, &user.0.id, &id)?;
-    let task = BoardTask::manual(&mut stored.run, request)?;
+    let mut task = BoardTask::manual(&mut stored.run, request)?;
+    if !task.status.starts_with("backlog") {
+        ensure_manual_task_requirements(&mut stored.run.requirement_matrix, &mut task);
+        mark_requirements_from_tasks(&mut stored.run, std::slice::from_ref(&task));
+        reset_requirement_review_state(&mut stored.run);
+    }
     stored.run.tasks.push(task);
     stored.run.append_log("Added manual board task");
     stored.run.touch();
@@ -1595,11 +1828,30 @@ async fn draft_tasks(
     Json(request): Json<PromptRequest>,
 ) -> Result<Json<Value>> {
     let stored = load_user_run(&state, &user.0.id, &id)?;
-    let prompt = trim_string(request.prompt).ok_or_else(|| bad_request("Prompt is required"))?;
-    let mut run = stored.run;
-    let tasks = prompt_to_task_drafts(&mut run, &prompt);
+    let prompt =
+        trim_string(request.prompt.clone()).ok_or_else(|| bad_request("Prompt is required"))?;
+    let attempt = generate_prompt_task_drafts(
+        &state,
+        &stored.run,
+        &prompt,
+        request.model.as_deref(),
+        request.run_profile.as_deref(),
+    )
+    .await;
+    {
+        let _guard = board_run_mutation_lock();
+        let mut stored = load_user_run(&state, &user.0.id, &id)?;
+        record_prompt_task_generation_attempt(
+            &mut stored.run,
+            "Kanban task draft preview",
+            &attempt,
+        );
+        stored.run.touch();
+        save_run(&state, &stored.run)?;
+    }
+    let (tasks, warning) = attempt.result?;
     Ok(Json(
-        json!({ "success": true, "tasks": tasks, "warning": null }),
+        json!({ "success": true, "tasks": tasks, "warning": warning }),
     ))
 }
 
@@ -1609,22 +1861,44 @@ async fn backlog_from_prompt(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<PromptRequest>,
 ) -> Result<(StatusCode, Json<Value>)> {
-    let prompt = trim_string(request.prompt).ok_or_else(|| bad_request("Prompt is required"))?;
-    let _guard = board_run_mutation_lock();
-    let mut stored = load_user_run(&state, &user.0.id, &id)?;
-    let tasks = prompt_to_task_drafts(&mut stored.run, &prompt);
-    stored.run.tasks.extend(tasks);
-    stored
-        .run
-        .append_log("Generated backlog board tasks from prompt");
-    stored.run.touch();
-    save_run(&state, &stored.run)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(
-            json!({ "success": true, "run": stored.run.detail_json(Some(stored.path.display().to_string())) }),
-        ),
-    ))
+    let prompt =
+        trim_string(request.prompt.clone()).ok_or_else(|| bad_request("Prompt is required"))?;
+    let model = trim_string(request.model.clone()).unwrap_or_default();
+    let run_profile = request
+        .run_profile
+        .as_deref()
+        .map(|value| normalize_run_profile(Some(value)))
+        .unwrap_or_default();
+    let (task_id, response) = {
+        let _guard = board_run_mutation_lock();
+        let mut stored = load_user_run(&state, &user.0.id, &id)?;
+        let task = backlog_generation_placeholder(&mut stored.run, &prompt, &model, &run_profile);
+        let task_id = task.id.clone();
+        stored.run.tasks.push(task);
+        stored.run.append_log(format!(
+            "Started backlog task generation from prompt: {task_id}"
+        ));
+        stored.run.touch();
+        save_run(&state, &stored.run)?;
+        (
+            task_id.clone(),
+            json!({
+                "success": true,
+                "taskId": task_id,
+                "run": stored.run.detail_json(Some(stored.path.display().to_string())),
+            }),
+        )
+    };
+    spawn_backlog_prompt_generation(
+        state.clone(),
+        user.0.id.clone(),
+        id,
+        task_id.clone(),
+        prompt,
+        model,
+        run_profile,
+    );
+    Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 async fn promote_task(
@@ -1668,7 +1942,61 @@ async fn retry_backlog_failed_tasks(
     Json(request): Json<TaskIdsRequest>,
 ) -> Result<Json<Value>> {
     let ids = request.task_ids.unwrap_or_default();
-    update_task_status(&state, &user.0.id, &id, &ids, "backlog")
+    let targets = {
+        let _guard = board_run_mutation_lock();
+        let mut stored = load_user_run(&state, &user.0.id, &id)?;
+        let requested = ids.into_iter().collect::<BTreeSet<_>>();
+        let mut targets = Vec::new();
+        for task in &mut stored.run.tasks {
+            if task.status != "backlog_failed"
+                || (!requested.is_empty() && !requested.contains(&task.id))
+            {
+                continue;
+            }
+            let prompt = if task.prompt.trim().is_empty() {
+                task.details.trim().to_string()
+            } else {
+                task.prompt.trim().to_string()
+            };
+            if prompt.is_empty() {
+                continue;
+            }
+            let model = task_reference_value(task, "Breakdown model:");
+            let run_profile = task_reference_value(task, "Breakdown profile:");
+            task.status = "backlog_generating".to_string();
+            task.summary.clear();
+            task.error = None;
+            task.started_at = None;
+            task.completed_at = None;
+            task.backlog_generation_task = true;
+            targets.push((task.id.clone(), prompt, model, run_profile));
+        }
+        if targets.is_empty() {
+            return Err(not_found("Danger run or failed backlog task not found"));
+        }
+        stored.run.append_log(format!(
+            "Retrying {} failed backlog task generation request(s)",
+            targets.len()
+        ));
+        stored.run.touch();
+        save_run(&state, &stored.run)?;
+        targets
+    };
+    for (task_id, prompt, model, run_profile) in targets {
+        spawn_backlog_prompt_generation(
+            state.clone(),
+            user.0.id.clone(),
+            id.clone(),
+            task_id,
+            prompt,
+            model,
+            run_profile,
+        );
+    }
+    let stored = load_user_run(&state, &user.0.id, &id)?;
+    Ok(Json(
+        json!({ "success": true, "run": stored.run.detail_json(Some(stored.path.display().to_string())) }),
+    ))
 }
 
 async fn delete_task(
@@ -1743,6 +2071,7 @@ fn update_task_status(
     let mut stored = load_user_run(state, user_id, run_id)?;
     let mut updated = 0usize;
     let update_all_attention = task_ids.is_empty() && status == "pending";
+    let mut updated_tasks = Vec::new();
     for task in &mut stored.run.tasks {
         let matches = task_ids.iter().any(|id| id == &task.id)
             || (update_all_attention
@@ -1753,11 +2082,23 @@ fn update_task_status(
         if matches {
             task.status = status.clone();
             task.error = None;
+            if matches!(status.as_str(), "pending" | "backlog") {
+                task.started_at = None;
+                task.completed_at = None;
+            }
+            if status == "pending" && is_user_authored_task(task) {
+                ensure_manual_task_requirements(&mut stored.run.requirement_matrix, task);
+            }
+            updated_tasks.push(task.clone());
             updated += 1;
         }
     }
     if updated == 0 {
         return Err(not_found("Danger run or task not found"));
+    }
+    if status == "pending" {
+        mark_requirements_from_tasks(&mut stored.run, &updated_tasks);
+        reset_requirement_review_state(&mut stored.run);
     }
     stored
         .run
@@ -1775,21 +2116,31 @@ fn mutate_run(
     id: &str,
     mutate: impl FnOnce(&mut BoardRun) -> Result<()>,
 ) -> Result<Json<Value>> {
+    let stored = mutate_stored_run(state, user_id, id, mutate)?;
+    Ok(Json(
+        json!({ "success": true, "run": stored.run.detail_json(Some(stored.path.display().to_string())) }),
+    ))
+}
+
+fn mutate_stored_run(
+    state: &AppState,
+    user_id: &str,
+    id: &str,
+    mutate: impl FnOnce(&mut BoardRun) -> Result<()>,
+) -> Result<StoredRun> {
     let _guard = board_run_mutation_lock();
     let mut stored = load_user_run(state, user_id, id)?;
     mutate(&mut stored.run)?;
     stored.run.touch();
     save_run(state, &stored.run)?;
-    Ok(Json(
-        json!({ "success": true, "run": stored.run.detail_json(Some(stored.path.display().to_string())) }),
-    ))
+    Ok(stored)
 }
 
 fn begin_run(state: &AppState, user_id: &str, id: &str) -> Result<StoredRun> {
     let (should_spawn, stored) = {
         let _guard = board_run_mutation_lock();
         let mut stored = load_user_run(state, user_id, id)?;
-        let should_spawn = !stored.run.loop_started || !stored.run.active;
+        let should_spawn = !stored.run.loop_started;
         stored.run.status = "running".to_string();
         stored.run.scheduled_start_at = None;
         stored.run.active = true;
@@ -1799,6 +2150,7 @@ fn begin_run(state: &AppState, user_id: &str, id: &str) -> Result<StoredRun> {
         stored.run.paused_at = None;
         stored.run.pause_reason = None;
         stored.run.cancellation_reason = None;
+        bump_control_revision(&mut stored.run);
         stored.run.current_phase = Some("task_execution".to_string());
         stored.run.phase_started_at = Some(Utc::now());
         stored.run.phase_details = Some(json!({ "source": "kanban_board" }));
@@ -1839,21 +2191,13 @@ async fn run_board_loop(state: AppState, user_id: String, run_id: String) -> Res
             return Ok(());
         }
         if stored.run.status == "paused" || stored.run.pause_requested {
-            stored.run.status = "paused".to_string();
-            stored.run.active = false;
-            stored.run.loop_started = false;
-            stored.run.paused_at = Some(Utc::now());
-            stored.run.current_task_id = None;
-            stored.run.current_task_title.clear();
-            stored.run.current_task_status.clear();
-            stored.run.append_log("Agentic board execution paused");
+            settle_board_pause(&mut stored.run);
             stored.run.touch();
             save_run(&state, &stored.run)?;
             return Ok(());
         }
 
         if !stored.run.bootstrap_complete {
-            save_run(&state, &stored.run)?;
             bootstrap_agentic_run(&state, &user_id, &run_id).await?;
             continue;
         }
@@ -2165,6 +2509,16 @@ async fn run_board_loop(state: AppState, user_id: String, run_id: String) -> Res
             save_run(&state, &stored.run)?;
             continue;
         }
+        stored = load_user_run(&state, &user_id, &run_id)?;
+        if stored.run.status == "paused" || stored.run.pause_requested {
+            settle_board_pause(&mut stored.run);
+            stored.run.touch();
+            save_run(&state, &stored.run)?;
+            return Ok(());
+        }
+        let Some(task_index) = stored.run.tasks.iter().position(|task| task.id == task_id) else {
+            continue;
+        };
         if let Some(task) = stored.run.tasks.get_mut(task_index) {
             if task.tdd_phase == "qa_failed_expected" {
                 task.tdd_phase = "dev_pending".to_string();
@@ -2174,8 +2528,22 @@ async fn run_board_loop(state: AppState, user_id: String, run_id: String) -> Res
         attach_rag_context_for_task(&mut stored.run, task_index).await;
         stored.run.touch();
         save_run(&state, &stored.run)?;
+        stored = load_user_run(&state, &user_id, &run_id)?;
+        if stored.run.status == "paused" || stored.run.pause_requested {
+            settle_board_pause(&mut stored.run);
+            stored.run.touch();
+            save_run(&state, &stored.run)?;
+            return Ok(());
+        }
+        let Some(task_index) = stored.run.tasks.iter().position(|task| task.id == task_id) else {
+            continue;
+        };
 
         let before_workspace = capture_workspace_snapshot(&stored.run.project_path);
+        stored.run.provider_call_started_at = Some(Utc::now());
+        stored.run.provider_call_label = Some(format!("task execution for {task_id}"));
+        stored.run.touch();
+        save_run(&state, &stored.run)?;
         let provider_attempt =
             execute_provider_task_with_fallback(&state, &stored.run, task_index).await;
         let mut stored = load_user_run(&state, &user_id, &run_id)?;
@@ -2367,6 +2735,7 @@ async fn run_board_loop(state: AppState, user_id: String, run_id: String) -> Res
                     );
                 }
                 refresh_codebase_context_after_task(&mut stored.run, &change_summary);
+                let completion_summary = resolved_execution_summary(&parsed, &result.summary);
                 if let Some(index) = task_position {
                     let task = &mut stored.run.tasks[index];
                     if result.session_id.is_some() {
@@ -2391,11 +2760,11 @@ async fn run_board_loop(state: AppState, user_id: String, run_id: String) -> Res
                         "timestamp": now,
                         "kind": "complete",
                         "exitCode": result.exit_code,
-                        "content": result.summary,
+                        "content": completion_summary,
                     }));
                     task.transcript_updated_at = Some(now);
                     task.completed_at = Some(now);
-                    task.summary = result.summary;
+                    task.summary = completion_summary;
                     task.result = Some(parsed.clone());
                     task.changed_file_summary = Some(change_summary.clone());
                     task.commands_run = value_to_strings(parsed.get("commandsRun").cloned());
@@ -2496,6 +2865,9 @@ async fn run_board_loop(state: AppState, user_id: String, run_id: String) -> Res
                 apply_task_result_to_run(&mut stored.run, &task_id, &parsed);
                 if !failed_with_provider_error {
                     ingest_rag_task_outcome(&mut stored.run, &task_id, &parsed).await;
+                }
+                if !failed_with_provider_error && !uses_simplified_orchestration(&stored.run) {
+                    append_suggested_backlog_tasks_from_result(&mut stored.run, &task_id, &parsed);
                 }
                 let qa_followup_added = if failed_with_provider_error {
                     false
@@ -2671,104 +3043,170 @@ async fn run_board_loop(state: AppState, user_id: String, run_id: String) -> Res
 }
 
 async fn bootstrap_agentic_run(state: &AppState, user_id: &str, run_id: &str) -> Result<()> {
-    let mut stored = load_user_run(state, user_id, run_id)?;
-    set_phase(
-        &mut stored.run,
-        "bootstrap_prepare",
-        json!({ "step": "guidance_and_sources" }),
-    );
-    if stored.run.workspace_baseline.is_none() {
-        let snapshot = capture_workspace_snapshot(&stored.run.project_path);
-        stored.run.workspace_baseline = Some(snapshot.clone());
-        stored.run.latest_workspace_snapshot = Some(snapshot);
+    let snapshot = load_user_run(state, user_id, run_id)?.run;
+    if bootstrap_should_yield(&snapshot) {
+        return Ok(());
     }
-    stored.run.agents_context = Some(read_agents_context(&stored.run.project_path));
-    stored
+    let workspace_baseline = snapshot
+        .workspace_baseline
+        .is_none()
+        .then(|| capture_workspace_snapshot(&snapshot.project_path));
+    let agents_context = read_agents_context(&snapshot.project_path);
+    mutate_stored_run(state, user_id, run_id, |run| {
+        set_phase(
+            run,
+            "bootstrap_prepare",
+            json!({ "step": "guidance_and_sources" }),
+        );
+        if let Some(workspace_baseline) = workspace_baseline.clone() {
+            run.workspace_baseline = Some(workspace_baseline.clone());
+            run.latest_workspace_snapshot = Some(workspace_baseline);
+        }
+        run.agents_context = Some(agents_context);
+        run.append_log("Loaded AGENTS.md guidance and workspace baseline");
+        Ok(())
+    })?;
+    if bootstrap_checkpoint_requested(state, user_id, run_id)? {
+        return Ok(());
+    }
+
+    let snapshot = load_user_run(state, user_id, run_id)?.run;
+    let source_bundle = build_source_bundle(&snapshot.project_path, &snapshot.source_prompt);
+    mutate_stored_run(state, user_id, run_id, |run| {
+        run.source_references = source_bundle.references;
+        run.source_manifest = source_bundle.manifest;
+        run.source_chunks = source_bundle.chunks;
+        run.append_log(format!(
+            "Resolved {} source references, {} source files and {} source chunks",
+            run.source_references.len(),
+            run.source_manifest.len(),
+            run.source_chunks.len()
+        ));
+        Ok(())
+    })?;
+    if bootstrap_checkpoint_requested(state, user_id, run_id)? {
+        return Ok(());
+    }
+
+    let mut rag_snapshot = load_user_run(state, user_id, run_id)?.run;
+    let rag_ingestion_count = rag_snapshot.rag_ingestions.len();
+    let rag_trace_count = rag_snapshot.rag_trace_refs.len();
+    index_project_for_rag(&mut rag_snapshot).await;
+    let rag_ingestions = rag_snapshot
+        .rag_ingestions
+        .into_iter()
+        .skip(rag_ingestion_count)
+        .collect::<Vec<_>>();
+    let rag_trace_refs = rag_snapshot
+        .rag_trace_refs
+        .into_iter()
+        .skip(rag_trace_count)
+        .collect::<Vec<_>>();
+    mutate_stored_run(state, user_id, run_id, |run| {
+        run.rag_ingestions.extend(rag_ingestions);
+        run.rag_trace_refs.extend(rag_trace_refs);
+        trim_rag_history(run);
+        Ok(())
+    })?;
+    if bootstrap_checkpoint_requested(state, user_id, run_id)? {
+        return Ok(());
+    }
+
+    let source_chunk_count = load_user_run(state, user_id, run_id)?
         .run
-        .append_log("Loaded AGENTS.md guidance and workspace baseline");
-    stored.run.touch();
-    save_run(state, &stored.run)?;
-
-    let source_bundle = build_source_bundle(&stored.run.project_path, &stored.run.source_prompt);
-    stored.run.source_references = source_bundle.references;
-    stored.run.source_manifest = source_bundle.manifest;
-    stored.run.source_chunks = source_bundle.chunks;
-    stored.run.append_log(format!(
-        "Resolved {} source references, {} source files and {} source chunks",
-        stored.run.source_references.len(),
-        stored.run.source_manifest.len(),
-        stored.run.source_chunks.len()
-    ));
-    stored.run.touch();
-    save_run(state, &stored.run)?;
-
-    index_project_for_rag(&mut stored.run).await;
-    stored.run.touch();
-    save_run(state, &stored.run)?;
-
-    let source_chunk_count = stored.run.source_chunks.len();
-    set_phase(
-        &mut stored.run,
-        "requirement_extraction",
-        json!({ "sourceChunks": source_chunk_count }),
-    );
-    stored.run.touch();
-    save_run(state, &stored.run)?;
+        .source_chunks
+        .len();
+    mutate_stored_run(state, user_id, run_id, |run| {
+        set_phase(
+            run,
+            "requirement_extraction",
+            json!({ "sourceChunks": source_chunk_count }),
+        );
+        Ok(())
+    })?;
+    if bootstrap_checkpoint_requested(state, user_id, run_id)? {
+        return Ok(());
+    }
     let requirements = extract_requirements_for_run(state, user_id, run_id).await?;
-    let mut stored = load_user_run(state, user_id, run_id)?;
-    stored.run.requirement_matrix = requirements.clone();
-    stored.run.requirement_baseline = requirements
-        .iter()
-        .map(|requirement| {
-            json!({
-                "id": requirement.get("id").cloned().unwrap_or(Value::Null),
-                "sourceChunkId": requirement.get("sourceChunkId").cloned().unwrap_or(Value::Null),
-                "sourcePath": requirement.get("sourcePath").cloned().unwrap_or(Value::Null),
-                "heading": requirement.get("heading").cloned().unwrap_or(Value::Null),
-                "requirement": requirement.get("requirement").cloned().unwrap_or(Value::Null),
-                "acceptanceCriteria": requirement.get("acceptanceCriteria").cloned().unwrap_or(json!([])),
-                "priority": requirement.get("priority").cloned().unwrap_or(json!("medium")),
-                "dependencies": requirement.get("dependencies").cloned().unwrap_or(json!([])),
+    mutate_stored_run(state, user_id, run_id, |run| {
+        run.requirement_matrix = requirements.clone();
+        run.requirement_baseline = requirements
+            .iter()
+            .map(|requirement| {
+                json!({
+                    "id": requirement.get("id").cloned().unwrap_or(Value::Null),
+                    "sourceChunkId": requirement.get("sourceChunkId").cloned().unwrap_or(Value::Null),
+                    "sourcePath": requirement.get("sourcePath").cloned().unwrap_or(Value::Null),
+                    "heading": requirement.get("heading").cloned().unwrap_or(Value::Null),
+                    "requirement": requirement.get("requirement").cloned().unwrap_or(Value::Null),
+                    "acceptanceCriteria": requirement.get("acceptanceCriteria").cloned().unwrap_or(json!([])),
+                    "priority": requirement.get("priority").cloned().unwrap_or(json!("medium")),
+                    "dependencies": requirement.get("dependencies").cloned().unwrap_or(json!([])),
+                })
             })
-        })
-        .collect();
-    stored.run.append_log(format!(
-        "Requirement matrix contains {} item(s)",
-        stored.run.requirement_matrix.len()
-    ));
-    stored.run.touch();
-    save_run(state, &stored.run)?;
+            .collect();
+        run.append_log(format!(
+            "Requirement matrix contains {} item(s)",
+            run.requirement_matrix.len()
+        ));
+        Ok(())
+    })?;
+    if bootstrap_checkpoint_requested(state, user_id, run_id)? {
+        return Ok(());
+    }
 
-    set_phase(
-        &mut stored.run,
-        "codebase_manifest",
-        json!({ "step": "build_manifest" }),
-    );
-    let codebase_bundle = build_codebase_bundle(&stored.run.project_path);
-    stored.run.codebase_manifest = codebase_bundle.manifest;
-    stored.run.codebase_chunks = codebase_bundle.chunks;
-    stored.run.append_log(format!(
-        "Loaded codebase manifest with {} files and {} chunks",
-        stored.run.codebase_manifest.len(),
-        stored.run.codebase_chunks.len()
-    ));
-    stored.run.touch();
-    save_run(state, &stored.run)?;
+    let project_path = load_user_run(state, user_id, run_id)?.run.project_path;
+    let codebase_bundle = build_codebase_bundle(&project_path);
+    mutate_stored_run(state, user_id, run_id, |run| {
+        set_phase(
+            run,
+            "codebase_manifest",
+            json!({ "step": "build_manifest" }),
+        );
+        run.codebase_manifest = codebase_bundle.manifest;
+        run.codebase_chunks = codebase_bundle.chunks;
+        run.append_log(format!(
+            "Loaded codebase manifest with {} files and {} chunks",
+            run.codebase_manifest.len(),
+            run.codebase_chunks.len()
+        ));
+        Ok(())
+    })?;
+    if bootstrap_checkpoint_requested(state, user_id, run_id)? {
+        return Ok(());
+    }
 
-    set_phase(&mut stored.run, "codebase_recon", json!({}));
+    mutate_stored_run(state, user_id, run_id, |run| {
+        set_phase(run, "codebase_recon", json!({}));
+        Ok(())
+    })?;
+    if bootstrap_checkpoint_requested(state, user_id, run_id)? {
+        return Ok(());
+    }
     let codebase_map = perform_codebase_recon(state, user_id, run_id).await?;
-    let mut stored = load_user_run(state, user_id, run_id)?;
-    stored.run.codebase_map = Some(codebase_map.clone());
-    stored.run.environment_state = Some(environment_from_codebase_map(&codebase_map));
-    stored.run.bootstrap_complete = true;
-    set_phase(
-        &mut stored.run,
-        "task_execution",
-        json!({ "bootstrapComplete": true }),
-    );
-    stored.run.append_log("Agentic bootstrap complete");
-    stored.run.touch();
-    save_run(state, &stored.run)
+    mutate_stored_run(state, user_id, run_id, |run| {
+        run.codebase_map = Some(codebase_map.clone());
+        run.environment_state = Some(environment_from_codebase_map(&codebase_map));
+        run.bootstrap_complete = true;
+        set_phase(run, "task_execution", json!({ "bootstrapComplete": true }));
+        run.append_log("Agentic bootstrap complete");
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn bootstrap_checkpoint_requested(state: &AppState, user_id: &str, run_id: &str) -> Result<bool> {
+    Ok(bootstrap_should_yield(
+        &load_user_run(state, user_id, run_id)?.run,
+    ))
+}
+
+fn bootstrap_should_yield(run: &BoardRun) -> bool {
+    run.pause_requested
+        || matches!(
+            run.status.as_str(),
+            "pausing" | "paused" | "cancelled" | "failed" | "blocked" | "completed"
+        )
 }
 
 async fn extract_requirements_for_run(
@@ -3244,6 +3682,190 @@ fn mark_requirements_from_tasks(run: &mut BoardRun, tasks: &[BoardTask]) {
         })
         .collect::<Vec<_>>();
     apply_requirement_updates(run, Some(&Value::Array(updates)), "task-planning");
+}
+
+fn normalize_suggested_task_key(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn append_suggested_backlog_tasks_from_result(
+    run: &mut BoardRun,
+    source_task_id: &str,
+    parsed: &Value,
+) -> Vec<String> {
+    let suggestions = parsed
+        .get("suggestedBacklogTasks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if suggestions.is_empty() {
+        return Vec::new();
+    }
+    let Some(source_task) = run
+        .tasks
+        .iter()
+        .find(|task| task.id == source_task_id)
+        .cloned()
+    else {
+        return Vec::new();
+    };
+    let mut existing_keys = run
+        .tasks
+        .iter()
+        .map(|task| normalize_suggested_task_key(&task.title))
+        .filter(|key| !key.is_empty())
+        .collect::<BTreeSet<_>>();
+    let mut created = Vec::new();
+    for suggestion in suggestions {
+        let title = ["title", "details", "description", "summary"]
+            .into_iter()
+            .filter_map(|key| suggestion.get(key).and_then(Value::as_str))
+            .map(str::trim)
+            .find(|value| !value.is_empty())
+            .map(str::to_string);
+        let Some(title) = title else {
+            continue;
+        };
+        let key = normalize_suggested_task_key(&title);
+        if key.is_empty() || !existing_keys.insert(key) {
+            continue;
+        }
+        let details = suggestion
+            .get("details")
+            .or_else(|| suggestion.get("description"))
+            .or_else(|| suggestion.get("summary"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&title)
+            .to_string();
+        let mut task = BoardTask::manual(
+            run,
+            TaskRequest {
+                prompt: Some(details.clone()),
+                command: None,
+                title: Some(title),
+                details: Some(details),
+                description: None,
+                acceptance_criteria: suggestion.get("acceptanceCriteria").cloned(),
+                acceptance: suggestion.get("acceptance").cloned(),
+                criteria: suggestion.get("criteria").cloned(),
+                references: suggestion.get("references").cloned(),
+                files: suggestion.get("files").cloned(),
+                paths: suggestion.get("paths").cloned(),
+                requirement_ids: suggestion.get("requirementIds").cloned(),
+                requirements: suggestion.get("requirements").cloned(),
+                priority: suggestion
+                    .get("priority")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                depends_on: suggestion.get("dependsOn").cloned(),
+                dependencies: suggestion.get("dependencies").cloned(),
+                status: Some("backlog".to_string()),
+            },
+        )
+        .expect("suggested backlog task has a title");
+        task.references.insert(
+            0,
+            format!(
+                "Suggested backlog task from {}: {}",
+                source_task.id, source_task.title
+            ),
+        );
+        task.task_origin = "ai_suggested_backlog".to_string();
+        task.manual_task = false;
+        task.prompt_task = false;
+        let task_id = task.id.clone();
+        run.tasks.push(task);
+        created.push(task_id);
+    }
+    if !created.is_empty() {
+        run.append_log(format!(
+            "Added {} suggested backlog task(s) from {}: {}",
+            created.len(),
+            source_task_id,
+            created.join(", ")
+        ));
+    }
+    created
+}
+
+fn is_user_authored_task(task: &BoardTask) -> bool {
+    task.manual_task
+        || task.prompt_task
+        || matches!(
+            task.task_origin.as_str(),
+            "user_manual"
+                | "user_prompt_generated"
+                | "ai_suggested_backlog"
+                | "manual"
+                | "prompt_breakdown"
+        )
+}
+
+fn ensure_manual_task_requirements(requirement_matrix: &mut Vec<Value>, task: &mut BoardTask) {
+    if task.requirement_ids.is_empty() {
+        task.requirement_ids = vec![next_manual_requirement_id(requirement_matrix)];
+    }
+    let now = Utc::now();
+    for requirement_id in task.requirement_ids.clone() {
+        if requirement_matrix.iter().any(|requirement| {
+            requirement.get("id").and_then(Value::as_str) == Some(&requirement_id)
+        }) {
+            continue;
+        }
+        let acceptance_criteria = if task.acceptance_criteria.is_empty() {
+            vec!["Complete the added task and verify it locally.".to_string()]
+        } else {
+            task.acceptance_criteria.clone()
+        };
+        let heading = match canonical_task_origin(&task.task_origin) {
+            "user_prompt_generated" => "Prompt-added task",
+            "ai_suggested_backlog" => "Suggested backlog task",
+            _ => "Manual task",
+        };
+        requirement_matrix.push(json!({
+            "id": requirement_id,
+            "sourceChunkId": "",
+            "sourcePath": "Agentic workspace",
+            "heading": heading,
+            "requirement": if task.prompt.trim().is_empty() { &task.title } else { &task.prompt },
+            "acceptanceCriteria": acceptance_criteria,
+            "priority": "medium",
+            "dependencies": [],
+            "status": "extracted",
+            "evidence": [format!("Created from {}: {}", task.id, task.title)],
+            "plannedBy": [],
+            "implementedBy": [],
+            "verifiedBy": [],
+            "blockedReason": "",
+            "notes": "",
+            "createdAt": now,
+            "updatedAt": now,
+        }));
+    }
+}
+
+fn next_manual_requirement_id(requirement_matrix: &[Value]) -> String {
+    let existing = requirement_matrix
+        .iter()
+        .filter_map(|requirement| requirement.get("id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    (1..)
+        .map(|index| format!("REQ-MANUAL-{index}"))
+        .find(|candidate| !existing.contains(candidate.as_str()))
+        .unwrap_or_else(|| format!("REQ-MANUAL-{}", Uuid::new_v4()))
+}
+
+fn reset_requirement_review_state(run: &mut BoardRun) {
+    run.matrix_gap_review_complete = false;
+    run.final_matrix_qa_complete = false;
+    run.final_review = None;
+    run.agents_knowledge_updated = false;
 }
 
 fn unique_task_id(run: &BoardRun, base: &str) -> String {
@@ -3936,6 +4558,39 @@ fn qa_needs_followup(parsed: &Value) -> bool {
             && !normalize_string_list(parsed.get("remainingIssues")).is_empty())
 }
 
+fn resolve_derived_requirement_ids(source_task: &BoardTask, parsed: &Value) -> Vec<String> {
+    if source_task.requirement_ids.is_empty() {
+        return Vec::new();
+    }
+    let source_ids = source_task
+        .requirement_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let explicit_ids = parsed
+        .get("requirementUpdates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|update| update.get("id").and_then(Value::as_str))
+        .filter(|id| source_ids.contains(id))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let explicit_ids = dedupe_strings(explicit_ids);
+    if !explicit_ids.is_empty() {
+        return explicit_ids;
+    }
+    let covered_ids = normalize_string_list(parsed.get("coveredRequirements"))
+        .into_iter()
+        .filter(|id| source_ids.contains(id.as_str()))
+        .collect::<Vec<_>>();
+    let covered_ids = dedupe_strings(covered_ids);
+    if !covered_ids.is_empty() {
+        return covered_ids;
+    }
+    source_task.requirement_ids.clone()
+}
+
 fn should_queue_qa_verdict_retry(
     run: &BoardRun,
     task_id: &str,
@@ -4006,7 +4661,7 @@ fn queue_qa_verdict_retry(run: &mut BoardRun, task_id: &str, parsed: &Value) -> 
                 .to_string(),
         ],
         references: vec![format!("Source QA task: {task_id}")],
-        requirement_ids: source_task.requirement_ids.clone(),
+        requirement_ids: resolve_derived_requirement_ids(&source_task, parsed),
         priority: source_task.priority.clone(),
         depends_on: vec![task_id.to_string()],
         manual_task: false,
@@ -4137,16 +4792,15 @@ fn append_followup_task_if_needed(
         return false;
     }
     let followup_index = existing_followups + 1;
-    let title = parsed
-        .get("suggestedBacklogTasks")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("title"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("Continue follow-up: {}", source_task.title));
+    let qa_fix = is_qa_task(&source_task);
+    let title = if qa_fix {
+        format!(
+            "Fix QA findings for: {}",
+            limit_text(&run.source_prompt, 180).replace('\n', " ")
+        )
+    } else {
+        format!("Continue follow-up: {}", source_task.title)
+    };
     let issues = normalize_string_list(parsed.get("remainingIssues"))
         .into_iter()
         .chain(normalize_string_list(parsed.get("remainingGaps")))
@@ -4184,13 +4838,21 @@ fn append_followup_task_if_needed(
             vec![format!("Source task: {source_task_id}")],
         ]
         .concat(),
-        requirement_ids: source_task.requirement_ids.clone(),
-        priority: source_task.priority.clone(),
-        depends_on: Vec::new(),
+        requirement_ids: resolve_derived_requirement_ids(&source_task, parsed),
+        priority: if qa_fix {
+            "high".to_string()
+        } else {
+            source_task.priority.clone()
+        },
+        depends_on: vec![source_task_id.to_string()],
         manual_task: false,
         prompt_task: false,
-        task_origin: "system_followup".to_string(),
-        task_type: if source_task.final_qa_task {
+        task_origin: if qa_fix {
+            "system_qa_fix".to_string()
+        } else {
+            "system_followup".to_string()
+        },
+        task_type: if qa_fix {
             "qa_fix".to_string()
         } else {
             "implementation".to_string()
@@ -4199,14 +4861,14 @@ fn append_followup_task_if_needed(
         qa_task: false,
         final_qa_task: false,
         followup_task: true,
-        qa_fix_task: source_task.final_qa_task || source_task.qa_task,
+        qa_fix_task: qa_fix,
         qa_verdict_retry_task: false,
         task_level_qa: false,
         agents_knowledge_task: false,
         internal_validation: false,
         qa_round: 0,
         source_task_id: Some(source_task_id.to_string()),
-        source_qa_task_id: None,
+        source_qa_task_id: qa_fix.then(|| source_task_id.to_string()),
         transcript: Vec::new(),
         transcript_updated_at: None,
         started_at: None,
@@ -4232,9 +4894,8 @@ fn append_followup_task_if_needed(
         coverage_evidence: Vec::new(),
         group_id: Some(group_id),
     };
-    if source_task.final_qa_task {
-        run.final_matrix_qa_complete = false;
-        run.matrix_gap_review_complete = false;
+    if qa_fix {
+        reset_requirement_review_state(run);
     }
     let insert_index = run
         .tasks
@@ -4341,13 +5002,6 @@ fn pick_next_task_index(run: &BoardRun) -> Option<usize> {
         .or_else(|| pending_only_waiting.first().copied())
 }
 
-fn task_completed(run: &BoardRun, task_id: &str) -> bool {
-    run.tasks
-        .iter()
-        .find(|task| task.id == task_id)
-        .is_some_and(|task| matches!(task.status.as_str(), "completed" | "done"))
-}
-
 fn unmet_task_dependencies(run: &BoardRun, task: &BoardTask) -> Vec<String> {
     let mut dependencies = task.depends_on.clone();
     if let Some(id) = task
@@ -4361,7 +5015,13 @@ fn unmet_task_dependencies(run: &BoardRun, task: &BoardTask) -> Vec<String> {
     }
     dependencies
         .into_iter()
-        .filter(|id| !task_completed(run, id))
+        .filter(|id| id != &task.id)
+        .filter(|id| {
+            run.tasks
+                .iter()
+                .find(|candidate| candidate.id == *id)
+                .is_some_and(|candidate| !matches!(candidate.status.as_str(), "completed" | "done"))
+        })
         .collect()
 }
 
@@ -4464,6 +5124,7 @@ async fn execute_provider_prompt(
         &model,
         prompt,
         reusable_session_id(run).as_deref(),
+        board_task_id_for_label(run, label).as_deref(),
     )
     .await?;
     if result.exit_code == 0 {
@@ -4897,6 +5558,14 @@ async fn ensure_tdd_baseline_for_task(
     attach_rag_context_for_task(run, task_index).await;
     run.touch();
     save_run(state, run)?;
+    if let Ok(stored) = load_user_run(state, user_id, run_id)
+        && (stored.run.status == "paused"
+            || stored.run.pause_requested
+            || stored.run.status == "cancelled")
+    {
+        *run = stored.run;
+        return Ok(false);
+    }
 
     let prompt = build_qa_generation_prompt(run, &task, task_index);
     let before_workspace = capture_workspace_snapshot(&run.project_path);
@@ -5429,10 +6098,16 @@ fn mark_promotion_review_task(run: &mut BoardRun, task_id: &str, result: Value) 
 }
 
 fn rag_client_for_run(run: &mut BoardRun) -> Option<RagClient> {
-    let client = match RagClient::from_env()? {
+    let Some(client_result) = RagClient::from_env() else {
+        run.rag_enabled = false;
+        run.rag_service_url = None;
+        return None;
+    };
+    let client = match client_result {
         Ok(client) => client,
         Err(error) => {
             run.rag_enabled = false;
+            run.rag_service_url = RagClient::configured_descriptor();
             run.rag_queries.push(json!({
                 "queriedAt": Utc::now(),
                 "ok": false,
@@ -5442,7 +6117,7 @@ fn rag_client_for_run(run: &mut BoardRun) -> Option<RagClient> {
         }
     };
     run.rag_enabled = true;
-    run.rag_service_url = env::var("IO_WORKBENCH_RAG_URL").ok();
+    run.rag_service_url = Some(client.descriptor());
     Some(client)
 }
 
@@ -5629,8 +6304,16 @@ async fn execute_provider_task(
         .provider_session_id
         .as_deref()
         .or(reusable_session.as_deref());
-    let result =
-        execute_shared_provider_turn(state, run, &provider, &model, &prompt, session_id).await?;
+    let result = execute_shared_provider_turn(
+        state,
+        run,
+        &provider,
+        &model,
+        &prompt,
+        session_id,
+        Some(&task.id),
+    )
+    .await?;
     let stream_events = shared_provider_stream_events(&provider, &result);
     let errors = if result.exit_code == 0 {
         Vec::new()
@@ -5835,7 +6518,11 @@ async fn execute_shared_provider_turn(
     model: &str,
     prompt: &str,
     session_id: Option<&str>,
+    board_task_id: Option<&str>,
 ) -> Result<SharedProviderTurnResult> {
+    if provider == "cursor" {
+        return execute_cursor_provider_turn(state, run, model, prompt, session_id).await;
+    }
     let provider = provider_enum(provider)?;
     let user_id = run.user_id.clone();
     let runtime = user_id
@@ -5851,12 +6538,17 @@ async fn execute_shared_provider_turn(
         None
     };
     let controls = board_provider_controls(run);
+    // Allocate the Workbench id before start so a provider-start failure can
+    // still be linked to its persisted board chat.
+    let workbench_session_id = session_id
+        .map(str::to_string)
+        .unwrap_or_else(|| new_id("session"));
     let session = state
-        .start_agent_session(
+        .start_board_agent_session(
             provider,
             run.project_path.clone(),
             prompt.to_string(),
-            session_id.map(str::to_string),
+            Some(workbench_session_id.clone()),
             model.clone(),
             controls.effort,
             Some("bypass".to_string()),
@@ -5865,11 +6557,399 @@ async fn execute_shared_provider_turn(
             runtime,
             direct_ai_config,
             user_id,
+            run.id.clone(),
+            board_task_id.map(str::to_string),
         )
-        .await
-        .map_err(ServerError::from)?;
+        .await;
+    let session = match session {
+        Ok(session) => session,
+        Err(error) => {
+            if board_task_id.is_some()
+                && state
+                    .storage
+                    .get_session_summary(&workbench_session_id)?
+                    .is_some()
+            {
+                link_board_task_session(
+                    state,
+                    run,
+                    board_task_id.unwrap_or_default(),
+                    &workbench_session_id,
+                )?;
+            }
+            return Err(ServerError::from(error));
+        }
+    };
+
+    // Persist the task link as soon as the Workbench session exists. This
+    // makes Open chat available while the provider is still running and also
+    // preserves the id when the provider later fails.
+    if let Some(task_id) = board_task_id {
+        link_board_task_session(state, run, task_id, &session.id)?;
+    }
 
     wait_for_shared_provider_turn(state, run, provider, session, model).await
+}
+
+fn link_board_task_session(
+    state: &AppState,
+    run: &BoardRun,
+    task_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    let Some(user_id) = run.user_id.as_deref() else {
+        return Ok(());
+    };
+    let _guard = board_run_mutation_lock();
+    let mut stored = load_user_run(state, user_id, &run.id)?;
+    if let Some(task) = stored.run.tasks.iter_mut().find(|task| task.id == task_id) {
+        task.provider_session_id = Some(session_id.to_string());
+        task.transcript_updated_at = Some(Utc::now());
+    }
+    stored.run.current_provider_session_id = Some(session_id.to_string());
+    stored.run.touch();
+    save_run(state, &stored.run)
+}
+
+#[derive(Debug)]
+struct CursorProcessOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    interrupted: bool,
+}
+
+fn cursor_cli_args(
+    prompt: &str,
+    model: &str,
+    session_id: Option<&str>,
+    trust_workspace: bool,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push(format!("--resume={session_id}"));
+    }
+    args.push("-p".to_string());
+    args.push(prompt.to_string());
+    if session_id.is_none() && !model.trim().is_empty() {
+        args.push("--model".to_string());
+        args.push(model.trim().to_string());
+    }
+    args.push("--output-format".to_string());
+    args.push("stream-json".to_string());
+    args.push("-f".to_string());
+    if trust_workspace {
+        args.push("--trust".to_string());
+    }
+    args
+}
+
+async fn execute_cursor_provider_turn(
+    state: &AppState,
+    run: &BoardRun,
+    model: &str,
+    prompt: &str,
+    session_id: Option<&str>,
+) -> Result<SharedProviderTurnResult> {
+    let mut output = run_cursor_cli_process(state, run, model, prompt, session_id, false).await?;
+    if !output.interrupted && cursor_workspace_trust_required(&output.stdout, &output.stderr) {
+        output = run_cursor_cli_process(state, run, model, prompt, session_id, true).await?;
+    }
+    Ok(parse_cursor_cli_output(output, session_id))
+}
+
+async fn run_cursor_cli_process(
+    state: &AppState,
+    run: &BoardRun,
+    model: &str,
+    prompt: &str,
+    session_id: Option<&str>,
+    trust_workspace: bool,
+) -> Result<CursorProcessOutput> {
+    let mut command = Command::new(CURSOR_CLI_COMMAND);
+    command
+        .args(cursor_cli_args(prompt, model, session_id, trust_workspace))
+        .current_dir(&run.project_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ServerError::with_details(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Cursor CLI is not installed",
+                format!("{CURSOR_CLI_COMMAND} was not found in PATH"),
+            )
+        } else {
+            ServerError::with_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to start Cursor CLI",
+                error.to_string(),
+            )
+        }
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        ServerError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Cursor CLI stdout was unavailable",
+        )
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| {
+        ServerError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Cursor CLI stderr was unavailable",
+        )
+    })?;
+    let stdout_task = tokio::spawn(async move {
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).await.map(|_| output)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut output = String::new();
+        stderr.read_to_string(&mut output).await.map(|_| output)
+    });
+
+    let (status, interrupted) = loop {
+        tokio::select! {
+            status = child.wait() => {
+                break (status.map_err(|error| ServerError::with_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed while waiting for Cursor CLI",
+                    error.to_string(),
+                ))?, false);
+            }
+            _ = sleep(PROVIDER_POLL_INTERVAL) => {
+                if board_run_interrupted(state, run) {
+                    let _ = child.kill().await;
+                    let status = child.wait().await.map_err(|error| ServerError::with_details(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to stop Cursor CLI",
+                        error.to_string(),
+                    ))?;
+                    break (status, true);
+                }
+            }
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .map_err(|error| {
+            ServerError::with_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to collect Cursor CLI stdout",
+                error.to_string(),
+            )
+        })?
+        .map_err(|error| {
+            ServerError::with_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read Cursor CLI stdout",
+                error.to_string(),
+            )
+        })?;
+    let stderr = stderr_task
+        .await
+        .map_err(|error| {
+            ServerError::with_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to collect Cursor CLI stderr",
+                error.to_string(),
+            )
+        })?
+        .map_err(|error| {
+            ServerError::with_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read Cursor CLI stderr",
+                error.to_string(),
+            )
+        })?;
+    Ok(CursorProcessOutput {
+        stdout: limit_text(&stdout, MAX_PROVIDER_OUTPUT_CHARS),
+        stderr: limit_text(&stderr, MAX_PROVIDER_OUTPUT_CHARS),
+        exit_code: if interrupted {
+            130
+        } else {
+            status.code().unwrap_or(1)
+        },
+        interrupted,
+    })
+}
+
+fn cursor_workspace_trust_required(stdout: &str, stderr: &str) -> bool {
+    let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    [
+        "workspace trust required",
+        "do you trust the contents of this directory",
+        "working with untrusted contents",
+        "pass --trust, --yolo, or -f",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+}
+
+fn parse_cursor_cli_output(
+    output: CursorProcessOutput,
+    requested_session_id: Option<&str>,
+) -> SharedProviderTurnResult {
+    if output.interrupted {
+        return SharedProviderTurnResult {
+            session_id: requested_session_id
+                .map(str::to_string)
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            assistant_text: String::new(),
+            stderr: "Provider task was interrupted by board abort.".to_string(),
+            token_usage: None,
+            exit_code: 130,
+            summary: "Provider task was interrupted by board abort.".to_string(),
+        };
+    }
+
+    let mut session_id = requested_session_id.map(str::to_string);
+    let mut assistant_parts = Vec::new();
+    let mut result_text = String::new();
+    let mut result_error = String::new();
+    let mut result_exit_code = None;
+    let mut token_usage = None;
+    let mut unparsed = Vec::new();
+    for line in output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            unparsed.push(line.to_string());
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("system") if event.get("subtype").and_then(Value::as_str) == Some("init") => {
+                if let Some(value) = event
+                    .get("session_id")
+                    .or_else(|| event.get("sessionId"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    session_id = Some(value.to_string());
+                }
+            }
+            Some("assistant") => {
+                assistant_parts.extend(cursor_assistant_text(&event));
+            }
+            Some("result") => {
+                result_exit_code = Some(
+                    if event.get("subtype").and_then(Value::as_str) == Some("success") {
+                        0
+                    } else {
+                        1
+                    },
+                );
+                result_text = event
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                result_error = event
+                    .get("error")
+                    .or_else(|| event.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                token_usage = cursor_token_usage(&event);
+            }
+            _ => {}
+        }
+    }
+    let streamed_assistant_text = assistant_parts.join("");
+    let assistant_text = limit_text(
+        if result_text.trim().is_empty() {
+            &streamed_assistant_text
+        } else {
+            &result_text
+        },
+        MAX_PROVIDER_OUTPUT_CHARS,
+    );
+    let mut stderr_parts = Vec::new();
+    if !output.stderr.trim().is_empty() {
+        stderr_parts.push(output.stderr.trim().to_string());
+    }
+    if !result_error.trim().is_empty() {
+        stderr_parts.push(result_error.trim().to_string());
+    }
+    if !unparsed.is_empty() {
+        stderr_parts.push(unparsed.join("\n"));
+    }
+    let stderr = limit_text(&stderr_parts.join("\n"), MAX_PROVIDER_OUTPUT_CHARS);
+    let exit_code = result_exit_code.unwrap_or(output.exit_code);
+    SharedProviderTurnResult {
+        session_id: session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        summary: summarize_provider_output(&assistant_text, &stderr, exit_code),
+        assistant_text,
+        stderr,
+        token_usage,
+        exit_code,
+    }
+}
+
+fn cursor_assistant_text(event: &Value) -> Vec<String> {
+    let Some(content) = event
+        .get("message")
+        .and_then(|message| message.get("content"))
+    else {
+        return Vec::new();
+    };
+    match content {
+        Value::String(text) => vec![text.clone()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.as_str())
+                    .map(str::to_string)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn cursor_token_usage(event: &Value) -> Option<Value> {
+    let usage = event
+        .get("usage")
+        .or_else(|| event.get("token_usage"))
+        .or_else(|| event.get("tokenUsage"))?;
+    let input_tokens = json_u64(usage, &["inputTokens", "input_tokens", "input"]);
+    let cached_input_tokens = json_u64(
+        usage,
+        &["cachedInputTokens", "cached_input_tokens", "cached_input"],
+    );
+    let output_tokens = json_u64(usage, &["outputTokens", "output_tokens", "output"]);
+    let total_tokens = json_u64(usage, &["totalTokens", "total_tokens", "total"])
+        .unwrap_or(input_tokens.unwrap_or(0) + output_tokens.unwrap_or(0));
+    if input_tokens.is_none()
+        && cached_input_tokens.is_none()
+        && output_tokens.is_none()
+        && total_tokens == 0
+    {
+        return None;
+    }
+    Some(json!({
+        "inputTokens": input_tokens.unwrap_or(0),
+        "cachedInputTokens": cached_input_tokens.unwrap_or(0),
+        "outputTokens": output_tokens.unwrap_or(0),
+        "totalTokens": total_tokens,
+    }))
+}
+
+fn json_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|entry| {
+            entry
+                .as_u64()
+                .or_else(|| entry.as_i64().and_then(|value| u64::try_from(value).ok()))
+                .or_else(|| entry.as_str().and_then(|value| value.parse().ok()))
+        })
+    })
 }
 
 async fn wait_for_shared_provider_turn(
@@ -5892,7 +6972,7 @@ async fn wait_for_shared_provider_turn(
             });
         }
 
-        let stored_session = state.storage.get_session(&session.id)?;
+        let stored_session = state.storage.get_session_summary(&session.id)?;
         let durable_run = state
             .storage
             .latest_durable_chat_run_for_session(&session.id)?;
@@ -5960,11 +7040,93 @@ async fn wait_for_shared_provider_turn(
 
 fn board_run_interrupted(state: &AppState, run: &BoardRun) -> bool {
     load_user_run(state, run.user_id.as_deref().unwrap_or_default(), &run.id)
-        .map(|stored| {
-            matches!(stored.run.status.as_str(), "cancelled" | "paused")
-                || stored.run.pause_requested
-        })
+        .map(|stored| board_run_should_abort_provider(&stored.run))
         .unwrap_or(false)
+}
+
+fn board_run_should_abort_provider(run: &BoardRun) -> bool {
+    run.status == "cancelled" || run.cancellation_reason.is_some() || run.canceled_at.is_some()
+}
+
+fn board_run_has_in_flight_work(run: &BoardRun) -> bool {
+    run.current_provider_session_id.is_some() || run.provider_call_started_at.is_some()
+}
+
+fn request_board_pause(run: &mut BoardRun, reason: Option<String>) {
+    bump_control_revision(run);
+    run.auto_run_enabled = false;
+    run.pause_reason = reason.or_else(|| Some("user request".to_string()));
+    if board_run_has_in_flight_work(run) {
+        run.status = "pausing".to_string();
+        run.active = true;
+        run.pause_requested = true;
+        run.paused_at = None;
+        run.append_log("Board pause requested; waiting for current work to finish");
+    } else {
+        settle_board_pause(run);
+        run.append_log("Board paused");
+    }
+}
+
+fn prepare_board_resume(run: &mut BoardRun) {
+    bump_control_revision(run);
+    run.status = "running".to_string();
+    run.scheduled_start_at = None;
+    run.active = true;
+    run.auto_run_enabled = true;
+    run.pause_requested = false;
+    run.paused_at = None;
+    run.pause_reason = None;
+    run.append_log("Board resume requested");
+}
+
+fn settle_board_pause(run: &mut BoardRun) {
+    if let Some(current_task_id) = run.current_task_id.as_deref()
+        && let Some(task) = run.tasks.iter_mut().find(|task| task.id == current_task_id)
+        && matches!(task.status.as_str(), "running" | "in_progress")
+    {
+        task.status = "pending".to_string();
+        task.started_at = None;
+        task.completed_at = None;
+        task.transcript.push(json!({
+            "timestamp": Utc::now(),
+            "kind": "status",
+            "status": "pending",
+            "content": "Task returned to Todo because the board paused before provider execution completed",
+        }));
+        task.transcript_updated_at = Some(Utc::now());
+    }
+    run.status = "paused".to_string();
+    run.active = false;
+    run.loop_started = false;
+    run.pause_requested = false;
+    run.paused_at = Some(Utc::now());
+    run.current_task_id = None;
+    run.current_task_title.clear();
+    run.current_task_status.clear();
+    run.append_log("Agentic board execution paused");
+}
+
+fn reset_in_flight_board_tasks(run: &mut BoardRun, message: &str) {
+    for task in &mut run.tasks {
+        if !matches!(task.status.as_str(), "running" | "in_progress") {
+            continue;
+        }
+        task.status = "pending".to_string();
+        task.started_at = None;
+        task.completed_at = None;
+        task.transcript.push(json!({
+            "timestamp": Utc::now(),
+            "kind": "status",
+            "status": "pending",
+            "content": message,
+        }));
+        task.transcript_updated_at = Some(Utc::now());
+    }
+}
+
+fn bump_control_revision(run: &mut BoardRun) {
+    run.control_revision = run.control_revision.saturating_add(1);
 }
 
 fn shared_provider_stream_events(provider: &str, result: &SharedProviderTurnResult) -> Vec<Value> {
@@ -6011,8 +7173,8 @@ fn agentic_chat_runtime(
     if provider == Provider::Gemini {
         return ChatRuntime::NativeCli;
     }
-    if let Some(session) =
-        session_id.and_then(|session_id| state.storage.get_session(session_id).ok().flatten())
+    if let Some(session) = session_id
+        .and_then(|session_id| state.storage.get_session_summary(session_id).ok().flatten())
     {
         return session.runtime.unwrap_or_else(|| {
             if model
@@ -7028,7 +8190,7 @@ fn task_from_json(run: &BoardRun, item: Value, index: usize, status: &str) -> Op
         depends_on: normalize_string_list(item.get("dependsOn")),
         manual_task: false,
         prompt_task: false,
-        task_origin: "planner".to_string(),
+        task_origin: "planned".to_string(),
         task_type: "implementation".to_string(),
         backlog_generation_task: false,
         qa_task: false,
@@ -7243,6 +8405,16 @@ fn parse_execution_result(stdout: &str) -> Option<Value> {
                 .find_map(|line| parse_json_object(line.trim()))
         })
         .map(mark_parsed_json_result)
+}
+
+fn resolved_execution_summary(parsed: &Value, provider_summary: &str) -> String {
+    parsed
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .unwrap_or_else(|| provider_summary.trim())
+        .to_string()
 }
 
 fn missing_json_task_result(output: &str) -> Value {
@@ -7669,6 +8841,19 @@ fn reusable_session_id(run: &BoardRun) -> Option<String> {
         .clone()
         .or_else(|| run.session_id.clone())
         .filter(|value| !value.trim().is_empty())
+}
+
+fn board_task_id_for_label(run: &BoardRun, label: &str) -> Option<String> {
+    let label = label.trim();
+    run.tasks
+        .iter()
+        .find(|task| {
+            label == task.id
+                || label.ends_with(&format!(" for {}", task.id))
+                || label.contains(&format!(" {} ", task.id))
+        })
+        .map(|task| task.id.clone())
+        .or_else(|| run.current_task_id.clone())
 }
 
 fn should_resume_provider_session(run: &BoardRun) -> bool {
@@ -8723,13 +9908,16 @@ fn auto_retry_enabled(value: &Value) -> bool {
 }
 
 fn is_resumable_run(run: &BoardRun) -> bool {
-    matches!(run.status.as_str(), "paused" | "blocked" | "failed")
-        || run.tasks.iter().any(|task| {
+    match run.status.as_str() {
+        "scheduled" | "paused" | "pausing" => true,
+        "blocked" | "failed" | "cancelled" => run.tasks.iter().any(|task| {
             matches!(
                 task.status.as_str(),
-                "failed" | "blocked" | "backlog_failed" | "pending" | "planned"
+                "pending" | "running" | "in_progress" | "blocked"
             )
-        })
+        }),
+        _ => false,
+    }
 }
 
 fn schedule_auto_retry_if_eligible(run: &mut BoardRun, reason: &str) -> bool {
@@ -9137,6 +10325,7 @@ fn effective_model_for_phase(run: &BoardRun, label: &str) -> String {
     run.task_model_overrides
         .get(&phase_key)
         .or_else(|| run.task_model_overrides.get(label))
+        .or_else(|| run.task_model_overrides.get(model_type_for_phase(label)))
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|model| !model.trim().is_empty())
@@ -9153,6 +10342,7 @@ fn effective_model_for_phase(run: &BoardRun, label: &str) -> String {
 fn effective_model_for_task(run: &BoardRun, task: &BoardTask) -> String {
     run.task_model_overrides
         .get(&task.id)
+        .or_else(|| run.task_model_overrides.get(model_type_for_task(task)))
         .or_else(|| run.task_model_overrides.get(&task.task_type))
         .or_else(|| run.task_model_overrides.get("task_execution"))
         .and_then(Value::as_str)
@@ -9171,6 +10361,33 @@ fn effective_model_for_task(run: &BoardRun, task: &BoardTask) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| run.model.clone())
+}
+
+fn model_type_for_phase(label: &str) -> &'static str {
+    let normalized = label.trim().to_ascii_lowercase();
+    if normalized.contains("final review") || normalized.contains("final qa") {
+        "final_qa"
+    } else if normalized.contains("result schema repair") {
+        "qa_fix"
+    } else if normalized.contains("qa") || normalized.contains("promotion review") {
+        "qa"
+    } else {
+        "breakdown"
+    }
+}
+
+fn model_type_for_task(task: &BoardTask) -> &'static str {
+    if task.final_qa_task {
+        "final_qa"
+    } else if task.qa_verdict_retry_task || task.qa_task || task.task_level_qa {
+        "qa"
+    } else if task.qa_fix_task || task.source_qa_task_id.is_some() {
+        "qa_fix"
+    } else if task.agents_knowledge_task || task.task_type == "agents_knowledge" {
+        "agents"
+    } else {
+        "implementation"
+    }
 }
 
 fn apply_task_model_routing(run: &mut BoardRun, task_index: usize) {
@@ -9327,18 +10544,77 @@ fn prompt_telemetry_summary(entries: &[Value]) -> Value {
         .iter()
         .filter_map(|entry| entry.get("estimatedTokens").and_then(Value::as_u64))
         .sum::<u64>();
-    let phases = entries
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .get("phase")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect::<BTreeSet<_>>()
+    let actual_input_tokens = telemetry_token_sum(entries, "actualInputTokens");
+    let actual_cached_input_tokens = telemetry_token_sum(entries, "actualCachedInputTokens");
+    let actual_output_tokens = telemetry_token_sum(entries, "actualOutputTokens");
+    let actual_tokens = telemetry_token_sum(entries, "actualTotalTokens");
+    let mut by_phase = BTreeMap::<String, (usize, u64, u64, u64)>::new();
+    for entry in entries {
+        let phase = entry
+            .get("phase")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        let accumulator = by_phase.entry(phase).or_default();
+        accumulator.0 += 1;
+        accumulator.1 += entry.get("chars").and_then(Value::as_u64).unwrap_or(0);
+        accumulator.2 += entry
+            .get("estimatedTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        accumulator.3 += entry
+            .get("actualTotalTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+    }
+    let mut phases = by_phase
         .into_iter()
+        .map(|(phase, (calls, chars, estimated_tokens, actual_tokens))| {
+            json!({
+                "phase": phase,
+                "calls": calls,
+                "chars": chars,
+                "estimatedTokens": estimated_tokens,
+                "actualTokens": actual_tokens,
+            })
+        })
         .collect::<Vec<_>>();
-    json!({ "calls": calls, "chars": chars, "estimatedTokens": estimated_tokens, "phases": phases })
+    phases.sort_by_key(|phase| {
+        std::cmp::Reverse(
+            phase
+                .get("estimatedTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        )
+    });
+    let largest_call = entries
+        .iter()
+        .max_by_key(|entry| {
+            entry
+                .get("estimatedTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        })
+        .cloned();
+    json!({
+        "calls": calls,
+        "chars": chars,
+        "estimatedTokens": estimated_tokens,
+        "actualInputTokens": actual_input_tokens,
+        "actualCachedInputTokens": actual_cached_input_tokens,
+        "actualOutputTokens": actual_output_tokens,
+        "actualTokens": actual_tokens,
+        "phases": phases,
+        "largestCall": largest_call,
+    })
+}
+
+fn telemetry_token_sum(entries: &[Value], key: &str) -> u64 {
+    entries
+        .iter()
+        .filter_map(|entry| entry.get(key).and_then(Value::as_u64))
+        .sum()
 }
 
 fn validation_summary(entries: &[Value]) -> Value {
@@ -9347,12 +10623,40 @@ fn validation_summary(entries: &[Value]) -> Value {
         .iter()
         .filter(|entry| entry.get("passed").and_then(Value::as_bool) == Some(true))
         .count();
+    let latest = entries.last();
+    let commands = entries.iter().map(validation_command_count).sum::<usize>();
     json!({
         "runs": runs,
         "passed": passed,
         "failed": runs.saturating_sub(passed),
-        "commands": runs,
+        "latestStage": latest
+            .and_then(|entry| entry.get("stage"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "latestPassed": latest
+            .and_then(|entry| entry.get("passed"))
+            .and_then(Value::as_bool),
+        "commands": commands,
     })
+}
+
+fn validation_command_count(entry: &Value) -> usize {
+    if let Some(commands) = entry.get("commands").and_then(Value::as_array) {
+        return commands.len();
+    }
+    if entry
+        .get("commands")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return 1;
+    }
+    usize::from(
+        entry
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty()),
+    )
 }
 
 fn server_error_message(error: &ServerError) -> String {
@@ -9380,7 +10684,7 @@ fn apply_run_options(run: &mut BoardRun, request: &CreateRunRequest) -> Result<(
         run.model_strategy = request.model_strategy.clone();
     }
     if let Some(profile) = trim_string(request.run_profile.clone()) {
-        run.run_profile = profile;
+        run.run_profile = normalize_run_profile(Some(&profile));
     }
     if let Some(overrides) = request.task_model_overrides.clone() {
         run.task_model_overrides = overrides;
@@ -9440,7 +10744,10 @@ fn load_runs(state: &AppState) -> Result<Vec<StoredRun>> {
         }
         let content = fs::read_to_string(&path).map_err(io_error)?;
         match serde_json::from_str::<BoardRun>(&content) {
-            Ok(run) => runs.push(StoredRun { path, run }),
+            Ok(mut run) => {
+                normalize_board_run_provenance(&mut run);
+                runs.push(StoredRun { path, run });
+            }
             Err(error) => {
                 tracing::warn!(file = %path.display(), %error, "failed to read agentic board snapshot");
             }
@@ -9450,11 +10757,20 @@ fn load_runs(state: &AppState) -> Result<Vec<StoredRun>> {
 }
 
 fn save_run(state: &AppState, run: &BoardRun) -> Result<()> {
+    let _guard = BOARD_RUN_SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = runs_dir(state);
     fs::create_dir_all(&dir).map_err(io_error)?;
     let path = run_file_path(state, &run.id);
     let temp_path = path.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
-    let content = serde_json::to_string_pretty(run).map_err(|error| {
+    let mut run_to_save = run.clone();
+    if let Ok(content) = fs::read_to_string(&path)
+        && let Ok(current) = serde_json::from_str::<BoardRun>(&content)
+    {
+        preserve_newer_control_state(&mut run_to_save, &current);
+    }
+    let content = serde_json::to_string_pretty(&run_to_save).map_err(|error| {
         ServerError::with_details(
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to serialize board",
@@ -9464,6 +10780,60 @@ fn save_run(state: &AppState, run: &BoardRun) -> Result<()> {
     fs::write(&temp_path, content).map_err(io_error)?;
     fs::rename(&temp_path, &path).map_err(io_error)?;
     Ok(())
+}
+
+fn preserve_newer_control_state(run: &mut BoardRun, current: &BoardRun) {
+    if current.control_revision <= run.control_revision {
+        return;
+    }
+    run.control_revision = current.control_revision;
+    run.status = current.status.clone();
+    run.active = current.active;
+    run.loop_started = current.loop_started;
+    run.auto_run_enabled = current.auto_run_enabled;
+    run.pause_requested = current.pause_requested;
+    run.paused_at = current.paused_at;
+    run.pause_reason = current.pause_reason.clone();
+    run.cancellation_reason = current.cancellation_reason.clone();
+    run.abort_source = current.abort_source.clone();
+    run.abort_requested_at = current.abort_requested_at;
+    run.canceled_at = current.canceled_at;
+    run.scheduled_start_at = current.scheduled_start_at;
+    if matches!(current.status.as_str(), "paused" | "pausing" | "cancelled") {
+        run.current_task_id = current.current_task_id.clone();
+        run.current_task_title = current.current_task_title.clone();
+        run.current_task_status = current.current_task_status.clone();
+        run.current_provider_session_id = current.current_provider_session_id.clone();
+        run.provider_call_started_at = current.provider_call_started_at;
+        run.provider_call_label = current.provider_call_label.clone();
+        for current_task in &current.tasks {
+            let Some(task) = run.tasks.iter_mut().find(|task| task.id == current_task.id) else {
+                continue;
+            };
+            if matches!(task.status.as_str(), "running" | "in_progress")
+                && !matches!(current_task.status.as_str(), "running" | "in_progress")
+            {
+                task.status = current_task.status.clone();
+                task.started_at = current_task.started_at;
+                task.completed_at = current_task.completed_at;
+                for entry in &current_task.transcript {
+                    if !task.transcript.contains(entry) {
+                        task.transcript.push(entry.clone());
+                    }
+                }
+                task.transcript_updated_at = current_task.transcript_updated_at;
+            }
+        }
+    }
+    for log in &current.logs {
+        if !run.logs.contains(log) {
+            run.logs.push(log.clone());
+        }
+    }
+    if run.logs.len() > 500 {
+        let remove_count = run.logs.len() - 500;
+        run.logs.drain(0..remove_count);
+    }
 }
 
 fn board_run_mutation_lock() -> MutexGuard<'static, ()> {
@@ -9480,6 +10850,7 @@ fn run_file_path(state: &AppState, id: &str) -> PathBuf {
     runs_dir(state).join(format!("{id}.json"))
 }
 
+#[cfg(test)]
 fn prompt_to_task_drafts(run: &mut BoardRun, prompt: &str) -> Vec<BoardTask> {
     let mut tasks = prompt
         .lines()
@@ -9507,6 +10878,517 @@ fn prompt_to_task_drafts(run: &mut BoardRun, prompt: &str) -> Vec<BoardTask> {
         ));
     }
     tasks
+}
+
+#[derive(Debug)]
+struct PromptTaskDraftAttempt {
+    result: Result<(Vec<Value>, Option<String>)>,
+    provider_prompt: String,
+    provider_output: String,
+    session_id: Option<String>,
+    token_usage: Option<Value>,
+    effective_model: String,
+    started_at: DateTime<Utc>,
+}
+
+async fn generate_prompt_task_drafts(
+    state: &AppState,
+    run: &BoardRun,
+    prompt: &str,
+    model: Option<&str>,
+    run_profile: Option<&str>,
+) -> PromptTaskDraftAttempt {
+    let profile = run_profile
+        .map(|value| normalize_run_profile(Some(value)))
+        .unwrap_or_else(|| normalize_run_profile(Some(&run.run_profile)));
+    let selected_model = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            run.task_model_overrides
+                .get("breakdown")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| trim_string(Some(run.primary_model.clone())))
+        .unwrap_or_else(|| run.model.clone());
+    let mut generation_run = run.clone();
+    generation_run.run_profile = profile.clone();
+    generation_run.actual_session_id = None;
+    generation_run.current_provider_session_id = None;
+    generation_run.session_id = None;
+    generation_run.current_task_id = run.current_task_id.clone().or_else(|| {
+        run.tasks
+            .iter()
+            .find(|task| task.backlog_generation_task && task.status == "backlog_generating")
+            .map(|task| task.id.clone())
+    });
+    if !selected_model.trim().is_empty() {
+        generation_run.model = selected_model.clone();
+        generation_run.primary_model = selected_model.clone();
+    }
+    let provider_prompt = build_prompt_task_draft_prompt(&generation_run, prompt, &profile);
+    let provider = generation_run.provider.clone();
+    let started_at = Utc::now();
+    let provider_result = execute_shared_provider_turn(
+        state,
+        &generation_run,
+        &provider,
+        &selected_model,
+        &provider_prompt,
+        None,
+        generation_run.current_task_id.as_deref(),
+    )
+    .await;
+    match provider_result {
+        Ok(result) if result.exit_code == 0 => {
+            let parsed = parse_json_object(&result.assistant_text).unwrap_or_else(|| json!({}));
+            let tasks = sanitize_prompt_task_drafts(&parsed, prompt);
+            let generation_result = if tasks.is_empty() {
+                Err(task_generation_error(
+                    "AI returned valid output but no usable task drafts.",
+                ))
+            } else {
+                Ok((tasks, None))
+            };
+            PromptTaskDraftAttempt {
+                result: generation_result,
+                provider_prompt,
+                provider_output: result.assistant_text,
+                session_id: Some(result.session_id),
+                token_usage: result.token_usage,
+                effective_model: selected_model,
+                started_at,
+            }
+        }
+        Ok(result) => PromptTaskDraftAttempt {
+            result: Err(task_generation_error(format!(
+                "AI task generation failed: {}",
+                result.summary
+            ))),
+            provider_prompt,
+            provider_output: result.assistant_text,
+            session_id: Some(result.session_id),
+            token_usage: result.token_usage,
+            effective_model: selected_model,
+            started_at,
+        },
+        Err(error) => PromptTaskDraftAttempt {
+            result: Err(task_generation_error(format!(
+                "AI task generation failed: {}",
+                server_error_message(&error)
+            ))),
+            provider_prompt,
+            provider_output: String::new(),
+            session_id: None,
+            token_usage: None,
+            effective_model: selected_model,
+            started_at,
+        },
+    }
+}
+
+fn record_prompt_task_generation_attempt(
+    run: &mut BoardRun,
+    label: &str,
+    attempt: &PromptTaskDraftAttempt,
+) {
+    let controls = board_provider_controls(run);
+    let mut telemetry = json!({
+        "phase": "backlog_generation",
+        "label": label,
+        "chars": attempt.provider_prompt.chars().count(),
+        "estimatedTokens": estimate_tokens(&attempt.provider_prompt),
+        "startedAt": attempt.started_at,
+        "reasoningEffort": controls.effort,
+        "fast": controls.fast,
+    });
+    if let Some(error) = attempt.result.as_ref().err() {
+        telemetry["error"] = json!(server_error_message(error));
+        telemetry["outcome"] = json!("failed");
+    } else {
+        telemetry["outcome"] = json!("completed");
+    }
+    run.prompt_telemetry.push(telemetry);
+    let telemetry_index = run.prompt_telemetry.len().saturating_sub(1);
+    finalize_prompt_telemetry(
+        run,
+        telemetry_index,
+        attempt.session_id.as_deref(),
+        Some(&attempt.effective_model),
+        attempt.token_usage.as_ref(),
+    );
+    if attempt.session_id.is_some() || !attempt.provider_output.is_empty() {
+        increment_provider_usage(
+            run,
+            &attempt.provider_prompt,
+            &attempt.provider_output,
+            attempt.session_id.as_deref(),
+            attempt.token_usage.as_ref(),
+        );
+    }
+}
+
+fn build_prompt_task_draft_prompt(run: &BoardRun, prompt: &str, profile: &str) -> String {
+    format!(
+        r#"Create implementation-ready Kanban backlog cards for this focused follow-up prompt.
+
+Prompt:
+{prompt}
+
+Run profile: {profile}
+Profile requirements: {profile_instructions}
+
+Known requirements:
+{requirements}
+
+Existing board tasks:
+{tasks}
+
+Return JSON only. No markdown fence.
+Schema:
+{{
+  "tasks": [
+    {{
+      "title": "specific implementation task",
+      "details": "bounded implementation details",
+      "acceptanceCriteria": ["verifiable outcome"],
+      "references": ["relevant file, source, or requirement"],
+      "files": ["likely file or path"],
+      "requirementIds": ["REQ-0001"],
+      "priority": "high|medium|low",
+      "dependsOn": []
+    }}
+  ]
+}}
+
+Rules:
+- Generate only cards directly needed for the prompt-matched feature area.
+- Preserve explicit user scope; do not add unrelated cleanup or product ideas.
+- Keep every card independently actionable and verifiable.
+- Prefer a small number of complete cards over many vague cards."#,
+        prompt = prompt,
+        profile = profile,
+        profile_instructions = run_profile_instructions(profile),
+        requirements = requirement_summary(run),
+        tasks = run
+            .tasks
+            .iter()
+            .filter(|task| !task.backlog_generation_task)
+            .rev()
+            .take(20)
+            .map(|task| format!("{} [{}] {}", task.id, task.status, task.title))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn run_profile_instructions(profile: &str) -> &'static str {
+    match normalize_run_profile(Some(profile)).as_str() {
+        "minimal" => {
+            "Implement explicit requirements with minimal expansion and the lowest useful context footprint."
+        }
+        "product_ready" => {
+            "Include complete workflow detail, useful summaries, structural responsive checks, and strict edge-case QA when relevant."
+        }
+        _ => {
+            "Include needed validation, persistence, empty and error states, and local verification for a complete feature."
+        }
+    }
+}
+
+fn sanitize_prompt_task_drafts(parsed: &Value, prompt: &str) -> Vec<Value> {
+    parsed
+        .get("tasks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(12)
+        .filter_map(|task| {
+            let title = task
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let details = task
+                .get("details")
+                .or_else(|| task.get("description"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(title);
+            let references = dedupe_strings(
+                normalize_string_list(task.get("references"))
+                    .into_iter()
+                    .chain(normalize_string_list(task.get("files")))
+                    .chain(normalize_string_list(task.get("paths")))
+                    .collect(),
+            );
+            Some(json!({
+                "title": title,
+                "details": details,
+                "prompt": prompt,
+                "acceptanceCriteria": normalize_string_list(
+                    task.get("acceptanceCriteria")
+                        .or_else(|| task.get("acceptance"))
+                        .or_else(|| task.get("criteria")),
+                ),
+                "references": references,
+                "requirementIds": normalize_string_list(
+                    task.get("requirementIds").or_else(|| task.get("requirements")),
+                ),
+                "priority": normalize_priority(task.get("priority").and_then(Value::as_str)),
+                "dependsOn": normalize_string_list(
+                    task.get("dependsOn").or_else(|| task.get("dependencies")),
+                ),
+                "status": "backlog",
+            }))
+        })
+        .collect()
+}
+
+fn backlog_generation_placeholder(
+    run: &mut BoardRun,
+    prompt: &str,
+    model: &str,
+    run_profile: &str,
+) -> BoardTask {
+    let profile = if run_profile.trim().is_empty() {
+        normalize_run_profile(Some(&run.run_profile))
+    } else {
+        normalize_run_profile(Some(run_profile))
+    };
+    let mut task = BoardTask::draft(
+        run,
+        "Adding tasks to backlog from prompt".to_string(),
+        prompt.to_string(),
+    );
+    task.status = "backlog_generating".to_string();
+    task.prompt = prompt.to_string();
+    task.acceptance_criteria =
+        vec!["Generate one or more backlog task cards from the prompt.".to_string()];
+    task.references = vec![
+        "Prompt backlog generation is running in the background.".to_string(),
+        format!(
+            "Breakdown model: {}",
+            model
+                .trim()
+                .is_empty()
+                .then_some("provider default")
+                .unwrap_or(model.trim())
+        ),
+        format!("Breakdown profile: {profile}"),
+        format!(
+            "Breakdown scope: {}",
+            if prompt_requests_broad_coverage(prompt) {
+                "Broad coverage"
+            } else {
+                "Focused prompt scope"
+            }
+        ),
+    ];
+    task.backlog_generation_task = true;
+    task.manual_task = false;
+    task.prompt_task = true;
+    task.task_origin = "user_prompt_generated".to_string();
+    task
+}
+
+fn spawn_backlog_prompt_generation(
+    state: AppState,
+    user_id: String,
+    run_id: String,
+    placeholder_task_id: String,
+    prompt: String,
+    model: String,
+    run_profile: String,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = complete_backlog_prompt_generation(
+            &state,
+            &user_id,
+            &run_id,
+            &placeholder_task_id,
+            &prompt,
+            &model,
+            &run_profile,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id = %run_id,
+                task_id = %placeholder_task_id,
+                error = %server_error_message(&error),
+                "backlog prompt generation failed"
+            );
+        }
+    });
+}
+
+async fn complete_backlog_prompt_generation(
+    state: &AppState,
+    user_id: &str,
+    run_id: &str,
+    placeholder_task_id: &str,
+    prompt: &str,
+    model: &str,
+    run_profile: &str,
+) -> Result<()> {
+    let snapshot = load_user_run(state, user_id, run_id)?;
+    let attempt = generate_prompt_task_drafts(
+        state,
+        &snapshot.run,
+        prompt,
+        (!model.trim().is_empty() && model.trim() != "provider default").then_some(model),
+        (!run_profile.trim().is_empty()).then_some(run_profile),
+    )
+    .await;
+    let _guard = board_run_mutation_lock();
+    let mut stored = load_user_run(state, user_id, run_id)?;
+    let Some(index) = stored
+        .run
+        .tasks
+        .iter()
+        .position(|task| task.id == placeholder_task_id)
+    else {
+        return Ok(());
+    };
+    if stored.run.tasks[index].status != "backlog_generating" {
+        return Ok(());
+    }
+    record_prompt_task_generation_attempt(
+        &mut stored.run,
+        "Kanban backlog prompt generation",
+        &attempt,
+    );
+    match attempt.result {
+        Ok((drafts, warning)) => {
+            let mut generated = drafts
+                .into_iter()
+                .map(|draft| prompt_task_from_draft(&mut stored.run, draft, prompt))
+                .collect::<Vec<_>>();
+            generated[0].id = placeholder_task_id.to_string();
+            sanitize_generated_task_dependencies(&stored.run, &mut generated, placeholder_task_id);
+            if let Some(warning) = warning.as_deref().filter(|value| !value.trim().is_empty()) {
+                generated[0]
+                    .references
+                    .push(format!("Task generation note: {warning}"));
+            }
+            let count = generated.len();
+            stored.run.tasks.splice(index..=index, generated);
+            stored.run.append_log(format!(
+                "Backlog prompt generated {count} task(s) from {placeholder_task_id}"
+            ));
+        }
+        Err(error) => {
+            let message = server_error_message(&error);
+            let task = &mut stored.run.tasks[index];
+            task.status = "backlog_failed".to_string();
+            task.error = Some(message.clone());
+            task.summary = "Task generation failed. Retry this card when ready.".to_string();
+            task.completed_at = Some(Utc::now());
+            stored.run.append_log(format!(
+                "Backlog prompt generation failed for {placeholder_task_id}: {message}"
+            ));
+        }
+    }
+    stored.run.touch();
+    save_run(state, &stored.run)
+}
+
+fn sanitize_generated_task_dependencies(
+    run: &BoardRun,
+    generated: &mut [BoardTask],
+    placeholder_task_id: &str,
+) {
+    let valid_ids = run
+        .tasks
+        .iter()
+        .filter(|task| task.id != placeholder_task_id)
+        .map(|task| task.id.clone())
+        .chain(generated.iter().map(|task| task.id.clone()))
+        .collect::<BTreeSet<_>>();
+    for task in generated {
+        task.depends_on
+            .retain(|dependency| dependency != &task.id && valid_ids.contains(dependency));
+    }
+}
+
+fn prompt_task_from_draft(run: &mut BoardRun, draft: Value, prompt: &str) -> BoardTask {
+    let title = draft
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("New board task")
+        .to_string();
+    let details = draft
+        .get("details")
+        .or_else(|| draft.get("description"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&title)
+        .to_string();
+    let mut task = BoardTask::draft(run, title, details.clone());
+    task.prompt = prompt.to_string();
+    task.acceptance_criteria = normalize_string_list(draft.get("acceptanceCriteria"));
+    if task.acceptance_criteria.is_empty() {
+        task.acceptance_criteria = vec!["Complete the task described by this card.".to_string()];
+    }
+    task.references = normalize_string_list(draft.get("references"));
+    task.requirement_ids = normalize_string_list(draft.get("requirementIds"));
+    task.priority = normalize_priority(draft.get("priority").and_then(Value::as_str)).to_string();
+    task.depends_on = normalize_string_list(draft.get("dependsOn"));
+    task.status = "backlog".to_string();
+    task.manual_task = false;
+    task.prompt_task = true;
+    task.task_origin = "user_prompt_generated".to_string();
+    task.backlog_generation_task = false;
+    task
+}
+
+fn task_reference_value(task: &BoardTask, prefix: &str) -> String {
+    task.references
+        .iter()
+        .find_map(|reference| {
+            reference
+                .to_ascii_lowercase()
+                .starts_with(&prefix.to_ascii_lowercase())
+                .then(|| reference[prefix.len()..].trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn prompt_requests_broad_coverage(prompt: &str) -> bool {
+    let text = prompt.to_ascii_lowercase();
+    let broad = ["all", "every", "entire", "whole", "complete", "full"]
+        .iter()
+        .any(|word| text.split_whitespace().any(|part| part == *word));
+    broad
+        && [
+            "app",
+            "application",
+            "project",
+            "codebase",
+            "requirements",
+            "features",
+            "workflows",
+            "modules",
+            "board",
+            "regression",
+            "coverage",
+            "audit",
+        ]
+        .iter()
+        .any(|word| text.contains(word))
 }
 
 fn allocate_task_id(run: &mut BoardRun) -> String {
@@ -9573,8 +11455,13 @@ fn value_to_strings(value: Option<Value>) -> Vec<String> {
     }
 }
 
-fn task_counts(tasks: &[BoardTask]) -> Value {
-    count_statuses(tasks.iter().map(|task| task.status.as_str()))
+fn task_counts(tasks: &[BoardTask], orchestration_version: u32) -> Value {
+    count_statuses(
+        tasks
+            .iter()
+            .filter(|task| orchestration_version < 2 || !task.internal_validation)
+            .map(|task| task.status.as_str()),
+    )
 }
 
 fn count_statuses<'a>(statuses: impl Iterator<Item = &'a str>) -> Value {
@@ -9600,14 +11487,11 @@ fn normalize_provider(provider: Option<&str>) -> Result<String> {
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_PROVIDER)
     {
-        "claude" | "codex" | "gemini" => {
+        "claude" | "cursor" | "codex" | "gemini" => {
             Ok(provider.unwrap_or(DEFAULT_PROVIDER).trim().to_string())
         }
-        "cursor" => Err(bad_request(
-            "Provider cursor is not supported by io-workbench agentic boards",
-        )),
         _ => Err(bad_request(
-            "Provider must be one of: claude, codex, gemini",
+            "Provider must be one of: claude, cursor, codex, gemini",
         )),
     }
 }
@@ -9634,10 +11518,81 @@ fn normalize_task_status(status: Option<&str>, default: &str) -> Result<String> 
     }
 }
 
+fn canonical_task_origin(origin: &str) -> &str {
+    match origin.trim() {
+        "manual" => "user_manual",
+        "prompt_breakdown" => "user_prompt_generated",
+        "planner" => "planned",
+        value => value,
+    }
+}
+
+fn normalize_board_run_provenance(run: &mut BoardRun) {
+    for task in &mut run.tasks {
+        let canonical = canonical_task_origin(&task.task_origin);
+        task.task_origin = if canonical.is_empty() {
+            infer_legacy_task_origin(task)
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            canonical.to_string()
+        };
+    }
+}
+
+fn infer_legacy_task_origin(task: &BoardTask) -> Option<&'static str> {
+    if task.final_qa_task || task.id == FINAL_QA_TASK_ID {
+        Some("system_final_qa")
+    } else if task.qa_verdict_retry_task {
+        Some("system_qa_verdict_retry")
+    } else if task.qa_fix_task {
+        Some("system_qa_fix")
+    } else if task.task_level_qa || task.qa_task {
+        Some("system_qa")
+    } else if task.agents_knowledge_task || task.id == AGENTS_KNOWLEDGE_TASK_ID {
+        Some("system_agents")
+    } else if task.followup_task {
+        Some("system_followup")
+    } else if task.references.iter().any(|reference| {
+        reference
+            .to_ascii_lowercase()
+            .contains("suggested backlog task from")
+    }) {
+        Some("ai_suggested_backlog")
+    } else if task.backlog_generation_task || (task.prompt_task && !task.manual_task) {
+        Some("user_prompt_generated")
+    } else if task.manual_task || task.prompt_task {
+        Some("user_manual")
+    } else {
+        None
+    }
+}
+
 fn normalize_git_policy(policy: Option<&str>) -> String {
     match policy.map(str::trim).filter(|value| !value.is_empty()) {
         Some("managed") | Some("managed_git") | Some("managed-workflow") => "managed".to_string(),
         _ => "read_only".to_string(),
+    }
+}
+
+fn normalize_run_profile(profile: Option<&str>) -> String {
+    match profile
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "minimal"
+        | "follow_requirements"
+        | "requirements"
+        | "requirement_only"
+        | "strict"
+        | "cheap" => "minimal".to_string(),
+        "product_ready" | "productready" | "product" | "polished" | "expensive" | "quality" => {
+            "product_ready".to_string()
+        }
+        _ => "complete_app".to_string(),
     }
 }
 
@@ -9669,7 +11624,7 @@ fn default_provider_string() -> String {
 }
 
 fn default_run_profile() -> String {
-    "complete_app".to_string()
+    normalize_run_profile(None)
 }
 
 fn default_git_policy() -> String {
@@ -9732,6 +11687,14 @@ fn not_found(message: impl Into<String>) -> ServerError {
     ServerError::new(StatusCode::NOT_FOUND, message)
 }
 
+fn task_generation_error(details: impl Into<String>) -> ServerError {
+    ServerError::with_details(
+        StatusCode::BAD_GATEWAY,
+        "Failed to generate task drafts",
+        details,
+    )
+}
+
 fn io_error(error: std::io::Error) -> ServerError {
     ServerError::with_details(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -9743,10 +11706,137 @@ fn io_error(error: std::io::Error) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iowb_core::AppConfig;
+    use iowb_protocol::ChatMessage;
 
     fn board_run(value: Value) -> BoardRun {
         let request = serde_json::from_value::<CreateRunRequest>(value).unwrap();
         BoardRun::new(None, request).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_backfill_hides_legacy_board_session_before_discovery() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-server-board-backfill-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        fs::create_dir_all(&project).expect("project directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": project.display().to_string(),
+            "provider": "codex"
+        }));
+        run.id = "legacy-run".to_string();
+        run.user_id = Some("user-1".to_string());
+        run.tasks[0].provider_session_id = Some("legacy-board-chat".to_string());
+        save_run(&state, &run).expect("persist legacy board run");
+
+        let session = SessionSummary {
+            id: "legacy-board-chat".to_string(),
+            provider: Provider::Codex,
+            project_path: project.display().to_string(),
+            title: "Legacy board chat".to_string(),
+            last_activity: Utc::now(),
+            ..Default::default()
+        };
+        state
+            .storage
+            .upsert_session(&session)
+            .expect("persist session");
+        state
+            .storage
+            .append_message(
+                &session.id,
+                &ChatMessage {
+                    id: "message-1".to_string(),
+                    role: MessageRole::User,
+                    content: format!("Board run id: {}\nTask 1: {}", run.id, run.tasks[0].id),
+                    timestamp: Utc::now(),
+                    metadata: Value::Null,
+                },
+            )
+            .expect("persist board prompt");
+
+        assert_eq!(
+            state
+                .storage
+                .list_sessions()
+                .expect("pre-backfill list")
+                .len(),
+            1
+        );
+        backfill_legacy_board_sessions(&state)
+            .await
+            .expect("backfill succeeds");
+
+        let classified = state
+            .storage
+            .get_session(&session.id)
+            .expect("read session")
+            .expect("session exists");
+        assert!(classified.board_session);
+        assert_eq!(classified.board_run_id.as_deref(), Some("legacy-run"));
+        assert_eq!(
+            classified.board_task_id.as_deref(),
+            Some(run.tasks[0].id.as_str())
+        );
+        assert!(
+            state
+                .storage
+                .list_sessions()
+                .expect("post-backfill list")
+                .is_empty()
+        );
+        assert!(
+            state
+                .sessions
+                .list_for_project(&session.project_path)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(state);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn structured_execution_summary_overrides_transport_json_tail() {
+        let parsed = parse_execution_result(
+            r#"{"status":"done","summary":"Created STATUS.md from retrieved context."}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved_execution_summary(&parsed, "}"),
+            "Created STATUS.md from retrieved context."
+        );
+    }
+
+    #[test]
+    fn execution_summary_falls_back_to_transport_summary() {
+        let parsed = json!({"status": "done", "summary": "  "});
+
+        assert_eq!(
+            resolved_execution_summary(&parsed, "Provider completed successfully"),
+            "Provider completed successfully"
+        );
     }
 
     #[test]
@@ -9801,6 +11891,87 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_v2_summary_hides_internal_validation_tasks() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project"
+        }));
+        run.tasks[0].status = "completed".to_string();
+        let mut validation = run.tasks[0].clone();
+        validation.id = "task-final-qa".to_string();
+        validation.internal_validation = true;
+        validation.status = "completed".to_string();
+        run.tasks.push(validation);
+
+        let summary = run.summary_json(None);
+
+        assert_eq!(summary["taskCounts"]["total"], 1);
+        assert_eq!(summary["taskCounts"]["completed"], 1);
+    }
+
+    #[test]
+    fn summary_reports_actual_telemetry_validation_and_resumability() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project"
+        }));
+        run.status = "running".to_string();
+        run.auto_run_enabled = true;
+        run.tasks[0].status = "pending".to_string();
+        run.prompt_telemetry = vec![
+            json!({
+                "phase": "implementation",
+                "label": "First",
+                "chars": 400,
+                "estimatedTokens": 100,
+                "actualInputTokens": 60,
+                "actualCachedInputTokens": 10,
+                "actualOutputTokens": 30,
+                "actualTotalTokens": 90,
+                "effectiveModel": "gpt-5.6-sol"
+            }),
+            json!({
+                "phase": "qa",
+                "label": "Second",
+                "chars": 800,
+                "estimatedTokens": 200,
+                "actualInputTokens": 100,
+                "actualOutputTokens": 50,
+                "actualTotalTokens": 150
+            }),
+        ];
+        run.validation_runs = vec![
+            json!({"stage": "feature", "passed": true, "commands": ["cargo test", "cargo fmt"]}),
+            json!({"stage": "final", "passed": true, "command": "cargo check"}),
+        ];
+
+        let summary = run.summary_json(None);
+
+        assert_eq!(summary["promptTelemetrySummary"]["actualInputTokens"], 160);
+        assert_eq!(
+            summary["promptTelemetrySummary"]["actualCachedInputTokens"],
+            10
+        );
+        assert_eq!(summary["promptTelemetrySummary"]["actualOutputTokens"], 80);
+        assert_eq!(summary["promptTelemetrySummary"]["actualTokens"], 240);
+        assert_eq!(
+            summary["promptTelemetrySummary"]["phases"][0]["phase"],
+            "qa"
+        );
+        assert_eq!(
+            summary["promptTelemetrySummary"]["largestCall"]["label"],
+            "Second"
+        );
+        assert_eq!(summary["validationSummary"]["latestStage"], "final");
+        assert_eq!(summary["validationSummary"]["latestPassed"], true);
+        assert_eq!(summary["validationSummary"]["commands"], 3);
+        assert_eq!(summary["resumable"], false);
+
+        run.status = "paused".to_string();
+        assert_eq!(run.summary_json(None)["resumable"], true);
+    }
+
+    #[test]
     fn manual_task_preserves_all_rich_authoring_fields() {
         let mut run = board_run(json!({
             "command": "Implement feature",
@@ -9833,6 +12004,135 @@ mod tests {
         );
         assert_eq!(task.requirement_ids, vec!["REQ-1"]);
         assert_eq!(task.depends_on, vec!["task-0"]);
+        assert_eq!(task.task_origin, "user_manual");
+    }
+
+    #[test]
+    fn legacy_task_origins_normalize_without_changing_system_origins() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        let mut prompt_task = BoardTask::draft(
+            &mut run,
+            "Prompt task".to_string(),
+            "Prompt details".to_string(),
+        );
+        prompt_task.task_origin = "prompt_breakdown".to_string();
+        let mut planned_task = prompt_task.clone();
+        planned_task.id = "task-3".to_string();
+        planned_task.task_origin = "planner".to_string();
+        let mut system_task = prompt_task.clone();
+        system_task.id = "task-4".to_string();
+        system_task.task_origin = "system_followup".to_string();
+        run.tasks[0].task_origin = "manual".to_string();
+        run.tasks.extend([prompt_task, planned_task, system_task]);
+
+        normalize_board_run_provenance(&mut run);
+
+        assert_eq!(
+            run.tasks
+                .iter()
+                .map(|task| task.task_origin.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "user_manual",
+                "user_prompt_generated",
+                "planned",
+                "system_followup",
+            ]
+        );
+    }
+
+    #[test]
+    fn promoted_user_task_receives_a_requirement_matrix_entry() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        run.requirement_matrix.clear();
+        let request = serde_json::from_value::<TaskRequest>(json!({
+            "title": "Export audit log",
+            "details": "Add CSV export with a focused test.",
+            "status": "backlog"
+        }))
+        .unwrap();
+        let mut task = BoardTask::manual(&mut run, request).unwrap();
+
+        ensure_manual_task_requirements(&mut run.requirement_matrix, &mut task);
+        mark_requirements_from_tasks(&mut run, std::slice::from_ref(&task));
+
+        assert_eq!(task.requirement_ids, vec!["REQ-MANUAL-1"]);
+        assert_eq!(run.requirement_matrix.len(), 1);
+        assert_eq!(run.requirement_matrix[0]["id"], "REQ-MANUAL-1");
+        assert_eq!(run.requirement_matrix[0]["heading"], "Manual task");
+        assert_eq!(run.requirement_matrix[0]["status"], "planned");
+    }
+
+    #[test]
+    fn successful_task_adds_deduplicated_optional_backlog_suggestions() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        run.tasks[0].title = "Existing card".to_string();
+        let status_before = run.status.clone();
+        let created = append_suggested_backlog_tasks_from_result(
+            &mut run,
+            "task-1",
+            &json!({
+                "suggestedBacklogTasks": [
+                    {"title": "Add metrics", "details": "Expose queue metrics."},
+                    {"title": "  add   metrics  ", "details": "Duplicate."},
+                    {"title": "Existing card", "details": "Already exists."}
+                ]
+            }),
+        );
+
+        assert_eq!(created.len(), 1);
+        let task = run.tasks.iter().find(|task| task.id == created[0]).unwrap();
+        assert_eq!(task.status, "backlog");
+        assert_eq!(task.task_origin, "ai_suggested_backlog");
+        assert!(!task.manual_task);
+        assert!(!task.prompt_task);
+        assert!(task.references[0].contains("Suggested backlog task from task-1"));
+        assert_eq!(run.status, status_before);
+    }
+
+    #[test]
+    fn derived_tasks_use_only_requirements_named_by_the_result() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        run.tasks[0].requirement_ids = vec![
+            "REQ-1".to_string(),
+            "REQ-2".to_string(),
+            "REQ-3".to_string(),
+        ];
+        let source = run.tasks[0].clone();
+
+        assert_eq!(
+            resolve_derived_requirement_ids(
+                &source,
+                &json!({
+                    "requirementUpdates": [{"id": "REQ-2"}, {"id": "OTHER"}],
+                    "coveredRequirements": ["REQ-1"]
+                }),
+            ),
+            vec!["REQ-2"]
+        );
+        assert_eq!(
+            resolve_derived_requirement_ids(
+                &source,
+                &json!({"coveredRequirements": ["REQ-3", "OTHER"]}),
+            ),
+            vec!["REQ-3"]
+        );
+        assert_eq!(
+            resolve_derived_requirement_ids(&source, &json!({})),
+            source.requirement_ids
+        );
     }
 
     #[test]
@@ -9851,6 +12151,327 @@ mod tests {
 
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert!(error.body.error.contains("Task status must be one of"));
+    }
+
+    #[test]
+    fn run_profiles_normalize_to_the_three_supported_journeys() {
+        assert_eq!(normalize_run_profile(Some("minimal")), "minimal");
+        assert_eq!(normalize_run_profile(Some("strict")), "minimal");
+        assert_eq!(normalize_run_profile(Some("complete")), "complete_app");
+        assert_eq!(
+            normalize_run_profile(Some("product-ready")),
+            "product_ready"
+        );
+        assert_eq!(normalize_run_profile(Some("quality")), "product_ready");
+    }
+
+    #[test]
+    fn prompt_generation_placeholder_preserves_retry_settings() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project",
+            "runProfile": "minimal"
+        }));
+
+        let task = backlog_generation_placeholder(
+            &mut run,
+            "Add export filters",
+            "gpt-5.6-sol",
+            "product_ready",
+        );
+
+        assert_eq!(task.status, "backlog_generating");
+        assert!(task.backlog_generation_task);
+        assert!(
+            task.references
+                .contains(&"Breakdown model: gpt-5.6-sol".to_string())
+        );
+        assert!(
+            task.references
+                .contains(&"Breakdown profile: product_ready".to_string())
+        );
+    }
+
+    #[test]
+    fn six_stage_model_routes_select_the_expected_override() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project",
+            "model": "fallback",
+            "taskModelOverrides": {
+                "breakdown": "breakdown-model",
+                "implementation": "implementation-model",
+                "qa": "qa-model",
+                "qa_fix": "qa-fix-model",
+                "agents": "agents-model",
+                "final_qa": "final-qa-model"
+            }
+        }));
+        assert_eq!(
+            effective_model_for_phase(&run, "planning breakdown"),
+            "breakdown-model"
+        );
+
+        let mut implementation = BoardTask::draft(
+            &mut run,
+            "Implementation".to_string(),
+            "Build it".to_string(),
+        );
+        implementation.status = "pending".to_string();
+        let mut qa = implementation.clone();
+        qa.qa_task = true;
+        let mut qa_fix = implementation.clone();
+        qa_fix.qa_fix_task = true;
+        let mut agents = implementation.clone();
+        agents.agents_knowledge_task = true;
+        let mut final_qa = implementation.clone();
+        final_qa.final_qa_task = true;
+
+        assert_eq!(
+            effective_model_for_task(&run, &implementation),
+            "implementation-model"
+        );
+        assert_eq!(effective_model_for_task(&run, &qa), "qa-model");
+        assert_eq!(effective_model_for_task(&run, &qa_fix), "qa-fix-model");
+        assert_eq!(effective_model_for_task(&run, &agents), "agents-model");
+        assert_eq!(effective_model_for_task(&run, &final_qa), "final-qa-model");
+    }
+
+    #[test]
+    fn pause_during_provider_turn_keeps_single_runner_owner() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project"
+        }));
+        run.status = "running".to_string();
+        run.active = true;
+        run.loop_started = true;
+        run.current_task_id = Some("task-1".to_string());
+        run.current_task_status = "in_progress".to_string();
+        run.current_provider_session_id = Some("provider-session".to_string());
+
+        request_board_pause(&mut run, Some("user request".to_string()));
+
+        assert_eq!(run.status, "pausing");
+        assert!(run.active);
+        assert!(run.loop_started);
+        assert!(run.pause_requested);
+        assert!(!run.auto_run_enabled);
+        assert!(!board_run_should_abort_provider(&run));
+    }
+
+    #[test]
+    fn pause_before_provider_turn_returns_current_card_to_todo() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project"
+        }));
+        run.status = "running".to_string();
+        run.active = true;
+        run.loop_started = true;
+        run.current_task_id = Some("task-1".to_string());
+        run.current_task_status = "in_progress".to_string();
+        run.tasks[0].status = "in_progress".to_string();
+        run.tasks[0].started_at = Some(Utc::now());
+
+        request_board_pause(&mut run, Some("user request".to_string()));
+
+        assert_eq!(run.status, "paused");
+        assert!(!run.active);
+        assert!(!run.loop_started);
+        assert!(!run.pause_requested);
+        assert_eq!(run.tasks[0].status, "pending");
+        assert_eq!(run.tasks[0].started_at, None);
+        assert_eq!(run.current_task_id, None);
+        assert_eq!(run.control_revision, 1);
+    }
+
+    #[test]
+    fn stale_runner_save_preserves_newer_pause_control_state() {
+        let mut stale = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project"
+        }));
+        stale.status = "running".to_string();
+        stale.active = true;
+        stale.loop_started = true;
+        stale.current_task_id = Some("task-1".to_string());
+        stale.current_task_status = "in_progress".to_string();
+        stale.tasks[0].status = "in_progress".to_string();
+
+        let mut paused = stale.clone();
+        request_board_pause(&mut paused, Some("user request".to_string()));
+
+        preserve_newer_control_state(&mut stale, &paused);
+
+        assert_eq!(stale.status, "paused");
+        assert!(!stale.active);
+        assert!(!stale.loop_started);
+        assert_eq!(stale.tasks[0].status, "pending");
+        assert_eq!(stale.control_revision, paused.control_revision);
+        assert_eq!(stale.pause_reason.as_deref(), Some("user request"));
+    }
+
+    #[test]
+    fn abort_resets_in_flight_cards_and_control_pointers() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project"
+        }));
+        run.status = "running".to_string();
+        run.active = true;
+        run.loop_started = true;
+        run.current_task_id = Some("task-1".to_string());
+        run.current_task_title = run.tasks[0].title.clone();
+        run.current_task_status = "in_progress".to_string();
+        run.current_provider_session_id = Some("provider-session".to_string());
+        run.provider_call_started_at = Some(Utc::now());
+        run.provider_call_label = Some("task execution".to_string());
+        run.tasks[0].status = "in_progress".to_string();
+
+        reset_in_flight_board_tasks(&mut run, "aborted");
+        run.status = "cancelled".to_string();
+        run.active = false;
+        run.loop_started = false;
+        run.current_task_id = None;
+        run.current_task_title.clear();
+        run.current_task_status.clear();
+        run.current_provider_session_id = None;
+        run.provider_call_started_at = None;
+        run.provider_call_label = None;
+
+        assert_eq!(run.tasks[0].status, "pending");
+        assert_eq!(run.current_task_id, None);
+        assert_eq!(run.current_provider_session_id, None);
+        assert_eq!(run.provider_call_started_at, None);
+    }
+
+    #[test]
+    fn immediate_resume_reuses_existing_runner_owner() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project"
+        }));
+        run.status = "running".to_string();
+        run.active = true;
+        run.loop_started = true;
+        run.current_task_id = Some("task-1".to_string());
+        run.current_provider_session_id = Some("provider-session".to_string());
+        request_board_pause(&mut run, Some("user request".to_string()));
+
+        prepare_board_resume(&mut run);
+
+        assert_eq!(run.status, "running");
+        assert!(run.active);
+        assert!(run.loop_started);
+        assert!(!run.pause_requested);
+        assert!(run.auto_run_enabled);
+    }
+
+    #[test]
+    fn idle_pause_transitions_directly_to_paused() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project"
+        }));
+
+        request_board_pause(&mut run, Some("user request".to_string()));
+
+        assert_eq!(run.status, "paused");
+        assert!(!run.active);
+        assert!(!run.loop_started);
+        assert!(!run.pause_requested);
+        assert!(!run.auto_run_enabled);
+    }
+
+    #[test]
+    fn only_cancellation_interrupts_active_provider_turn() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project"
+        }));
+        run.status = "pausing".to_string();
+        run.pause_requested = true;
+        assert!(!board_run_should_abort_provider(&run));
+
+        run.status = "cancelled".to_string();
+        assert!(board_run_should_abort_provider(&run));
+    }
+
+    #[test]
+    fn cursor_cli_arguments_match_new_and_resume_journeys() {
+        assert_eq!(
+            cursor_cli_args("Implement it", "gpt-5.3-codex", None, false),
+            vec![
+                "-p",
+                "Implement it",
+                "--model",
+                "gpt-5.3-codex",
+                "--output-format",
+                "stream-json",
+                "-f",
+            ]
+        );
+        assert_eq!(
+            cursor_cli_args(
+                "Continue",
+                "ignored-on-resume",
+                Some("cursor-session"),
+                true,
+            ),
+            vec![
+                "--resume=cursor-session",
+                "-p",
+                "Continue",
+                "--output-format",
+                "stream-json",
+                "-f",
+                "--trust",
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_ndjson_parser_extracts_session_result_and_usage() {
+        let result = parse_cursor_cli_output(
+            CursorProcessOutput {
+                stdout: [
+                    r#"{"type":"system","subtype":"init","session_id":"cursor-1"}"#,
+                    r#"{"type":"assistant","message":{"content":[{"text":"partial"}]}}"#,
+                    r#"{"type":"result","subtype":"success","result":"final answer","usage":{"input_tokens":12,"cached_input_tokens":3,"output_tokens":8}}"#,
+                ]
+                .join("\n"),
+                stderr: String::new(),
+                exit_code: 0,
+                interrupted: false,
+            },
+            None,
+        );
+
+        assert_eq!(result.session_id, "cursor-1");
+        assert_eq!(result.assistant_text, "final answer");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            result.token_usage,
+            Some(json!({
+                "inputTokens": 12,
+                "cachedInputTokens": 3,
+                "outputTokens": 8,
+                "totalTokens": 20,
+            }))
+        );
+    }
+
+    #[test]
+    fn cursor_workspace_trust_output_requests_one_retry() {
+        assert!(cursor_workspace_trust_required(
+            "Workspace trust required. Pass --trust, --yolo, or -f",
+            ""
+        ));
+        assert!(!cursor_workspace_trust_required(
+            "implementation completed",
+            ""
+        ));
     }
 
     #[test]
@@ -9908,6 +12529,66 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, vec!["task-4", "task-5", "task-6"]);
+    }
+
+    #[test]
+    fn task_dependencies_ignore_self_and_missing_cards() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        let mut dependent =
+            BoardTask::draft(&mut run, "Dependent".to_string(), "Dependent".to_string());
+        dependent.depends_on = vec![
+            dependent.id.clone(),
+            "missing-task".to_string(),
+            "task-1".to_string(),
+        ];
+        run.tasks.push(dependent.clone());
+
+        assert_eq!(unmet_task_dependencies(&run, &dependent), vec!["task-1"]);
+
+        run.tasks[0].status = "completed".to_string();
+        assert!(unmet_task_dependencies(&run, &dependent).is_empty());
+    }
+
+    #[test]
+    fn generated_placeholder_card_drops_self_dependency() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        let placeholder_id = "task-2".to_string();
+        let mut task = prompt_task_from_draft(
+            &mut run,
+            json!({
+                "title": "Generated task",
+                "details": "Generated task details",
+                "dependsOn": [placeholder_id],
+            }),
+            "Generate a task",
+        );
+        task.id = placeholder_id;
+        let mut generated = vec![task];
+        sanitize_generated_task_dependencies(&run, &mut generated, "task-2");
+
+        assert!(generated[0].depends_on.is_empty());
+    }
+
+    #[test]
+    fn prompt_draft_context_excludes_generation_placeholders() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project"
+        }));
+        let placeholder =
+            backlog_generation_placeholder(&mut run, "Generate a task", "gpt-5.6-sol", "minimal");
+        run.tasks.push(placeholder.clone());
+
+        let prompt = build_prompt_task_draft_prompt(&run, "Generate a task", "minimal");
+
+        assert!(!prompt.contains(&format!("{} [", placeholder.id)));
+        assert!(prompt.contains("task-1 [pending] Initial task"));
     }
 
     #[test]
@@ -9980,6 +12661,50 @@ mod tests {
                 fast: Some(true),
             }
         );
+    }
+
+    #[test]
+    fn prompt_task_generation_records_model_fast_mode_and_usage() {
+        let mut run = board_run(json!({
+            "command": "Initial task",
+            "projectPath": "/tmp/project",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "modelStrategy": {
+                "reasoningEffort": "low",
+                "serviceTier": "fast"
+            }
+        }));
+        let attempt = PromptTaskDraftAttempt {
+            result: Ok((vec![json!({ "title": "Generated task" })], None)),
+            provider_prompt: "Generate one focused task".to_string(),
+            provider_output: r#"{"tasks":[{"title":"Generated task"}]}"#.to_string(),
+            session_id: Some("session-1".to_string()),
+            token_usage: Some(json!({
+                "inputTokens": 12,
+                "cachedInputTokens": 2,
+                "outputTokens": 8,
+                "totalTokens": 20,
+            })),
+            effective_model: "gpt-5.6-sol".to_string(),
+            started_at: Utc::now(),
+        };
+
+        record_prompt_task_generation_attempt(
+            &mut run,
+            "Kanban backlog prompt generation",
+            &attempt,
+        );
+
+        let telemetry = run.prompt_telemetry.last().unwrap();
+        assert_eq!(telemetry["effectiveModel"], "gpt-5.6-sol");
+        assert_eq!(telemetry["reasoningEffort"], "low");
+        assert_eq!(telemetry["fast"], true);
+        assert_eq!(telemetry["outcome"], "completed");
+        assert_eq!(telemetry["actualTotalTokens"], 20);
+        assert_eq!(run.provider_usage["totalTokens"], 20);
+        assert_eq!(run.provider_usage["invocationsWithUsage"], 1);
+        assert_eq!(run.last_effective_model.as_deref(), Some("gpt-5.6-sol"));
     }
 
     #[test]
@@ -10120,5 +12845,60 @@ mod tests {
         assert!(provider_result_requires_fallback(&Err(bad_request(
             "offline"
         ))));
+    }
+
+    #[test]
+    fn legacy_tcd_qa_prompt_maps_to_exact_board_task() {
+        let mut run = board_run(json!({
+            "command": "Implement all written in docs folder",
+            "projectPath": "/tmp/TCD-Meida-new"
+        }));
+        run.id = "28c3b53f-e616-43d9-b4dc-8353fdac7249".to_string();
+        run.tasks = ["feature-repair-1", "feature-repair-1-2"]
+            .into_iter()
+            .map(|id| {
+                let mut task =
+                    BoardTask::draft(&mut run, "User request".to_string(), id.to_string());
+                task.id = id.to_string();
+                task
+            })
+            .collect();
+        let prompt = r#"You are the QA phase of a TDD-first io-workbench Kanban runner.
+
+Project: TCD-Meida-new
+Board run id: 28c3b53f-e616-43d9-b4dc-8353fdac7249
+Task 2: feature-repair-1-2
+Title: User request"#;
+
+        assert!(legacy_board_prompt_signature(prompt));
+        assert_eq!(
+            legacy_board_task_id(&run, prompt).as_deref(),
+            Some("feature-repair-1-2")
+        );
+    }
+
+    #[test]
+    fn legacy_internal_prompt_requires_nearby_board_telemetry() {
+        let mut run = board_run(json!({
+            "command": "Implement all written in docs folder",
+            "projectPath": "/tmp/TCD-Meida-new"
+        }));
+        let started_at = Utc::now();
+        run.prompt_telemetry = vec![json!({
+            "label": "codebase recon",
+            "startedAt": started_at,
+        })];
+        let prompt = "You are performing read-only codebase reconnaissance before Kanban planning.";
+
+        assert!(legacy_board_prompt_signature(prompt));
+        assert!(legacy_prompt_matches_run_telemetry(
+            &run,
+            started_at + chrono::Duration::seconds(20)
+        ));
+        assert!(!legacy_prompt_matches_run_telemetry(
+            &run,
+            started_at + chrono::Duration::minutes(2)
+        ));
+        assert_eq!(legacy_board_task_id(&run, prompt), None);
     }
 }

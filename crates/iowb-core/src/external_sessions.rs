@@ -1,23 +1,56 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufRead, BufReader},
+    hash::{Hash, Hasher},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Utc};
 use iowb_protocol::{ChatMessage, MessageRole, Provider, SessionSummary, SessionTitleSource};
+use iowb_storage::{Storage, StoredExternalHistorySource, StoredExternalSessionRecord};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 const MAX_EXTERNAL_TOOL_CONTENT_BYTES: usize = 128 * 1024;
 const EXTERNAL_TOOL_CONTENT_TAIL_BYTES: usize = 32 * 1024;
+pub(crate) const EXTERNAL_HISTORY_PARSER_VERSION: u32 = 1;
+pub(crate) const EXTERNAL_MESSAGE_PARSER_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExternalSessionRecord {
     pub summary: SessionSummary,
     pub file_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalFileFingerprint {
+    pub file_identity: Option<String>,
+    pub file_size: u64,
+    pub modified_nanos: Option<i64>,
+}
+
+pub(crate) fn external_file_fingerprint(path: &Path) -> Option<ExternalFileFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok());
+    #[cfg(unix)]
+    let file_identity = Some(format!("{}:{}", metadata.dev(), metadata.ino()));
+    #[cfg(not(unix))]
+    let file_identity = None;
+    Some(ExternalFileFingerprint {
+        file_identity,
+        file_size: metadata.len(),
+        modified_nanos,
+    })
 }
 
 #[derive(Default)]
@@ -31,6 +64,23 @@ struct SessionBuilder {
     model: Option<String>,
 }
 
+struct CodexSessionMeta {
+    id: String,
+    forked_from_id: Option<String>,
+    project_path: String,
+    model: Option<String>,
+    subagent: bool,
+}
+
+struct CountedCodexMessage {
+    role: MessageRole,
+    fingerprint: u64,
+    trimmed_len: usize,
+    native_final: bool,
+    io_workbench_live_transcript: bool,
+}
+
+#[cfg(test)]
 pub(crate) fn discover_external_sessions(home: &Path) -> Vec<ExternalSessionRecord> {
     let mut records = Vec::new();
     discover_claude(home, &mut records);
@@ -52,11 +102,279 @@ pub(crate) fn discover_external_sessions(home: &Path) -> Vec<ExternalSessionReco
     records
 }
 
+/// Discover provider histories through a durable metadata index. Unchanged
+/// sources are served directly from SQLite; append-only Claude JSONL files are
+/// resumed from their last complete byte offset.
+pub(crate) fn sync_external_sessions(
+    home: &Path,
+    storage: &Storage,
+) -> iowb_storage::Result<Vec<ExternalSessionRecord>> {
+    let mut records = Vec::new();
+    sync_claude_sources(home, storage, &mut records)?;
+    sync_codex_sources(home, storage, &mut records)?;
+    sync_gemini_sources(home, storage, &mut records)?;
+    Ok(unique_external_records(records))
+}
+
+fn unique_external_records(records: Vec<ExternalSessionRecord>) -> Vec<ExternalSessionRecord> {
+    let mut unique = HashMap::<(Provider, String), ExternalSessionRecord>::new();
+    for record in records {
+        let key = (record.summary.provider, record.summary.id.clone());
+        match unique.get(&key) {
+            Some(existing) if existing.summary.last_activity >= record.summary.last_activity => {}
+            _ => {
+                unique.insert(key, record);
+            }
+        }
+    }
+    let mut records = unique.into_values().collect::<Vec<_>>();
+    records.sort_by_key(|record| std::cmp::Reverse(record.summary.last_activity));
+    records
+}
+
+fn stored_records(records: &[ExternalSessionRecord]) -> Vec<StoredExternalSessionRecord> {
+    records
+        .iter()
+        .map(|record| StoredExternalSessionRecord {
+            summary: record.summary.clone(),
+            file_path: record.file_path.display().to_string(),
+        })
+        .collect()
+}
+
+fn restored_records(source: &StoredExternalHistorySource) -> Vec<ExternalSessionRecord> {
+    source
+        .records
+        .iter()
+        .map(|record| ExternalSessionRecord {
+            summary: record.summary.clone(),
+            file_path: PathBuf::from(&record.file_path),
+        })
+        .collect()
+}
+
+fn source_matches(
+    source: &StoredExternalHistorySource,
+    fingerprint: &ExternalFileFingerprint,
+) -> bool {
+    source.parser_version == EXTERNAL_HISTORY_PARSER_VERSION
+        && source.file_identity == fingerprint.file_identity
+        && source.file_size == fingerprint.file_size
+        && source.modified_nanos == fingerprint.modified_nanos
+}
+
+fn persist_source(
+    storage: &Storage,
+    provider: Provider,
+    source_path: &Path,
+    fingerprint: &ExternalFileFingerprint,
+    scan_offset: u64,
+    records: &[ExternalSessionRecord],
+) -> iowb_storage::Result<()> {
+    storage.upsert_external_history_source(&StoredExternalHistorySource {
+        provider,
+        source_path: source_path.display().to_string(),
+        file_identity: fingerprint.file_identity.clone(),
+        file_size: fingerprint.file_size,
+        modified_nanos: fingerprint.modified_nanos,
+        scan_offset,
+        parser_version: EXTERNAL_HISTORY_PARSER_VERSION,
+        records: stored_records(records),
+    })
+}
+
+fn sync_claude_sources(
+    home: &Path,
+    storage: &Storage,
+    records: &mut Vec<ExternalSessionRecord>,
+) -> iowb_storage::Result<()> {
+    let root = home.join(".claude/projects");
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let paths = files_below(&root, 2, "jsonl")
+        .into_iter()
+        .filter(|path| {
+            !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("agent-"))
+        })
+        .collect::<Vec<_>>();
+    let retained = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    for path in paths {
+        let Some(fingerprint) = external_file_fingerprint(&path) else {
+            continue;
+        };
+        let source_path = path.display().to_string();
+        let stored = storage.external_history_source(Provider::Claude, &source_path)?;
+        if let Some(stored) = stored
+            .as_ref()
+            .filter(|source| source_matches(source, &fingerprint))
+        {
+            records.extend(restored_records(stored));
+            continue;
+        }
+
+        let (discovered, scan_offset) = if let Some(stored) = stored.filter(|source| {
+            source.parser_version == EXTERNAL_HISTORY_PARSER_VERSION
+                && source.file_identity == fingerprint.file_identity
+                && source.file_size <= fingerprint.file_size
+                && source.scan_offset <= source.file_size
+                && !source.records.is_empty()
+        }) {
+            let mut builders = stored
+                .records
+                .iter()
+                .map(|record| {
+                    let summary = &record.summary;
+                    (
+                        summary.id.clone(),
+                        SessionBuilder {
+                            id: summary.id.clone(),
+                            project_path: summary.project_path.clone(),
+                            title: Some(summary.title.clone()),
+                            first_user: None,
+                            message_count: summary.message_count,
+                            last_activity: Some(summary.last_activity),
+                            model: summary.model.clone(),
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let offset = for_each_json_line_from(&path, stored.scan_offset, |entry| {
+                update_claude_builder(&mut builders, entry)
+            });
+            (
+                finish_claude_builders(builders, &path, modified_time(&path)),
+                offset,
+            )
+        } else {
+            let mut builders = HashMap::new();
+            let offset = for_each_json_line_from(&path, 0, |entry| {
+                update_claude_builder(&mut builders, entry)
+            });
+            (
+                finish_claude_builders(builders, &path, modified_time(&path)),
+                offset,
+            )
+        };
+        persist_source(
+            storage,
+            Provider::Claude,
+            &path,
+            &fingerprint,
+            scan_offset,
+            &discovered,
+        )?;
+        records.extend(discovered);
+    }
+    storage.prune_external_history_sources(Provider::Claude, &retained)
+}
+
+fn sync_codex_sources(
+    home: &Path,
+    storage: &Storage,
+    records: &mut Vec<ExternalSessionRecord>,
+) -> iowb_storage::Result<()> {
+    let codex_dir = home.join(".codex");
+    let (source_path, fingerprint) =
+        if let Some(index) = newest_matching_file(&codex_dir, "state_", "sqlite") {
+            let fingerprint = codex_sqlite_fingerprint(&index);
+            (index, fingerprint)
+        } else {
+            let root = codex_dir.join("sessions");
+            (root.clone(), external_tree_fingerprint(&root, 8, "jsonl"))
+        };
+    let retained = vec![source_path.display().to_string()];
+    if let Some(stored) = storage
+        .external_history_source(Provider::Codex, &retained[0])?
+        .filter(|source| source_matches(source, &fingerprint))
+    {
+        records.extend(restored_records(&stored));
+        return storage.prune_external_history_sources(Provider::Codex, &retained);
+    }
+
+    let mut discovered = Vec::new();
+    discover_codex(home, &mut discovered);
+    persist_source(
+        storage,
+        Provider::Codex,
+        &source_path,
+        &fingerprint,
+        fingerprint.file_size,
+        &discovered,
+    )?;
+    records.extend(discovered);
+    storage.prune_external_history_sources(Provider::Codex, &retained)
+}
+
+fn codex_sqlite_fingerprint(database_path: &Path) -> ExternalFileFingerprint {
+    // SQLite may keep fresh thread metadata exclusively in WAL for a long
+    // time, so the durable cursor must include both files.
+    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
+    let mut hasher = DefaultHasher::new();
+    let mut total_size = 0u64;
+    let mut modified_nanos = None;
+    for path in [database_path, wal_path.as_path()] {
+        let Some(fingerprint) = external_file_fingerprint(path) else {
+            continue;
+        };
+        path.hash(&mut hasher);
+        fingerprint.file_identity.hash(&mut hasher);
+        fingerprint.file_size.hash(&mut hasher);
+        fingerprint.modified_nanos.hash(&mut hasher);
+        total_size = total_size.saturating_add(fingerprint.file_size);
+        modified_nanos = modified_nanos.max(fingerprint.modified_nanos);
+    }
+    ExternalFileFingerprint {
+        file_identity: Some(format!("sqlite:{:016x}", hasher.finish())),
+        file_size: total_size,
+        modified_nanos,
+    }
+}
+
+fn external_tree_fingerprint(
+    root: &Path,
+    max_depth: usize,
+    extension: &str,
+) -> ExternalFileFingerprint {
+    let mut hasher = DefaultHasher::new();
+    let mut total_size = 0u64;
+    let mut modified_nanos = None;
+    for path in files_below(root, max_depth, extension) {
+        let Some(fingerprint) = external_file_fingerprint(&path) else {
+            continue;
+        };
+        path.hash(&mut hasher);
+        fingerprint.file_identity.hash(&mut hasher);
+        fingerprint.file_size.hash(&mut hasher);
+        fingerprint.modified_nanos.hash(&mut hasher);
+        total_size = total_size.saturating_add(fingerprint.file_size);
+        modified_nanos = modified_nanos.max(fingerprint.modified_nanos);
+    }
+    ExternalFileFingerprint {
+        file_identity: Some(format!("tree:{:016x}", hasher.finish())),
+        file_size: total_size,
+        modified_nanos,
+    }
+}
+
 pub(crate) fn load_external_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
     match record.summary.provider {
         Provider::Claude => load_claude_messages(record),
         Provider::Codex => load_codex_messages(record),
         Provider::Gemini => load_gemini_messages(record),
+    }
+}
+
+pub(crate) fn count_external_messages(record: &ExternalSessionRecord) -> usize {
+    match record.summary.provider {
+        Provider::Codex => count_codex_messages(record),
+        Provider::Claude | Provider::Gemini => record.summary.message_count,
     }
 }
 
@@ -69,6 +387,7 @@ pub(crate) fn same_project_path(left: &str, right: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn discover_claude(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
     let root = home.join(".claude/projects");
     for path in files_below(&root, 2, "jsonl") {
@@ -80,83 +399,97 @@ fn discover_claude(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
             continue;
         }
 
-        let fallback_time = modified_time(&path);
-        let mut sessions = HashMap::<String, SessionBuilder>::new();
-        for_each_json_line(&path, |entry| {
-            if entry
-                .get("isSidechain")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                return;
-            }
-            let Some(session_id) = entry
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            else {
-                return;
-            };
-            let builder =
-                sessions
-                    .entry(session_id.to_string())
-                    .or_insert_with(|| SessionBuilder {
-                        id: session_id.to_string(),
-                        ..Default::default()
-                    });
-            if builder.project_path.is_empty() {
-                builder.project_path = entry
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-            }
-            if entry.get("type").and_then(Value::as_str) == Some("summary") {
-                if let Some(summary) = entry.get("summary").and_then(Value::as_str) {
-                    builder.title = Some(summary.to_string());
-                }
-            }
-            let timestamp = value_timestamp(entry.get("timestamp"));
-            builder.last_activity = latest(builder.last_activity, timestamp);
-
-            let Some(role) = entry
-                .get("message")
-                .and_then(|message| message.get("role"))
-                .and_then(Value::as_str)
-            else {
-                return;
-            };
-            let content = extract_text(
-                entry
-                    .get("message")
-                    .and_then(|message| message.get("content")),
-            );
-            if content.is_empty() || (role == "user" && !is_visible_user_text(&content)) {
-                return;
-            }
-            if matches!(role, "user" | "assistant") {
-                builder.message_count += 1;
-            }
-            if role == "user" && builder.first_user.is_none() {
-                builder.first_user = Some(content);
-            }
-            if role == "assistant" && builder.model.is_none() {
-                builder.model = entry
-                    .get("message")
-                    .and_then(|message| message.get("model"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-            }
-        });
-
-        for builder in sessions.into_values() {
-            if let Some(record) =
-                finish_builder(builder, Provider::Claude, path.clone(), fallback_time)
-            {
-                records.push(record);
-            }
-        }
+        records.extend(discover_claude_file(&path));
     }
+}
+
+#[cfg(test)]
+fn discover_claude_file(path: &Path) -> Vec<ExternalSessionRecord> {
+    let fallback_time = modified_time(path);
+    let mut sessions = HashMap::<String, SessionBuilder>::new();
+    for_each_json_line(path, |entry| update_claude_builder(&mut sessions, entry));
+    finish_claude_builders(sessions, path, fallback_time)
+}
+
+fn update_claude_builder(sessions: &mut HashMap<String, SessionBuilder>, entry: &Value) {
+    if entry
+        .get("isSidechain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Some(session_id) = entry
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let builder = sessions
+        .entry(session_id.to_string())
+        .or_insert_with(|| SessionBuilder {
+            id: session_id.to_string(),
+            ..Default::default()
+        });
+    if builder.project_path.is_empty() {
+        builder.project_path = entry
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
+    if entry.get("type").and_then(Value::as_str) == Some("summary")
+        && let Some(summary) = entry.get("summary").and_then(Value::as_str)
+    {
+        builder.title = Some(summary.to_string());
+    }
+    builder.last_activity = latest(
+        builder.last_activity,
+        value_timestamp(entry.get("timestamp")),
+    );
+
+    let Some(role) = entry
+        .get("message")
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let content = extract_text(
+        entry
+            .get("message")
+            .and_then(|message| message.get("content")),
+    );
+    if content.is_empty() || (role == "user" && !is_visible_user_text(&content)) {
+        return;
+    }
+    if matches!(role, "user" | "assistant") {
+        builder.message_count += 1;
+    }
+    if role == "user" && builder.first_user.is_none() {
+        builder.first_user = Some(content);
+    }
+    if role == "assistant" && builder.model.is_none() {
+        builder.model = entry
+            .get("message")
+            .and_then(|message| message.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+}
+
+fn finish_claude_builders(
+    sessions: HashMap<String, SessionBuilder>,
+    path: &Path,
+    fallback_time: Option<DateTime<Utc>>,
+) -> Vec<ExternalSessionRecord> {
+    sessions
+        .into_values()
+        .filter_map(|builder| {
+            finish_builder(builder, Provider::Claude, path.to_path_buf(), fallback_time)
+        })
+        .collect()
 }
 
 fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
@@ -164,32 +497,28 @@ fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
     if discover_codex_index(home, records) {
         return;
     }
+    let mut candidates = Vec::new();
     for path in files_below(&root, 8, "jsonl") {
         let fallback_time = modified_time(&path);
         let mut builder = SessionBuilder::default();
         let mut last_visible: Option<(MessageRole, String)> = None;
         let mut subagent = false;
+        let mut forked_from_id = None;
+        let mut found_session_meta = false;
         for_each_json_line(&path, |entry| {
             let timestamp = value_timestamp(entry.get("timestamp"));
             builder.last_activity = latest(builder.last_activity, timestamp);
             match entry.get("type").and_then(Value::as_str) {
                 Some("session_meta") => {
                     let payload = entry.get("payload").unwrap_or(&Value::Null);
-                    subagent |= is_codex_subagent_session_meta(payload);
-                    builder.id = payload
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    builder.project_path = payload
-                        .get("cwd")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    builder.model = payload
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
+                    if !found_session_meta && let Some(meta) = codex_session_meta(payload) {
+                        builder.id = meta.id;
+                        builder.project_path = meta.project_path;
+                        builder.model = meta.model;
+                        subagent = meta.subagent;
+                        forked_from_id = meta.forked_from_id;
+                        found_session_meta = true;
+                    }
                 }
                 Some("event_msg") => {
                     let payload = entry.get("payload").unwrap_or(&Value::Null);
@@ -248,10 +577,11 @@ fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
                 .to_string();
         }
         if let Some(mut record) = finish_builder(builder, Provider::Codex, path, fallback_time) {
-            record.summary.message_count = load_codex_messages(&record).len();
-            records.push(record);
+            record.summary.message_count = count_external_messages(&record);
+            candidates.push((record, forked_from_id));
         }
     }
+    records.extend(remove_resumed_codex_ancestors(candidates));
 }
 
 fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -> bool {
@@ -267,11 +597,22 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
     };
     let Ok(mut statement) = connection.prepare(
         r#"
-        SELECT id, rollout_path, cwd, title, first_user_message,
-               updated_at_ms, updated_at, model, thread_source
-        FROM threads
-        WHERE archived = 0 AND first_user_message <> ''
-        ORDER BY updated_at_ms DESC
+        SELECT t.id, t.rollout_path, t.cwd, t.title, t.first_user_message,
+               t.updated_at_ms, t.updated_at, t.model, t.thread_source,
+               COUNT(*) OVER (
+                   PARTITION BY t.cwd, t.first_user_message
+               ) AS possible_resume_count
+        FROM threads AS t
+        WHERE t.archived = 0
+          AND t.first_user_message <> ''
+          AND LOWER(COALESCE(t.thread_source, '')) <> 'subagent'
+          AND INSTR(LOWER(COALESCE(t.source, '')), '"subagent"') = 0
+          AND NOT EXISTS (
+              SELECT 1
+              FROM thread_spawn_edges AS edge
+              WHERE edge.child_thread_id = t.id
+          )
+        ORDER BY t.updated_at_ms DESC
         "#,
     ) else {
         return false;
@@ -287,12 +628,13 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
             row.get::<_, i64>(6)?,
             row.get::<_, Option<String>>(7)?,
             row.get::<_, Option<String>>(8)?,
+            row.get::<_, i64>(9)?,
         ))
     }) else {
         return false;
     };
 
-    let mut found = false;
+    let mut candidates = Vec::new();
     for row in rows.flatten() {
         let (
             id,
@@ -304,6 +646,7 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
             updated,
             model,
             thread_source,
+            possible_resume_count,
         ) = row;
         if is_codex_subagent_thread_source(thread_source.as_deref()) {
             continue;
@@ -315,6 +658,13 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
         if !file_path.is_file() {
             continue;
         }
+        let forked_from_id = if possible_resume_count > 1 {
+            first_codex_session_meta(&file_path)
+                .filter(|meta| meta.id == id)
+                .and_then(|meta| meta.forked_from_id)
+        } else {
+            None
+        };
         let last_activity = updated_ms
             .and_then(DateTime::from_timestamp_millis)
             .or_else(|| DateTime::from_timestamp(updated, 0))
@@ -325,29 +675,99 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
             .find(|value| is_visible_user_text(value))
             .map(|value| summarize(&value))
             .unwrap_or_else(|| "Codex session".to_string());
-        records.push(ExternalSessionRecord {
-            summary: SessionSummary {
-                id,
-                provider: Provider::Codex,
-                external: true,
-                project_path,
-                title: visible_title,
-                // The Codex index does not store a message count. Keep discovery
-                // metadata-only; the messages endpoint loads the selected rollout
-                // lazily and returns its authoritative total.
-                message_count: 1,
-                last_activity,
-                active: false,
-                model,
-                last_message_at: Some(last_activity),
-                title_source: Some(SessionTitleSource::External),
-                ..Default::default()
+        candidates.push((
+            ExternalSessionRecord {
+                summary: SessionSummary {
+                    id,
+                    provider: Provider::Codex,
+                    external: true,
+                    project_path,
+                    title: visible_title,
+                    // The Codex index does not store a message count. Keep discovery
+                    // metadata-only; the messages endpoint loads the selected rollout
+                    // lazily and returns its authoritative total.
+                    message_count: 1,
+                    last_activity,
+                    active: false,
+                    model,
+                    last_message_at: Some(last_activity),
+                    title_source: Some(SessionTitleSource::External),
+                    ..Default::default()
+                },
+                file_path,
             },
-            file_path,
-        });
-        found = true;
+            forked_from_id,
+        ));
     }
+    let discovered = remove_resumed_codex_ancestors(candidates);
+    let found = !discovered.is_empty();
+    records.extend(discovered);
     found
+}
+
+fn codex_session_meta(payload: &Value) -> Option<CodexSessionMeta> {
+    let id = payload
+        .get("id")
+        .or_else(|| payload.get("session_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    let forked_from_id = payload
+        .get("forked_from_id")
+        .or_else(|| payload.get("forkedFromId"))
+        .and_then(Value::as_str)
+        .filter(|parent_id| !parent_id.is_empty() && *parent_id != id.as_str())
+        .map(str::to_string);
+    Some(CodexSessionMeta {
+        id,
+        forked_from_id,
+        project_path: payload
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        model: payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        subagent: is_codex_subagent_session_meta(payload),
+    })
+}
+
+fn first_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
+    let file = File::open(path).ok()?;
+    for line in BufReader::new(file).lines().map_while(Result::ok).take(16) {
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        if let Some(meta) = codex_session_meta(entry.get("payload").unwrap_or(&Value::Null)) {
+            return Some(meta);
+        }
+    }
+    None
+}
+
+fn remove_resumed_codex_ancestors(
+    candidates: Vec<(ExternalSessionRecord, Option<String>)>,
+) -> Vec<ExternalSessionRecord> {
+    let candidate_ids = candidates
+        .iter()
+        .map(|(record, _)| record.summary.id.clone())
+        .collect::<HashSet<_>>();
+    let resumed_ancestor_ids = candidates
+        .iter()
+        .filter_map(|(_, parent_id)| parent_id.as_deref())
+        .filter(|parent_id| candidate_ids.contains(*parent_id))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    candidates
+        .into_iter()
+        .filter(|(record, _)| !resumed_ancestor_ids.contains(&record.summary.id))
+        .map(|(record, _)| record)
+        .collect()
 }
 
 fn is_codex_subagent_thread_source(thread_source: Option<&str>) -> bool {
@@ -362,6 +782,7 @@ fn is_codex_subagent_session_meta(payload: &Value) -> bool {
             .is_some()
 }
 
+#[cfg(test)]
 fn discover_gemini(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
     let root = home.join(".gemini/tmp");
     let Ok(project_dirs) = fs::read_dir(root) else {
@@ -384,70 +805,124 @@ fn discover_gemini(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(raw) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(session) = serde_json::from_str::<Value>(&raw) else {
-                continue;
-            };
-            let messages = session
-                .get("messages")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let mut builder = SessionBuilder {
-                id: session
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| {
-                        path.file_stem()
-                            .and_then(|stem| stem.to_str())
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_default(),
-                project_path: project_path.clone(),
-                last_activity: value_timestamp(
-                    session
-                        .get("lastUpdated")
-                        .or_else(|| session.get("startTime")),
-                ),
-                model: session
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                ..Default::default()
-            };
-            for message in messages {
-                let role = message
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let content = extract_text(message.get("content"));
-                if content.is_empty() || (role == "user" && !is_visible_user_text(&content)) {
-                    continue;
-                }
-                if matches!(role, "user" | "gemini" | "assistant") {
-                    builder.message_count += 1;
-                }
-                if role == "user" && builder.first_user.is_none() {
-                    builder.first_user = Some(content);
-                }
-                builder.last_activity = latest(
-                    builder.last_activity,
-                    value_timestamp(message.get("timestamp")),
-                );
-            }
-            if let Some(record) = finish_builder(
-                builder,
-                Provider::Gemini,
-                path.clone(),
-                modified_time(&path),
-            ) {
+            if let Some(record) = discover_gemini_file(&path, &project_path) {
                 records.push(record);
             }
         }
     }
+}
+
+fn discover_gemini_file(path: &Path, project_path: &str) -> Option<ExternalSessionRecord> {
+    let raw = fs::read_to_string(path).ok()?;
+    let session = serde_json::from_str::<Value>(&raw).ok()?;
+    let messages = session
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut builder = SessionBuilder {
+        id: session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default(),
+        project_path: project_path.to_string(),
+        last_activity: value_timestamp(
+            session
+                .get("lastUpdated")
+                .or_else(|| session.get("startTime")),
+        ),
+        model: session
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ..Default::default()
+    };
+    for message in messages {
+        let role = message
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let content = extract_text(message.get("content"));
+        if content.is_empty() || (role == "user" && !is_visible_user_text(&content)) {
+            continue;
+        }
+        if matches!(role, "user" | "gemini" | "assistant") {
+            builder.message_count += 1;
+        }
+        if role == "user" && builder.first_user.is_none() {
+            builder.first_user = Some(content);
+        }
+        builder.last_activity = latest(
+            builder.last_activity,
+            value_timestamp(message.get("timestamp")),
+        );
+    }
+    finish_builder(
+        builder,
+        Provider::Gemini,
+        path.to_path_buf(),
+        modified_time(path),
+    )
+}
+
+fn sync_gemini_sources(
+    home: &Path,
+    storage: &Storage,
+    records: &mut Vec<ExternalSessionRecord>,
+) -> iowb_storage::Result<()> {
+    let root = home.join(".gemini/tmp");
+    let mut retained = Vec::new();
+    let Ok(project_dirs) = fs::read_dir(root) else {
+        return Ok(());
+    };
+    for project_dir in project_dirs.flatten().filter(|entry| entry.path().is_dir()) {
+        let project_path = fs::read_to_string(project_dir.path().join(".project_root"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if project_path.is_empty() {
+            continue;
+        }
+        let Ok(chat_files) = fs::read_dir(project_dir.path().join("chats")) else {
+            continue;
+        };
+        for path in chat_files.flatten().map(|entry| entry.path()) {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(fingerprint) = external_file_fingerprint(&path) else {
+                continue;
+            };
+            let source_path = path.display().to_string();
+            retained.push(source_path.clone());
+            if let Some(stored) = storage
+                .external_history_source(Provider::Gemini, &source_path)?
+                .filter(|source| source_matches(source, &fingerprint))
+            {
+                records.extend(restored_records(&stored));
+                continue;
+            }
+            let discovered = discover_gemini_file(&path, &project_path)
+                .into_iter()
+                .collect::<Vec<_>>();
+            persist_source(
+                storage,
+                Provider::Gemini,
+                &path,
+                &fingerprint,
+                fingerprint.file_size,
+                &discovered,
+            )?;
+            records.extend(discovered);
+        }
+    }
+    storage.prune_external_history_sources(Provider::Gemini, &retained)
 }
 
 fn finish_builder(
@@ -711,6 +1186,292 @@ fn load_codex_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
         }
     });
     deduplicate_adjacent(filter_legacy_codex_transcript_messages(messages))
+}
+
+fn count_codex_messages(record: &ExternalSessionRecord) -> usize {
+    let mut messages = Vec::<CountedCodexMessage>::new();
+    let mut tool_names = HashMap::<String, String>::new();
+    for_each_json_line(&record.file_path, |entry| {
+        match entry.get("type").and_then(Value::as_str) {
+            Some("event_msg") => {
+                let payload = entry.get("payload").unwrap_or(&Value::Null);
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("user_message") => {
+                        if payload
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .is_some_and(|kind| kind != "plain")
+                        {
+                            return;
+                        }
+                        let content = payload
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(visible_user_text)
+                            .unwrap_or_default();
+                        push_counted_codex_message(
+                            &mut messages,
+                            MessageRole::User,
+                            &content,
+                            false,
+                            false,
+                        );
+                    }
+                    Some("task_complete") => {
+                        let Some(error) = payload.get("error").filter(|error| !error.is_null())
+                        else {
+                            return;
+                        };
+                        if let Some(detail) = codex_task_error_detail(error) {
+                            push_counted_codex_message(
+                                &mut messages,
+                                MessageRole::Assistant,
+                                &format!("ERROR: {detail}"),
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("response_item") => {
+                let payload = entry.get("payload").unwrap_or(&Value::Null);
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("message") => {
+                        let Some(role) = payload
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .and_then(parse_role)
+                        else {
+                            return;
+                        };
+                        let mut content = extract_text(payload.get("content"));
+                        if role == MessageRole::User {
+                            content = visible_user_text(&content);
+                        }
+                        push_counted_codex_message(
+                            &mut messages,
+                            role,
+                            &content,
+                            counted_native_codex_final_message(role, payload, &content),
+                            counted_io_workbench_live_transcript(role, payload, &content),
+                        );
+                    }
+                    Some("reasoning") => {
+                        let content = extract_text(payload.get("summary"));
+                        if !content.is_empty() {
+                            push_counted_codex_message(
+                                &mut messages,
+                                MessageRole::Assistant,
+                                &format!("thinking\n{content}"),
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                    Some("function_call") => {
+                        let name = payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool");
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !call_id.is_empty() {
+                            tool_names.insert(call_id.to_string(), name.to_string());
+                        }
+                        let arguments = payload
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        push_counted_tool_message(
+                            &mut messages,
+                            "function_call",
+                            name,
+                            call_id,
+                            arguments,
+                        );
+                    }
+                    Some("function_call_output") => {
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let name = tool_names
+                            .get(call_id)
+                            .map(String::as_str)
+                            .unwrap_or("tool");
+                        push_counted_tool_message(
+                            &mut messages,
+                            "function_call_output",
+                            name,
+                            call_id,
+                            payload
+                                .get("output")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        );
+                    }
+                    Some("custom_tool_call") => {
+                        let name = payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("custom_tool");
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !call_id.is_empty() {
+                            tool_names.insert(call_id.to_string(), name.to_string());
+                        }
+                        let input = payload
+                            .get("input")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        push_counted_tool_message(
+                            &mut messages,
+                            "custom_tool_call",
+                            name,
+                            call_id,
+                            input,
+                        );
+                    }
+                    Some("custom_tool_call_output") => {
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let name = tool_names
+                            .get(call_id)
+                            .map(String::as_str)
+                            .unwrap_or("custom_tool");
+                        push_counted_tool_message(
+                            &mut messages,
+                            "custom_tool_call_output",
+                            name,
+                            call_id,
+                            payload
+                                .get("output")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    });
+
+    count_visible_codex_messages(messages)
+}
+
+fn push_counted_codex_message(
+    messages: &mut Vec<CountedCodexMessage>,
+    role: MessageRole,
+    content: &str,
+    native_final: bool,
+    io_workbench_live_transcript: bool,
+) {
+    let content = content.trim();
+    if content.is_empty() {
+        return;
+    }
+    messages.push(CountedCodexMessage {
+        role,
+        fingerprint: text_fingerprint(content),
+        trimmed_len: content.len(),
+        native_final,
+        io_workbench_live_transcript,
+    });
+}
+
+fn push_counted_tool_message(
+    messages: &mut Vec<CountedCodexMessage>,
+    kind: &str,
+    name: &str,
+    call_id: &str,
+    content_hint: &str,
+) {
+    let content_hint = content_hint.trim();
+    let mut hasher = DefaultHasher::new();
+    kind.hash(&mut hasher);
+    name.hash(&mut hasher);
+    call_id.hash(&mut hasher);
+    content_hint.hash(&mut hasher);
+    messages.push(CountedCodexMessage {
+        role: MessageRole::Tool,
+        fingerprint: hasher.finish(),
+        trimmed_len: kind.len() + name.len() + call_id.len() + content_hint.len(),
+        native_final: false,
+        io_workbench_live_transcript: false,
+    });
+}
+
+fn count_visible_codex_messages(messages: Vec<CountedCodexMessage>) -> usize {
+    let mut turn = 0_usize;
+    let mut message_turns = Vec::with_capacity(messages.len());
+    let mut native_final_turns = HashSet::new();
+
+    for message in &messages {
+        if message.role == MessageRole::User {
+            turn += 1;
+        }
+        message_turns.push(turn);
+        if message.native_final {
+            native_final_turns.insert(turn);
+        }
+    }
+
+    let mut count = 0_usize;
+    let mut previous: Option<(MessageRole, u64, usize)> = None;
+    for (message, turn) in messages.into_iter().zip(message_turns) {
+        if native_final_turns.contains(&turn) && message.io_workbench_live_transcript {
+            continue;
+        }
+        let current = (message.role, message.fingerprint, message.trimmed_len);
+        if previous.is_some_and(|previous| previous == current) {
+            continue;
+        }
+        previous = Some(current);
+        count += 1;
+    }
+    count
+}
+
+fn counted_native_codex_final_message(role: MessageRole, payload: &Value, content: &str) -> bool {
+    if role != MessageRole::Assistant || counted_io_workbench_source(payload) {
+        return false;
+    }
+    if payload.get("kind").and_then(Value::as_str) == Some("thinking")
+        || payload.get("kind").and_then(Value::as_str) == Some("terminal_status")
+        || payload.get("phase").and_then(Value::as_str) == Some("commentary")
+    {
+        return false;
+    }
+    let content = content.trim_start();
+    !content.starts_with("thinking\n") && !content.starts_with("ERROR:")
+}
+
+fn counted_io_workbench_live_transcript(role: MessageRole, payload: &Value, content: &str) -> bool {
+    role == MessageRole::Assistant
+        && counted_io_workbench_source(payload)
+        && looks_like_codex_live_transcript(content)
+}
+
+fn counted_io_workbench_source(payload: &Value) -> bool {
+    payload
+        .get("source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.eq_ignore_ascii_case("io-workbench"))
+}
+
+fn text_fingerprint(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn codex_response_message_metadata(payload: &Value) -> Value {
@@ -1179,13 +1940,10 @@ fn extract_text(value: Option<&Value>) -> String {
 
 pub(crate) fn visible_user_text(text: &str) -> String {
     let mut candidate = text.trim();
-    loop {
-        let Some(tag) = ["system-reminder", "environment_context"]
-            .into_iter()
-            .find(|tag| candidate.starts_with(&format!("<{tag}>")))
-        else {
-            break;
-        };
+    while let Some(tag) = ["system-reminder", "environment_context"]
+        .into_iter()
+        .find(|tag| candidate.starts_with(&format!("<{tag}>")))
+    {
         let close = format!("</{tag}>");
         let Some(index) = candidate.find(&close) else {
             return String::new();
@@ -1285,6 +2043,43 @@ fn for_each_json_line(path: &Path, mut visit: impl FnMut(&Value)) {
     }
 }
 
+/// Parse complete JSONL records beginning at a previously persisted boundary.
+/// The returned offset always points immediately after a newline, so a partial
+/// final write is retried safely on the next synchronization.
+fn for_each_json_line_from(path: &Path, offset: u64, mut visit: impl FnMut(&Value)) -> u64 {
+    let Ok(mut file) = File::open(path) else {
+        return offset;
+    };
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return offset;
+    }
+    let mut reader = BufReader::new(file);
+    let mut committed_offset = offset;
+    loop {
+        let mut bytes = Vec::new();
+        let Ok(read) = reader.read_until(b'\n', &mut bytes) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        if !bytes.ends_with(b"\n") {
+            break;
+        }
+        committed_offset = committed_offset.saturating_add(read as u64);
+        bytes.pop();
+        if bytes.ends_with(b"\r") {
+            bytes.pop();
+        }
+        if let Ok(line) = std::str::from_utf8(&bytes)
+            && let Ok(value) = serde_json::from_str::<Value>(line)
+        {
+            visit(&value);
+        }
+    }
+    committed_offset
+}
+
 fn files_below(root: &Path, max_depth: usize, extension: &str) -> Vec<PathBuf> {
     fn visit(dir: &Path, depth: usize, max_depth: usize, extension: &str, out: &mut Vec<PathBuf>) {
         if depth > max_depth {
@@ -1354,6 +2149,7 @@ fn extract_uuid(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use uuid::Uuid;
 
     #[test]
@@ -1449,6 +2245,80 @@ mod tests {
         }
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_claude_index_resumes_from_last_complete_jsonl_offset() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-external-incremental-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let session_id = "44444444-4444-4444-8444-444444444444";
+        let history = root
+            .join(".claude/projects/test")
+            .join(format!("{session_id}.jsonl"));
+        fs::create_dir_all(history.parent().expect("history parent")).expect("history directory");
+        fs::create_dir_all(&project).expect("project directory");
+        write_jsonl(
+            &history,
+            &[
+                json!({"type":"user","sessionId":session_id,"cwd":project,"timestamp":"2026-08-14T01:00:00Z","message":{"role":"user","content":"first"}}),
+                json!({"type":"assistant","sessionId":session_id,"cwd":project,"timestamp":"2026-08-14T01:00:01Z","message":{"role":"assistant","content":"second"}}),
+            ],
+        );
+        let database = root.join("index.db");
+        let storage = Storage::open(&database).expect("storage");
+        let initial = sync_external_sessions(&root, &storage).expect("initial sync");
+        let initial = initial
+            .iter()
+            .find(|record| record.summary.id == session_id)
+            .expect("initial record");
+        assert_eq!(initial.summary.message_count, 2);
+        drop(storage);
+
+        let partial = format!(
+            "{{\"type\":\"assistant\",\"sessionId\":\"{session_id}\",\"cwd\":\"{}\",",
+            project.display()
+        );
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&history)
+            .expect("append partial");
+        file.write_all(partial.as_bytes()).expect("partial line");
+        drop(file);
+        let storage = Storage::open(&database).expect("reopened storage");
+        let partial_sync = sync_external_sessions(&root, &storage).expect("partial sync");
+        assert_eq!(
+            partial_sync
+                .iter()
+                .find(|record| record.summary.id == session_id)
+                .expect("partial record")
+                .summary
+                .message_count,
+            2,
+        );
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&history)
+            .expect("complete partial");
+        file.write_all(
+            b"\"timestamp\":\"2026-08-14T01:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":\"third\"}}\n",
+        )
+        .expect("complete line");
+        drop(file);
+        let completed = sync_external_sessions(&root, &storage).expect("completed sync");
+        assert_eq!(
+            completed
+                .iter()
+                .find(|record| record.summary.id == session_id)
+                .expect("completed record")
+                .summary
+                .message_count,
+            3,
+        );
+
+        drop(storage);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1710,6 +2580,51 @@ mod tests {
     }
 
     #[test]
+    fn hides_resumed_codex_ancestors_in_json_fallback() {
+        let root = std::env::temp_dir().join(format!("iowb-codex-resume-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let sessions_dir = root.join(".codex/sessions/2026/08/13");
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let resumed_id = "22222222-2222-4222-8222-222222222222";
+        let sibling_id = "33333333-3333-4333-8333-333333333333";
+        fs::create_dir_all(&project).unwrap();
+        write_jsonl(
+            &sessions_dir.join(format!("rollout-parent-{parent_id}.jsonl")),
+            &[
+                json!({"timestamp":"2026-08-13T00:00:00Z","type":"session_meta","payload":{"id":parent_id,"cwd":project}}),
+                json!({"timestamp":"2026-08-13T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Original question","kind":"plain"}}),
+            ],
+        );
+        write_jsonl(
+            &sessions_dir.join(format!("rollout-resumed-{resumed_id}.jsonl")),
+            &[
+                json!({"timestamp":"2026-08-13T00:01:00Z","type":"session_meta","payload":{"id":resumed_id,"forked_from_id":parent_id,"cwd":project}}),
+                json!({"timestamp":"2026-08-13T00:01:00Z","type":"session_meta","payload":{"id":parent_id,"cwd":project}}),
+                json!({"timestamp":"2026-08-13T00:01:01Z","type":"event_msg","payload":{"type":"user_message","message":"Original question","kind":"plain"}}),
+                json!({"timestamp":"2026-08-13T00:01:02Z","type":"event_msg","payload":{"type":"user_message","message":"Continue the original chat","kind":"plain"}}),
+            ],
+        );
+        write_jsonl(
+            &sessions_dir.join(format!("rollout-sibling-{sibling_id}.jsonl")),
+            &[
+                json!({"timestamp":"2026-08-13T00:02:00Z","type":"session_meta","payload":{"id":sibling_id,"forked_from_id":parent_id,"cwd":project}}),
+                json!({"timestamp":"2026-08-13T00:02:01Z","type":"event_msg","payload":{"type":"user_message","message":"Explore another branch","kind":"plain"}}),
+            ],
+        );
+
+        let ids = discover_external_sessions(&root)
+            .into_iter()
+            .map(|record| record.summary.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            HashSet::from([resumed_id.to_string(), sibling_id.to_string()]),
+            ids,
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn codex_index_discovery_defers_rollout_message_loading() {
         let root = std::env::temp_dir().join(format!("iowb-codex-index-{}", Uuid::new_v4()));
         let project = root.join("project");
@@ -1752,8 +2667,14 @@ mod tests {
                     updated_at_ms INTEGER,
                     updated_at INTEGER NOT NULL,
                     model TEXT,
+                    source TEXT NOT NULL DEFAULT 'exec',
                     thread_source TEXT,
                     archived INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE thread_spawn_edges (
+                    parent_thread_id TEXT NOT NULL,
+                    child_thread_id TEXT NOT NULL PRIMARY KEY,
+                    status TEXT NOT NULL
                 );
                 "#,
             )
@@ -1796,8 +2717,18 @@ mod tests {
                     1_785_459_603_000_i64,
                     1_785_459_603_i64,
                     "gpt-test",
-                    "subagent",
+                    Option::<String>::None,
                 ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                INSERT INTO thread_spawn_edges (
+                    parent_thread_id, child_thread_id, status
+                ) VALUES (?1, ?2, 'running')
+                "#,
+                rusqlite::params![session_id, subagent_id],
             )
             .unwrap();
         drop(connection);
@@ -1808,12 +2739,98 @@ mod tests {
             .find(|record| record.summary.id == session_id)
             .unwrap();
         assert_eq!(1, record.summary.message_count);
-        assert_eq!(2, load_external_messages(&record).len());
+        assert_eq!(2, load_external_messages(record).len());
         assert!(
             records
                 .iter()
                 .all(|record| record.summary.id != subagent_id)
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_index_hides_resumed_ancestors() {
+        let root = std::env::temp_dir().join(format!("iowb-codex-index-resume-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let codex_dir = root.join(".codex");
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let resumed_id = "22222222-2222-4222-8222-222222222222";
+        let parent_rollout = codex_dir
+            .join("sessions/2026/08/13")
+            .join(format!("rollout-{parent_id}.jsonl"));
+        let resumed_rollout = codex_dir
+            .join("sessions/2026/08/13")
+            .join(format!("rollout-{resumed_id}.jsonl"));
+        fs::create_dir_all(&project).unwrap();
+        write_jsonl(
+            &parent_rollout,
+            &[
+                json!({"timestamp":"2026-08-13T00:00:00Z","type":"session_meta","payload":{"id":parent_id,"cwd":project}}),
+                json!({"timestamp":"2026-08-13T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Original question","kind":"plain"}}),
+            ],
+        );
+        write_jsonl(
+            &resumed_rollout,
+            &[
+                json!({"timestamp":"2026-08-13T00:01:00Z","type":"session_meta","payload":{"id":resumed_id,"forked_from_id":parent_id,"cwd":project}}),
+                json!({"timestamp":"2026-08-13T00:01:00Z","type":"session_meta","payload":{"id":parent_id,"cwd":project}}),
+                json!({"timestamp":"2026-08-13T00:01:01Z","type":"event_msg","payload":{"type":"user_message","message":"Continue the original chat","kind":"plain"}}),
+            ],
+        );
+
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    first_user_message TEXT NOT NULL,
+                    updated_at_ms INTEGER,
+                    updated_at INTEGER NOT NULL,
+                    model TEXT,
+                    source TEXT NOT NULL DEFAULT 'exec',
+                    thread_source TEXT,
+                    archived INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE thread_spawn_edges (
+                    parent_thread_id TEXT NOT NULL,
+                    child_thread_id TEXT NOT NULL PRIMARY KEY,
+                    status TEXT NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        for (id, rollout, updated) in [
+            (parent_id, &parent_rollout, 1_786_579_200_i64),
+            (resumed_id, &resumed_rollout, 1_786_579_260_i64),
+        ] {
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO threads (
+                        id, rollout_path, cwd, title, first_user_message,
+                        updated_at_ms, updated_at, model, thread_source, archived
+                    ) VALUES (?1, ?2, ?3, 'Same title', 'Original question', ?4, ?5, 'gpt-test', 'user', 0)
+                    "#,
+                    rusqlite::params![
+                        id,
+                        rollout.display().to_string(),
+                        project.display().to_string(),
+                        updated * 1_000,
+                        updated,
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let records = discover_external_sessions(&root);
+        assert_eq!(1, records.len(), "{records:#?}");
+        assert_eq!(resumed_id, records[0].summary.id);
 
         fs::remove_dir_all(root).unwrap();
     }

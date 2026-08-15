@@ -7,9 +7,10 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, RwLock as StdRwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -24,13 +25,17 @@ use hmac::{Hmac, Mac};
 use iowb_fs::{FileService, WorkspacePathValidator};
 use iowb_process::ProcessManager;
 use iowb_protocol::{
-    AuthStatusResponse, AuthTokenResponse, CONFIG_DIR_NAME, ChatMessage, ChatRuntime,
-    DATABASE_FILE_NAME, ForkSessionResponse, MessageRole, PRODUCT_NAME, ProjectSummary,
-    PromptHistoryCursor, PromptHistoryEntry, Provider, ServerStatusResponse, SessionDraftResponse,
-    SessionSummary, SessionTitleSource, SessionTokenUsage, UserProfile, WsServerEvent, new_id,
-    session_title_from_prompt,
+    AuthStatusResponse, AuthTokenResponse, CONFIG_DIR_NAME, ChatContextRecovery, ChatMessage,
+    ChatRuntime, CompactSessionContextResponse, DATABASE_FILE_NAME, ForkSessionResponse,
+    MessageRole, PRODUCT_NAME, ProjectSummary, PromptHistoryCursor, PromptHistoryEntry, Provider,
+    ServerStatusResponse, SessionDraftResponse, SessionLifetimeTokenUsage, SessionSummary,
+    SessionTitleSource, SessionTokenUsage, TokenUsageCompleteness, UserProfile, WsServerEvent,
+    new_id, session_title_from_prompt,
 };
-use iowb_storage::{CreateSessionForkOutcome, Storage, StoredDurableChatRun};
+use iowb_storage::{
+    CreateSessionForkOutcome, ExternalHistoryFingerprint, Storage, StoredChatRunAttempt,
+    StoredDurableChatRun, StoredSessionContextRollover,
+};
 use serde_json::Value;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -45,8 +50,9 @@ use uuid::Uuid;
 
 use codex_app_server::{CodexAppServerClient, CodexThreadSnapshot};
 use external_sessions::{
-    ExternalSessionRecord, discover_external_sessions, load_external_messages,
-    looks_like_codex_live_transcript, same_project_path, visible_user_text,
+    EXTERNAL_MESSAGE_PARSER_VERSION, ExternalSessionRecord, external_file_fingerprint,
+    load_external_messages, looks_like_codex_live_transcript, same_project_path,
+    sync_external_sessions, visible_user_text,
 };
 
 type HmacSha1 = Hmac<Sha1>;
@@ -56,6 +62,9 @@ const DIRECT_AI_HISTORY_MAX_MESSAGES: usize = 48;
 const DIRECT_AI_HISTORY_MAX_BYTES: usize = 96 * 1024;
 const AGENT_LIVE_EVENT_MAX_BYTES: usize = 256 * 1024;
 const AGENT_WEBSOCKET_CHUNK_MAX_BYTES: usize = 32 * 1024;
+const AGENT_REPLAY_MAX_BYTES: usize = 1024 * 1024;
+const AGENT_REPLAY_TOTAL_MAX_BYTES: usize = 4 * 1024 * 1024;
+const AGENT_REPLAY_TOTAL_MAX_EVENTS: usize = 384;
 const AGENT_TOOL_MESSAGE_MAX_BYTES: usize = 64 * 1024;
 const AGENT_TOOL_MESSAGES_MAX_COUNT: usize = 96;
 const AGENT_TOOL_MESSAGES_MAX_TOTAL_BYTES: usize = 512 * 1024;
@@ -73,6 +82,13 @@ const DURABLE_AGENT_OWNER_START_ENV: &str = "IO_WORKBENCH_DURABLE_OWNER_START";
 const IO_WORKBENCH_GATEWAY_KEY_ENV: &str = "IOWB_IO_GATEWAY_API_KEY";
 pub const DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS: u32 = 3;
 const DURABLE_CHAT_RUN_RECOVERY_PROMPT_LIMIT: usize = 6_000;
+const CODEX_GATEWAY_BODY_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
+const CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES: u64 = 12 * 1024 * 1024;
+const CONTEXT_ROLLOVER_HANDOFF_MAX_BYTES: usize = 48 * 1024;
+const EXTERNAL_MESSAGE_CACHE_MAX_ENTRIES: usize = 8;
+const EXTERNAL_MESSAGE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const EXTERNAL_MESSAGE_TAIL_CACHE_MAX_MESSAGES: usize = 500;
+const ORDERED_TEXT_MATCH_MATRIX_MAX_CELLS: usize = 1_000_000;
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -256,6 +272,80 @@ impl AppState {
         direct_ai_config: Option<DirectAiRuntimeConfig>,
         user_id: Option<String>,
     ) -> Result<SessionSummary> {
+        self.start_agent_session_scoped(
+            provider,
+            project_path,
+            prompt,
+            session_id,
+            model,
+            effort,
+            mode,
+            thinking,
+            fast,
+            runtime,
+            direct_ai_config,
+            user_id,
+            None,
+        )
+        .await
+    }
+
+    /// Start a session owned by an agentic-board run. The scope is persisted
+    /// before the provider starts and before any active-session broadcast, so
+    /// the board chat can never briefly leak into ordinary chat discovery.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_board_agent_session(
+        &self,
+        provider: Provider,
+        project_path: impl Into<String>,
+        prompt: impl Into<String>,
+        session_id: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        mode: Option<String>,
+        thinking: Option<bool>,
+        fast: Option<bool>,
+        runtime: ChatRuntime,
+        direct_ai_config: Option<DirectAiRuntimeConfig>,
+        user_id: Option<String>,
+        board_run_id: impl Into<String>,
+        board_task_id: Option<String>,
+    ) -> Result<SessionSummary> {
+        self.start_agent_session_scoped(
+            provider,
+            project_path,
+            prompt,
+            session_id,
+            model,
+            effort,
+            mode,
+            thinking,
+            fast,
+            runtime,
+            direct_ai_config,
+            user_id,
+            Some((board_run_id.into(), board_task_id)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_agent_session_scoped(
+        &self,
+        provider: Provider,
+        project_path: impl Into<String>,
+        prompt: impl Into<String>,
+        session_id: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        mode: Option<String>,
+        thinking: Option<bool>,
+        fast: Option<bool>,
+        runtime: ChatRuntime,
+        direct_ai_config: Option<DirectAiRuntimeConfig>,
+        user_id: Option<String>,
+        board_scope: Option<(String, Option<String>)>,
+    ) -> Result<SessionSummary> {
         let project_path = project_path.into();
         let prompt = prompt.into();
         let resolved_project_path = self
@@ -270,21 +360,39 @@ impl AppState {
             ));
         }
 
+        // Recovery is a state transition for the current visible chat, not a
+        // new turn. Reject ordinary sends before create_or_update can mark the
+        // session active or append another user message to a poisoned native
+        // thread. The compact-and-retry endpoint bypasses this method.
+        if provider == Provider::Codex
+            && let Some(existing_session_id) = session_id.as_deref()
+            && self.context_recovery(existing_session_id).await?.is_some()
+        {
+            return Err(CoreError::Conflict(
+                "this chat needs clean-context recovery before another message can be sent"
+                    .to_string(),
+            ));
+        }
+
         let (external, native_resume_session_id) = if let Some(session_id) = session_id.as_deref() {
             let stored_session = self.sessions.get_stored(session_id);
-            let external = self
-                .sessions
-                .external_record(
-                    session_id,
-                    Some(provider),
-                    Some(&resolved_project_path.display().to_string()),
-                )
-                .await
-                .is_some()
-                || stored_session
-                    .as_ref()
-                    .is_some_and(|session| session.external);
-            let native_resume_session_id = if external {
+            let has_context_rollover = self.storage.has_context_rollover(session_id)?;
+            let external = !has_context_rollover
+                && (self
+                    .sessions
+                    .external_record(
+                        session_id,
+                        Some(provider),
+                        Some(&resolved_project_path.display().to_string()),
+                    )
+                    .await
+                    .is_some()
+                    || stored_session
+                        .as_ref()
+                        .is_some_and(|session| session.external));
+            let native_resume_session_id = if has_context_rollover {
+                stored_session.and_then(|session| session.native_session_id)
+            } else if external {
                 Some(session_id.to_string())
             } else {
                 match stored_session.and_then(|session| session.native_session_id) {
@@ -324,22 +432,50 @@ impl AppState {
         } else {
             None
         };
+        let native_rollout_bytes =
+            if provider == Provider::Codex && native_resume_session_id.is_some() {
+                if let Some(session_id) = session_id.as_deref() {
+                    self.sessions.native_rollout_size(session_id).await
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-        let mut session = self
-            .sessions
-            .create_or_update(
-                provider,
-                resolved_project_path.display().to_string(),
-                session_id,
-                external,
-                model.clone(),
-                Some(runtime),
-                effort.clone(),
-                mode.clone(),
-                thinking,
-                fast,
-            )
-            .await?;
+        let mut session = if let Some((board_run_id, board_task_id)) = board_scope {
+            self.sessions
+                .create_or_update_board(
+                    provider,
+                    resolved_project_path.display().to_string(),
+                    session_id,
+                    external,
+                    model.clone(),
+                    Some(runtime),
+                    effort.clone(),
+                    mode.clone(),
+                    thinking,
+                    fast,
+                    board_run_id,
+                    board_task_id,
+                )
+                .await?
+        } else {
+            self.sessions
+                .create_or_update(
+                    provider,
+                    resolved_project_path.display().to_string(),
+                    session_id,
+                    external,
+                    model.clone(),
+                    Some(runtime),
+                    effort.clone(),
+                    mode.clone(),
+                    thinking,
+                    fast,
+                )
+                .await?
+        };
 
         // The durable row is committed before the provider starts. If the
         // server is killed at any point after this write, startup recovery has
@@ -417,6 +553,43 @@ impl AppState {
             return Err(error.into());
         }
 
+        if provider == Provider::Codex
+            && runtime == ChatRuntime::IoGateway
+            && native_resume_session_id.is_some()
+            && native_rollout_bytes
+                .is_some_and(|bytes| bytes >= CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES)
+        {
+            let observed_bytes = native_rollout_bytes;
+            let message = format!(
+                "native Codex context is {} bytes, above the {} byte safe rollover threshold",
+                observed_bytes.unwrap_or_default(),
+                CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES,
+            );
+            self.storage
+                .mark_durable_chat_run_failed(&durable_run_id, &message)?;
+            session = self.sessions.set_active(&session.id, false).await?;
+            if let Some(failed_message_id) = durable_run.user_message_id.clone() {
+                self.ws_hub.publish(WsServerEvent::ChatRecoveryRequired {
+                    provider,
+                    session_id: session.id.clone(),
+                    response_id: None,
+                    recovery: ChatContextRecovery {
+                        code: "context_too_large".to_string(),
+                        state: "required".to_string(),
+                        message: "This chat is close to the gateway request limit. Compact it into a clean context to continue without changing the visible chat.".to_string(),
+                        failed_message_id,
+                        observed_bytes,
+                        limit_bytes: CODEX_GATEWAY_BODY_LIMIT_BYTES,
+                        request_id: None,
+                    },
+                });
+            }
+            self.ws_hub.publish(WsServerEvent::ActiveSessions {
+                sessions: self.sessions.list_active().await,
+            });
+            return Ok(session);
+        }
+
         let direct_ai_messages = if should_use_direct_ai_gateway_runtime(provider, model.as_deref())
         {
             direct_ai_conversation_messages(self.sessions.messages(&session.id)?, prompt.as_str())
@@ -424,12 +597,26 @@ impl AppState {
             Vec::new()
         };
 
+        let attempt_id = new_id("attempt");
+        self.storage
+            .create_chat_run_attempt(&StoredChatRunAttempt::new(
+                attempt_id.clone(),
+                durable_run_id.clone(),
+                session.id.clone(),
+                durable_run.user_message_id.clone(),
+                provider.as_str(),
+                runtime_label(runtime),
+                model.clone(),
+                native_resume_session_id.clone(),
+            ))?;
+
         let start_result = self
             .agents
             .start(AgentStartContext {
                 provider,
                 session_id: session.id.clone(),
                 durable_run_id: Some(durable_run_id.clone()),
+                attempt_id: Some(attempt_id),
                 response_id: new_id("response"),
                 sequence: Arc::new(AtomicU64::new(0)),
                 project_path: resolved_project_path,
@@ -441,6 +628,7 @@ impl AppState {
                 thinking,
                 fast,
                 native_resume_session_id,
+                context_rollover_id: None,
                 direct_ai_config,
                 direct_ai_messages,
                 sessions: self.sessions.clone(),
@@ -470,6 +658,8 @@ impl AppState {
         source_session_id: &str,
         before_message_id: &str,
         request_id: &str,
+        replace: bool,
+        draft_content: Option<&str>,
     ) -> Result<ForkSessionResponse> {
         if let Some(existing) =
             self.storage
@@ -481,6 +671,7 @@ impl AppState {
                     source_session_id,
                     &existing.before_message_id,
                     &existing.destination_session_id,
+                    existing.replaces_source,
                 )
                 .await;
         }
@@ -491,7 +682,10 @@ impl AppState {
                 "session_active: stop the current response before editing from here".to_string(),
             ));
         }
-        let source_is_stored = self.storage.get_session(source_session_id)?.is_some();
+        let source_is_stored = self
+            .storage
+            .get_session_summary(source_session_id)?
+            .is_some();
         let source_messages = self
             .sessions
             .messages_including_external(source_session_id)
@@ -511,6 +705,7 @@ impl AppState {
             ));
         }
         let prefix = &source_messages[..target_index];
+        let draft_content = draft_content.unwrap_or(&target.content);
         let has_prior_user_turn = prefix
             .iter()
             .any(|message| message.role == MessageRole::User);
@@ -580,10 +775,13 @@ impl AppState {
             id: destination_id,
             provider: source.provider,
             external: false,
+            board_session: source.board_session,
+            board_run_id: source.board_run_id.clone(),
+            board_task_id: source.board_task_id.clone(),
             native_session_id: native_forked_thread_id.clone(),
             title_source: Some(SessionTitleSource::Prompt),
             project_path: source.project_path.clone(),
-            title: session_title_from_prompt(&target.content)
+            title: session_title_from_prompt(draft_content)
                 .unwrap_or_else(|| "New Session".to_string()),
             message_count: cloned_messages.len(),
             last_activity: now,
@@ -605,6 +803,7 @@ impl AppState {
                 .find(|message| message.role == MessageRole::Assistant)
                 .map(|message| message.timestamp),
             token_usage: None,
+            lifetime_token_usage: None,
         };
 
         let outcome = self.storage.create_session_fork(
@@ -614,8 +813,9 @@ impl AppState {
             request_id,
             &destination,
             &cloned_messages,
-            &target.content,
+            draft_content,
             source_is_stored,
+            replace,
         );
         match outcome {
             Ok(CreateSessionForkOutcome::Created) => {
@@ -628,11 +828,12 @@ impl AppState {
                     session: destination.clone(),
                     draft: SessionDraftResponse {
                         session_id: destination.id,
-                        content: target.content.clone(),
+                        content: draft_content.to_string(),
                         updated_at: Some(now),
                     },
                     native_forked: native_forked_thread_id.is_some(),
                     files_unchanged: true,
+                    source_hidden: replace,
                 })
             }
             Ok(CreateSessionForkOutcome::Existing(existing)) => {
@@ -643,6 +844,7 @@ impl AppState {
                     source_session_id,
                     &existing.before_message_id,
                     &existing.destination_session_id,
+                    existing.replaces_source,
                 )
                 .await
             }
@@ -668,6 +870,7 @@ impl AppState {
         source_session_id: &str,
         before_message_id: &str,
         destination_session_id: &str,
+        source_hidden: bool,
     ) -> Result<ForkSessionResponse> {
         let session = self.sessions.get(destination_session_id).await?;
         let draft = self
@@ -678,6 +881,7 @@ impl AppState {
             before_message_id: before_message_id.to_string(),
             native_forked: session.native_session_id.is_some(),
             files_unchanged: true,
+            source_hidden,
             session,
             draft,
         })
@@ -797,7 +1001,7 @@ impl AppState {
         let provider = parse_stored_provider(&run.provider)?;
         let stored_session = self
             .storage
-            .get_session(&run.session_id)?
+            .get_session_summary(&run.session_id)?
             .ok_or_else(|| CoreError::SessionNotFound(run.session_id.clone()))?;
         let runtime = stored_session
             .runtime
@@ -847,29 +1051,44 @@ impl AppState {
             )));
         }
 
-        let mut native_resume_session_id = run
-            .native_session_id
-            .clone()
-            .or_else(|| stored_session.native_session_id.clone());
-        if native_resume_session_id.is_none() && stored_session.external {
-            native_resume_session_id = Some(run.session_id.clone());
-        }
-        if native_resume_session_id.is_none() {
-            native_resume_session_id = self
-                .sessions
-                .infer_native_session_id(
-                    &run.session_id,
-                    provider,
-                    &resolved_project_path.display().to_string(),
-                )
-                .await?;
+        let context_rollover = self.storage.context_rollover_for_retry_run(&run.id)?;
+        let mut native_resume_session_id = if let Some(rollover) = context_rollover.as_ref() {
+            rollover
+                .candidate_native_session_id
+                .clone()
+                .filter(|candidate| {
+                    run.native_session_id
+                        .as_deref()
+                        .is_none_or(|run_native| run_native == candidate)
+                })
+        } else {
+            run.native_session_id
+                .clone()
+                .or_else(|| stored_session.native_session_id.clone())
+        };
+        if context_rollover.is_none() {
+            if native_resume_session_id.is_none() && stored_session.external {
+                native_resume_session_id = Some(run.session_id.clone());
+            }
+            if native_resume_session_id.is_none() {
+                native_resume_session_id = self
+                    .sessions
+                    .infer_native_session_id(
+                        &run.session_id,
+                        provider,
+                        &resolved_project_path.display().to_string(),
+                    )
+                    .await?;
+            }
         }
         if let Some(native_session_id) = native_resume_session_id.as_deref() {
             self.storage
                 .update_durable_chat_run_native_session_id(&run.id, Some(native_session_id))?;
-            self.sessions
-                .set_native_session_id(&run.session_id, native_session_id)
-                .await?;
+            if context_rollover.is_none() {
+                self.sessions
+                    .set_native_session_id(&run.session_id, native_session_id)
+                    .await?;
+            }
         }
 
         let session = self.sessions.set_active(&run.session_id, true).await?;
@@ -884,13 +1103,31 @@ impl AppState {
                 Vec::new()
             };
 
+        let response_id = if context_rollover.is_some() {
+            run.id.clone()
+        } else {
+            new_id("response")
+        };
+        let attempt_id = new_id("attempt");
+        self.storage
+            .create_chat_run_attempt(&StoredChatRunAttempt::new(
+                attempt_id.clone(),
+                run.id.clone(),
+                run.session_id.clone(),
+                run.user_message_id.clone(),
+                provider.as_str(),
+                runtime_label(runtime),
+                run.model.clone(),
+                native_resume_session_id.clone(),
+            ))?;
         let start_result = self
             .agents
             .start(AgentStartContext {
                 provider,
                 session_id: run.session_id.clone(),
                 durable_run_id: Some(run.id.clone()),
-                response_id: new_id("response"),
+                attempt_id: Some(attempt_id),
+                response_id,
                 sequence: Arc::new(AtomicU64::new(0)),
                 project_path: resolved_project_path,
                 prompt: recovery_prompt,
@@ -901,6 +1138,9 @@ impl AppState {
                 thinking: run.thinking,
                 fast: run.fast,
                 native_resume_session_id,
+                context_rollover_id: context_rollover
+                    .as_ref()
+                    .map(|rollover| rollover.id.clone()),
                 direct_ai_config,
                 direct_ai_messages,
                 sessions: self.sessions.clone(),
@@ -911,6 +1151,9 @@ impl AppState {
 
         if let Err(error) = start_result {
             let message = error.to_string();
+            if let Some(rollover) = context_rollover.as_ref() {
+                let _ = self.storage.fail_context_rollover(&rollover.id, &message);
+            }
             let _ = self.storage.mark_durable_chat_run_failed(&run.id, &message);
             let _ = self.sessions.set_active(&run.session_id, false).await;
             return Err(error);
@@ -958,6 +1201,259 @@ impl AppState {
             sessions: self.sessions.list_active().await,
         });
         Ok(aborted)
+    }
+
+    pub async fn compact_and_retry_session_context(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        failed_message_id: &str,
+        request_id: &str,
+        direct_ai_config: Option<DirectAiRuntimeConfig>,
+    ) -> Result<CompactSessionContextResponse> {
+        if let Some(existing) = self
+            .storage
+            .context_rollover_for_request(user_id, session_id, request_id)?
+        {
+            if existing.failed_message_id != failed_message_id {
+                return Err(CoreError::Conflict(
+                    "this recovery request id was already used for a different failed message"
+                        .to_string(),
+                ));
+            }
+            return Ok(CompactSessionContextResponse {
+                session_id: session_id.to_string(),
+                request_id: request_id.to_string(),
+                response_id: existing.retry_run_id,
+                state: existing.state,
+            });
+        }
+
+        let session = self.sessions.get(session_id).await?;
+        if session.provider != Provider::Codex {
+            return Err(CoreError::InvalidInput(
+                "clean context rollover is currently available only for Codex sessions".to_string(),
+            ));
+        }
+        if session.active || self.agents.is_running(Provider::Codex, session_id).await {
+            return Err(CoreError::Conflict(
+                "stop the active response before compacting this chat".to_string(),
+            ));
+        }
+        let failed_message = self
+            .storage
+            .message_by_id(session_id, failed_message_id)?
+            .filter(|message| message.role == MessageRole::User)
+            .ok_or_else(|| {
+                CoreError::InvalidInput("failed user message was not found".to_string())
+            })?;
+        let failed_run = self
+            .storage
+            .durable_chat_run_for_user_message(session_id, failed_message_id)?
+            .filter(|run| run.status == "failed")
+            .ok_or_else(|| {
+                CoreError::Conflict(
+                    "the selected user message does not belong to a failed turn".to_string(),
+                )
+            })?;
+        let latest_run = self
+            .storage
+            .latest_durable_chat_run_for_session(session_id)?;
+        if latest_run.as_ref().map(|run| run.id.as_str()) != Some(failed_run.id.as_str()) {
+            return Err(CoreError::Conflict(
+                "only the latest failed turn can be retried with a clean context".to_string(),
+            ));
+        }
+
+        let observed_bytes = self
+            .sessions
+            .native_rollout_size(session_id)
+            .await
+            .filter(|size| *size > 0);
+        let visible_messages = self
+            .sessions
+            .messages_including_external(session_id)
+            .await?;
+        let handoff =
+            build_context_rollover_handoff(visible_messages.clone(), &failed_message.content);
+        let rollover_id = new_id("rollover");
+        let compact_run_id = new_id("run");
+        let now = Utc::now();
+        let rollover = StoredSessionContextRollover {
+            id: rollover_id.clone(),
+            user_id: user_id.to_string(),
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            failed_message_id: failed_message_id.to_string(),
+            trigger_run_id: failed_run.id.clone(),
+            retry_run_id: compact_run_id.clone(),
+            from_native_session_id: session.native_session_id.clone(),
+            candidate_native_session_id: None,
+            state: "starting".to_string(),
+            handoff: handoff.clone(),
+            observed_bytes,
+            limit_bytes: CODEX_GATEWAY_BODY_LIMIT_BYTES,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            activated_at: None,
+        };
+        let mut compact_run = StoredDurableChatRun::new(
+            compact_run_id.clone(),
+            Some(user_id.to_string()),
+            session_id.to_string(),
+            Provider::Codex.as_str(),
+            handoff.clone(),
+            session.project_path.clone(),
+        );
+        compact_run.model = failed_run.model.clone().or(session.model.clone());
+        compact_run.effort = failed_run.effort.clone().or(session.effort.clone());
+        compact_run.mode = failed_run.mode.clone().or(session.mode.clone());
+        compact_run.thinking = failed_run.thinking.or(session.thinking);
+        compact_run.fast = failed_run.fast.or(session.fast);
+        compact_run.native_session_id = None;
+
+        self.storage
+            .materialize_session_messages(session_id, &visible_messages)?;
+        if !self
+            .storage
+            .prepare_context_rollover(&rollover, &compact_run)?
+        {
+            let existing = self
+                .storage
+                .context_rollover_for_request(user_id, session_id, request_id)?
+                .ok_or_else(|| {
+                    CoreError::Conflict("context rollover already exists".to_string())
+                })?;
+            if existing.failed_message_id != failed_message_id {
+                return Err(CoreError::Conflict(
+                    "this recovery request id was already used for a different failed message"
+                        .to_string(),
+                ));
+            }
+            return Ok(CompactSessionContextResponse {
+                session_id: session_id.to_string(),
+                request_id: request_id.to_string(),
+                response_id: existing.retry_run_id,
+                state: existing.state,
+            });
+        }
+        self.sessions.set_active(session_id, true).await?;
+        let runtime = session.runtime.unwrap_or(ChatRuntime::NativeCli);
+        let attempt_id = new_id("attempt");
+        self.storage
+            .create_chat_run_attempt(&StoredChatRunAttempt::new(
+                attempt_id.clone(),
+                compact_run_id.clone(),
+                session_id.to_string(),
+                compact_run.user_message_id.clone(),
+                Provider::Codex.as_str(),
+                runtime_label(runtime),
+                compact_run.model.clone(),
+                None,
+            ))?;
+        let start_result = self
+            .agents
+            .start(AgentStartContext {
+                provider: Provider::Codex,
+                session_id: session_id.to_string(),
+                durable_run_id: Some(compact_run_id.clone()),
+                attempt_id: Some(attempt_id),
+                response_id: compact_run_id.clone(),
+                sequence: Arc::new(AtomicU64::new(0)),
+                project_path: PathBuf::from(&session.project_path),
+                prompt: handoff,
+                model: compact_run.model.clone(),
+                runtime,
+                effort: compact_run.effort.clone(),
+                mode: compact_run.mode.clone(),
+                thinking: compact_run.thinking,
+                fast: compact_run.fast,
+                native_resume_session_id: None,
+                context_rollover_id: Some(rollover_id.clone()),
+                direct_ai_config,
+                direct_ai_messages: Vec::new(),
+                sessions: self.sessions.clone(),
+                storage: self.storage.clone(),
+                hub: self.ws_hub.clone(),
+            })
+            .await;
+        if let Err(error) = start_result {
+            let message = error.to_string();
+            let _ = self.storage.fail_context_rollover(&rollover_id, &message);
+            let _ = self
+                .storage
+                .mark_durable_chat_run_failed(&compact_run_id, &message);
+            let _ = self.sessions.set_active(session_id, false).await;
+            return Err(error);
+        }
+
+        Ok(CompactSessionContextResponse {
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            response_id: compact_run_id,
+            state: self
+                .storage
+                .context_rollover_for_retry_run(&rollover.retry_run_id)?
+                .map(|stored| stored.state)
+                .unwrap_or_else(|| "starting".to_string()),
+        })
+    }
+
+    pub async fn context_recovery(&self, session_id: &str) -> Result<Option<ChatContextRecovery>> {
+        if let Some(rollover) = self.storage.latest_context_rollover(session_id)? {
+            match rollover.state.as_str() {
+                "starting" | "failed" => {
+                    return Ok(Some(ChatContextRecovery {
+                        code: "context_too_large".to_string(),
+                        state: rollover.state,
+                        message: rollover.error.unwrap_or_else(|| {
+                            "This chat needs a clean native context before it can continue."
+                                .to_string()
+                        }),
+                        failed_message_id: rollover.failed_message_id,
+                        observed_bytes: rollover.observed_bytes,
+                        limit_bytes: rollover.limit_bytes,
+                        request_id: Some(rollover.request_id),
+                    }));
+                }
+                // An active rollover is historical. A later turn in this same
+                // visible chat may independently hit the gateway limit and
+                // must be allowed to surface another recovery operation.
+                _ => {}
+            }
+        }
+
+        let Some(run) = self
+            .storage
+            .latest_durable_chat_run_for_session(session_id)?
+        else {
+            return Ok(None);
+        };
+        if run.status != "failed" || run.provider != Provider::Codex.as_str() {
+            return Ok(None);
+        }
+        let Some(failed_message_id) = run.user_message_id else {
+            return Ok(None);
+        };
+        let observed_bytes = self.sessions.native_rollout_size(session_id).await;
+        let error = run.last_error.unwrap_or_default().to_ascii_lowercase();
+        if observed_bytes.is_none_or(|bytes| bytes < CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES)
+            && !error.contains("invalid body")
+            && !error.contains("413")
+            && !error.contains("too large")
+        {
+            return Ok(None);
+        }
+        Ok(Some(ChatContextRecovery {
+            code: "context_too_large".to_string(),
+            state: "required".to_string(),
+            message: "This chat's native context is too large to resume safely. Compact it into a clean context and retry the same message.".to_string(),
+            failed_message_id,
+            observed_bytes,
+            limit_bytes: CODEX_GATEWAY_BODY_LIMIT_BYTES,
+            request_id: None,
+        }))
     }
 
     pub async fn replay_agent_events(&self) -> Vec<WsServerEvent> {
@@ -1163,21 +1659,28 @@ impl AuthManager {
 pub struct SessionManager {
     storage: Storage,
     sessions: Arc<RwLock<HashMap<String, SessionSummary>>>,
+    board_session_ids: Arc<StdRwLock<HashSet<String>>>,
     max_sessions: usize,
     external_home: Arc<PathBuf>,
     external_cache: Arc<RwLock<ExternalSessionCache>>,
+    external_sync: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Default)]
 struct ExternalSessionCache {
     loaded_at: Option<Instant>,
     records: Vec<ExternalSessionRecord>,
+    message_bytes: usize,
     messages: HashMap<String, CachedExternalMessages>,
 }
 
 #[derive(Clone)]
 struct CachedExternalMessages {
     modified_at: Option<SystemTime>,
+    estimated_bytes: usize,
+    last_access: Instant,
+    total_count: usize,
+    complete: bool,
     messages: Arc<Vec<ChatMessage>>,
 }
 
@@ -1195,8 +1698,13 @@ impl SessionManager {
         // Active sessions are reconciled against durable chat runs by the
         // server after AppState is fully initialized. Clearing them here would
         // destroy the only durable signal that a forced-stop recovery is due.
-        let sessions = storage
-            .list_sessions()?
+        let persisted_sessions = storage.list_sessions_including_board()?;
+        let board_session_ids = persisted_sessions
+            .iter()
+            .filter(|session| session.board_session)
+            .map(|session| session.id.clone())
+            .collect();
+        let sessions = persisted_sessions
             .into_iter()
             .take(max_sessions)
             .map(|session| (session.id.clone(), session))
@@ -1205,6 +1713,7 @@ impl SessionManager {
         Ok(Self {
             storage,
             sessions: Arc::new(RwLock::new(sessions)),
+            board_session_ids: Arc::new(StdRwLock::new(board_session_ids)),
             max_sessions,
             external_home: Arc::new(
                 env_path("IO_WORKBENCH_CLI_HOME")
@@ -1212,6 +1721,7 @@ impl SessionManager {
                     .unwrap_or_default(),
             ),
             external_cache: Arc::new(RwLock::new(ExternalSessionCache::default())),
+            external_sync: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -1274,15 +1784,89 @@ impl SessionManager {
         thinking: Option<bool>,
         fast: Option<bool>,
     ) -> Result<SessionSummary> {
+        self.create_or_update_scoped(
+            provider,
+            project_path,
+            session_id,
+            external,
+            model,
+            runtime,
+            effort,
+            mode,
+            thinking,
+            fast,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_or_update_board(
+        &self,
+        provider: Provider,
+        project_path: impl Into<String>,
+        session_id: Option<String>,
+        external: bool,
+        model: Option<String>,
+        runtime: Option<ChatRuntime>,
+        effort: Option<String>,
+        mode: Option<String>,
+        thinking: Option<bool>,
+        fast: Option<bool>,
+        board_run_id: String,
+        board_task_id: Option<String>,
+    ) -> Result<SessionSummary> {
+        self.create_or_update_scoped(
+            provider,
+            project_path,
+            session_id,
+            external,
+            model,
+            runtime,
+            effort,
+            mode,
+            thinking,
+            fast,
+            Some((board_run_id, board_task_id)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_or_update_scoped(
+        &self,
+        provider: Provider,
+        project_path: impl Into<String>,
+        session_id: Option<String>,
+        external: bool,
+        model: Option<String>,
+        runtime: Option<ChatRuntime>,
+        effort: Option<String>,
+        mode: Option<String>,
+        thinking: Option<bool>,
+        fast: Option<bool>,
+        board_scope: Option<(String, Option<String>)>,
+    ) -> Result<SessionSummary> {
         let id = session_id.unwrap_or_else(|| new_id("session"));
         let now = Utc::now();
         let mut sessions = self.sessions.write().await;
+        // A persisted row may have been evicted from the bounded in-memory
+        // cache. Seed from storage so continuation never drops classification
+        // metadata such as board ownership.
+        if !sessions.contains_key(&id)
+            && let Some(stored) = self.storage.get_session_summary(&id)?
+        {
+            sessions.insert(id.clone(), stored);
+        }
         let session = sessions
             .entry(id.clone())
             .or_insert_with(|| SessionSummary {
                 id: id.clone(),
                 provider,
                 external,
+                board_session: false,
+                board_run_id: None,
+                board_task_id: None,
                 project_path: project_path.into(),
                 title: "New Session".to_string(),
                 message_count: 0,
@@ -1298,6 +1882,7 @@ impl SessionManager {
                 first_user_at: None,
                 received_at: None,
                 token_usage: None,
+                lifetime_token_usage: None,
                 native_session_id: None,
                 title_source: Some(SessionTitleSource::Prompt),
             });
@@ -1325,11 +1910,59 @@ impl SessionManager {
         session.last_activity = now;
         session.active = true;
         session.token_usage = None;
+        if let Some((board_run_id, board_task_id)) = board_scope {
+            if board_run_id.trim().is_empty() {
+                return Err(CoreError::InvalidInput(
+                    "board run id must not be empty".to_string(),
+                ));
+            }
+            session.board_session = true;
+            session.board_run_id = Some(board_run_id);
+            session.board_task_id = board_task_id.filter(|value| !value.trim().is_empty());
+        }
 
         self.storage.upsert_session(session)?;
+        if session.board_session {
+            self.board_session_ids
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.clone());
+        }
         let updated = session.clone();
         self.evict_if_needed(&mut sessions)?;
         Ok(updated)
+    }
+
+    pub async fn mark_board_session(
+        &self,
+        session_id: &str,
+        board_run_id: impl Into<String>,
+        board_task_id: Option<String>,
+    ) -> Result<SessionSummary> {
+        let board_run_id = board_run_id.into();
+        if board_run_id.trim().is_empty() {
+            return Err(CoreError::InvalidInput(
+                "board run id must not be empty".to_string(),
+            ));
+        }
+        let mut sessions = self.sessions.write().await;
+        if !sessions.contains_key(session_id)
+            && let Some(stored) = self.storage.get_session_summary(session_id)?
+        {
+            sessions.insert(session_id.to_string(), stored);
+        }
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
+        session.board_session = true;
+        session.board_run_id = Some(board_run_id);
+        session.board_task_id = board_task_id.filter(|value| !value.trim().is_empty());
+        self.storage.upsert_session(session)?;
+        self.board_session_ids
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id.to_string());
+        Ok(session.clone())
     }
 
     pub async fn append_message(
@@ -1398,7 +2031,7 @@ impl SessionManager {
 
         let mut sessions = self.sessions.write().await;
         if !sessions.contains_key(session_id)
-            && let Some(stored) = self.storage.get_session(session_id)?
+            && let Some(stored) = self.storage.get_session_summary(session_id)?
         {
             sessions.insert(session_id.to_string(), stored);
         }
@@ -1474,7 +2107,7 @@ impl SessionManager {
     pub async fn set_active(&self, session_id: &str, active: bool) -> Result<SessionSummary> {
         let mut sessions = self.sessions.write().await;
         if !sessions.contains_key(session_id)
-            && let Some(stored) = self.storage.get_session(session_id)?
+            && let Some(stored) = self.storage.get_session_summary(session_id)?
         {
             sessions.insert(session_id.to_string(), stored);
         }
@@ -1501,7 +2134,7 @@ impl SessionManager {
 
         let mut sessions = self.sessions.write().await;
         if !sessions.contains_key(session_id)
-            && let Some(stored) = self.storage.get_session(session_id)?
+            && let Some(stored) = self.storage.get_session_summary(session_id)?
         {
             sessions.insert(session_id.to_string(), stored);
         }
@@ -1570,13 +2203,25 @@ impl SessionManager {
     }
 
     pub async fn list_active(&self) -> Vec<SessionSummary> {
-        self.sessions
-            .read()
-            .await
-            .values()
-            .filter(|session| session.active)
-            .cloned()
-            .collect()
+        let mut sessions: Vec<_> = {
+            self.sessions
+                .read()
+                .await
+                .values()
+                .filter(|session| session.active && !session.board_session)
+                .cloned()
+                .collect()
+        };
+        for session in &mut sessions {
+            if let Err(error) = self.refresh_summary_message_count(session).await {
+                warn!(
+                    error = %error,
+                    session_id = %session.id,
+                    "failed to refresh active session message count"
+                );
+            }
+        }
+        sessions
     }
 
     pub async fn list_for_project(&self, project_path: &str) -> Result<Vec<SessionSummary>> {
@@ -1594,8 +2239,10 @@ impl SessionManager {
             if !same_project_path(&record.summary.project_path, project_path) {
                 continue;
             }
+            let mut external_summary = record.summary.clone();
+            external_summary.message_count = self.external_record_message_count(&record).await;
             if let Some(existing) = sessions.iter_mut().find(|session| {
-                session.id == record.summary.id && session.provider == record.summary.provider
+                session.id == external_summary.id && session.provider == external_summary.provider
             }) {
                 if existing.external {
                     let active = existing.active;
@@ -1611,7 +2258,8 @@ impl SessionManager {
                     let mode = existing.mode.clone();
                     let thinking = existing.thinking;
                     let token_usage = existing.token_usage.clone();
-                    *existing = record.summary;
+                    let lifetime_token_usage = existing.lifetime_token_usage.clone();
+                    *existing = external_summary;
                     existing.active = active;
                     if preserve_local_title {
                         existing.title = title;
@@ -1622,13 +2270,81 @@ impl SessionManager {
                     existing.mode = mode;
                     existing.thinking = thinking;
                     existing.token_usage = token_usage;
+                    existing.lifetime_token_usage = lifetime_token_usage;
                 }
             } else {
-                sessions.push(record.summary);
+                sessions.push(external_summary);
             }
+        }
+        for session in &mut sessions {
+            self.refresh_summary_message_count(session).await?;
         }
         sessions.sort_by_key(|session| std::cmp::Reverse(session.last_activity));
         Ok(sessions)
+    }
+
+    async fn refresh_summary_message_count(&self, session: &mut SessionSummary) -> Result<()> {
+        let stored_summary_count = session.message_count;
+        let loaded_count = if session.external {
+            if let Some(record) = self
+                .external_record(
+                    &session.id,
+                    Some(session.provider),
+                    Some(&session.project_path),
+                )
+                .await
+            {
+                Some(self.external_record_message_count(&record).await)
+            } else {
+                None
+            }
+        } else if session.provider == Provider::Codex
+            && session.native_session_id.is_some()
+            && !self.storage.has_context_rollover(&session.id)?
+        {
+            if let Some(record) = self.external_record_for_messages(&session.id).await {
+                self.cached_external_record_message_count(&record)
+                    .await
+                    .or_else(|| {
+                        (record.summary.message_count > 1).then_some(record.summary.message_count)
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(loaded_count) = loaded_count {
+            session.message_count = if session.active {
+                stored_summary_count.max(loaded_count)
+            } else {
+                loaded_count
+            };
+        }
+        Ok(())
+    }
+
+    async fn external_record_message_count(&self, record: &ExternalSessionRecord) -> usize {
+        self.cached_external_record_message_count(record)
+            .await
+            .unwrap_or(record.summary.message_count)
+    }
+
+    async fn cached_external_record_message_count(
+        &self,
+        record: &ExternalSessionRecord,
+    ) -> Option<usize> {
+        let key = external_session_cache_key(record);
+        let modified_at = std::fs::metadata(&record.file_path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        self.external_cache
+            .read()
+            .await
+            .messages
+            .get(&key)
+            .filter(|cached| cached.modified_at == modified_at)
+            .map(|cached| cached.total_count)
     }
 
     pub fn messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
@@ -1636,6 +2352,9 @@ impl SessionManager {
     }
 
     pub async fn messages_including_external(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
+        if self.storage.has_context_rollover(session_id)? {
+            return self.messages(session_id);
+        }
         if let Some(messages) = self.external_messages_for_session(session_id).await? {
             return Ok(messages);
         }
@@ -1700,7 +2419,9 @@ impl SessionManager {
         {
             let mut cache = self.external_cache.write().await;
             cache.loaded_at = None;
-            cache.messages.remove(&external_session_cache_key(&record));
+            if let Some(stale) = cache.messages.remove(&external_session_cache_key(&record)) {
+                cache.message_bytes = cache.message_bytes.saturating_sub(stale.estimated_bytes);
+            }
         }
 
         info!(
@@ -1723,7 +2444,7 @@ impl SessionManager {
     ) -> Result<(Vec<ChatMessage>, usize)> {
         Ok(self
             .storage
-            .list_messages_page(session_id, limit.max(1).min(500), offset)?)
+            .list_messages_page(session_id, limit.clamp(1, 500), offset)?)
     }
 
     pub async fn messages_page_including_external(
@@ -1732,10 +2453,13 @@ impl SessionManager {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ChatMessage>, usize)> {
+        if self.storage.has_context_rollover(session_id)? {
+            return self.messages_page(session_id, limit, offset);
+        }
         if let Some(messages) = self.external_messages_for_session(session_id).await? {
             let total = messages.len();
             let start = offset.min(total);
-            let end = start.saturating_add(limit.max(1).min(500)).min(total);
+            let end = start.saturating_add(limit.clamp(1, 500)).min(total);
             return Ok((messages[start..end].to_vec(), total));
         }
         self.messages_page(session_id, limit, offset)
@@ -1746,11 +2470,17 @@ impl SessionManager {
         session_id: &str,
         limit: usize,
     ) -> Result<(Vec<ChatMessage>, usize)> {
-        let limit = limit.max(1).min(500);
-        if let Some(messages) = self.external_messages_for_session(session_id).await? {
-            let total = messages.len();
+        let limit = limit.clamp(1, 500);
+        if self.storage.has_context_rollover(session_id)? {
+            let (_, total) = self.messages_page(session_id, 1, 0)?;
             let start = total.saturating_sub(limit);
-            return Ok((messages[start..].to_vec(), total));
+            return self.messages_page(session_id, limit, start);
+        }
+        if let Some((messages, total)) = self
+            .external_messages_tail_for_session(session_id, limit)
+            .await?
+        {
+            return Ok((messages, total));
         }
         let (_, total) = self.messages_page(session_id, 1, 0)?;
         let start = total.saturating_sub(limit);
@@ -1763,7 +2493,12 @@ impl SessionManager {
         limit: usize,
         before: Option<PromptHistoryCursor>,
     ) -> Result<(Vec<PromptHistoryEntry>, bool)> {
-        let limit = limit.max(1).min(500);
+        let limit = limit.clamp(1, 500);
+        if self.storage.has_context_rollover(session_id)? {
+            return Ok(self
+                .storage
+                .list_user_prompts_page(session_id, limit, before.as_ref())?);
+        }
         if let Some(messages) = self.external_messages_for_session(session_id).await? {
             let mut prompts = messages
                 .into_iter()
@@ -1790,48 +2525,88 @@ impl SessionManager {
     }
 
     pub async fn get(&self, session_id: &str) -> Result<SessionSummary> {
-        if let Some(session) = self.sessions.read().await.get(session_id).cloned() {
+        if let Some(mut session) = self.sessions.read().await.get(session_id).cloned() {
+            self.refresh_summary_message_count(&mut session).await?;
             return Ok(session);
         }
 
-        if let Some(session) = self.storage.get_session(session_id)? {
+        if let Some(mut session) = self.storage.get_session(session_id)? {
+            self.refresh_summary_message_count(&mut session).await?;
             return Ok(session);
         }
-        self.external_record(session_id, None, None)
-            .await
-            .map(|record| record.summary)
-            .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))
+        if let Some(record) = self.external_record(session_id, None, None).await {
+            let mut session = record.summary.clone();
+            session.message_count = self.external_record_message_count(&record).await;
+            return Ok(session);
+        }
+        Err(CoreError::SessionNotFound(session_id.to_string()))
     }
 
     pub async fn remember_persisted_session(&self, session: SessionSummary) -> Result<()> {
+        if session.board_session {
+            self.board_session_ids
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(session.id.clone());
+        }
         let mut sessions = self.sessions.write().await;
         sessions.insert(session.id.clone(), session);
         self.evict_if_needed(&mut sessions)
     }
 
+    /// Board visibility is checked for every streamed WebSocket event. Keep
+    /// this lookup entirely in memory so output chunks never contend on the
+    /// single SQLite connection.
+    pub fn is_board_session_cached(&self, session_id: &str) -> bool {
+        self.board_session_ids
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(session_id)
+    }
+
     fn get_stored(&self, session_id: &str) -> Option<SessionSummary> {
-        self.storage.get_session(session_id).ok().flatten()
+        self.storage.get_session_summary(session_id).ok().flatten()
     }
 
     async fn external_records(&self) -> Vec<ExternalSessionRecord> {
         const CACHE_TTL: Duration = Duration::from_secs(30);
-        let mut records = {
+        let cached = {
             let cache = self.external_cache.read().await;
-            if cache
+            cache
                 .loaded_at
                 .is_some_and(|loaded_at| loaded_at.elapsed() < CACHE_TTL)
-            {
-                cache.records.clone()
+                .then(|| cache.records.clone())
+        };
+        let mut records = if let Some(records) = cached {
+            records
+        } else {
+            // Only one request may refresh provider indexes at a time. Recheck
+            // after acquiring the guard so concurrent mobile/web connections
+            // reuse the first completed synchronization.
+            let _sync_guard = self.external_sync.lock().await;
+            let refreshed = {
+                let cache = self.external_cache.read().await;
+                cache
+                    .loaded_at
+                    .is_some_and(|loaded_at| loaded_at.elapsed() < CACHE_TTL)
+                    .then(|| cache.records.clone())
+            };
+            if let Some(records) = refreshed {
+                records
             } else {
-                let stale_records = cache.records.clone();
-                drop(cache);
+                let stale_records = self.external_cache.read().await.records.clone();
                 let external_home = self.external_home.clone();
+                let storage = self.storage.clone();
                 let records = match tokio::task::spawn_blocking(move || {
-                    discover_external_sessions(&external_home)
+                    sync_external_sessions(&external_home, &storage)
                 })
                 .await
                 {
-                    Ok(records) => records,
+                    Ok(Ok(records)) => records,
+                    Ok(Err(error)) => {
+                        warn!(%error, "external session synchronization failed");
+                        stale_records
+                    }
                     Err(error) => {
                         warn!(%error, "external session discovery worker failed");
                         stale_records
@@ -1856,7 +2631,7 @@ impl SessionManager {
                     .get(&key)
                     .filter(|cached| cached.modified_at == modified_at)
                 {
-                    record.summary.message_count = cached.messages.len();
+                    record.summary.message_count = cached.total_count;
                 }
             }
         }
@@ -1883,9 +2658,17 @@ impl SessionManager {
                 HashSet::new()
             }
         };
+        let replaced_source_ids = match self.storage.list_replaced_source_session_ids() {
+            Ok(session_ids) => session_ids.into_iter().collect::<HashSet<_>>(),
+            Err(error) => {
+                warn!(%error, "failed to load replaced source session ids");
+                HashSet::new()
+            }
+        };
         records
             .into_iter()
             .filter(|record| !mapped_native_ids.contains(&record.summary.id))
+            .filter(|record| !replaced_source_ids.contains(&record.summary.id))
             .filter(|record| {
                 !deleted_sessions.contains(&(record.summary.provider, record.summary.id.clone()))
             })
@@ -1921,7 +2704,7 @@ impl SessionManager {
             .await
             .get(session_id)
             .cloned()
-            .or_else(|| self.storage.get_session(session_id).ok().flatten())?;
+            .or_else(|| self.storage.get_session_summary(session_id).ok().flatten())?;
         if session.provider != Provider::Codex {
             return None;
         }
@@ -1955,6 +2738,22 @@ impl SessionManager {
         find_record().await
     }
 
+    async fn native_rollout_size(&self, session_id: &str) -> Option<u64> {
+        let record = self.external_record_for_messages(session_id).await?;
+        std::fs::metadata(record.file_path)
+            .ok()
+            .map(|metadata| metadata.len())
+    }
+
+    /// Resolve the provider-owned transcript through the existing discovery
+    /// index/cache. Callers should use this instead of recursively walking the
+    /// entire CLI history tree for a known session id.
+    pub async fn external_session_file(&self, session_id: &str) -> Option<PathBuf> {
+        self.external_record_for_messages(session_id)
+            .await
+            .map(|record| record.file_path)
+    }
+
     async fn external_messages_for_session(
         &self,
         session_id: &str,
@@ -1977,42 +2776,216 @@ impl SessionManager {
         )))
     }
 
+    async fn external_messages_tail_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Option<(Vec<ChatMessage>, usize)>> {
+        let Some(record) = self.external_record_for_messages(session_id).await else {
+            return Ok(None);
+        };
+        let (external, external_total) = self.external_messages_tail(&record, limit).await;
+        if external.is_empty() {
+            return Ok(None);
+        }
+        if record.summary.id == session_id {
+            return Ok(Some((external, external_total)));
+        }
+
+        let stored = self.messages(session_id)?;
+        let stored_system_count = stored
+            .iter()
+            .filter(|message| message.role == MessageRole::System)
+            .count();
+        let merged = merge_mapped_external_messages(stored, external);
+        let start = merged.len().saturating_sub(limit);
+        Ok(Some((
+            merged[start..].to_vec(),
+            external_total.saturating_add(stored_system_count),
+        )))
+    }
+
+    async fn external_messages_tail(
+        &self,
+        record: &ExternalSessionRecord,
+        limit: usize,
+    ) -> (Vec<ChatMessage>, usize) {
+        let key = external_session_cache_key(record);
+        let modified_at = std::fs::metadata(&record.file_path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        {
+            let mut cache = self.external_cache.write().await;
+            if let Some(cached) = cache.messages.get_mut(&key) {
+                if cached.modified_at == modified_at {
+                    cached.last_access = Instant::now();
+                    let start = cached.messages.len().saturating_sub(limit);
+                    return (cached.messages[start..].to_vec(), cached.total_count);
+                }
+                if let Some(stale) = cache.messages.remove(&key) {
+                    cache.message_bytes = cache.message_bytes.saturating_sub(stale.estimated_bytes);
+                }
+            }
+        }
+
+        if let Some(fingerprint) = external_file_fingerprint(&record.file_path) {
+            let file_path = record.file_path.display().to_string();
+            let storage_fingerprint = ExternalHistoryFingerprint {
+                file_identity: fingerprint.file_identity.as_deref(),
+                file_size: fingerprint.file_size,
+                modified_nanos: fingerprint.modified_nanos,
+                parser_version: EXTERNAL_MESSAGE_PARSER_VERSION,
+            };
+            match self.storage.external_messages_tail_if_current(
+                record.summary.provider,
+                &record.summary.id,
+                &file_path,
+                &storage_fingerprint,
+                limit,
+            ) {
+                Ok(Some(messages)) => return messages,
+                Ok(None) => {}
+                Err(error) => warn!(
+                    %error,
+                    session_id = %record.summary.id,
+                    "failed to read persisted external message tail"
+                ),
+            }
+        }
+
+        let messages = self.external_messages(record).await;
+        let total = messages.len();
+        let start = total.saturating_sub(limit);
+        (messages[start..].to_vec(), total)
+    }
+
     async fn external_messages(&self, record: &ExternalSessionRecord) -> Arc<Vec<ChatMessage>> {
         let key = external_session_cache_key(record);
         let modified_at = std::fs::metadata(&record.file_path)
             .and_then(|metadata| metadata.modified())
             .ok();
         {
-            let cache = self.external_cache.read().await;
-            if let Some(cached) = cache.messages.get(&key) {
-                if cached.modified_at == modified_at {
+            let mut cache = self.external_cache.write().await;
+            if let Some(cached) = cache.messages.get_mut(&key) {
+                if cached.modified_at == modified_at && cached.complete {
+                    cached.last_access = Instant::now();
                     return cached.messages.clone();
+                } else if let Some(stale) = cache.messages.remove(&key) {
+                    cache.message_bytes = cache.message_bytes.saturating_sub(stale.estimated_bytes);
                 }
             }
         }
 
-        let record = record.clone();
-        let messages =
-            match tokio::task::spawn_blocking(move || load_external_messages(&record)).await {
-                Ok(messages) => Arc::new(messages),
+        let cache_warning_session_id = record.summary.id.clone();
+        let cache_warning_provider = record.summary.provider;
+        let fingerprint_before = external_file_fingerprint(&record.file_path);
+        let file_path = record.file_path.display().to_string();
+        let persisted = fingerprint_before.as_ref().and_then(|fingerprint| {
+            let storage_fingerprint = ExternalHistoryFingerprint {
+                file_identity: fingerprint.file_identity.as_deref(),
+                file_size: fingerprint.file_size,
+                modified_nanos: fingerprint.modified_nanos,
+                parser_version: EXTERNAL_MESSAGE_PARSER_VERSION,
+            };
+            match self.storage.external_messages_if_current(
+                record.summary.provider,
+                &record.summary.id,
+                &file_path,
+                &storage_fingerprint,
+            ) {
+                Ok(messages) => messages,
                 Err(error) => {
-                    warn!(%error, "external session parser worker failed");
-                    return Arc::new(Vec::new());
+                    warn!(
+                        %error,
+                        session_id = %record.summary.id,
+                        "failed to read persisted external messages"
+                    );
+                    None
                 }
-            };
+            }
+        });
+        let messages = if let Some(messages) = persisted {
+            Arc::new(messages)
+        } else {
+            let parse_record = record.clone();
+            let messages =
+                match tokio::task::spawn_blocking(move || load_external_messages(&parse_record))
+                    .await
+                {
+                    Ok(messages) => Arc::new(messages),
+                    Err(error) => {
+                        warn!(%error, "external session parser worker failed");
+                        return Arc::new(Vec::new());
+                    }
+                };
+            let fingerprint_after = external_file_fingerprint(&record.file_path);
+            if fingerprint_before == fingerprint_after
+                && let Some(fingerprint) = fingerprint_after.as_ref()
+            {
+                let storage_fingerprint = ExternalHistoryFingerprint {
+                    file_identity: fingerprint.file_identity.as_deref(),
+                    file_size: fingerprint.file_size,
+                    modified_nanos: fingerprint.modified_nanos,
+                    parser_version: EXTERNAL_MESSAGE_PARSER_VERSION,
+                };
+                if let Err(error) = self.storage.replace_external_messages(
+                    record.summary.provider,
+                    &record.summary.id,
+                    &file_path,
+                    &storage_fingerprint,
+                    messages.as_ref(),
+                ) {
+                    warn!(
+                        %error,
+                        session_id = %record.summary.id,
+                        "failed to persist external messages"
+                    );
+                }
+            }
+            messages
+        };
+        let estimated_bytes = estimate_external_messages_bytes(&messages);
+        let total_count = messages.len();
         let mut cache = self.external_cache.write().await;
-        cache.messages.insert(
-            key,
-            CachedExternalMessages {
-                modified_at,
-                messages: messages.clone(),
-            },
-        );
-        while cache.messages.len() > 64 {
-            let Some(key) = cache.messages.keys().next().cloned() else {
-                break;
+        if let Some(stale) = cache.messages.remove(&key) {
+            cache.message_bytes = cache.message_bytes.saturating_sub(stale.estimated_bytes);
+        }
+        let (cached_messages, cached_bytes, complete) =
+            if estimated_bytes <= EXTERNAL_MESSAGE_CACHE_MAX_BYTES {
+                (messages.clone(), estimated_bytes, true)
+            } else {
+                let tail = bounded_external_message_tail(
+                    &messages,
+                    EXTERNAL_MESSAGE_TAIL_CACHE_MAX_MESSAGES,
+                    EXTERNAL_MESSAGE_CACHE_MAX_BYTES,
+                );
+                let cached_bytes = estimate_external_messages_bytes(&tail);
+                (Arc::new(tail), cached_bytes, false)
             };
-            cache.messages.remove(&key);
+        if cached_bytes <= EXTERNAL_MESSAGE_CACHE_MAX_BYTES {
+            cache.messages.insert(
+                key,
+                CachedExternalMessages {
+                    modified_at,
+                    estimated_bytes: cached_bytes,
+                    last_access: Instant::now(),
+                    total_count,
+                    complete,
+                    messages: cached_messages,
+                },
+            );
+            cache.message_bytes = cache.message_bytes.saturating_add(cached_bytes);
+            evict_external_message_cache(&mut cache);
+        }
+        if !complete {
+            warn!(
+                session_id = %cache_warning_session_id,
+                provider = cache_warning_provider.as_str(),
+                estimated_bytes,
+                max_bytes = EXTERNAL_MESSAGE_CACHE_MAX_BYTES,
+                cached_tail_messages = total_count.min(EXTERNAL_MESSAGE_TAIL_CACHE_MAX_MESSAGES),
+                "external session messages exceed full-cache budget; retained a bounded tail"
+            );
         }
         messages
     }
@@ -2026,7 +2999,7 @@ impl SessionManager {
         let mut session = sessions
             .get(session_id)
             .cloned()
-            .or_else(|| self.storage.get_session(session_id).ok().flatten())
+            .or_else(|| self.storage.get_session_summary(session_id).ok().flatten())
             .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
 
         session.model = model;
@@ -2042,7 +3015,7 @@ impl SessionManager {
         let mut session = sessions
             .get(session_id)
             .cloned()
-            .or_else(|| self.storage.get_session(session_id).ok().flatten())
+            .or_else(|| self.storage.get_session_summary(session_id).ok().flatten())
             .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
 
         session.title = title;
@@ -2059,7 +3032,7 @@ impl SessionManager {
             let sessions = self.sessions.read().await;
             sessions.get(session_id).cloned()
         }
-        .or_else(|| self.storage.get_session(session_id).ok().flatten());
+        .or_else(|| self.storage.get_session_summary(session_id).ok().flatten());
         let session = match session {
             Some(session) => session,
             None => self
@@ -2068,9 +3041,18 @@ impl SessionManager {
                 .map(|record| record.summary)
                 .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?,
         };
+        for native_session_id in self.storage.context_native_session_ids(session_id)? {
+            self.storage
+                .tombstone_session(&native_session_id, session.provider)?;
+        }
         if session.external {
             self.storage
                 .tombstone_session(session_id, session.provider)?;
+        } else if self.storage.is_session_fork_destination(session_id)? {
+            if let Some(native_session_id) = session.native_session_id.as_deref() {
+                self.storage
+                    .tombstone_session(native_session_id, session.provider)?;
+            }
         }
         if !self.storage.delete_session(session_id)? {
             if !session.external {
@@ -2079,6 +3061,10 @@ impl SessionManager {
         }
         let mut sessions = self.sessions.write().await;
         sessions.remove(session_id);
+        self.board_session_ids
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
         Ok(session)
     }
 
@@ -2095,6 +3081,67 @@ impl SessionManager {
             }
         }
         Ok(())
+    }
+}
+
+fn estimate_external_messages_bytes(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| {
+            std::mem::size_of::<ChatMessage>()
+                .saturating_add(message.id.len())
+                .saturating_add(message.content.len())
+                .saturating_add(estimate_json_value_bytes(&message.metadata))
+        })
+        .sum()
+}
+
+fn bounded_external_message_tail(
+    messages: &[ChatMessage],
+    max_messages: usize,
+    max_bytes: usize,
+) -> Vec<ChatMessage> {
+    let mut tail = Vec::new();
+    let mut estimated_bytes = 0usize;
+    for message in messages.iter().rev().take(max_messages) {
+        let message_bytes = estimate_external_messages_bytes(std::slice::from_ref(message));
+        if !tail.is_empty() && estimated_bytes.saturating_add(message_bytes) > max_bytes {
+            break;
+        }
+        estimated_bytes = estimated_bytes.saturating_add(message_bytes);
+        tail.push(message.clone());
+    }
+    tail.reverse();
+    tail
+}
+
+fn estimate_json_value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => std::mem::size_of_val(value),
+        Value::String(value) => value.len(),
+        Value::Array(values) => values.iter().map(estimate_json_value_bytes).sum(),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| key.len().saturating_add(estimate_json_value_bytes(value)))
+            .sum(),
+    }
+}
+
+fn evict_external_message_cache(cache: &mut ExternalSessionCache) {
+    while cache.messages.len() > EXTERNAL_MESSAGE_CACHE_MAX_ENTRIES
+        || cache.message_bytes > EXTERNAL_MESSAGE_CACHE_MAX_BYTES
+    {
+        let Some(key) = cache
+            .messages
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_access)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if let Some(removed) = cache.messages.remove(&key) {
+            cache.message_bytes = cache.message_bytes.saturating_sub(removed.estimated_bytes);
+        }
     }
 }
 
@@ -2144,6 +3191,16 @@ fn message_match_key(message: &ChatMessage) -> String {
 
 fn clone_forked_message(source_session_id: &str, source: &ChatMessage) -> ChatMessage {
     let mut metadata = source.metadata.as_object().cloned().unwrap_or_default();
+    let usage_source_session_id = metadata
+        .get("usageSourceSessionId")
+        .and_then(Value::as_str)
+        .unwrap_or(source_session_id)
+        .to_string();
+    let usage_source_message_id = metadata
+        .get("usageSourceMessageId")
+        .and_then(Value::as_str)
+        .unwrap_or(&source.id)
+        .to_string();
     metadata.insert(
         "forkedFromSessionId".to_string(),
         Value::String(source_session_id.to_string()),
@@ -2151,6 +3208,14 @@ fn clone_forked_message(source_session_id: &str, source: &ChatMessage) -> ChatMe
     metadata.insert(
         "forkedFromMessageId".to_string(),
         Value::String(source.id.clone()),
+    );
+    metadata.insert(
+        "usageSourceSessionId".to_string(),
+        Value::String(usage_source_session_id),
+    );
+    metadata.insert(
+        "usageSourceMessageId".to_string(),
+        Value::String(usage_source_message_id),
     );
     ChatMessage {
         id: new_id("msg"),
@@ -2171,7 +3236,92 @@ fn normalized_fork_prompt(value: &str) -> String {
     selected.replace("\r\n", "\n")
 }
 
+fn build_context_rollover_handoff(messages: Vec<ChatMessage>, failed_prompt: &str) -> String {
+    let failed_prompt = sanitize_context_handoff_text(failed_prompt);
+    let mut selected = Vec::<String>::new();
+    let mut remaining = CONTEXT_ROLLOVER_HANDOFF_MAX_BYTES;
+    for message in messages.into_iter().rev() {
+        if !matches!(message.role, MessageRole::User | MessageRole::Assistant) {
+            continue;
+        }
+        if message.role == MessageRole::Assistant
+            && (message.metadata.get("kind").and_then(Value::as_str) == Some("thinking")
+                || message.metadata.get("phase").and_then(Value::as_str) == Some("commentary"))
+        {
+            continue;
+        }
+        if message.role == MessageRole::User && message.id.is_empty() {
+            continue;
+        }
+        let content = sanitize_context_handoff_text(&message.content);
+        if content.is_empty() || (message.role == MessageRole::User && content == failed_prompt) {
+            continue;
+        }
+        let role = if message.role == MessageRole::User {
+            "User"
+        } else {
+            "Assistant"
+        };
+        let entry = format!("{role}: {content}");
+        if entry.len() + 2 > remaining {
+            continue;
+        }
+        remaining -= entry.len() + 2;
+        selected.push(entry);
+        if selected.len() >= 24 {
+            break;
+        }
+    }
+    selected.reverse();
+    let history = if selected.is_empty() {
+        "No earlier text messages were retained.".to_string()
+    } else {
+        selected.join("\n\n")
+    };
+    format!(
+        "<system-reminder>\nThe visible io-workbench chat is being moved into a clean native Codex context because its previous history exceeded the gateway body-size limit. The same Workbench chat and full visible transcript remain available to the user. Use the bounded text handoff below only to re-establish context. Do not answer the failed user request yet; a subsequent message will contain that request after this clean context is activated. Do not claim that old tool outputs or inline image bytes are present. Reopen only specific local image paths when genuinely needed, one at a time. Inspect current files before changing them and preserve existing unrelated work. Reply exactly: Context ready.\n\nRecent text-only handoff:\n{history}\n</system-reminder>"
+    )
+}
+
+fn sanitize_context_handoff_text(value: &str) -> String {
+    let visible = normalized_fork_prompt(value);
+    let mut output = String::with_capacity(visible.len().min(8 * 1024));
+    let mut cursor = 0;
+    while let Some(relative_start) = visible[cursor..].find("data:") {
+        let start = cursor + relative_start;
+        output.push_str(&visible[cursor..start]);
+        let tail = &visible[start..];
+        let Some(marker) = tail.find(";base64,") else {
+            output.push_str("data:");
+            cursor = start + "data:".len();
+            continue;
+        };
+        let payload_start = start + marker + ";base64,".len();
+        let payload_len = visible.as_bytes()[payload_start..]
+            .iter()
+            .take_while(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
+            })
+            .count();
+        if payload_len == 0 {
+            output.push_str("[inline attachment omitted]");
+            cursor = payload_start;
+        } else {
+            output.push_str("[inline image omitted; use its local file path if available]");
+            cursor = payload_start + payload_len;
+        }
+    }
+    output.push_str(&visible[cursor..]);
+    bound_agent_text(&output, 8 * 1024, "handoff message")
+        .trim()
+        .to_string()
+}
+
 fn ordered_text_matches(left: &[String], right: &[String]) -> Vec<(usize, usize)> {
+    if left.len().saturating_mul(right.len()) > ORDERED_TEXT_MATCH_MATRIX_MAX_CELLS {
+        return ordered_text_matches_greedy(left, right);
+    }
     let mut lengths = vec![vec![0usize; right.len() + 1]; left.len() + 1];
     for left_index in (0..left.len()).rev() {
         for right_index in (0..right.len()).rev() {
@@ -2199,16 +3349,65 @@ fn ordered_text_matches(left: &[String], right: &[String]) -> Vec<(usize, usize)
     matches
 }
 
+fn ordered_text_matches_greedy(left: &[String], right: &[String]) -> Vec<(usize, usize)> {
+    let mut positions = HashMap::<&str, VecDeque<usize>>::new();
+    for (index, value) in right.iter().enumerate() {
+        positions
+            .entry(value.as_str())
+            .or_default()
+            .push_back(index);
+    }
+    let mut next_right_index = 0usize;
+    let mut matches = Vec::new();
+    for (left_index, value) in left.iter().enumerate() {
+        let Some(indices) = positions.get_mut(value.as_str()) else {
+            continue;
+        };
+        while indices
+            .front()
+            .is_some_and(|index| *index < next_right_index)
+        {
+            indices.pop_front();
+        }
+        if let Some(right_index) = indices.pop_front() {
+            matches.push((left_index, right_index));
+            next_right_index = right_index.saturating_add(1);
+        }
+    }
+    matches
+}
+
+fn ws_event_estimated_bytes(event: &WsServerEvent) -> usize {
+    const ENVELOPE_BYTES: usize = 256;
+    match event {
+        WsServerEvent::Output { content, .. } => ENVELOPE_BYTES.saturating_add(content.len()),
+        WsServerEvent::Error {
+            message, details, ..
+        } => ENVELOPE_BYTES
+            .saturating_add(message.len())
+            .saturating_add(details.as_deref().map_or(0, str::len)),
+        WsServerEvent::SessionStatus {
+            latest_user_prompt, ..
+        } => ENVELOPE_BYTES.saturating_add(latest_user_prompt.as_deref().map_or(0, str::len)),
+        WsServerEvent::ProjectFilesChanged { paths, .. } => {
+            ENVELOPE_BYTES.saturating_add(paths.iter().map(String::len).sum::<usize>())
+        }
+        _ => 1024,
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentRuntimeManager {
     runs: Arc<RwLock<HashMap<String, AgentRuntimeRecord>>>,
     max_runs: usize,
     max_replay_events: usize,
+    max_replay_bytes: usize,
     max_output_bytes: usize,
 }
 
 struct AgentRuntimeRecord {
     replay: VecDeque<WsServerEvent>,
+    replay_bytes: usize,
     abort_tx: Option<oneshot::Sender<()>>,
     last_activity: DateTime<Utc>,
 }
@@ -2218,6 +3417,7 @@ struct AgentStartContext {
     provider: Provider,
     session_id: String,
     durable_run_id: Option<String>,
+    attempt_id: Option<String>,
     response_id: String,
     sequence: Arc<AtomicU64>,
     project_path: PathBuf,
@@ -2229,11 +3429,17 @@ struct AgentStartContext {
     thinking: Option<bool>,
     fast: Option<bool>,
     native_resume_session_id: Option<String>,
+    context_rollover_id: Option<String>,
     direct_ai_config: Option<DirectAiRuntimeConfig>,
     direct_ai_messages: Vec<DirectAiConversationMessage>,
     sessions: SessionManager,
     storage: iowb_storage::Storage,
     hub: WsHub,
+}
+
+#[derive(Clone)]
+struct ContextRolloverFollowUp {
+    run: StoredDurableChatRun,
 }
 
 impl AgentStartContext {
@@ -2270,6 +3476,22 @@ enum AgentProcessEvent {
     Failed(String),
 }
 
+#[derive(Debug, Clone)]
+struct CodexTurnError {
+    message: String,
+    code: Option<String>,
+    limit_bytes: Option<u64>,
+    observed_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedRunUsage {
+    usage: SessionTokenUsage,
+    raw_usage_json: Option<String>,
+    source: &'static str,
+    completeness: TokenUsageCompleteness,
+}
+
 #[derive(Default)]
 struct CodexLiveOutputNormalizer {
     pending_line: String,
@@ -2279,6 +3501,8 @@ struct CodexLiveOutputNormalizer {
     saw_structured_event: bool,
     tool_messages: Vec<NormalizedToolMessage>,
     tool_message_bytes: usize,
+    last_error: Option<CodexTurnError>,
+    final_usage: Option<NormalizedRunUsage>,
 }
 
 #[derive(Debug, Clone)]
@@ -2291,6 +3515,7 @@ struct NormalizedToolMessage {
 struct GeminiLiveOutputNormalizer {
     pending_line: String,
     pending_session_id: Option<String>,
+    final_usage: Option<NormalizedRunUsage>,
 }
 
 impl AgentRuntimeManager {
@@ -2299,241 +3524,239 @@ impl AgentRuntimeManager {
             runs: Arc::new(RwLock::new(HashMap::new())),
             max_runs,
             max_replay_events: 256,
+            max_replay_bytes: AGENT_REPLAY_MAX_BYTES,
             max_output_bytes: AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
         }
     }
 
-    async fn start(&self, context: AgentStartContext) -> Result<()> {
-        let key = agent_run_key(context.provider, &context.session_id);
-        let runtime_provider = if context.runtime == ChatRuntime::IoGateway {
-            context.provider
-        } else {
-            effective_agent_command_provider(context.provider, context.model.as_deref())
-        };
-        if should_use_direct_ai_gateway_runtime(context.provider, context.model.as_deref()) {
-            return self.start_direct_ai(context).await;
-        }
-
-        let mut command = match resolve_agent_command(
-            runtime_provider,
-            &context.prompt,
-            &context.session_id,
-            context.model.as_deref(),
-            context.effort.as_deref(),
-            context.mode.as_deref(),
-            context.thinking,
-            context.fast,
-            context.native_resume_session_id.as_deref(),
-            context.runtime,
-        ) {
-            Ok(command) => command,
-            Err(error) => {
-                let error_message = error.to_string();
-                self.publish(
-                    &context.hub,
-                    &key,
-                    WsServerEvent::Error {
-                        message: "failed to prepare agent command".to_string(),
-                        details: Some(error_message.clone()),
-                    },
-                )
-                .await;
-                self.finish(
-                    &key,
-                    &context,
-                    iowb_protocol::SessionRuntimeStatus::Failed,
-                    Some(error_message),
-                )
-                .await;
-                return Ok(());
-            }
-        };
-        if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Codex {
-            let Some(config) = context.direct_ai_config.as_ref() else {
-                return Err(CoreError::InvalidInput(
-                    "IO Gateway is not configured for this session".to_string(),
-                ));
+    fn start(
+        &self,
+        context: AgentStartContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            let key = agent_run_key(context.provider, &context.session_id);
+            let runtime_provider = if context.runtime == ChatRuntime::IoGateway {
+                context.provider
+            } else {
+                effective_agent_command_provider(context.provider, context.model.as_deref())
             };
-            apply_codex_cli_io_gateway_args(&mut command.args, &config.base_url);
-        }
-        let (abort_tx, abort_rx) = oneshot::channel();
+            if should_use_direct_ai_gateway_runtime(context.provider, context.model.as_deref()) {
+                return self.start_direct_ai(context).await;
+            }
 
-        self.register(key.clone(), abort_tx).await;
+            let mut command = match resolve_agent_command(
+                runtime_provider,
+                &context.prompt,
+                &context.session_id,
+                context.model.as_deref(),
+                context.effort.as_deref(),
+                context.mode.as_deref(),
+                context.thinking,
+                context.fast,
+                context.native_resume_session_id.as_deref(),
+                context.runtime,
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    let error_message = error.to_string();
+                    self.publish(
+                        &context.hub,
+                        &key,
+                        WsServerEvent::Error {
+                            message: "failed to prepare agent command".to_string(),
+                            details: Some(error_message.clone()),
+                            session_id: Some(context.session_id.clone()),
+                        },
+                    )
+                    .await;
+                    self.finish(
+                        &key,
+                        &context,
+                        iowb_protocol::SessionRuntimeStatus::Failed,
+                        Some(error_message),
+                        None,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+            if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Codex {
+                let Some(config) = context.direct_ai_config.as_ref() else {
+                    return Err(CoreError::InvalidInput(
+                        "IO Gateway is not configured for this session".to_string(),
+                    ));
+                };
+                apply_codex_cli_io_gateway_args(&mut command.args, &config.base_url);
+            }
+            let (abort_tx, abort_rx) = oneshot::channel();
 
-        self.publish(
-            &context.hub,
-            &key,
-            WsServerEvent::SessionStatus {
-                provider: context.provider,
-                session_id: context.session_id.clone(),
-                status: iowb_protocol::SessionRuntimeStatus::Starting,
-                response_id: Some(context.response_id.clone()),
-                sequence: Some(context.next_sequence()),
-                latest_user_prompt: Some(context.prompt.clone()),
-            },
-        )
-        .await;
+            self.register(key.clone(), abort_tx).await;
 
-        let mut child_command = Command::new(&command.command);
-        child_command
-            .args(&command.args)
-            .current_dir(&context.project_path)
-            .env("PATH", augmented_user_path())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Claude {
-            let Some(config) = context.direct_ai_config.as_ref() else {
-                let error_message =
+            self.publish(
+                &context.hub,
+                &key,
+                WsServerEvent::SessionStatus {
+                    provider: context.provider,
+                    session_id: context.session_id.clone(),
+                    status: iowb_protocol::SessionRuntimeStatus::Starting,
+                    response_id: Some(context.response_id.clone()),
+                    sequence: Some(context.next_sequence()),
+                    latest_user_prompt: Some(context.prompt.clone()),
+                },
+            )
+            .await;
+
+            let mut child_command = Command::new(&command.command);
+            child_command
+                .args(&command.args)
+                .current_dir(&context.project_path)
+                .env("PATH", augmented_user_path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Claude {
+                let Some(config) = context.direct_ai_config.as_ref() else {
+                    let error_message =
                     "IO Gateway is not configured. Configure the IO Gateway URL and API key in Settings."
                         .to_string();
-                self.publish(
-                    &context.hub,
-                    &key,
-                    WsServerEvent::Error {
-                        message: "IO Gateway is not configured".to_string(),
-                        details: Some(error_message.clone()),
-                    },
-                )
-                .await;
-                self.finish(
-                    &key,
-                    &context,
-                    iowb_protocol::SessionRuntimeStatus::Failed,
-                    Some(error_message),
-                )
-                .await;
-                return Ok(());
-            };
-            apply_claude_cli_io_gateway_env(&mut child_command, config);
-        }
-        if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Codex {
-            let Some(config) = context.direct_ai_config.as_ref() else {
-                unreachable!("gateway configuration was validated above");
-            };
-            child_command.env(IO_WORKBENCH_GATEWAY_KEY_ENV, &config.api_key);
-        }
-        if let Some(run_id) = context.durable_run_id.as_deref() {
-            // Descendants inherit these markers. The database scope prevents a
-            // server opened on a copied database from targeting the original
-            // run, while the process identity distinguishes a live owner from
-            // a server process that has actually exited.
-            child_command.env(DURABLE_AGENT_RUN_ENV, run_id).env(
-                DURABLE_AGENT_SCOPE_ENV,
-                durable_agent_run_scope(context.storage.path()),
-            );
-            #[cfg(target_os = "linux")]
-            if let Some((owner_pid, owner_start)) = current_process_identity() {
-                child_command
-                    .env(DURABLE_AGENT_OWNER_PID_ENV, owner_pid.to_string())
-                    .env(DURABLE_AGENT_OWNER_START_ENV, owner_start.to_string());
+                    self.publish(
+                        &context.hub,
+                        &key,
+                        WsServerEvent::Error {
+                            message: "IO Gateway is not configured".to_string(),
+                            details: Some(error_message.clone()),
+                            session_id: Some(context.session_id.clone()),
+                        },
+                    )
+                    .await;
+                    self.finish(
+                        &key,
+                        &context,
+                        iowb_protocol::SessionRuntimeStatus::Failed,
+                        Some(error_message),
+                        None,
+                    )
+                    .await;
+                    return Ok(());
+                };
+                apply_claude_cli_io_gateway_env(&mut child_command, config);
             }
-        }
-        // Log the exact spawn so misconfigured flag sets are easy to spot.
-        let rendered_cmd = std::iter::once(command.command.clone())
-            .chain(command.args.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        info!(
-            provider = context.provider.as_str(),
-            session_id = %context.session_id,
-            project = %context.project_path.display(),
-            cmd = %rendered_cmd,
-            "spawning agent command"
-        );
-        if command.stdin_prompt {
-            child_command.stdin(Stdio::piped());
-        } else {
-            child_command.stdin(Stdio::null());
-        }
-        isolate_agent_process(&mut child_command);
-
-        let mut child = match child_command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let error_message = format!(
-                    "failed to spawn agent provider: {}: {}",
-                    command.command, error
+            if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Codex {
+                let Some(config) = context.direct_ai_config.as_ref() else {
+                    unreachable!("gateway configuration was validated above");
+                };
+                child_command.env(IO_WORKBENCH_GATEWAY_KEY_ENV, &config.api_key);
+            }
+            if let Some(run_id) = context.durable_run_id.as_deref() {
+                // Descendants inherit these markers. The database scope prevents a
+                // server opened on a copied database from targeting the original
+                // run, while the process identity distinguishes a live owner from
+                // a server process that has actually exited.
+                child_command.env(DURABLE_AGENT_RUN_ENV, run_id).env(
+                    DURABLE_AGENT_SCOPE_ENV,
+                    durable_agent_run_scope(context.storage.path()),
                 );
-                self.publish(
-                    &context.hub,
-                    &key,
-                    WsServerEvent::Error {
-                        message: "failed to spawn agent provider".to_string(),
-                        details: Some(error_message.clone()),
-                    },
-                )
-                .await;
-                self.finish(
-                    &key,
-                    &context,
-                    iowb_protocol::SessionRuntimeStatus::Failed,
-                    Some(error_message),
-                )
-                .await;
-                return Ok(());
+                #[cfg(target_os = "linux")]
+                if let Some((owner_pid, owner_start)) = current_process_identity() {
+                    child_command
+                        .env(DURABLE_AGENT_OWNER_PID_ENV, owner_pid.to_string())
+                        .env(DURABLE_AGENT_OWNER_START_ENV, owner_start.to_string());
+                }
             }
-        };
-
-        if command.stdin_prompt {
-            if let Some(mut stdin) = child.stdin.take() {
-                let prompt = command.prompt.clone();
-                tokio::spawn(async move {
-                    let _ = stdin.write_all(prompt.as_bytes()).await;
-                    let _ = stdin.write_all(b"\n").await;
-                    let _ = stdin.shutdown().await;
-                });
+            // Log the exact spawn so misconfigured flag sets are easy to spot.
+            let rendered_cmd = std::iter::once(command.command.clone())
+                .chain(command.args.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            info!(
+                provider = context.provider.as_str(),
+                session_id = %context.session_id,
+                project = %context.project_path.display(),
+                cmd = %rendered_cmd,
+                "spawning agent command"
+            );
+            if command.stdin_prompt {
+                child_command.stdin(Stdio::piped());
+            } else {
+                child_command.stdin(Stdio::null());
             }
-        }
+            isolate_agent_process(&mut child_command);
 
-        let (output_tx, mut output_rx) = mpsc::channel::<AgentProcessEvent>(256);
-        if let Some(stdout) = child.stdout.take() {
-            spawn_agent_output_reader(output_tx.clone(), stdout, AgentOutputStream::Stdout);
-        }
-        if let Some(stderr) = child.stderr.take() {
-            spawn_agent_output_reader(output_tx.clone(), stderr, AgentOutputStream::Stderr);
-        }
-        drop(output_tx);
+            let mut child = match child_command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    let error_message = format!(
+                        "failed to spawn agent provider: {}: {}",
+                        command.command, error
+                    );
+                    self.publish(
+                        &context.hub,
+                        &key,
+                        WsServerEvent::Error {
+                            message: "failed to spawn agent provider".to_string(),
+                            details: Some(error_message.clone()),
+                            session_id: Some(context.session_id.clone()),
+                        },
+                    )
+                    .await;
+                    self.finish(
+                        &key,
+                        &context,
+                        iowb_protocol::SessionRuntimeStatus::Failed,
+                        Some(error_message),
+                        None,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
 
-        self.publish(
-            &context.hub,
-            &key,
-            WsServerEvent::SessionStatus {
-                provider: context.provider,
-                session_id: context.session_id.clone(),
-                status: iowb_protocol::SessionRuntimeStatus::Running,
-                response_id: Some(context.response_id.clone()),
-                sequence: Some(context.next_sequence()),
-                latest_user_prompt: Some(context.prompt.clone()),
-            },
-        )
-        .await;
+            if command.stdin_prompt {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let prompt = command.prompt.clone();
+                    tokio::spawn(async move {
+                        let _ = stdin.write_all(prompt.as_bytes()).await;
+                        let _ = stdin.write_all(b"\n").await;
+                        let _ = stdin.shutdown().await;
+                    });
+                }
+            }
 
-        let manager = self.clone();
-        tokio::spawn(async move {
-            let mut abort_rx = abort_rx;
-            let mut output = String::new();
-            let mut codex_normalizer =
-                (runtime_provider == Provider::Codex).then(CodexLiveOutputNormalizer::default);
-            let mut claude_normalizer =
-                (runtime_provider == Provider::Claude).then(ClaudeLiveOutputNormalizer::default);
-            let mut gemini_normalizer =
-                (runtime_provider == Provider::Gemini).then(GeminiLiveOutputNormalizer::default);
-            loop {
-                tokio::select! {
-                    Some(event) = output_rx.recv() => {
-                        process_agent_event(
-                            &manager,
-                            &context,
-                            &key,
-                            event,
-                            &mut codex_normalizer,
-                            &mut claude_normalizer,
-                            &mut gemini_normalizer,
-                            &mut output,
-                        ).await;
-                    }
-                    status = child.wait() => {
-                        while let Some(event) = output_rx.recv().await {
+            let (output_tx, mut output_rx) = mpsc::channel::<AgentProcessEvent>(256);
+            if let Some(stdout) = child.stdout.take() {
+                spawn_agent_output_reader(output_tx.clone(), stdout, AgentOutputStream::Stdout);
+            }
+            if let Some(stderr) = child.stderr.take() {
+                spawn_agent_output_reader(output_tx.clone(), stderr, AgentOutputStream::Stderr);
+            }
+            drop(output_tx);
+
+            self.publish(
+                &context.hub,
+                &key,
+                WsServerEvent::SessionStatus {
+                    provider: context.provider,
+                    session_id: context.session_id.clone(),
+                    status: iowb_protocol::SessionRuntimeStatus::Running,
+                    response_id: Some(context.response_id.clone()),
+                    sequence: Some(context.next_sequence()),
+                    latest_user_prompt: Some(context.prompt.clone()),
+                },
+            )
+            .await;
+
+            let manager = self.clone();
+            tokio::spawn(async move {
+                let mut abort_rx = abort_rx;
+                let mut output = String::new();
+                let mut codex_normalizer =
+                    (runtime_provider == Provider::Codex).then(CodexLiveOutputNormalizer::default);
+                let mut claude_normalizer = (runtime_provider == Provider::Claude)
+                    .then(ClaudeLiveOutputNormalizer::default);
+                let mut gemini_normalizer = (runtime_provider == Provider::Gemini)
+                    .then(GeminiLiveOutputNormalizer::default);
+                loop {
+                    tokio::select! {
+                        Some(event) = output_rx.recv() => {
                             process_agent_event(
                                 &manager,
                                 &context,
@@ -2545,136 +3768,201 @@ impl AgentRuntimeManager {
                                 &mut output,
                             ).await;
                         }
-                        flush_codex_live_output(
-                            &manager,
-                            &context,
-                            &key,
-                            &mut codex_normalizer,
-                            &mut output,
-                        ).await;
-                        flush_claude_live_output(
-                            &manager,
-                            &context,
-                            &key,
-                            &mut claude_normalizer,
-                            &mut output,
-                        ).await;
-                        flush_gemini_live_output(
-                            &manager,
-                            &context,
-                            &key,
-                            &mut gemini_normalizer,
-                            &mut output,
-                        ).await;
-                        let codex_saw_structured_event = codex_normalizer
-                            .as_ref()
-                            .is_some_and(CodexLiveOutputNormalizer::saw_structured_event);
-                        let codex_final_assistant = codex_normalizer
-                            .as_mut()
-                            .and_then(CodexLiveOutputNormalizer::take_final_assistant_message);
-                        let claude_final_assistant = claude_normalizer
-                            .as_mut()
-                            .and_then(ClaudeLiveOutputNormalizer::take_final_assistant_message);
-                        persist_codex_tool_messages(&context, &mut codex_normalizer).await;
-                        let provider_specific_final = codex_final_assistant
-                            .or(claude_final_assistant);
-                        match status {
-                            Ok(status) if status.success() => {
-                                match select_completed_agent_output(
-                                    runtime_provider,
-                                    provider_specific_final,
-                                    &output,
-                                    codex_saw_structured_event,
-                                ) {
-                                    Ok(persisted_output) => {
-                                        manager.finish(
+                        status = child.wait() => {
+                            while let Some(event) = output_rx.recv().await {
+                                process_agent_event(
+                                    &manager,
+                                    &context,
+                                    &key,
+                                    event,
+                                    &mut codex_normalizer,
+                                    &mut claude_normalizer,
+                                    &mut gemini_normalizer,
+                                    &mut output,
+                                ).await;
+                            }
+                            flush_codex_live_output(
+                                &manager,
+                                &context,
+                                &key,
+                                &mut codex_normalizer,
+                                &mut output,
+                            ).await;
+                            flush_claude_live_output(
+                                &manager,
+                                &context,
+                                &key,
+                                &mut claude_normalizer,
+                                &mut output,
+                            ).await;
+                            flush_gemini_live_output(
+                                &manager,
+                                &context,
+                                &key,
+                                &mut gemini_normalizer,
+                                &mut output,
+                            ).await;
+                            let codex_saw_structured_event = codex_normalizer
+                                .as_ref()
+                                .is_some_and(CodexLiveOutputNormalizer::saw_structured_event);
+                            let run_usage = codex_normalizer
+                                .as_mut()
+                                .and_then(CodexLiveOutputNormalizer::take_final_usage)
+                                .or_else(|| {
+                                    claude_normalizer
+                                        .as_mut()
+                                        .and_then(ClaudeLiveOutputNormalizer::take_final_usage)
+                                })
+                                .or_else(|| {
+                                    gemini_normalizer
+                                        .as_mut()
+                                        .and_then(GeminiLiveOutputNormalizer::take_final_usage)
+                                });
+                            let codex_final_assistant = codex_normalizer
+                                .as_mut()
+                                .and_then(CodexLiveOutputNormalizer::take_final_assistant_message);
+                            let codex_error = codex_normalizer
+                                .as_mut()
+                                .and_then(CodexLiveOutputNormalizer::take_error);
+                            let claude_final_assistant = claude_normalizer
+                                .as_mut()
+                                .and_then(ClaudeLiveOutputNormalizer::take_final_assistant_message);
+                            persist_codex_tool_messages(&context, &mut codex_normalizer).await;
+                            let provider_specific_final = codex_final_assistant
+                                .or(claude_final_assistant);
+                            match status {
+                                Ok(status) if status.success() => {
+                                    if context.context_rollover_id.is_some() {
+                                        let follow_up = manager.finish(
                                             &key,
                                             &context,
                                             iowb_protocol::SessionRuntimeStatus::Completed,
-                                            Some(persisted_output),
+                                            None,
+                                            run_usage.clone(),
                                         ).await;
+                                        if let Some(follow_up) = follow_up {
+                                            manager
+                                                .start_context_rollover_follow_up(&context, follow_up)
+                                                .await;
+                                        }
+                                    } else {
+                                        match select_completed_agent_output(
+                                            runtime_provider,
+                                            provider_specific_final,
+                                            &output,
+                                            codex_saw_structured_event,
+                                        ) {
+                                            Ok(persisted_output) => {
+                                                manager.finish(
+                                                    &key,
+                                                    &context,
+                                                    iowb_protocol::SessionRuntimeStatus::Completed,
+                                                    Some(persisted_output),
+                                                    run_usage.clone(),
+                                                ).await;
+                                            }
+                                            Err(error_output) => {
+                                                manager.publish(&context.hub, &key, WsServerEvent::Error {
+                                                    message: "Codex completed without a final assistant response".to_string(),
+                                                    details: Some(
+                                                        "The Codex process exited successfully, but its event stream did not contain a final assistant message. The accumulated CLI transcript was not saved as the reply."
+                                                            .to_string(),
+                                                    ),
+                                                    session_id: Some(context.session_id.clone()),
+                                                }).await;
+                                                manager.finish(
+                                                    &key,
+                                                    &context,
+                                                    iowb_protocol::SessionRuntimeStatus::Failed,
+                                                    Some(error_output),
+                                                    run_usage.clone(),
+                                                ).await;
+                                            }
+                                        }
                                     }
-                                    Err(error_output) => {
-                                        manager.publish(&context.hub, &key, WsServerEvent::Error {
-                                            message: "Codex completed without a final assistant response".to_string(),
-                                            details: Some(
-                                                "The Codex process exited successfully, but its event stream did not contain a final assistant message. The accumulated CLI transcript was not saved as the reply."
-                                                    .to_string(),
-                                            ),
-                                        }).await;
-                                        manager.finish(
+                                }
+                                Ok(status) => {
+                                    let mut persisted_output = provider_specific_final
+                                        .unwrap_or_else(|| output.clone());
+                                    append_bounded(
+                                        &mut output,
+                                        &format!("\nAgent exited with status {status}"),
+                                        manager.max_output_bytes,
+                                    );
+                                    append_bounded(
+                                        &mut persisted_output,
+                                        &format!("\nAgent exited with status {status}"),
+                                        manager.max_output_bytes,
+                                    );
+                                    manager.finish(
+                                        &key,
+                                        &context,
+                                        iowb_protocol::SessionRuntimeStatus::Failed,
+                                        Some(persisted_output.clone()),
+                                        run_usage.clone(),
+                                    ).await;
+                                    if let Some(error) = codex_error.as_ref() {
+                                        if let Some(run_id) = context.durable_run_id.as_deref() {
+                                            let _ = context.storage.update_durable_chat_run_error(
+                                                run_id,
+                                                &error.message,
+                                            );
+                                        }
+                                        manager.publish_context_recovery_if_needed(
                                             &key,
                                             &context,
-                                            iowb_protocol::SessionRuntimeStatus::Failed,
-                                            Some(error_output),
+                                            error,
                                         ).await;
                                     }
                                 }
+                                Err(error) => {
+                                    let persisted_output = provider_specific_final
+                                        .unwrap_or_else(|| output.clone());
+                                    manager.publish(&context.hub, &key, WsServerEvent::Error {
+                                        message: "agent process wait failed".to_string(),
+                                        details: Some(error.to_string()),
+                                        session_id: Some(context.session_id.clone()),
+                                    }).await;
+                                    manager.finish(
+                                        &key,
+                                        &context,
+                                        iowb_protocol::SessionRuntimeStatus::Failed,
+                                        Some(persisted_output.clone()),
+                                        run_usage.clone(),
+                                    ).await;
+                                }
                             }
-                            Ok(status) => {
-                                let mut persisted_output = provider_specific_final
-                                    .unwrap_or_else(|| output.clone());
-                                append_bounded(
-                                    &mut output,
-                                    &format!("\nAgent exited with status {status}"),
-                                    manager.max_output_bytes,
-                                );
-                                append_bounded(
-                                    &mut persisted_output,
-                                    &format!("\nAgent exited with status {status}"),
-                                    manager.max_output_bytes,
-                                );
-                                manager.finish(
-                                    &key,
-                                    &context,
-                                    iowb_protocol::SessionRuntimeStatus::Failed,
-                                    Some(persisted_output.clone()),
-                                ).await;
-                            }
-                            Err(error) => {
-                                let persisted_output = provider_specific_final
-                                    .unwrap_or_else(|| output.clone());
-                                manager.publish(&context.hub, &key, WsServerEvent::Error {
-                                    message: "agent process wait failed".to_string(),
-                                    details: Some(error.to_string()),
-                                }).await;
-                                manager.finish(
-                                    &key,
-                                    &context,
-                                    iowb_protocol::SessionRuntimeStatus::Failed,
-                                    Some(persisted_output.clone()),
-                                ).await;
-                            }
+                            break;
                         }
-                        break;
+                        _ = &mut abort_rx => {
+                            terminate_agent_process_tree(&mut child, &context.session_id).await;
+                            drain_aborted_agent_output(&mut output_rx).await;
+                            let codex_final_assistant = codex_normalizer
+                                .as_mut()
+                                .and_then(CodexLiveOutputNormalizer::take_final_assistant_message);
+                            let claude_final_assistant = claude_normalizer
+                                .as_mut()
+                                .and_then(ClaudeLiveOutputNormalizer::take_final_assistant_message);
+                            persist_codex_tool_messages(&context, &mut codex_normalizer).await;
+                            let final_assistant = codex_final_assistant
+                                .or(claude_final_assistant)
+                                .unwrap_or_else(|| output.clone());
+                            manager.finish(
+                                &key,
+                                &context,
+                                iowb_protocol::SessionRuntimeStatus::Aborted,
+                                Some(final_assistant),
+                                None,
+                            ).await;
+                            break;
+                        }
+                        else => break,
                     }
-                    _ = &mut abort_rx => {
-                        terminate_agent_process_tree(&mut child, &context.session_id).await;
-                        drain_aborted_agent_output(&mut output_rx).await;
-                        let codex_final_assistant = codex_normalizer
-                            .as_mut()
-                            .and_then(CodexLiveOutputNormalizer::take_final_assistant_message);
-                        let claude_final_assistant = claude_normalizer
-                            .as_mut()
-                            .and_then(ClaudeLiveOutputNormalizer::take_final_assistant_message);
-                        persist_codex_tool_messages(&context, &mut codex_normalizer).await;
-                        let final_assistant = codex_final_assistant
-                            .or(claude_final_assistant)
-                            .unwrap_or_else(|| output.clone());
-                        manager.finish(
-                            &key,
-                            &context,
-                            iowb_protocol::SessionRuntimeStatus::Aborted,
-                            Some(final_assistant),
-                        ).await;
-                        break;
-                    }
-                    else => break,
                 }
-            }
-        });
+            });
 
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn start_direct_ai(&self, context: AgentStartContext) -> Result<()> {
@@ -2707,6 +3995,7 @@ impl AgentRuntimeManager {
                 WsServerEvent::Error {
                     message: "Direct AI gateway is not configured".to_string(),
                     details: Some(error_message.clone()),
+                    session_id: Some(context.session_id.clone()),
                 },
             )
             .await;
@@ -2715,6 +4004,7 @@ impl AgentRuntimeManager {
                 &context,
                 iowb_protocol::SessionRuntimeStatus::Failed,
                 Some(error_message),
+                None,
             )
             .await;
             return Ok(());
@@ -2734,6 +4024,7 @@ impl AgentRuntimeManager {
                 WsServerEvent::Error {
                     message: error_message.clone(),
                     details: None,
+                    session_id: Some(context.session_id.clone()),
                 },
             )
             .await;
@@ -2742,6 +4033,7 @@ impl AgentRuntimeManager {
                 &context,
                 iowb_protocol::SessionRuntimeStatus::Failed,
                 Some(error_message),
+                None,
             )
             .await;
             return Ok(());
@@ -2831,6 +4123,7 @@ impl AgentRuntimeManager {
                                 &context,
                                 iowb_protocol::SessionRuntimeStatus::Completed,
                                 Some(bounded),
+                                output.usage,
                             ).await;
                         }
                         Err(error) => {
@@ -2838,12 +4131,14 @@ impl AgentRuntimeManager {
                             manager.publish(&context.hub, &key, WsServerEvent::Error {
                                 message: "Direct AI gateway request failed".to_string(),
                                 details: Some(error_message.clone()),
+                                session_id: Some(context.session_id.clone()),
                             }).await;
                             manager.finish(
                                 &key,
                                 &context,
                                 iowb_protocol::SessionRuntimeStatus::Failed,
                                 Some(error_message),
+                                None,
                             ).await;
                         }
                     }
@@ -2853,6 +4148,7 @@ impl AgentRuntimeManager {
                         &key,
                         &context,
                         iowb_protocol::SessionRuntimeStatus::Aborted,
+                        None,
                         None,
                     ).await;
                 }
@@ -2868,6 +4164,7 @@ impl AgentRuntimeManager {
             key,
             AgentRuntimeRecord {
                 replay: VecDeque::new(),
+                replay_bytes: 0,
                 abort_tx: Some(abort_tx),
                 last_activity: Utc::now(),
             },
@@ -2885,14 +4182,78 @@ impl AgentRuntimeManager {
         }
     }
 
+    async fn is_running(&self, provider: Provider, session_id: &str) -> bool {
+        let key = agent_run_key(provider, session_id);
+        self.runs
+            .read()
+            .await
+            .get(&key)
+            .is_some_and(|record| record.abort_tx.is_some())
+    }
+
+    async fn publish_context_recovery_if_needed(
+        &self,
+        key: &str,
+        context: &AgentStartContext,
+        error: &CodexTurnError,
+    ) {
+        if context.context_rollover_id.is_some()
+            || context.native_resume_session_id.is_none()
+            || !is_request_body_too_large_error(error)
+        {
+            return;
+        }
+        let Some(run_id) = context.durable_run_id.as_deref() else {
+            return;
+        };
+        let failed_message_id = context
+            .storage
+            .get_durable_chat_run(run_id)
+            .ok()
+            .flatten()
+            .and_then(|run| run.user_message_id)
+            .unwrap_or_default();
+        if failed_message_id.is_empty() {
+            return;
+        }
+        self.publish(
+            &context.hub,
+            key,
+            WsServerEvent::ChatRecoveryRequired {
+                provider: context.provider,
+                session_id: context.session_id.clone(),
+                response_id: Some(context.response_id.clone()),
+                recovery: ChatContextRecovery {
+                    code: "context_too_large".to_string(),
+                    state: "required".to_string(),
+                    message: "This chat's native context is too large to resume safely. Compact it into a clean context and retry the same message.".to_string(),
+                    failed_message_id,
+                    observed_bytes: error.observed_bytes,
+                    limit_bytes: error.limit_bytes.unwrap_or(CODEX_GATEWAY_BODY_LIMIT_BYTES),
+                    request_id: None,
+                },
+            },
+        )
+        .await;
+    }
+
     async fn publish(&self, hub: &WsHub, key: &str, event: WsServerEvent) {
         {
             let mut runs = self.runs.write().await;
             if let Some(record) = runs.get_mut(key) {
                 record.last_activity = Utc::now();
-                if record.replay.len() >= self.max_replay_events {
-                    record.replay.pop_front();
+                let event_bytes = ws_event_estimated_bytes(&event);
+                while record.replay.len() >= self.max_replay_events
+                    || (!record.replay.is_empty()
+                        && record.replay_bytes.saturating_add(event_bytes) > self.max_replay_bytes)
+                {
+                    if let Some(removed) = record.replay.pop_front() {
+                        record.replay_bytes = record
+                            .replay_bytes
+                            .saturating_sub(ws_event_estimated_bytes(&removed));
+                    }
                 }
+                record.replay_bytes = record.replay_bytes.saturating_add(event_bytes);
                 record.replay.push_back(event.clone());
             }
         }
@@ -2905,7 +4266,9 @@ impl AgentRuntimeManager {
         context: &AgentStartContext,
         status: iowb_protocol::SessionRuntimeStatus,
         assistant_output: Option<String>,
-    ) {
+        usage: Option<NormalizedRunUsage>,
+    ) -> Option<ContextRolloverFollowUp> {
+        let mut status = status;
         let received_at = Utc::now();
         let output = assistant_output
             .map(|output| output.trim().to_string())
@@ -2914,20 +4277,62 @@ impl AgentRuntimeManager {
                 iowb_protocol::SessionRuntimeStatus::Failed => Some("Failed".to_string()),
                 iowb_protocol::SessionRuntimeStatus::Aborted => Some("Aborted".to_string()),
                 _ => None,
+            })
+            .map(|output| {
+                bound_agent_text(
+                    &output,
+                    AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
+                    "assistant response",
+                )
             });
-        if let Some(output) = output {
-            let output = bound_agent_text(
-                &output,
-                AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                "assistant response",
-            );
+        let mut rollover_completed_atomically = false;
+        let mut rollover_follow_up = None;
+        if let Some(rollover_id) = context.context_rollover_id.as_deref() {
+            if matches!(status, iowb_protocol::SessionRuntimeStatus::Completed) {
+                match activate_completed_context_rollover(context, rollover_id, received_at).await {
+                    Ok(follow_up) => {
+                        rollover_completed_atomically = true;
+                        rollover_follow_up = Some(follow_up);
+                    }
+                    Err(error) => {
+                        let message = format!("failed to activate clean context: {error}");
+                        let _ = context.storage.fail_context_rollover(rollover_id, &message);
+                        self.publish(
+                            &context.hub,
+                            key,
+                            WsServerEvent::Error {
+                                message: "clean context could not be activated".to_string(),
+                                details: Some(message),
+                                session_id: Some(context.session_id.clone()),
+                            },
+                        )
+                        .await;
+                        status = iowb_protocol::SessionRuntimeStatus::Failed;
+                    }
+                }
+            } else {
+                let message = match status {
+                    iowb_protocol::SessionRuntimeStatus::Aborted => {
+                        "clean context compaction was aborted"
+                    }
+                    _ => "clean context compaction failed",
+                };
+                let _ = context.storage.fail_context_rollover(rollover_id, message);
+            }
+        }
+        // A rollover response is committed together with its mapping, marker,
+        // and durable-run completion. On any rollover failure, leave the
+        // visible transcript untouched so the same recovery can be retried.
+        if context.context_rollover_id.is_none()
+            && let Some(output) = output
+        {
             let persisted_output = output.clone();
             // Persist the assistant message with footer metadata so the
             // bubble at the bottom of the reply stays populated after a
             // refresh or session switch.
             let sent_at = context
                 .storage
-                .get_session(&context.session_id)
+                .get_session_summary(&context.session_id)
                 .ok()
                 .flatten()
                 .and_then(|s| s.first_user_at);
@@ -3014,7 +4419,9 @@ impl AgentRuntimeManager {
             warn!(error = %error, session_id = %context.session_id, "failed to mark session inactive");
         }
 
-        if let Some(run_id) = context.durable_run_id.as_deref() {
+        let lifetime_token_usage = persist_run_attempt_usage(context, status, usage.as_ref()).await;
+
+        if !rollover_completed_atomically && let Some(run_id) = context.durable_run_id.as_deref() {
             let terminal_result = match status {
                 iowb_protocol::SessionRuntimeStatus::Completed => {
                     context.storage.mark_durable_chat_run_completed(run_id)
@@ -3041,17 +4448,29 @@ impl AgentRuntimeManager {
             }
         }
 
-        // Stamp metadata so the UI can show "received at" and the conversation
-        // metadata snapshot. Token usage is fetched separately by the UI via
-        // /api/projects/{name}/sessions/{id}/token-usage.
-        if let Ok(Some(mut session)) = context.storage.get_session(&context.session_id) {
+        // Stamp metadata so the UI can show "received at", normalized usage,
+        // and the conversation metadata snapshot without a follow-up rollout
+        // scan. Legacy sessions can still use the token-usage endpoint.
+        if let Ok(Some(mut session)) = context.storage.get_session_summary(&context.session_id) {
+            // Atomic rollover completion owns the marker timestamp. Do not
+            // regress its persisted last-message/activity timestamp during
+            // the generic footer pass.
+            let completed_at = if rollover_completed_atomically {
+                session.last_activity
+            } else {
+                received_at
+            };
             session.received_at = Some(received_at);
-            session.last_message_at = Some(received_at);
-            session.last_activity = received_at;
+            session.last_message_at = Some(completed_at);
+            session.last_activity = completed_at;
             session.effort = context.effort.clone().or(session.effort);
             session.mode = context.mode.clone().or(session.mode);
             session.thinking = context.thinking.or(session.thinking);
             session.fast = context.fast.or(session.fast);
+            session.token_usage = usage
+                .as_ref()
+                .map(|usage| usage.usage.clone())
+                .or(session.token_usage);
             let snapshot = session.clone();
             if let Err(error) = context.storage.upsert_session(&session) {
                 warn!(error = %error, session_id = %context.session_id, "failed to persist session metadata");
@@ -3072,6 +4491,9 @@ impl AgentRuntimeManager {
                     last_message_at: snapshot.last_message_at,
                     first_user_at: snapshot.first_user_at,
                     token_usage: snapshot.token_usage,
+                    lifetime_token_usage: lifetime_token_usage
+                        .clone()
+                        .or(snapshot.lifetime_token_usage),
                     response_id: Some(context.response_id.clone()),
                     sequence: Some(context.next_sequence()),
                 },
@@ -3114,6 +4536,151 @@ impl AgentRuntimeManager {
             record.abort_tx = None;
             record.last_activity = Utc::now();
         }
+        drop(runs);
+
+        rollover_follow_up
+    }
+
+    async fn start_context_rollover_follow_up(
+        &self,
+        context: &AgentStartContext,
+        follow_up: ContextRolloverFollowUp,
+    ) {
+        let run = follow_up.run;
+        let run_id = run.id.clone();
+        let session_id = run.session_id.clone();
+        let key = agent_run_key(context.provider, &session_id);
+        let fail_follow_up = |storage: &Storage, sessions: &SessionManager, message: String| {
+            let run_id = run_id.clone();
+            let session_id = session_id.clone();
+            let storage = storage.clone();
+            let sessions = sessions.clone();
+            async move {
+                let _ = storage.mark_durable_chat_run_failed(&run_id, &message);
+                let _ = sessions.set_active(&session_id, false).await;
+            }
+        };
+
+        if let Err(error) = context.sessions.set_active(&session_id, true).await {
+            let message =
+                format!("failed to activate original prompt after clean context: {error}");
+            fail_follow_up(&context.storage, &context.sessions, message.clone()).await;
+            self.publish(
+                &context.hub,
+                &key,
+                WsServerEvent::Error {
+                    message: "clean-context retry could not start".to_string(),
+                    details: Some(message),
+                    session_id: Some(session_id),
+                },
+            )
+            .await;
+            return;
+        }
+
+        let direct_ai_messages =
+            if should_use_direct_ai_gateway_runtime(context.provider, run.model.as_deref()) {
+                match context.sessions.messages(&session_id) {
+                    Ok(messages) => direct_ai_conversation_messages(messages, run.prompt.as_str()),
+                    Err(error) => {
+                        let message =
+                            format!("failed to build retry history after clean context: {error}");
+                        fail_follow_up(&context.storage, &context.sessions, message.clone()).await;
+                        self.publish(
+                            &context.hub,
+                            &key,
+                            WsServerEvent::Error {
+                                message: "clean-context retry could not start".to_string(),
+                                details: Some(message),
+                                session_id: Some(session_id),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+        let attempt_id = new_id("attempt");
+        if let Err(error) = context
+            .storage
+            .create_chat_run_attempt(&StoredChatRunAttempt::new(
+                attempt_id.clone(),
+                run_id.clone(),
+                session_id.clone(),
+                run.user_message_id.clone(),
+                context.provider.as_str(),
+                runtime_label(context.runtime),
+                run.model.clone(),
+                run.native_session_id.clone(),
+            ))
+        {
+            let message = format!("failed to create retry attempt after clean context: {error}");
+            fail_follow_up(&context.storage, &context.sessions, message.clone()).await;
+            self.publish(
+                &context.hub,
+                &key,
+                WsServerEvent::Error {
+                    message: "clean-context retry could not start".to_string(),
+                    details: Some(message),
+                    session_id: Some(session_id),
+                },
+            )
+            .await;
+            return;
+        }
+
+        let follow_up_context = AgentStartContext {
+            provider: context.provider,
+            session_id: session_id.clone(),
+            durable_run_id: Some(run_id.clone()),
+            attempt_id: Some(attempt_id),
+            response_id: new_id("response"),
+            sequence: Arc::new(AtomicU64::new(0)),
+            project_path: context.project_path.clone(),
+            prompt: run.prompt.clone(),
+            model: run.model.clone(),
+            runtime: context.runtime,
+            effort: run.effort.clone(),
+            mode: run.mode.clone(),
+            thinking: run.thinking,
+            fast: run.fast,
+            native_resume_session_id: run.native_session_id.clone(),
+            context_rollover_id: None,
+            direct_ai_config: context.direct_ai_config.clone(),
+            direct_ai_messages,
+            sessions: context.sessions.clone(),
+            storage: context.storage.clone(),
+            hub: context.hub.clone(),
+        };
+        let start_future: Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> =
+            Box::pin(self.start(follow_up_context));
+        let start_result = start_future.await;
+
+        if let Err(error) = start_result {
+            let message = format!("failed to start original prompt after clean context: {error}");
+            fail_follow_up(&context.storage, &context.sessions, message.clone()).await;
+            self.publish(
+                &context.hub,
+                &key,
+                WsServerEvent::Error {
+                    message: "clean-context retry could not start".to_string(),
+                    details: Some(message),
+                    session_id: Some(session_id.clone()),
+                },
+            )
+            .await;
+        }
+        context.hub.publish(WsServerEvent::ActiveSessions {
+            sessions: context.sessions.list_active().await,
+        });
+        info!(
+            session_id = %session_id,
+            run_id = %run_id,
+            "started original prompt after clean context activation"
+        );
     }
 
     pub async fn abort(&self, provider: Provider, session_id: &str) -> bool {
@@ -3132,10 +4699,74 @@ impl AgentRuntimeManager {
 
     pub async fn replay_events(&self) -> Vec<WsServerEvent> {
         let runs = self.runs.read().await;
-        runs.values()
+        let mut active = runs
+            .values()
             .filter(|record| record.abort_tx.is_some())
+            .collect::<Vec<_>>();
+        active.sort_by_key(|record| record.last_activity);
+        let mut replay = VecDeque::new();
+        let mut replay_bytes = 0usize;
+        for event in active
+            .into_iter()
             .flat_map(|record| record.replay.iter().cloned())
-            .collect()
+        {
+            replay_bytes = replay_bytes.saturating_add(ws_event_estimated_bytes(&event));
+            replay.push_back(event);
+            while replay.len() > AGENT_REPLAY_TOTAL_MAX_EVENTS
+                || replay_bytes > AGENT_REPLAY_TOTAL_MAX_BYTES
+            {
+                let Some(removed) = replay.pop_front() else {
+                    break;
+                };
+                replay_bytes = replay_bytes.saturating_sub(ws_event_estimated_bytes(&removed));
+            }
+        }
+        replay.into()
+    }
+}
+
+async fn persist_run_attempt_usage(
+    context: &AgentStartContext,
+    status: iowb_protocol::SessionRuntimeStatus,
+    usage: Option<&NormalizedRunUsage>,
+) -> Option<SessionLifetimeTokenUsage> {
+    let Some(attempt_id) = context.attempt_id.as_deref() else {
+        return None;
+    };
+    let status = runtime_status_label(status);
+    let (usage_value, raw, source, completeness) = if let Some(usage) = usage {
+        (
+            Some(&usage.usage),
+            usage.raw_usage_json.as_deref(),
+            Some(usage.source),
+            usage.completeness,
+        )
+    } else {
+        (
+            None,
+            None,
+            Some("provider"),
+            TokenUsageCompleteness::Missing,
+        )
+    };
+    match context.storage.finish_chat_run_attempt(
+        attempt_id,
+        status,
+        usage_value,
+        raw,
+        source,
+        completeness,
+    ) {
+        Ok(lifetime) => lifetime,
+        Err(error) => {
+            warn!(
+                error = %error,
+                attempt_id,
+                session_id = %context.session_id,
+                "failed to persist chat run token usage"
+            );
+            None
+        }
     }
 }
 
@@ -3517,6 +5148,7 @@ impl Default for WsHub {
 struct DirectAiStreamOutput {
     text: String,
     streamed: bool,
+    usage: Option<NormalizedRunUsage>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -3653,6 +5285,9 @@ where
         "model": model,
         "max_tokens": max_tokens,
         "stream": true,
+        "stream_options": {
+            "include_usage": true,
+        },
         "messages": messages,
     });
 
@@ -3701,6 +5336,7 @@ where
     let mut line_buffer = String::new();
     let mut text = String::new();
     let mut streamed = false;
+    let mut usage = None;
 
     while let Some(bytes) = response
         .chunk()
@@ -3709,14 +5345,32 @@ where
     {
         raw.extend_from_slice(&bytes);
         line_buffer.push_str(&String::from_utf8_lossy(&bytes));
-        drain_direct_ai_sse_lines(&mut line_buffer, &mut text, &mut streamed, on_chunk).await;
+        drain_direct_ai_sse_lines(
+            &mut line_buffer,
+            &mut text,
+            &mut streamed,
+            &mut usage,
+            on_chunk,
+        )
+        .await;
     }
     if !line_buffer.trim().is_empty() {
-        process_direct_ai_sse_line(line_buffer.trim(), &mut text, &mut streamed, on_chunk).await;
+        process_direct_ai_sse_line(
+            line_buffer.trim(),
+            &mut text,
+            &mut streamed,
+            &mut usage,
+            on_chunk,
+        )
+        .await;
     }
 
     if streamed {
-        return Ok(DirectAiStreamOutput { text, streamed });
+        return Ok(DirectAiStreamOutput {
+            text,
+            streamed,
+            usage,
+        });
     }
 
     let value = serde_json::from_slice::<Value>(&raw)
@@ -3724,6 +5378,7 @@ where
     Ok(DirectAiStreamOutput {
         text: extract_direct_ai_response_text(&value),
         streamed: false,
+        usage: normalize_direct_ai_run_usage(&value),
     })
 }
 
@@ -3731,6 +5386,7 @@ async fn drain_direct_ai_sse_lines<F, Fut>(
     buffer: &mut String,
     text: &mut String,
     streamed: &mut bool,
+    usage: &mut Option<NormalizedRunUsage>,
     on_chunk: &mut F,
 ) where
     F: FnMut(String) -> Fut,
@@ -3739,7 +5395,7 @@ async fn drain_direct_ai_sse_lines<F, Fut>(
     while let Some(index) = buffer.find('\n') {
         let line = buffer[..index].trim_end_matches('\r').to_string();
         buffer.drain(..index + 1);
-        process_direct_ai_sse_line(&line, text, streamed, on_chunk).await;
+        process_direct_ai_sse_line(&line, text, streamed, usage, on_chunk).await;
     }
 }
 
@@ -3747,6 +5403,7 @@ async fn process_direct_ai_sse_line<F, Fut>(
     line: &str,
     text: &mut String,
     streamed: &mut bool,
+    usage: &mut Option<NormalizedRunUsage>,
     on_chunk: &mut F,
 ) where
     F: FnMut(String) -> Fut,
@@ -3762,6 +5419,9 @@ async fn process_direct_ai_sse_line<F, Fut>(
     let Ok(value) = serde_json::from_str::<Value>(data) else {
         return;
     };
+    if let Some(parsed) = normalize_direct_ai_run_usage(&value) {
+        *usage = Some(parsed);
+    }
     let chunk = extract_direct_ai_stream_delta(&value);
     if chunk.is_empty() {
         return;
@@ -4097,6 +5757,374 @@ fn collect_direct_ai_text(value: Option<&Value>) -> Option<String> {
     }
 }
 
+fn normalize_codex_run_usage(value: &Value) -> NormalizedRunUsage {
+    let usage = usage_container(value);
+    let input = usage_u64(usage, &["input_tokens", "inputTokens", "input"]);
+    let output = usage_u64(usage, &["output_tokens", "outputTokens", "output"]);
+    let cache_creation = usage_u64(
+        usage,
+        &[
+            "cache_write_input_tokens",
+            "cacheWriteInputTokens",
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_creation",
+            "cacheCreation",
+        ],
+    );
+    let cache_read = usage_u64(
+        usage,
+        &[
+            "cached_input_tokens",
+            "cachedInputTokens",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "cache_read",
+            "cacheRead",
+        ],
+    );
+    let reasoning = usage_u64(
+        usage,
+        &[
+            "reasoning_output_tokens",
+            "reasoningOutputTokens",
+            "reasoning_tokens",
+            "reasoningTokens",
+            "reasoning",
+        ],
+    );
+    normalized_run_usage(
+        usage,
+        "codex.turn.completed.usage",
+        input,
+        output,
+        cache_creation,
+        cache_read,
+        reasoning,
+        usage_f64(usage, &["cost_usd", "costUsd"]),
+    )
+}
+
+fn normalize_claude_run_usage(event: &Value) -> NormalizedRunUsage {
+    let usage = event
+        .get("modelUsage")
+        .or_else(|| event.get("model_usage"))
+        .or_else(|| event.get("usage"))
+        .unwrap_or(event);
+    let totals = aggregate_usage_like_values(usage);
+    let mut result = normalized_run_usage(
+        usage,
+        if event.get("modelUsage").is_some() || event.get("model_usage").is_some() {
+            "claude.result.modelUsage"
+        } else {
+            "claude.result.usage"
+        },
+        totals.input,
+        totals.output,
+        totals.cache_creation,
+        totals.cache_read,
+        totals.reasoning,
+        usage_f64(
+            event,
+            &["total_cost_usd", "totalCostUsd", "cost_usd", "costUsd"],
+        )
+        .or_else(|| {
+            usage_f64(
+                usage,
+                &["total_cost_usd", "totalCostUsd", "cost_usd", "costUsd"],
+            )
+        }),
+    );
+    if result.usage.used == 0 {
+        result.completeness = TokenUsageCompleteness::Missing;
+    }
+    result
+}
+
+fn normalize_gemini_run_usage(event: &Value) -> Option<NormalizedRunUsage> {
+    let usage = event
+        .get("stats")
+        .or_else(|| event.pointer("/result/stats"))
+        .or_else(|| event.get("usage"))
+        .or_else(|| event.get("usageMetadata"))
+        .or_else(|| event.get("usage_metadata"))?;
+    let input = usage_u64(
+        usage,
+        &[
+            "input_tokens",
+            "inputTokens",
+            "prompt_token_count",
+            "promptTokenCount",
+        ],
+    );
+    let output = usage_u64(
+        usage,
+        &[
+            "output_tokens",
+            "outputTokens",
+            "candidates_token_count",
+            "candidatesTokenCount",
+        ],
+    );
+    let cache_read = usage_u64(
+        usage,
+        &[
+            "cached_content_token_count",
+            "cachedContentTokenCount",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+        ],
+    );
+    let mut result = normalized_run_usage(
+        usage,
+        "gemini.result.stats",
+        input,
+        output,
+        0,
+        cache_read,
+        usage_u64(
+            usage,
+            &["thoughts_token_count", "thoughtsTokenCount", "reasoning"],
+        ),
+        usage_f64(usage, &["cost_usd", "costUsd"]),
+    );
+    if result.usage.used == 0 {
+        result.completeness = TokenUsageCompleteness::Missing;
+    }
+    Some(result)
+}
+
+fn normalize_direct_ai_run_usage(value: &Value) -> Option<NormalizedRunUsage> {
+    let usage = value
+        .get("usage")
+        .or_else(|| value.get("usageMetadata"))
+        .or_else(|| value.get("usage_metadata"))
+        .or_else(|| value.pointer("/response/usage"))?;
+    let mut result = if value.get("usageMetadata").is_some()
+        || value.get("usage_metadata").is_some()
+    {
+        normalize_gemini_run_usage(value)
+            .unwrap_or_else(|| normalized_run_usage(usage, "direct_ai.usage", 0, 0, 0, 0, 0, None))
+    } else {
+        normalized_direct_ai_usage_from_container(usage)
+    };
+    result.source = "direct_ai.usage";
+    Some(result)
+}
+
+fn normalized_direct_ai_usage_from_container(usage: &Value) -> NormalizedRunUsage {
+    let input = usage_u64(
+        usage,
+        &[
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokens",
+            "input",
+        ],
+    );
+    let output = usage_u64(
+        usage,
+        &[
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+            "output",
+        ],
+    );
+    let cache_creation = usage_u64(
+        usage,
+        &[
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_write_input_tokens",
+            "cacheWriteInputTokens",
+        ],
+    );
+    let cache_read = usage_u64(
+        usage,
+        &[
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "cached_input_tokens",
+            "cachedInputTokens",
+        ],
+    );
+    let reasoning = usage_u64(
+        usage,
+        &[
+            "reasoning_tokens",
+            "reasoningTokens",
+            "reasoning_output_tokens",
+            "reasoningOutputTokens",
+        ],
+    );
+    normalized_run_usage(
+        usage,
+        "direct_ai.usage",
+        input,
+        output,
+        cache_creation,
+        cache_read,
+        reasoning,
+        usage_f64(
+            usage,
+            &["cost_usd", "costUsd", "total_cost_usd", "totalCostUsd"],
+        ),
+    )
+}
+
+#[derive(Default)]
+struct UsageFields {
+    input: u64,
+    output: u64,
+    cache_creation: u64,
+    cache_read: u64,
+    reasoning: u64,
+}
+
+fn aggregate_usage_like_values(value: &Value) -> UsageFields {
+    if let Some(object) = value.as_object() {
+        let directly_has_usage = object.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "input_tokens"
+                    | "inputTokens"
+                    | "output_tokens"
+                    | "outputTokens"
+                    | "cache_creation_input_tokens"
+                    | "cacheCreationInputTokens"
+                    | "cache_read_input_tokens"
+                    | "cacheReadInputTokens"
+            )
+        });
+        if directly_has_usage {
+            return UsageFields {
+                input: usage_u64(value, &["input_tokens", "inputTokens", "input"]),
+                output: usage_u64(value, &["output_tokens", "outputTokens", "output"]),
+                cache_creation: usage_u64(
+                    value,
+                    &[
+                        "cache_creation_input_tokens",
+                        "cacheCreationInputTokens",
+                        "cache_creation",
+                        "cacheCreation",
+                    ],
+                ),
+                cache_read: usage_u64(
+                    value,
+                    &[
+                        "cache_read_input_tokens",
+                        "cacheReadInputTokens",
+                        "cache_read",
+                        "cacheRead",
+                    ],
+                ),
+                reasoning: usage_u64(value, &["reasoning_tokens", "reasoningTokens", "reasoning"]),
+            };
+        }
+        return object.values().map(aggregate_usage_like_values).fold(
+            UsageFields::default(),
+            |mut total, usage| {
+                total.input = total.input.saturating_add(usage.input);
+                total.output = total.output.saturating_add(usage.output);
+                total.cache_creation = total.cache_creation.saturating_add(usage.cache_creation);
+                total.cache_read = total.cache_read.saturating_add(usage.cache_read);
+                total.reasoning = total.reasoning.saturating_add(usage.reasoning);
+                total
+            },
+        );
+    }
+    if let Some(array) = value.as_array() {
+        return array.iter().map(aggregate_usage_like_values).fold(
+            UsageFields::default(),
+            |mut total, usage| {
+                total.input = total.input.saturating_add(usage.input);
+                total.output = total.output.saturating_add(usage.output);
+                total.cache_creation = total.cache_creation.saturating_add(usage.cache_creation);
+                total.cache_read = total.cache_read.saturating_add(usage.cache_read);
+                total.reasoning = total.reasoning.saturating_add(usage.reasoning);
+                total
+            },
+        );
+    }
+    UsageFields::default()
+}
+
+fn normalized_run_usage(
+    usage: &Value,
+    source: &'static str,
+    input: u64,
+    output: u64,
+    cache_creation: u64,
+    cache_read: u64,
+    reasoning: u64,
+    cost_usd: Option<f64>,
+) -> NormalizedRunUsage {
+    let total = usage_u64(
+        usage,
+        &[
+            "total_tokens",
+            "totalTokens",
+            "total_token_count",
+            "totalTokenCount",
+            "total",
+        ],
+    )
+    .max(input.saturating_add(output));
+    let usage_value = SessionTokenUsage {
+        used: total,
+        input,
+        output,
+        cache_creation,
+        cache_read,
+        reasoning,
+        cost_usd: cost_usd.unwrap_or(0.0),
+    };
+    let completeness = if total > 0 {
+        TokenUsageCompleteness::Complete
+    } else {
+        TokenUsageCompleteness::Missing
+    };
+    NormalizedRunUsage {
+        usage: usage_value,
+        raw_usage_json: serde_json::to_string(usage_container(usage)).ok(),
+        source,
+        completeness,
+    }
+}
+
+fn usage_container(value: &Value) -> &Value {
+    value
+        .get("total_token_usage")
+        .or_else(|| value.get("totalTokenUsage"))
+        .unwrap_or(value)
+}
+
+fn usage_u64(value: &Value, keys: &[&str]) -> u64 {
+    keys.iter()
+        .find_map(|key| {
+            value.get(*key).and_then(|raw| {
+                raw.as_u64().or_else(|| {
+                    raw.as_i64()
+                        .and_then(|value| u64::try_from(value).ok())
+                        .or_else(|| raw.as_str().and_then(|value| value.parse::<u64>().ok()))
+                })
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn usage_f64(value: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|raw| {
+            raw.as_f64()
+                .or_else(|| raw.as_str().and_then(|value| value.parse::<f64>().ok()))
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_agent_command(
     provider: Provider,
@@ -4365,6 +6393,24 @@ fn should_use_direct_ai_gateway_runtime(provider: Provider, model: Option<&str>)
             looks_like_proxy_model(model) && !uses_codex_aiproxy_cli_runtime(model)
         }),
         Provider::Codex => false,
+    }
+}
+
+fn runtime_label(runtime: ChatRuntime) -> &'static str {
+    match runtime {
+        ChatRuntime::NativeCli => "native_cli",
+        ChatRuntime::IoGateway => "io_gateway",
+    }
+}
+
+fn runtime_status_label(status: iowb_protocol::SessionRuntimeStatus) -> &'static str {
+    match status {
+        iowb_protocol::SessionRuntimeStatus::Starting => "starting",
+        iowb_protocol::SessionRuntimeStatus::Running => "running",
+        iowb_protocol::SessionRuntimeStatus::WaitingForInput => "waiting_for_input",
+        iowb_protocol::SessionRuntimeStatus::Completed => "completed",
+        iowb_protocol::SessionRuntimeStatus::Aborted => "aborted",
+        iowb_protocol::SessionRuntimeStatus::Failed => "failed",
     }
 }
 
@@ -4944,6 +6990,128 @@ fn sanitize_agent_text(value: &str) -> String {
     sanitized
 }
 
+async fn activate_completed_context_rollover(
+    context: &AgentStartContext,
+    rollover_id: &str,
+    activated_at: DateTime<Utc>,
+) -> Result<ContextRolloverFollowUp> {
+    let retry_run_id = context
+        .durable_run_id
+        .as_deref()
+        .ok_or_else(|| CoreError::InvalidInput("rollover run id is missing".to_string()))?;
+    let rollover = context
+        .storage
+        .context_rollover_for_retry_run(retry_run_id)?
+        .filter(|rollover| rollover.id == rollover_id)
+        .ok_or_else(|| CoreError::InvalidInput("context rollover was not found".to_string()))?;
+    let candidate = rollover
+        .candidate_native_session_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CoreError::InvalidInput("Codex did not report a clean thread id".to_string())
+        })?;
+    let mut session = context
+        .storage
+        .get_session_summary(&context.session_id)?
+        .ok_or_else(|| CoreError::SessionNotFound(context.session_id.clone()))?;
+    session.native_session_id = Some(candidate.clone());
+    session.external = false;
+    session.active = false;
+    session.last_activity = activated_at;
+    session.last_message_at = Some(activated_at);
+    session.received_at = Some(activated_at);
+    session.effort = context.effort.clone().or(session.effort);
+    session.mode = context.mode.clone().or(session.mode);
+    session.thinking = context.thinking.or(session.thinking);
+    session.fast = context.fast.or(session.fast);
+    let observed = rollover
+        .observed_bytes
+        .map(|bytes| {
+            format!(
+                " · {} of image-heavy context archived",
+                human_byte_size(bytes)
+            )
+        })
+        .unwrap_or_default();
+    let marker = ChatMessage {
+        id: new_id("msg"),
+        role: MessageRole::System,
+        content: format!(
+            "Context compacted here{observed}. Earlier messages remain visible, while subsequent replies use a clean Codex context."
+        ),
+        timestamp: activated_at,
+        metadata: serde_json::json!({
+            "kind": "context_compaction",
+            "rolloverId": rollover.id,
+            "requestId": rollover.request_id,
+            "failedMessageId": rollover.failed_message_id,
+            "fromNativeSessionId": rollover.from_native_session_id,
+            "toNativeSessionId": candidate.clone(),
+            "observedBytes": rollover.observed_bytes,
+            "limitBytes": rollover.limit_bytes,
+        }),
+    };
+    let failed_message = context
+        .storage
+        .message_by_id(&context.session_id, &rollover.failed_message_id)?
+        .filter(|message| message.role == MessageRole::User)
+        .ok_or_else(|| CoreError::InvalidInput("failed user message was not found".to_string()))?;
+    let mut follow_up_run = StoredDurableChatRun::new(
+        new_id("run"),
+        Some(rollover.user_id.clone()),
+        session.id.clone(),
+        context.provider.as_str(),
+        failed_message.content.clone(),
+        session.project_path.clone(),
+    );
+    follow_up_run.user_message_id = Some(failed_message.id.clone());
+    follow_up_run.native_session_id = Some(candidate.clone());
+    follow_up_run.model = context.model.clone();
+    follow_up_run.effort = context.effort.clone();
+    follow_up_run.mode = context.mode.clone();
+    follow_up_run.thinking = context.thinking;
+    follow_up_run.fast = context.fast;
+    if !context.storage.complete_context_rollover(
+        rollover_id,
+        retry_run_id,
+        &candidate,
+        &session,
+        &marker,
+        None,
+        Some(&follow_up_run),
+    )? {
+        return Err(CoreError::Conflict(
+            "clean context rollover is no longer pending".to_string(),
+        ));
+    }
+    let persisted_session = context
+        .storage
+        .get_session_summary(&context.session_id)?
+        .ok_or_else(|| CoreError::SessionNotFound(context.session_id.clone()))?;
+    context
+        .sessions
+        .remember_persisted_session(persisted_session)
+        .await?;
+    info!(
+        session_id = %context.session_id,
+        rollover_id,
+        native_session_id = %candidate,
+        "activated clean native context and staged original prompt"
+    );
+    Ok(ContextRolloverFollowUp { run: follow_up_run })
+}
+
+fn human_byte_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn utf8_prefix_boundary(value: &str, max_bytes: usize) -> usize {
     if value.len() <= max_bytes {
         return value.len();
@@ -5061,6 +7229,7 @@ async fn process_agent_event(
                     WsServerEvent::Error {
                         message: "agent output stream failed".to_string(),
                         details: Some(message),
+                        session_id: Some(context.session_id.clone()),
                     },
                 )
                 .await;
@@ -5123,6 +7292,14 @@ async fn persist_codex_tool_messages(
     let Some(normalizer) = normalizer.as_mut() else {
         return;
     };
+    // Rollover output is provisional until the marker, native mapping,
+    // assistant response, and retry run can commit atomically. Tool rows are
+    // intentionally kept ephemeral for this one turn; otherwise a failed or
+    // aborted rollover would mutate the visible transcript before activation.
+    if context.context_rollover_id.is_some() {
+        normalizer.take_tool_messages();
+        return;
+    }
     for tool in normalizer.take_tool_messages() {
         let metadata = serde_json::json!({
             "kind": "tool_output",
@@ -5154,6 +7331,77 @@ async fn persist_native_session_id(context: &AgentStartContext, native_session_i
     let Some(native_session_id) = native_session_id else {
         return;
     };
+    if let Some(rollover_id) = context.context_rollover_id.as_deref() {
+        let Some(run_id) = context.durable_run_id.as_deref() else {
+            warn!(
+                session_id = %context.session_id,
+                native_session_id = %native_session_id,
+                rollover_id,
+                "ignored clean native context candidate without a durable retry run"
+            );
+            return;
+        };
+        match context.storage.set_context_rollover_candidate(
+            rollover_id,
+            run_id,
+            &native_session_id,
+        ) {
+            Ok(true) => info!(
+                session_id = %context.session_id,
+                native_session_id = %native_session_id,
+                rollover_id,
+                "staged clean native context candidate"
+            ),
+            Ok(false) => warn!(
+                session_id = %context.session_id,
+                native_session_id = %native_session_id,
+                rollover_id,
+                "ignored native context candidate for inactive rollover"
+            ),
+            Err(error) => warn!(
+                error = %error,
+                session_id = %context.session_id,
+                native_session_id = %native_session_id,
+                rollover_id,
+                "failed to stage clean native context candidate"
+            ),
+        }
+        return;
+    }
+    // Once a visible chat has rollover history, only its currently active
+    // native mapping is valid. Late thread.started events from an archived
+    // process must never replace it, including on the durable run row.
+    if context.provider == Provider::Codex {
+        match context
+            .storage
+            .context_native_session_ids(&context.session_id)
+        {
+            Ok(ids) if !ids.is_empty() => {
+                match context.storage.get_session_summary(&context.session_id) {
+                    Ok(Some(session))
+                        if session.native_session_id.as_deref()
+                            == Some(native_session_id.as_str()) => {}
+                    Ok(_) => {
+                        warn!(
+                            session_id = %context.session_id,
+                            native_session_id = %native_session_id,
+                            "ignored non-active native thread id after context rollover"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(error = %error, session_id = %context.session_id, "failed to validate native thread id after context rollover");
+                        return;
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(error = %error, session_id = %context.session_id, "failed to inspect context rollover history");
+                return;
+            }
+        }
+    }
     if let Some(run_id) = context.durable_run_id.as_deref()
         && let Err(error) = context
             .storage
@@ -5283,6 +7531,7 @@ impl CodexLiveOutputNormalizer {
             "turn.completed" => {
                 let mut output = self.take_pending_agent_message(false);
                 if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
+                    self.final_usage = Some(normalize_codex_run_usage(usage));
                     append_live_section(
                         &mut output,
                         &format!(
@@ -5302,6 +7551,7 @@ impl CodexLiveOutputNormalizer {
                     .map(display_codex_live_value)
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "Codex turn failed".to_string());
+                self.last_error = Some(codex_turn_error(&event, &message));
                 append_live_section(&mut output, &format!("ERROR: {message}"));
                 output
             }
@@ -5313,6 +7563,7 @@ impl CodexLiveOutputNormalizer {
                     .map(display_codex_live_value)
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "Codex reported an error".to_string());
+                self.last_error = Some(codex_turn_error(&event, &message));
                 append_live_section(&mut output, &format!("ERROR: {message}"));
                 output
             }
@@ -5443,6 +7694,10 @@ impl CodexLiveOutputNormalizer {
         self.final_assistant_message.take()
     }
 
+    fn take_final_usage(&mut self) -> Option<NormalizedRunUsage> {
+        self.final_usage.take()
+    }
+
     fn saw_structured_event(&self) -> bool {
         self.saw_structured_event
     }
@@ -5455,6 +7710,40 @@ impl CodexLiveOutputNormalizer {
     fn take_thread_id(&mut self) -> Option<String> {
         self.pending_thread_id.take()
     }
+
+    fn take_error(&mut self) -> Option<CodexTurnError> {
+        self.last_error.take()
+    }
+}
+
+fn codex_turn_error(event: &Value, message: &str) -> CodexTurnError {
+    let code = event
+        .pointer("/error/code")
+        .or_else(|| event.get("code"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let limit_bytes = event
+        .pointer("/error/details/limit_bytes")
+        .or_else(|| event.pointer("/details/limit_bytes"))
+        .and_then(Value::as_u64);
+    let observed_bytes = event
+        .pointer("/error/details/content_length_bytes")
+        .or_else(|| event.pointer("/details/content_length_bytes"))
+        .and_then(Value::as_u64);
+    CodexTurnError {
+        message: message.to_string(),
+        code,
+        limit_bytes,
+        observed_bytes,
+    }
+}
+
+fn is_request_body_too_large_error(error: &CodexTurnError) -> bool {
+    error.code.as_deref() == Some("request_body_too_large")
+        || error.message.to_ascii_lowercase().contains("http 413")
+        || error.message.to_ascii_lowercase().contains("payload too large")
+        // Compatibility with gateways deployed before the structured 413 fix.
+        || error.message.trim().eq_ignore_ascii_case("invalid body")
 }
 
 fn is_codex_tool_item_type(item_type: &str) -> bool {
@@ -5486,6 +7775,7 @@ struct ClaudeLiveOutputNormalizer {
     tool_names: HashMap<String, String>,
     emitted_tool_results: HashSet<String>,
     final_assistant_message: Option<String>,
+    final_usage: Option<NormalizedRunUsage>,
 }
 
 #[derive(Default)]
@@ -5726,6 +8016,21 @@ impl ClaudeLiveOutputNormalizer {
                         parts.push(format!("claude\n{trimmed}"));
                     }
                 }
+                if event
+                    .get("modelUsage")
+                    .filter(|value| !value.is_null())
+                    .is_some()
+                    || event
+                        .get("model_usage")
+                        .filter(|value| !value.is_null())
+                        .is_some()
+                    || event
+                        .get("usage")
+                        .filter(|value| !value.is_null())
+                        .is_some()
+                {
+                    self.final_usage = Some(normalize_claude_run_usage(event));
+                }
                 if let Some(usage) = event.get("usage").filter(|value| !value.is_null()) {
                     parts.push(self.format_activity_section(format!(
                         "tokens used\n{}",
@@ -5751,6 +8056,10 @@ impl ClaudeLiveOutputNormalizer {
 
     fn take_final_assistant_message(&mut self) -> Option<String> {
         self.final_assistant_message.take()
+    }
+
+    fn take_final_usage(&mut self) -> Option<NormalizedRunUsage> {
+        self.final_usage.take()
     }
 
     fn format_activity_section(&mut self, section: String) -> String {
@@ -6098,6 +8407,12 @@ impl GeminiLiveOutputNormalizer {
             .and_then(Value::as_str)
             .unwrap_or_default()
         {
+            "result" => {
+                if let Some(usage) = normalize_gemini_run_usage(&event) {
+                    self.final_usage = Some(usage);
+                }
+                String::new()
+            }
             "message" | "content" => {
                 let role = event
                     .get("role")
@@ -6137,6 +8452,10 @@ impl GeminiLiveOutputNormalizer {
 
     fn take_session_id(&mut self) -> Option<String> {
         self.pending_session_id.take()
+    }
+
+    fn take_final_usage(&mut self) -> Option<NormalizedRunUsage> {
+        self.final_usage.take()
     }
 }
 
@@ -6580,19 +8899,33 @@ mod tests {
             .expect("source inactive");
 
         let response = state
-            .fork_session_before_message("user-1", &source.id, &target.id, "request-first")
+            .fork_session_before_message(
+                "user-1",
+                &source.id,
+                &target.id,
+                "request-first",
+                true,
+                Some("Rewrite authentication with passkeys"),
+            )
             .await
             .expect("fork first prompt");
         assert_eq!(response.source_session_id, source.id);
         assert_eq!(response.before_message_id, target.id);
-        assert_eq!(response.session.title, "Rewrite the authentication flow");
+        assert_eq!(
+            response.session.title,
+            "Rewrite authentication with passkeys"
+        );
         assert_eq!(response.session.message_count, 0);
         assert_eq!(response.session.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(response.session.effort.as_deref(), Some("high"));
         assert_eq!(response.session.thinking, Some(true));
-        assert_eq!(response.draft.content, "Rewrite the authentication flow");
+        assert_eq!(
+            response.draft.content,
+            "Rewrite authentication with passkeys"
+        );
         assert!(!response.native_forked);
         assert!(response.files_unchanged);
+        assert!(response.source_hidden);
         assert!(
             state
                 .sessions
@@ -6615,12 +8948,117 @@ mod tests {
                 &source.id,
                 "different-message-id",
                 "request-first",
+                false,
+                Some("This retry must not replace the original draft"),
             )
             .await
             .expect("idempotent retry");
         assert_eq!(retry.session.id, response.session.id);
         assert_eq!(retry.before_message_id, target.id);
         assert_eq!(retry.draft.content, response.draft.content);
+        assert!(retry.source_hidden);
+        let listed = state
+            .sessions
+            .list_for_project(project.to_str().expect("project path"))
+            .await
+            .expect("replacement list");
+        assert!(listed.iter().all(|session| session.id != source.id));
+        assert!(
+            listed
+                .iter()
+                .any(|session| session.id == response.session.id)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn board_scope_survives_cache_miss_and_propagates_to_fork() {
+        let (state, root, project) = temporary_app_state("board-scope-continuation").await;
+        let source = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("board-chat".to_string()),
+                false,
+                None,
+                Some(ChatRuntime::NativeCli),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("source session");
+        let source = state
+            .sessions
+            .mark_board_session(&source.id, "run-1", Some("task-1".to_string()))
+            .await
+            .expect("mark board session");
+        let target = state
+            .sessions
+            .append_message(&source.id, MessageRole::User, "board prompt")
+            .await
+            .expect("target prompt");
+        state
+            .sessions
+            .set_active(&source.id, false)
+            .await
+            .expect("source inactive");
+
+        // A fresh manager models restart/eviction. Continuation must seed the
+        // cached entry from storage instead of replacing its scope metadata.
+        let reloaded = SessionManager::load(state.storage.clone(), 0).expect("reload manager");
+        assert!(reloaded.is_board_session_cached(&source.id));
+        let continued = reloaded
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some(source.id.clone()),
+                false,
+                None,
+                Some(ChatRuntime::NativeCli),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("continue board session");
+        assert!(continued.board_session);
+        assert_eq!(continued.board_run_id.as_deref(), Some("run-1"));
+        assert_eq!(continued.board_task_id.as_deref(), Some("task-1"));
+        assert!(reloaded.list_active().await.is_empty());
+
+        reloaded
+            .set_active(&source.id, false)
+            .await
+            .expect("continued source inactive");
+        let fork = state
+            .fork_session_before_message(
+                "user-1",
+                &source.id,
+                &target.id,
+                "board-fork",
+                false,
+                None,
+            )
+            .await
+            .expect("fork board session");
+        assert!(fork.session.board_session);
+        assert_eq!(fork.session.board_run_id.as_deref(), Some("run-1"));
+        assert_eq!(fork.session.board_task_id.as_deref(), Some("task-1"));
+        assert!(!fork.source_hidden);
+        assert!(
+            state
+                .sessions
+                .list_for_project(project.to_str().expect("project path"))
+                .await
+                .expect("project sessions")
+                .iter()
+                .all(|session| session.id != source.id && session.id != fork.session.id)
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6671,7 +9109,14 @@ mod tests {
             .expect("source inactive");
 
         let response = state
-            .fork_session_before_message("user-1", &source.id, &target.id, "request-middle")
+            .fork_session_before_message(
+                "user-1",
+                &source.id,
+                &target.id,
+                "request-middle",
+                false,
+                None,
+            )
             .await
             .expect("fork middle prompt");
         let cloned = state
@@ -6694,6 +9139,7 @@ mod tests {
         assert_eq!(response.session.message_count, 2);
         assert_eq!(response.draft.content, "same prompt");
         assert!(!response.native_forked);
+        assert!(!response.source_hidden);
         assert_eq!(
             state
                 .sessions
@@ -6701,6 +9147,117 @@ mod tests {
                 .expect("original messages")
                 .len(),
             4
+        );
+        let listed = state
+            .sessions
+            .list_for_project(project.to_str().expect("project path"))
+            .await
+            .expect("non-replacement list");
+        assert!(listed.iter().any(|session| session.id == source.id));
+        assert!(
+            listed
+                .iter()
+                .any(|session| session.id == response.session.id)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacing_external_session_hides_and_delete_restores_source() {
+        let (mut state, root, project) = temporary_app_state("fork-external-source").await;
+        let native_id = "55555555-5555-4555-8555-555555555555";
+        let now = Utc::now();
+        let rollout = root
+            .join(".codex/sessions/2026/08/13")
+            .join(format!("rollout-2026-08-13T00-00-00-{native_id}.jsonl"));
+        std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("rollout dir");
+        std::fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "session_meta",
+                    "payload": {"id": native_id, "cwd": project, "thread_source": "user"}
+                }),
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "replace external prompt",
+                        "kind": "plain"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": now + chrono::Duration::seconds(1),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "external answer"}]
+                    }
+                })
+            ),
+        )
+        .expect("rollout");
+        state.sessions.external_home = Arc::new(root.clone());
+
+        let source = state
+            .sessions
+            .get(native_id)
+            .await
+            .expect("external source");
+        assert!(source.external);
+        let target = state
+            .sessions
+            .messages_including_external(native_id)
+            .await
+            .expect("external messages")
+            .into_iter()
+            .find(|message| message.role == MessageRole::User)
+            .expect("external user prompt");
+
+        let response = state
+            .fork_session_before_message(
+                "user-1",
+                native_id,
+                &target.id,
+                "request-external-replace",
+                true,
+                Some("edited external prompt"),
+            )
+            .await
+            .expect("replace external source");
+        assert!(response.source_hidden);
+        let hidden = state
+            .sessions
+            .list_for_project(project.to_str().expect("project path"))
+            .await
+            .expect("hidden source list");
+        assert!(hidden.iter().all(|session| session.id != native_id));
+        assert!(
+            hidden
+                .iter()
+                .any(|session| session.id == response.session.id)
+        );
+
+        state
+            .sessions
+            .delete(&response.session.id)
+            .await
+            .expect("delete replacement");
+        let restored = state
+            .sessions
+            .list_for_project(project.to_str().expect("project path"))
+            .await
+            .expect("restored source list");
+        assert!(restored.iter().any(|session| session.id == native_id));
+        assert!(
+            restored
+                .iter()
+                .all(|session| session.id != response.session.id)
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -7412,6 +9969,64 @@ mod tests {
     }
 
     #[test]
+    fn run_usage_normalizers_keep_total_and_subset_fields_separate() {
+        let codex = normalize_codex_run_usage(&serde_json::json!({
+            "input_tokens": 30,
+            "cached_input_tokens": 12,
+            "cache_write_input_tokens": 3,
+            "output_tokens": 12,
+            "reasoning_output_tokens": 5,
+            "total_tokens": 42
+        }));
+        assert_eq!(codex.usage.used, 42);
+        assert_eq!(codex.usage.input, 30);
+        assert_eq!(codex.usage.output, 12);
+        assert_eq!(codex.usage.cache_read, 12);
+        assert_eq!(codex.usage.cache_creation, 3);
+        assert_eq!(codex.usage.reasoning, 5);
+
+        let claude = normalize_claude_run_usage(&serde_json::json!({
+            "type": "result",
+            "modelUsage": {
+                "sonnet": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "output_tokens": 40
+                },
+                "haiku": {
+                    "input_tokens": 1,
+                    "output_tokens": 4
+                }
+            },
+            "total_cost_usd": 0.02
+        }));
+        assert_eq!(claude.usage.used, 55);
+        assert_eq!(claude.usage.input, 11);
+        assert_eq!(claude.usage.output, 44);
+        assert_eq!(claude.usage.cache_creation, 20);
+        assert_eq!(claude.usage.cache_read, 30);
+        assert_eq!(claude.usage.cost_usd, 0.02);
+
+        let gemini = normalize_gemini_run_usage(&serde_json::json!({
+            "type": "result",
+            "stats": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 25,
+                "cachedContentTokenCount": 80,
+                "thoughtsTokenCount": 7,
+                "totalTokenCount": 125
+            }
+        }))
+        .expect("gemini usage");
+        assert_eq!(gemini.usage.used, 125);
+        assert_eq!(gemini.usage.input, 100);
+        assert_eq!(gemini.usage.output, 25);
+        assert_eq!(gemini.usage.cache_read, 80);
+        assert_eq!(gemini.usage.reasoning, 7);
+    }
+
+    #[test]
     fn claude_and_gemini_normalizers_capture_native_session_ids() {
         let mut claude = ClaudeLiveOutputNormalizer::default();
         let claude_output = claude.push_chunks(concat!(
@@ -7609,6 +10224,275 @@ mod tests {
         assert!(recovery.contains("[original request truncated]"));
     }
 
+    #[test]
+    fn context_rollover_handoff_is_bounded_text_only_and_defers_failed_prompt() {
+        let now = Utc::now();
+        let inline_payload = "A".repeat(80_000);
+        let failed_prompt =
+            format!("Finish the image diagnosis ![failed](data:image/png;base64,{inline_payload})");
+        let messages = vec![
+            ChatMessage {
+                id: "old-user".to_string(),
+                role: MessageRole::User,
+                content: format!(
+                    "Inspect the screenshot at `.io-workbench/chat-images/screenshot.png` ![inline](data:image/webp;base64,{inline_payload})"
+                ),
+                timestamp: now,
+                metadata: Value::Null,
+            },
+            ChatMessage {
+                id: "old-tool".to_string(),
+                role: MessageRole::Tool,
+                content: format!("tool bytes and secret payload {inline_payload}"),
+                timestamp: now + chrono::Duration::seconds(1),
+                metadata: serde_json::json!({"tool": "view_image"}),
+            },
+            ChatMessage {
+                id: "old-thinking".to_string(),
+                role: MessageRole::Assistant,
+                content: "private reasoning should not be retained".to_string(),
+                timestamp: now + chrono::Duration::seconds(2),
+                metadata: serde_json::json!({"kind": "thinking"}),
+            },
+            ChatMessage {
+                id: "old-commentary".to_string(),
+                role: MessageRole::Assistant,
+                content: "temporary commentary should not be retained".to_string(),
+                timestamp: now + chrono::Duration::seconds(3),
+                metadata: serde_json::json!({"phase": "commentary"}),
+            },
+            ChatMessage {
+                id: "old-assistant".to_string(),
+                role: MessageRole::Assistant,
+                content:
+                    "The request failed because the native context exceeded the gateway limit."
+                        .to_string(),
+                timestamp: now + chrono::Duration::seconds(4),
+                metadata: Value::Null,
+            },
+            ChatMessage {
+                id: "failed-user".to_string(),
+                role: MessageRole::User,
+                content: failed_prompt.clone(),
+                timestamp: now + chrono::Duration::seconds(5),
+                metadata: Value::Null,
+            },
+        ];
+
+        let handoff = build_context_rollover_handoff(messages, &failed_prompt);
+
+        assert!(handoff.starts_with("<system-reminder>\n"));
+        assert!(handoff.contains("Recent text-only handoff:"));
+        assert!(handoff.contains(".io-workbench/chat-images/screenshot.png"));
+        assert!(handoff.contains("native context exceeded the gateway limit"));
+        assert!(handoff.contains("[inline image omitted; use its local file path if available]"));
+        assert!(!handoff.contains(";base64,"));
+        assert!(!handoff.contains(&inline_payload));
+        assert!(!handoff.contains("tool bytes and secret payload"));
+        assert!(!handoff.contains("private reasoning should not be retained"));
+        assert!(!handoff.contains("temporary commentary should not be retained"));
+        assert_eq!(handoff.matches("Finish the image diagnosis").count(), 0);
+        assert!(
+            handoff.len() <= CONTEXT_ROLLOVER_HANDOFF_MAX_BYTES + 2 * 1024,
+            "handoff unexpectedly large: {} bytes",
+            handoff.len()
+        );
+    }
+
+    #[test]
+    fn context_rollover_handoff_keeps_newest_text_that_fits() {
+        let now = Utc::now();
+        let mut messages = (0..40)
+            .map(|index| ChatMessage {
+                id: format!("message-{index:02}"),
+                role: if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content: format!("history-{index:02} {}", "x".repeat(3_000)),
+                timestamp: now + chrono::Duration::seconds(index),
+                metadata: Value::Null,
+            })
+            .collect::<Vec<_>>();
+        messages.push(ChatMessage {
+            id: "failed-user".to_string(),
+            role: MessageRole::User,
+            content: "retry newest request".to_string(),
+            timestamp: now + chrono::Duration::seconds(41),
+            metadata: Value::Null,
+        });
+
+        let handoff = build_context_rollover_handoff(messages, "retry newest request");
+
+        assert!(handoff.contains("history-39"));
+        assert!(!handoff.contains("history-00"));
+        assert_eq!(handoff.matches("retry newest request").count(), 0);
+        assert!(
+            handoff.len() <= CONTEXT_ROLLOVER_HANDOFF_MAX_BYTES + 2 * 1024,
+            "handoff unexpectedly large: {} bytes",
+            handoff.len()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_context_rollover_discards_provisional_codex_tool_rows() {
+        let (state, root, project) = temporary_app_state("rollover-tool-rollback").await;
+        let session = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("session-rollover-tool-rollback".to_string()),
+                false,
+                None,
+                Some(ChatRuntime::NativeCli),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+        let failed_message = state
+            .sessions
+            .append_message(
+                &session.id,
+                MessageRole::User,
+                "retry without leaking tools",
+            )
+            .await
+            .expect("failed prompt");
+        let mut trigger_run = StoredDurableChatRun::new(
+            "run-rollover-tool-trigger",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            Provider::Codex.as_str(),
+            failed_message.content.clone(),
+            project.display().to_string(),
+        );
+        trigger_run.user_message_id = Some(failed_message.id.clone());
+        state
+            .storage
+            .create_durable_chat_run(&trigger_run)
+            .expect("trigger run");
+        state
+            .storage
+            .mark_durable_chat_run_failed(&trigger_run.id, "invalid body")
+            .expect("failed trigger");
+        let now = Utc::now();
+        let rollover = StoredSessionContextRollover {
+            id: "rollover-tool-rollback".to_string(),
+            user_id: "user-1".to_string(),
+            session_id: session.id.clone(),
+            request_id: "request-rollover-tool-rollback".to_string(),
+            failed_message_id: failed_message.id.clone(),
+            trigger_run_id: trigger_run.id.clone(),
+            retry_run_id: "run-rollover-tool-retry".to_string(),
+            from_native_session_id: Some("native-poisoned".to_string()),
+            candidate_native_session_id: None,
+            state: "starting".to_string(),
+            handoff: "bounded handoff".to_string(),
+            observed_bytes: Some(CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES),
+            limit_bytes: CODEX_GATEWAY_BODY_LIMIT_BYTES,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            activated_at: None,
+        };
+        let mut retry_run = StoredDurableChatRun::new(
+            rollover.retry_run_id.clone(),
+            Some("user-1".to_string()),
+            session.id.clone(),
+            Provider::Codex.as_str(),
+            rollover.handoff.clone(),
+            project.display().to_string(),
+        );
+        retry_run.user_message_id = Some(failed_message.id.clone());
+        assert!(
+            state
+                .storage
+                .prepare_context_rollover(&rollover, &retry_run)
+                .expect("prepare rollover")
+        );
+        let before = state
+            .storage
+            .list_messages(&session.id)
+            .expect("baseline transcript");
+        let context = AgentStartContext {
+            provider: Provider::Codex,
+            session_id: session.id.clone(),
+            durable_run_id: Some(retry_run.id.clone()),
+            attempt_id: None,
+            response_id: retry_run.id.clone(),
+            sequence: Arc::new(AtomicU64::new(0)),
+            project_path: project.clone(),
+            prompt: rollover.handoff.clone(),
+            model: None,
+            runtime: ChatRuntime::NativeCli,
+            effort: None,
+            mode: None,
+            thinking: None,
+            fast: None,
+            native_resume_session_id: None,
+            context_rollover_id: Some(rollover.id.clone()),
+            direct_ai_config: None,
+            direct_ai_messages: Vec::new(),
+            sessions: state.sessions.clone(),
+            storage: state.storage.clone(),
+            hub: WsHub::new(),
+        };
+        let mut normalizer = Some(CodexLiveOutputNormalizer::default());
+        normalizer.as_mut().expect("normalizer").push(&format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "custom_tool_call_output",
+                    "name": "view_image",
+                    "output": "provisional image analysis that must not persist"
+                }
+            })
+        ));
+        persist_codex_tool_messages(&context, &mut normalizer).await;
+        AgentRuntimeManager::default()
+            .finish(
+                "codex:session-rollover-tool-rollback",
+                &context,
+                iowb_protocol::SessionRuntimeStatus::Failed,
+                Some("clean retry failed".to_string()),
+                None,
+            )
+            .await;
+
+        let after = state
+            .storage
+            .list_messages(&session.id)
+            .expect("transcript after failed rollover");
+        let transcript_identity = |messages: &[ChatMessage]| {
+            messages
+                .iter()
+                .map(|message| (message.id.clone(), message.role, message.content.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            transcript_identity(&after),
+            transcript_identity(&before),
+            "a failed rollover must not append provisional tool or assistant rows"
+        );
+        assert_eq!(
+            state
+                .storage
+                .context_rollover_for_retry_run(&retry_run.id)
+                .expect("rollover lookup")
+                .expect("rollover")
+                .state,
+            "failed"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn token_usage_persists_and_clears_when_the_next_turn_starts() {
         let root = std::env::temp_dir().join(format!("iowb-token-usage-{}", Uuid::new_v4()));
@@ -7640,6 +10524,7 @@ mod tests {
                     output: 2_700,
                     cache_creation: 0,
                     cache_read: 121,
+                    reasoning: 0,
                     cost_usd: 0.0,
                 },
             )
@@ -7706,6 +10591,9 @@ mod tests {
             id: "stale-session".to_string(),
             provider: Provider::Codex,
             external: false,
+            board_session: false,
+            board_run_id: None,
+            board_task_id: None,
             project_path: root.display().to_string(),
             title: "Interrupted chat".to_string(),
             message_count: 1,
@@ -7721,6 +10609,7 @@ mod tests {
             first_user_at: Some(now),
             received_at: None,
             token_usage: None,
+            lifetime_token_usage: None,
             native_session_id: Some("native-session".to_string()),
             title_source: Some(SessionTitleSource::Manual),
         };
@@ -7807,7 +10696,7 @@ mod tests {
         std::fs::write(
             historical_rollout,
             format!(
-                "{}\n{}\n",
+                "{}\n{}\n{}\n",
                 serde_json::json!({
                     "timestamp": now - chrono::Duration::seconds(60),
                     "type": "session_meta",
@@ -7821,12 +10710,61 @@ mod tests {
                         "message": "older prompt",
                         "kind": "plain"
                     }
+                }),
+                serde_json::json!({
+                    "timestamp": now - chrono::Duration::seconds(59),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "older answer"}]
+                    }
                 })
             ),
         )
         .expect("historical rollout");
 
         let storage = Storage::open(config_dir.join("test.db")).expect("storage");
+        storage
+            .upsert_session(&SessionSummary {
+                id: historical_native_id.to_string(),
+                provider: Provider::Codex,
+                external: true,
+                project_path: project.display().to_string(),
+                title: "Stored historical session".to_string(),
+                message_count: 1,
+                last_activity: now - chrono::Duration::seconds(60),
+                ..Default::default()
+            })
+            .expect("stored historical external session");
+        let mut historical_attempt = StoredChatRunAttempt::new(
+            "attempt-historical-usage",
+            "run-historical-usage",
+            historical_native_id,
+            None,
+            "codex",
+            "legacy_history",
+            None,
+            Some(historical_native_id.to_string()),
+        );
+        historical_attempt.status = "completed".to_string();
+        historical_attempt.usage = Some(SessionTokenUsage {
+            used: 42,
+            input: 30,
+            output: 12,
+            cache_creation: 0,
+            cache_read: 0,
+            reasoning: 0,
+            cost_usd: 0.0,
+        });
+        historical_attempt.source = Some("test".to_string());
+        historical_attempt.completeness = TokenUsageCompleteness::Complete;
+        historical_attempt.created_at = now;
+        historical_attempt.updated_at = now;
+        historical_attempt.completed_at = Some(now);
+        storage
+            .create_chat_run_attempt(&historical_attempt)
+            .expect("historical usage attempt");
         let mut sessions = SessionManager::load(storage.clone(), 10).expect("sessions");
         sessions.external_home = Arc::new(root.clone());
         let internal = sessions
@@ -7929,17 +10867,103 @@ mod tests {
             listed.iter().all(|session| session.id != native_id),
             "mapped native rollout must not appear as an extra chat: {listed:#?}"
         );
+        let historical_session = listed
+            .iter()
+            .find(|session| session.id == historical_native_id);
         assert!(
-            listed
-                .iter()
-                .any(|session| session.id == historical_native_id),
+            historical_session.is_some(),
             "unmapped historical rollout must remain discoverable: {listed:#?}"
         );
+        assert_eq!(
+            historical_session
+                .expect("historical session checked above")
+                .message_count,
+            2,
+            "unmapped external session count must come from loaded rollout messages"
+        );
+        assert_eq!(
+            historical_session
+                .expect("historical session checked above")
+                .lifetime_token_usage
+                .as_ref()
+                .map(|usage| usage.total),
+            Some(42),
+            "external refresh must preserve stored lifetime token usage"
+        );
+        let internal_session = listed.iter().find(|session| session.id == internal.id);
         assert!(
-            listed.iter().any(|session| session.id == internal.id),
+            internal_session.is_some(),
             "internal chat must remain visible: {listed:#?}"
         );
+        assert_eq!(
+            internal_session
+                .expect("internal session checked above")
+                .message_count,
+            mapped_messages.len(),
+            "mapped native session list count must match loaded message total"
+        );
+        sessions
+            .set_active(&internal.id, true)
+            .await
+            .expect("mark mapped session active");
+        let active_sessions = sessions.list_active().await;
+        let active_internal_session = active_sessions
+            .iter()
+            .find(|session| session.id == internal.id)
+            .expect("mapped active session");
+        assert_eq!(
+            active_internal_session.message_count,
+            mapped_messages.len(),
+            "active-session events must use the loaded message total"
+        );
+        sessions
+            .set_active(&internal.id, false)
+            .await
+            .expect("mark mapped session inactive");
 
+        let stale_internal = sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("stale-count-session".to_string()),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("stale-count session");
+        sessions
+            .set_native_session_id(&stale_internal.id, historical_native_id.to_string())
+            .await
+            .expect("map stale-count session");
+        sessions
+            .set_active(&stale_internal.id, false)
+            .await
+            .expect("mark stale-count session inactive");
+        let mut stale_summary = storage
+            .get_session(&stale_internal.id)
+            .expect("stale-count storage query")
+            .expect("stale-count stored session");
+        stale_summary.message_count = 99;
+        storage
+            .upsert_session(&stale_summary)
+            .expect("persist stale count");
+        let stale_listed = sessions
+            .list_for_project(project.to_str().expect("project path"))
+            .await
+            .expect("project sessions after stale count");
+        let stale_listed_session = stale_listed
+            .iter()
+            .find(|session| session.id == stale_internal.id)
+            .expect("stale-count listed session");
+        assert_eq!(
+            stale_listed_session.message_count, 2,
+            "inactive mapped session counts must come from loaded messages, not stale stored metadata"
+        );
         let args = default_agent_args_with_resume(
             Provider::Codex,
             "second prompt",
@@ -8704,6 +11728,477 @@ mod tests {
                 .expect("stored session")
                 .expect("session exists")
                 .active
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_session_list_does_not_cache_external_rollout_messages() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-list-external-cache-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project dir");
+
+        let native_id = "44444444-4444-4444-8444-444444444444";
+        let now = Utc::now();
+        let rollout = root
+            .join(".codex/sessions/2026/08/14")
+            .join(format!("rollout-2026-08-14T00-00-00-{native_id}.jsonl"));
+        std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("rollout dir");
+        std::fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "session_meta",
+                    "payload": {"id": native_id, "cwd": project}
+                }),
+                serde_json::json!({
+                    "timestamp": now + chrono::Duration::seconds(1),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "check memory",
+                        "kind": "plain"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": now + chrono::Duration::seconds(2),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}]
+                    }
+                })
+            ),
+        )
+        .expect("rollout");
+
+        let storage = Storage::open(config_dir.join("test.db")).expect("storage");
+        let mut sessions = SessionManager::load(storage.clone(), 10).expect("sessions");
+        sessions.external_home = Arc::new(root.clone());
+        let mapped = sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("mapped-list-session".to_string()),
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mapped session");
+        sessions
+            .set_native_session_id(&mapped.id, native_id.to_string())
+            .await
+            .expect("native mapping");
+
+        let listed = sessions
+            .list_for_project(project.to_str().expect("project path"))
+            .await
+            .expect("project sessions");
+        assert!(
+            listed.iter().any(|session| session.id == mapped.id),
+            "mapped Workbench session must remain listed: {listed:#?}"
+        );
+        assert!(
+            listed.iter().all(|session| session.id != native_id),
+            "mapped native rollout must not be listed separately: {listed:#?}"
+        );
+        assert!(
+            sessions.external_cache.read().await.messages.is_empty(),
+            "project list must not parse and cache full external rollout messages"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rollover_recovery_never_infers_or_resumes_archived_native_context() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-rollover-recovery-selection-{}",
+            Uuid::new_v4()
+        ));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let database = config_dir.join("test.db");
+        let initial_state = AppState::initialize(AppConfig {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: database.clone(),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("initial state");
+        initial_state
+            .storage
+            .create_user("user-rollover", "user-rollover", "test-hash")
+            .expect("create user");
+        let mut session = initial_state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("session-rollover-recovery".to_string()),
+                false,
+                None,
+                Some(ChatRuntime::IoGateway),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+        initial_state
+            .sessions
+            .set_native_session_id(&session.id, "native-poisoned")
+            .await
+            .expect("poisoned mapping");
+        let failed_message = initial_state
+            .sessions
+            .append_message(
+                &session.id,
+                MessageRole::User,
+                "finish the image-heavy request",
+            )
+            .await
+            .expect("failed prompt");
+        initial_state
+            .sessions
+            .set_active(&session.id, false)
+            .await
+            .expect("inactive session");
+        session = initial_state
+            .sessions
+            .get(&session.id)
+            .await
+            .expect("stored session");
+
+        let mut trigger_run = StoredDurableChatRun::new(
+            "run-rollover-trigger",
+            Some("user-rollover".to_string()),
+            session.id.clone(),
+            "codex",
+            failed_message.content.clone(),
+            project.display().to_string(),
+        );
+        trigger_run.user_message_id = Some(failed_message.id.clone());
+        trigger_run.native_session_id = Some("native-poisoned".to_string());
+        initial_state
+            .storage
+            .create_durable_chat_run(&trigger_run)
+            .expect("trigger run");
+        initial_state
+            .storage
+            .mark_durable_chat_run_failed(&trigger_run.id, "invalid body")
+            .expect("trigger failed");
+        let now = Utc::now();
+        let rollover = StoredSessionContextRollover {
+            id: "rollover-recovery-selection".to_string(),
+            user_id: "user-rollover".to_string(),
+            session_id: session.id.clone(),
+            request_id: "request-rollover-recovery".to_string(),
+            failed_message_id: failed_message.id.clone(),
+            trigger_run_id: trigger_run.id.clone(),
+            retry_run_id: "run-rollover-retry".to_string(),
+            from_native_session_id: Some("native-poisoned".to_string()),
+            candidate_native_session_id: None,
+            state: "starting".to_string(),
+            handoff: "bounded text-only handoff".to_string(),
+            observed_bytes: Some(19_760_000),
+            limit_bytes: CODEX_GATEWAY_BODY_LIMIT_BYTES,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            activated_at: None,
+        };
+        let mut retry_run = StoredDurableChatRun::new(
+            rollover.retry_run_id.clone(),
+            Some("user-rollover".to_string()),
+            session.id.clone(),
+            "codex",
+            rollover.handoff.clone(),
+            project.display().to_string(),
+        );
+        retry_run.user_message_id = Some(failed_message.id.clone());
+        assert!(
+            initial_state
+                .storage
+                .prepare_context_rollover(&rollover, &retry_run)
+                .expect("prepare rollover")
+        );
+        drop(initial_state);
+
+        // Reopen from disk to exercise the same selection logic used after a
+        // forced server restart. This fake external rollout would be a valid
+        // inference match for the failed prompt if rollover recovery did not
+        // explicitly suppress inference.
+        let restarted = AppState::initialize(AppConfig {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: database.clone(),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("restarted state");
+        {
+            let mut cache = restarted.sessions.external_cache.write().await;
+            cache.loaded_at = Some(Instant::now());
+            let record = ExternalSessionRecord {
+                summary: SessionSummary {
+                    id: "native-inferred-poison".to_string(),
+                    provider: Provider::Codex,
+                    external: true,
+                    project_path: project.display().to_string(),
+                    title: failed_message.content.clone(),
+                    last_activity: Utc::now(),
+                    ..Default::default()
+                },
+                file_path: root.join("missing-inference-rollout.jsonl"),
+            };
+            let cache_key = external_session_cache_key(&record);
+            let cached_messages = Arc::new(vec![failed_message.clone()]);
+            let estimated_bytes = estimate_external_messages_bytes(cached_messages.as_ref());
+            cache.records = vec![record];
+            cache.message_bytes = estimated_bytes;
+            cache.messages.insert(
+                cache_key,
+                CachedExternalMessages {
+                    modified_at: None,
+                    estimated_bytes,
+                    last_access: Instant::now(),
+                    total_count: cached_messages.len(),
+                    complete: true,
+                    messages: cached_messages,
+                },
+            );
+        }
+        let claimed = restarted
+            .storage
+            .mark_durable_chat_run_recovering(&retry_run.id, DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS)
+            .expect("claim rollover recovery")
+            .expect("recoverable rollover run");
+        let recovery = restarted.recover_agent_run(claimed, None).await;
+        assert!(
+            matches!(recovery, Err(CoreError::InvalidInput(_))),
+            "missing gateway config should stop after native-id selection: {recovery:?}"
+        );
+        let stored_retry = restarted
+            .storage
+            .get_durable_chat_run(&retry_run.id)
+            .expect("retry lookup")
+            .expect("retry run");
+        assert_eq!(stored_retry.native_session_id, None);
+        assert_ne!(
+            stored_retry.native_session_id.as_deref(),
+            Some("native-poisoned")
+        );
+        assert_ne!(
+            stored_retry.native_session_id.as_deref(),
+            Some("native-inferred-poison")
+        );
+        assert_eq!(
+            restarted
+                .storage
+                .get_session(&session.id)
+                .expect("session lookup")
+                .expect("session")
+                .native_session_id
+                .as_deref(),
+            Some("native-poisoned"),
+            "failed recovery must not change the visible session mapping"
+        );
+        assert_eq!(
+            restarted
+                .storage
+                .context_rollover_for_retry_run(&retry_run.id)
+                .expect("rollover lookup")
+                .expect("rollover")
+                .candidate_native_session_id,
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rollover_recovery_resumes_only_the_staged_clean_candidate() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-rollover-clean-candidate-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let state = AppState::initialize(AppConfig {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state");
+        state
+            .storage
+            .create_user("user-rollover", "user-rollover", "test-hash")
+            .expect("create user");
+        let mut session = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("session-rollover-clean".to_string()),
+                false,
+                None,
+                Some(ChatRuntime::IoGateway),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .set_native_session_id(&session.id, "native-poisoned")
+            .await
+            .expect("old mapping");
+        let failed_message = state
+            .sessions
+            .append_message(&session.id, MessageRole::User, "continue cleanly")
+            .await
+            .expect("failed prompt");
+        state
+            .sessions
+            .set_active(&session.id, false)
+            .await
+            .expect("inactive");
+        session = state.sessions.get(&session.id).await.expect("session");
+        let mut trigger_run = StoredDurableChatRun::new(
+            "run-clean-trigger",
+            Some("user-rollover".to_string()),
+            session.id.clone(),
+            "codex",
+            failed_message.content.clone(),
+            project.display().to_string(),
+        );
+        trigger_run.user_message_id = Some(failed_message.id.clone());
+        trigger_run.native_session_id = Some("native-poisoned".to_string());
+        state
+            .storage
+            .create_durable_chat_run(&trigger_run)
+            .expect("trigger run");
+        state
+            .storage
+            .mark_durable_chat_run_failed(&trigger_run.id, "invalid body")
+            .expect("trigger failed");
+        let now = Utc::now();
+        let rollover = StoredSessionContextRollover {
+            id: "rollover-clean-candidate".to_string(),
+            user_id: "user-rollover".to_string(),
+            session_id: session.id.clone(),
+            request_id: "request-clean-candidate".to_string(),
+            failed_message_id: failed_message.id.clone(),
+            trigger_run_id: trigger_run.id.clone(),
+            retry_run_id: "run-clean-retry".to_string(),
+            from_native_session_id: Some("native-poisoned".to_string()),
+            candidate_native_session_id: None,
+            state: "starting".to_string(),
+            handoff: "bounded clean handoff".to_string(),
+            observed_bytes: Some(19_760_000),
+            limit_bytes: CODEX_GATEWAY_BODY_LIMIT_BYTES,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            activated_at: None,
+        };
+        let mut retry_run = StoredDurableChatRun::new(
+            rollover.retry_run_id.clone(),
+            Some("user-rollover".to_string()),
+            session.id.clone(),
+            "codex",
+            rollover.handoff.clone(),
+            project.display().to_string(),
+        );
+        retry_run.user_message_id = Some(failed_message.id.clone());
+        assert!(
+            state
+                .storage
+                .prepare_context_rollover(&rollover, &retry_run)
+                .expect("prepare rollover")
+        );
+        assert!(
+            state
+                .storage
+                .set_context_rollover_candidate(&rollover.id, &retry_run.id, "native-clean-staged",)
+                .expect("stage clean candidate")
+        );
+        let claimed = state
+            .storage
+            .mark_durable_chat_run_recovering(&retry_run.id, DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS)
+            .expect("claim recovery")
+            .expect("recoverable retry");
+        let recovery = state.recover_agent_run(claimed, None).await;
+        assert!(matches!(recovery, Err(CoreError::InvalidInput(_))));
+        assert_eq!(
+            state
+                .storage
+                .get_durable_chat_run(&retry_run.id)
+                .expect("retry lookup")
+                .expect("retry")
+                .native_session_id
+                .as_deref(),
+            Some("native-clean-staged")
+        );
+        assert_ne!(
+            state
+                .storage
+                .get_durable_chat_run(&retry_run.id)
+                .expect("retry lookup")
+                .expect("retry")
+                .native_session_id
+                .as_deref(),
+            Some("native-poisoned")
+        );
+        assert_eq!(
+            state
+                .storage
+                .get_session(&session.id)
+                .expect("session lookup")
+                .expect("session")
+                .native_session_id
+                .as_deref(),
+            Some("native-poisoned"),
+            "candidate stays staged until successful atomic completion"
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -9735,6 +13230,45 @@ mod tests {
             effective_agent_command_provider(Provider::Gemini, Some("gemini-2.5-pro")),
             Provider::Gemini
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_history_is_bounded_by_bytes() {
+        let mut manager = AgentRuntimeManager::new(1);
+        manager.max_replay_bytes = 900;
+        let (abort_tx, _abort_rx) = oneshot::channel();
+        let key = "codex:replay-test".to_string();
+        manager.register(key.clone(), abort_tx).await;
+        let hub = WsHub::new();
+        for sequence in 1..=4 {
+            manager
+                .publish(
+                    &hub,
+                    &key,
+                    WsServerEvent::Output {
+                        provider: Provider::Codex,
+                        session_id: "replay-test".to_string(),
+                        response_id: Some("response-1".to_string()),
+                        sequence: Some(sequence),
+                        content: "x".repeat(400),
+                        done: false,
+                    },
+                )
+                .await;
+        }
+
+        let replay = manager.replay_events().await;
+        assert_eq!(replay.len(), 1);
+        assert!(
+            replay.iter().map(ws_event_estimated_bytes).sum::<usize>() <= manager.max_replay_bytes
+        );
+        assert!(matches!(
+            replay.last(),
+            Some(WsServerEvent::Output {
+                sequence: Some(4),
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -7,10 +8,11 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use iowb_protocol::{
     ChatMessage, DatabaseConnectionInput, DatabaseConnectionProfile, DatabaseTestStatus,
     DatabaseTransferJob, MessageRole, ProjectSummary, PromptHistoryCursor, PromptHistoryEntry,
-    Provider, SessionDraftResponse, SessionSummary, SessionTitleSource, SettingEntry,
-    SupportedDatabaseType, session_title_from_prompt,
+    Provider, SessionDraftResponse, SessionLifetimeTokenUsage, SessionSummary, SessionTitleSource,
+    SessionTokenUsage, SettingEntry, SupportedDatabaseType, TokenUsageCompleteness,
+    session_title_from_prompt,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -130,6 +132,89 @@ pub struct StoredDurableChatRun {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredChatRunAttempt {
+    pub id: String,
+    pub durable_run_id: String,
+    pub session_id: String,
+    pub user_message_id: Option<String>,
+    pub provider: String,
+    pub runtime: String,
+    pub model: Option<String>,
+    pub native_session_id: Option<String>,
+    pub status: String,
+    pub usage: Option<SessionTokenUsage>,
+    pub raw_usage_json: Option<String>,
+    pub source: Option<String>,
+    pub completeness: TokenUsageCompleteness,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// A durable fingerprint and normalized summary set for one provider-owned
+/// history source. A source is normally one JSON/JSONL transcript; Codex may
+/// use its SQLite thread index as the source for many rollout summaries.
+#[derive(Debug, Clone)]
+pub struct StoredExternalHistorySource {
+    pub provider: Provider,
+    pub source_path: String,
+    pub file_identity: Option<String>,
+    pub file_size: u64,
+    pub modified_nanos: Option<i64>,
+    pub scan_offset: u64,
+    pub parser_version: u32,
+    pub records: Vec<StoredExternalSessionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct StoredExternalSessionRecord {
+    pub summary: SessionSummary,
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalHistoryFingerprint<'a> {
+    pub file_identity: Option<&'a str>,
+    pub file_size: u64,
+    pub modified_nanos: Option<i64>,
+    pub parser_version: u32,
+}
+
+impl StoredChatRunAttempt {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: impl Into<String>,
+        durable_run_id: impl Into<String>,
+        session_id: impl Into<String>,
+        user_message_id: Option<String>,
+        provider: impl Into<String>,
+        runtime: impl Into<String>,
+        model: Option<String>,
+        native_session_id: Option<String>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: id.into(),
+            durable_run_id: durable_run_id.into(),
+            session_id: session_id.into(),
+            user_message_id,
+            provider: provider.into(),
+            runtime: runtime.into(),
+            model,
+            native_session_id,
+            status: "running".to_string(),
+            usage: None,
+            raw_usage_json: None,
+            source: None,
+            completeness: TokenUsageCompleteness::Missing,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        }
+    }
+}
+
 impl StoredDurableChatRun {
     pub fn new(
         id: impl Into<String>,
@@ -178,6 +263,28 @@ pub enum CreateSessionForkOutcome {
 pub struct StoredSessionFork {
     pub before_message_id: String,
     pub destination_session_id: String,
+    pub replaces_source: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSessionContextRollover {
+    pub id: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub request_id: String,
+    pub failed_message_id: String,
+    pub trigger_run_id: String,
+    pub retry_run_id: String,
+    pub from_native_session_id: Option<String>,
+    pub candidate_native_session_id: Option<String>,
+    pub state: String,
+    pub handoff: String,
+    pub observed_bytes: Option<u64>,
+    pub limit_bytes: u64,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub activated_at: Option<DateTime<Utc>>,
 }
 
 impl Storage {
@@ -403,6 +510,7 @@ impl Storage {
                     before_message_id TEXT NOT NULL,
                     request_id TEXT NOT NULL,
                     destination_session_id TEXT NOT NULL,
+                    replaces_source INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(user_id, source_session_id, request_id),
                     FOREIGN KEY(destination_session_id) REFERENCES sessions(id) ON DELETE CASCADE
@@ -410,6 +518,86 @@ impl Storage {
 
                 CREATE INDEX IF NOT EXISTS idx_session_forks_destination
                     ON session_forks(destination_session_id);
+
+                CREATE TABLE IF NOT EXISTS session_context_rollovers (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    failed_message_id TEXT NOT NULL,
+                    trigger_run_id TEXT NOT NULL,
+                    retry_run_id TEXT NOT NULL,
+                    from_native_session_id TEXT,
+                    candidate_native_session_id TEXT,
+                    state TEXT NOT NULL,
+                    handoff TEXT NOT NULL,
+                    observed_bytes INTEGER,
+                    limit_bytes INTEGER NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    activated_at TEXT,
+                    UNIQUE(user_id, session_id, request_id),
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_context_rollovers_session
+                    ON session_context_rollovers(session_id, created_at DESC);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_session_context_rollovers_retry_run
+                    ON session_context_rollovers(retry_run_id);
+
+                CREATE TABLE IF NOT EXISTS chat_run_attempts (
+                    id TEXT PRIMARY KEY,
+                    durable_run_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    user_message_id TEXT,
+                    provider TEXT NOT NULL,
+                    runtime TEXT NOT NULL,
+                    model TEXT,
+                    native_session_id TEXT,
+                    status TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    raw_usage_json TEXT,
+                    source TEXT,
+                    completeness TEXT NOT NULL DEFAULT 'missing',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_chat_run_attempts_session
+                    ON chat_run_attempts(session_id, created_at, id);
+
+                CREATE INDEX IF NOT EXISTS idx_chat_run_attempts_run
+                    ON chat_run_attempts(durable_run_id, created_at, id);
+
+                CREATE INDEX IF NOT EXISTS idx_chat_run_attempts_user_message
+                    ON chat_run_attempts(session_id, user_message_id);
+
+                CREATE TABLE IF NOT EXISTS session_usage_baselines (
+                    session_id TEXT PRIMARY KEY,
+                    source_session_id TEXT NOT NULL,
+                    before_message_id TEXT NOT NULL,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    partial_attempts INTEGER NOT NULL DEFAULT 0,
+                    missing_attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
 
                 CREATE TABLE IF NOT EXISTS fcm_device_tokens (
                     token TEXT PRIMARY KEY,
@@ -477,6 +665,7 @@ impl Storage {
                     before_message_id TEXT NOT NULL,
                     request_id TEXT NOT NULL,
                     destination_session_id TEXT NOT NULL,
+                    replaces_source INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(user_id, source_session_id, request_id),
                     FOREIGN KEY(destination_session_id) REFERENCES sessions(id) ON DELETE CASCADE
@@ -484,11 +673,156 @@ impl Storage {
 
                 CREATE INDEX IF NOT EXISTS idx_session_forks_destination
                     ON session_forks(destination_session_id);
+
+                CREATE TABLE IF NOT EXISTS session_context_rollovers (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    failed_message_id TEXT NOT NULL,
+                    trigger_run_id TEXT NOT NULL,
+                    retry_run_id TEXT NOT NULL,
+                    from_native_session_id TEXT,
+                    candidate_native_session_id TEXT,
+                    state TEXT NOT NULL,
+                    handoff TEXT NOT NULL,
+                    observed_bytes INTEGER,
+                    limit_bytes INTEGER NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    activated_at TEXT,
+                    UNIQUE(user_id, session_id, request_id),
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_context_rollovers_session
+                    ON session_context_rollovers(session_id, created_at DESC);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_session_context_rollovers_retry_run
+                    ON session_context_rollovers(retry_run_id);
+
+                CREATE TABLE IF NOT EXISTS chat_run_attempts (
+                    id TEXT PRIMARY KEY,
+                    durable_run_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    user_message_id TEXT,
+                    provider TEXT NOT NULL,
+                    runtime TEXT NOT NULL,
+                    model TEXT,
+                    native_session_id TEXT,
+                    status TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    raw_usage_json TEXT,
+                    source TEXT,
+                    completeness TEXT NOT NULL DEFAULT 'missing',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_chat_run_attempts_session
+                    ON chat_run_attempts(session_id, created_at, id);
+
+                CREATE INDEX IF NOT EXISTS idx_chat_run_attempts_run
+                    ON chat_run_attempts(durable_run_id, created_at, id);
+
+                CREATE INDEX IF NOT EXISTS idx_chat_run_attempts_user_message
+                    ON chat_run_attempts(session_id, user_message_id);
+
+                CREATE TABLE IF NOT EXISTS session_usage_baselines (
+                    session_id TEXT PRIMARY KEY,
+                    source_session_id TEXT NOT NULL,
+                    before_message_id TEXT NOT NULL,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    partial_attempts INTEGER NOT NULL DEFAULT 0,
+                    missing_attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                "#,
+            )?;
+
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS external_history_sources (
+                    provider TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    file_identity TEXT,
+                    file_size INTEGER NOT NULL,
+                    modified_nanos INTEGER,
+                    scan_offset INTEGER NOT NULL DEFAULT 0,
+                    parser_version INTEGER NOT NULL,
+                    records_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(provider, source_path)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_external_history_sources_provider
+                    ON external_history_sources(provider, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS external_history_message_state (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_identity TEXT,
+                    file_size INTEGER NOT NULL,
+                    modified_nanos INTEGER,
+                    parser_version INTEGER NOT NULL,
+                    total_count INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(provider, session_id, file_path)
+                );
+
+                CREATE TABLE IF NOT EXISTS external_history_messages (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    message_json TEXT NOT NULL,
+                    PRIMARY KEY(provider, session_id, file_path, sequence)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_external_history_messages_tail
+                    ON external_history_messages(
+                        provider, session_id, file_path, sequence DESC
+                    );
+                "#,
+            )?;
+
+            let has_replaces_source: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('session_forks') WHERE name = 'replaces_source'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_replaces_source == 0 {
+                conn.execute_batch(
+                    "ALTER TABLE session_forks ADD COLUMN replaces_source INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            conn.execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_session_forks_replaced_source
+                    ON session_forks(source_session_id)
+                    WHERE replaces_source = 1;
                 "#,
             )?;
 
             conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '3')",
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '7')",
                 [],
             )?;
 
@@ -843,22 +1177,311 @@ impl Storage {
         })
     }
 
+    pub fn external_history_source(
+        &self,
+        provider: Provider,
+        source_path: &str,
+    ) -> Result<Option<StoredExternalHistorySource>> {
+        self.with_connection(|conn| {
+            let row = conn
+                .query_row(
+                    r#"
+                    SELECT file_identity, file_size, modified_nanos, scan_offset,
+                           parser_version, records_json
+                    FROM external_history_sources
+                    WHERE provider = ?1 AND source_path = ?2
+                    "#,
+                    params![provider.as_str(), source_path],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(
+                |(
+                    file_identity,
+                    file_size,
+                    modified_nanos,
+                    scan_offset,
+                    parser_version,
+                    records_json,
+                )| {
+                    Ok(StoredExternalHistorySource {
+                        provider,
+                        source_path: source_path.to_string(),
+                        file_identity,
+                        file_size: nonnegative_u64(file_size),
+                        modified_nanos,
+                        scan_offset: nonnegative_u64(scan_offset),
+                        parser_version: nonnegative_u32(parser_version),
+                        records: serde_json::from_str(&records_json)?,
+                    })
+                },
+            )
+            .transpose()
+        })
+    }
+
+    pub fn upsert_external_history_source(
+        &self,
+        source: &StoredExternalHistorySource,
+    ) -> Result<()> {
+        let records_json = serde_json::to_string(&source.records)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                r#"
+                INSERT INTO external_history_sources (
+                    provider, source_path, file_identity, file_size,
+                    modified_nanos, scan_offset, parser_version, records_json,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(provider, source_path) DO UPDATE SET
+                    file_identity = excluded.file_identity,
+                    file_size = excluded.file_size,
+                    modified_nanos = excluded.modified_nanos,
+                    scan_offset = excluded.scan_offset,
+                    parser_version = excluded.parser_version,
+                    records_json = excluded.records_json,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    source.provider.as_str(),
+                    source.source_path,
+                    source.file_identity,
+                    bounded_i64(source.file_size),
+                    source.modified_nanos,
+                    bounded_i64(source.scan_offset),
+                    i64::from(source.parser_version),
+                    records_json,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn prune_external_history_sources(
+        &self,
+        provider: Provider,
+        retained_source_paths: &[String],
+    ) -> Result<()> {
+        let retained = retained_source_paths.iter().collect::<HashSet<_>>();
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT source_path FROM external_history_sources WHERE provider = ?1",
+            )?;
+            let rows = stmt.query_map(params![provider.as_str()], |row| row.get::<_, String>(0))?;
+            let mut stale = Vec::new();
+            for row in rows {
+                let path = row?;
+                if !retained.contains(&path) {
+                    stale.push(path);
+                }
+            }
+            drop(stmt);
+            let transaction = conn.unchecked_transaction()?;
+            for path in stale {
+                transaction.execute(
+                    "DELETE FROM external_history_sources WHERE provider = ?1 AND source_path = ?2",
+                    params![provider.as_str(), path],
+                )?;
+                transaction.execute(
+                    "DELETE FROM external_history_message_state WHERE provider = ?1 AND file_path = ?2",
+                    params![provider.as_str(), path],
+                )?;
+                transaction.execute(
+                    "DELETE FROM external_history_messages WHERE provider = ?1 AND file_path = ?2",
+                    params![provider.as_str(), path],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn external_messages_if_current(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        file_path: &str,
+        fingerprint: &ExternalHistoryFingerprint<'_>,
+    ) -> Result<Option<Vec<ChatMessage>>> {
+        self.with_connection(|conn| {
+            if !external_message_state_matches(conn, provider, session_id, file_path, fingerprint)?
+            {
+                return Ok(None);
+            }
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT message_json
+                FROM external_history_messages
+                WHERE provider = ?1 AND session_id = ?2 AND file_path = ?3
+                ORDER BY sequence
+                "#,
+            )?;
+            let rows = stmt
+                .query_map(params![provider.as_str(), session_id, file_path], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            let mut messages = Vec::new();
+            for row in rows {
+                messages.push(serde_json::from_str(&row?)?);
+            }
+            Ok(Some(messages))
+        })
+    }
+
+    pub fn external_messages_tail_if_current(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        file_path: &str,
+        fingerprint: &ExternalHistoryFingerprint<'_>,
+        limit: usize,
+    ) -> Result<Option<(Vec<ChatMessage>, usize)>> {
+        self.with_connection(|conn| {
+            let Some(total_count) = external_message_state_total_if_matches(
+                conn,
+                provider,
+                session_id,
+                file_path,
+                fingerprint,
+            )?
+            else {
+                return Ok(None);
+            };
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT message_json
+                FROM external_history_messages
+                WHERE provider = ?1 AND session_id = ?2 AND file_path = ?3
+                ORDER BY sequence DESC
+                LIMIT ?4
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    provider.as_str(),
+                    session_id,
+                    file_path,
+                    bounded_i64(limit as u64),
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut messages = Vec::new();
+            for row in rows {
+                messages.push(serde_json::from_str(&row?)?);
+            }
+            messages.reverse();
+            Ok(Some((messages, total_count)))
+        })
+    }
+
+    pub fn replace_external_messages(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        file_path: &str,
+        fingerprint: &ExternalHistoryFingerprint<'_>,
+        messages: &[ChatMessage],
+    ) -> Result<()> {
+        let serialized = messages
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute(
+                "DELETE FROM external_history_messages WHERE provider = ?1 AND session_id = ?2 AND file_path = ?3",
+                params![provider.as_str(), session_id, file_path],
+            )?;
+            {
+                let mut insert = transaction.prepare(
+                    r#"
+                    INSERT INTO external_history_messages (
+                        provider, session_id, file_path, sequence, message_json
+                    ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    "#,
+                )?;
+                for (sequence, message_json) in serialized.iter().enumerate() {
+                    insert.execute(params![
+                        provider.as_str(),
+                        session_id,
+                        file_path,
+                        bounded_i64(sequence as u64),
+                        message_json,
+                    ])?;
+                }
+            }
+            transaction.execute(
+                r#"
+                INSERT INTO external_history_message_state (
+                    provider, session_id, file_path, file_identity, file_size,
+                    modified_nanos, parser_version, total_count, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(provider, session_id, file_path) DO UPDATE SET
+                    file_identity = excluded.file_identity,
+                    file_size = excluded.file_size,
+                    modified_nanos = excluded.modified_nanos,
+                    parser_version = excluded.parser_version,
+                    total_count = excluded.total_count,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    provider.as_str(),
+                    session_id,
+                    file_path,
+                    fingerprint.file_identity,
+                    bounded_i64(fingerprint.file_size),
+                    fingerprint.modified_nanos,
+                    i64::from(fingerprint.parser_version),
+                    bounded_i64(messages.len() as u64),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn upsert_session(&self, session: &SessionSummary) -> Result<()> {
         self.with_connection(|conn| upsert_session_conn(conn, session))
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        Ok(self
+            .list_sessions_including_board()?
+            .into_iter()
+            .filter(|session| !session.board_session)
+            .collect())
+    }
+
+    /// Raw persisted session loading for recovery and the in-memory manager.
+    /// Unlike user-facing discovery this deliberately retains board chats.
+    pub fn list_sessions_including_board(&self) -> Result<Vec<SessionSummary>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 r#"
                 SELECT s.id, s.provider, s.project_path, s.title,
-                       CASE
-                           WHEN EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)
-                           THEN (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
-                           ELSE s.message_count
-                       END,
+                       COALESCE(m.message_count, s.message_count),
                        s.last_activity, s.active, s.model, s.metadata
                 FROM sessions s
+                LEFT JOIN (
+                    SELECT session_id, COUNT(*) AS message_count
+                    FROM messages
+                    GROUP BY session_id
+                ) m ON m.session_id = s.id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM session_forks f
+                    WHERE f.source_session_id = s.id AND f.replaces_source = 1
+                )
                 ORDER BY last_activity DESC, metadata
                 "#,
             )?;
@@ -868,6 +1491,8 @@ impl Storage {
             for row in rows {
                 sessions.push(row?);
             }
+            drop(stmt);
+            attach_lifetime_usage_conn(conn, &mut sessions)?;
             Ok(sessions)
         })
     }
@@ -904,7 +1529,160 @@ impl Storage {
                     native_session_ids.push(native_session_id.to_string());
                 }
             }
+            let mut rollover_stmt = conn.prepare(
+                r#"
+                SELECT from_native_session_id, candidate_native_session_id
+                FROM session_context_rollovers
+                "#,
+            )?;
+            let rollover_rows = rollover_stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })?;
+            for row in rollover_rows {
+                let (from_native, candidate_native) = row?;
+                native_session_ids.extend(
+                    [from_native, candidate_native]
+                        .into_iter()
+                        .flatten()
+                        .filter(|value| !value.trim().is_empty()),
+                );
+            }
+            native_session_ids.sort();
+            native_session_ids.dedup();
             Ok(native_session_ids)
+        })
+    }
+
+    pub fn latest_context_rollover(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredSessionContextRollover>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT id, user_id, session_id, request_id, failed_message_id,
+                       trigger_run_id, retry_run_id, from_native_session_id,
+                       candidate_native_session_id, state, handoff, observed_bytes,
+                       limit_bytes, error, created_at, updated_at, activated_at
+                FROM session_context_rollovers
+                WHERE session_id = ?1
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                "#,
+                params![session_id],
+                map_session_context_rollover_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    pub fn context_rollover_for_request(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<Option<StoredSessionContextRollover>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT id, user_id, session_id, request_id, failed_message_id,
+                       trigger_run_id, retry_run_id, from_native_session_id,
+                       candidate_native_session_id, state, handoff, observed_bytes,
+                       limit_bytes, error, created_at, updated_at, activated_at
+                FROM session_context_rollovers
+                WHERE user_id = ?1 AND session_id = ?2 AND request_id = ?3
+                "#,
+                params![user_id, session_id, request_id],
+                map_session_context_rollover_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    pub fn context_rollover_for_retry_run(
+        &self,
+        retry_run_id: &str,
+    ) -> Result<Option<StoredSessionContextRollover>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT id, user_id, session_id, request_id, failed_message_id,
+                       trigger_run_id, retry_run_id, from_native_session_id,
+                       candidate_native_session_id, state, handoff, observed_bytes,
+                       limit_bytes, error, created_at, updated_at, activated_at
+                FROM session_context_rollovers
+                WHERE retry_run_id = ?1
+                "#,
+                params![retry_run_id],
+                map_session_context_rollover_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    pub fn has_context_rollover(&self, session_id: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM session_context_rollovers WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
+    }
+
+    pub fn context_native_session_ids(&self, session_id: &str) -> Result<Vec<String>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT from_native_session_id, candidate_native_session_id
+                FROM session_context_rollovers
+                WHERE session_id = ?1
+                "#,
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let (from_native, candidate_native) = row?;
+                ids.extend(
+                    [from_native, candidate_native]
+                        .into_iter()
+                        .flatten()
+                        .filter(|value| !value.trim().is_empty()),
+                );
+            }
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
+        })
+    }
+
+    pub fn list_replaced_source_session_ids(&self) -> Result<Vec<String>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT DISTINCT source_session_id
+                FROM session_forks
+                WHERE replaces_source = 1
+                "#,
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            let mut session_ids = Vec::new();
+            for row in rows {
+                session_ids.push(row?);
+            }
+            Ok(session_ids)
         })
     }
 
@@ -913,14 +1691,19 @@ impl Storage {
             let mut stmt = conn.prepare(
                 r#"
                 SELECT s.id, s.provider, s.project_path, s.title,
-                       CASE
-                           WHEN EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)
-                           THEN (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
-                           ELSE s.message_count
-                       END,
+                       COALESCE(m.message_count, s.message_count),
                        s.last_activity, s.active, s.model, s.metadata
                 FROM sessions s
+                LEFT JOIN (
+                    SELECT session_id, COUNT(*) AS message_count
+                    FROM messages
+                    GROUP BY session_id
+                ) m ON m.session_id = s.id
                 WHERE s.project_path = ?1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_forks f
+                      WHERE f.source_session_id = s.id AND f.replaces_source = 1
+                  )
                 ORDER BY last_activity DESC, metadata
                 "#,
             )?;
@@ -928,38 +1711,47 @@ impl Storage {
             let rows = stmt.query_map(params![project_path], map_session_row)?;
             let mut sessions = Vec::new();
             for row in rows {
-                sessions.push(row?);
+                let session = row?;
+                if !session.board_session {
+                    sessions.push(session);
+                }
             }
+            drop(stmt);
+            attach_lifetime_usage_conn(conn, &mut sessions)?;
             Ok(sessions)
         })
     }
 
+    /// Load a persisted session without token aggregates. Internal control
+    /// paths generally need identity/runtime metadata only and should not pay
+    /// for lifetime aggregation while holding the shared SQLite connection.
+    pub fn get_session_summary(&self, session_id: &str) -> Result<Option<SessionSummary>> {
+        self.with_connection(|conn| get_session_summary_conn(conn, session_id))
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionSummary>> {
         self.with_connection(|conn| {
-            conn.query_row(
-                r#"
-                SELECT s.id, s.provider, s.project_path, s.title,
-                       CASE
-                           WHEN EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)
-                           THEN (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
-                           ELSE s.message_count
-                       END,
-                       s.last_activity, s.active, s.model, s.metadata
-                FROM sessions s
-                WHERE s.id = ?1
-                "#,
-                params![session_id],
-                map_session_row,
-            )
-            .optional()
-            .map_err(StorageError::from)
+            let session = get_session_summary_conn(conn, session_id)?;
+            session
+                .map(|mut session| {
+                    session.lifetime_token_usage =
+                        Some(session_lifetime_token_usage_conn(conn, &session.id)?);
+                    Ok(session)
+                })
+                .transpose()
         })
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<bool> {
         self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute(
+                "DELETE FROM session_forks WHERE destination_session_id = ?1",
+                params![session_id],
+            )?;
             let changed =
-                conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+                transaction.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+            transaction.commit()?;
             Ok(changed > 0)
         })
     }
@@ -1024,6 +1816,366 @@ impl Storage {
         })
     }
 
+    pub fn create_chat_run_attempt(&self, attempt: &StoredChatRunAttempt) -> Result<bool> {
+        self.with_connection(|conn| insert_chat_run_attempt_conn(conn, attempt))
+    }
+
+    pub fn finish_chat_run_attempt(
+        &self,
+        attempt_id: &str,
+        status: &str,
+        usage: Option<&SessionTokenUsage>,
+        raw_usage_json: Option<&str>,
+        source: Option<&str>,
+        completeness: TokenUsageCompleteness,
+    ) -> Result<Option<SessionLifetimeTokenUsage>> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let session_id = transaction
+                .query_row(
+                    "SELECT session_id FROM chat_run_attempts WHERE id = ?1",
+                    params![attempt_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(session_id) = session_id else {
+                return Ok(None);
+            };
+            let zero = SessionTokenUsage::default();
+            let usage = usage.unwrap_or(&zero);
+            transaction.execute(
+                r#"
+                UPDATE chat_run_attempts
+                SET status = ?1,
+                    input_tokens = ?2,
+                    output_tokens = ?3,
+                    cache_creation_tokens = ?4,
+                    cache_read_tokens = ?5,
+                    reasoning_tokens = ?6,
+                    total_tokens = ?7,
+                    cost_usd = ?8,
+                    raw_usage_json = ?9,
+                    source = ?10,
+                    completeness = ?11,
+                    updated_at = ?12,
+                    completed_at = ?12
+                WHERE id = ?13
+                "#,
+                params![
+                    status,
+                    usage.input as i64,
+                    usage.output as i64,
+                    usage.cache_creation as i64,
+                    usage.cache_read as i64,
+                    usage.reasoning as i64,
+                    usage.used as i64,
+                    usage.cost_usd,
+                    raw_usage_json,
+                    source,
+                    token_usage_completeness_to_str(completeness),
+                    now,
+                    attempt_id,
+                ],
+            )?;
+            let lifetime = session_lifetime_token_usage_conn(&transaction, &session_id)?;
+            transaction.commit()?;
+            Ok(Some(lifetime))
+        })
+    }
+
+    pub fn session_lifetime_token_usage(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionLifetimeTokenUsage> {
+        self.with_connection(|conn| session_lifetime_token_usage_conn(conn, session_id))
+    }
+
+    pub fn latest_session_token_usage(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionTokenUsage>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT total_tokens, input_tokens, output_tokens,
+                       cache_creation_tokens, cache_read_tokens,
+                       reasoning_tokens, cost_usd
+                FROM chat_run_attempts
+                WHERE session_id = ?1
+                  AND completeness <> 'missing'
+                  AND total_tokens > 0
+                ORDER BY completed_at DESC, created_at DESC, id DESC
+                LIMIT 1
+                "#,
+                params![session_id],
+                |row| {
+                    Ok(SessionTokenUsage {
+                        used: row_i64_to_u64(row, 0)?,
+                        input: row_i64_to_u64(row, 1)?,
+                        output: row_i64_to_u64(row, 2)?,
+                        cache_creation: row_i64_to_u64(row, 3)?,
+                        cache_read: row_i64_to_u64(row, 4)?,
+                        reasoning: row_i64_to_u64(row, 5)?,
+                        cost_usd: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    pub fn set_context_rollover_candidate(
+        &self,
+        rollover_id: &str,
+        retry_run_id: &str,
+        native_session_id: &str,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let eligible = transaction
+                .query_row(
+                    r#"
+                    SELECT 1
+                    FROM session_context_rollovers r
+                    JOIN durable_chat_runs d ON d.id = r.retry_run_id
+                    WHERE r.id = ?1
+                      AND r.retry_run_id = ?2
+                      AND r.state = 'starting'
+                      AND (r.candidate_native_session_id IS NULL
+                           OR r.candidate_native_session_id = ?3)
+                      AND d.session_id = r.session_id
+                      AND d.status IN ('running', 'recovering')
+                      AND (d.native_session_id IS NULL OR d.native_session_id = ?3)
+                    "#,
+                    params![rollover_id, retry_run_id, native_session_id],
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if eligible.is_none() {
+                return Ok(false);
+            }
+            let run_changed = transaction.execute(
+                r#"
+                UPDATE durable_chat_runs
+                SET native_session_id = ?1, updated_at = ?2
+                WHERE id = ?3
+                  AND status IN ('running', 'recovering')
+                  AND (native_session_id IS NULL OR native_session_id = ?1)
+                "#,
+                params![native_session_id, now, retry_run_id],
+            )?;
+            let rollover_changed = transaction.execute(
+                r#"
+                UPDATE session_context_rollovers
+                SET candidate_native_session_id = ?1, updated_at = ?2
+                WHERE id = ?3
+                  AND retry_run_id = ?4
+                  AND state = 'starting'
+                  AND (candidate_native_session_id IS NULL
+                       OR candidate_native_session_id = ?1)
+                "#,
+                params![native_session_id, now, rollover_id, retry_run_id],
+            )?;
+            if run_changed != 1 || rollover_changed != 1 {
+                return Ok(false);
+            }
+            transaction.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn prepare_context_rollover(
+        &self,
+        rollover: &StoredSessionContextRollover,
+        retry_run: &StoredDurableChatRun,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let inserted = transaction.execute(
+                r#"
+                INSERT OR IGNORE INTO session_context_rollovers (
+                    id, user_id, session_id, request_id, failed_message_id,
+                    trigger_run_id, retry_run_id, from_native_session_id,
+                    candidate_native_session_id, state, handoff, observed_bytes,
+                    limit_bytes, error, created_at, updated_at, activated_at
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16, ?17
+                )
+                "#,
+                params![
+                    rollover.id,
+                    rollover.user_id,
+                    rollover.session_id,
+                    rollover.request_id,
+                    rollover.failed_message_id,
+                    rollover.trigger_run_id,
+                    rollover.retry_run_id,
+                    rollover.from_native_session_id,
+                    rollover.candidate_native_session_id,
+                    rollover.state,
+                    rollover.handoff,
+                    rollover.observed_bytes.map(|value| value as i64),
+                    rollover.limit_bytes as i64,
+                    rollover.error,
+                    rollover.created_at.to_rfc3339(),
+                    rollover.updated_at.to_rfc3339(),
+                    rollover.activated_at.map(|time| time.to_rfc3339()),
+                ],
+            )?;
+            if inserted == 0 {
+                return Ok(false);
+            }
+            let superseded = transaction.execute(
+                r#"
+                UPDATE durable_chat_runs
+                SET status = 'superseded', auto_resume = 0,
+                    last_error = 'superseded by clean context rollover',
+                    updated_at = ?1, completed_at = ?1
+                WHERE id = ?2 AND status = 'failed'
+                "#,
+                params![now, rollover.trigger_run_id],
+            )?;
+            if superseded != 1 {
+                return Ok(false);
+            }
+            insert_durable_chat_run_conn(&transaction, retry_run)?;
+            transaction.commit()?;
+            Ok(true)
+        })
+    }
+
+    /// Atomically switch a visible chat to its staged native thread and
+    /// persist the compaction marker, optional completed assistant response,
+    /// optional follow-up run, and compact run terminal state. Returning
+    /// `false` leaves the transaction untouched.
+    pub fn complete_context_rollover(
+        &self,
+        rollover_id: &str,
+        retry_run_id: &str,
+        candidate_native_session_id: &str,
+        session: &SessionSummary,
+        marker: &ChatMessage,
+        assistant: Option<&ChatMessage>,
+        follow_up_run: Option<&StoredDurableChatRun>,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let eligible = transaction
+                .query_row(
+                    r#"
+                    SELECT 1
+                    FROM session_context_rollovers r
+                    JOIN durable_chat_runs d ON d.id = r.retry_run_id
+                    WHERE r.id = ?1
+                      AND r.session_id = ?2
+                      AND r.retry_run_id = ?3
+                      AND r.candidate_native_session_id = ?4
+                      AND r.state = 'starting'
+                      AND d.session_id = r.session_id
+                      AND d.native_session_id = r.candidate_native_session_id
+                      AND d.status IN ('running', 'recovering')
+                    "#,
+                    params![
+                        rollover_id,
+                        session.id,
+                        retry_run_id,
+                        candidate_native_session_id
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if eligible.is_none()
+                || session.native_session_id.as_deref() != Some(candidate_native_session_id)
+                || marker.role != MessageRole::System
+                || assistant.is_some_and(|message| message.role != MessageRole::Assistant)
+                || follow_up_run.is_some_and(|run| {
+                    run.session_id != session.id
+                        || run.native_session_id.as_deref() != Some(candidate_native_session_id)
+                        || run.status != "running"
+                })
+            {
+                return Ok(false);
+            }
+
+            upsert_session_conn(&transaction, session)?;
+            insert_message_conn(&transaction, &session.id, marker)?;
+            if let Some(assistant) = assistant {
+                insert_message_conn(&transaction, &session.id, assistant)?;
+            }
+            if let Some(follow_up_run) = follow_up_run {
+                insert_durable_chat_run_conn(&transaction, follow_up_run)?;
+            }
+            transaction.execute(
+                r#"
+                UPDATE sessions
+                SET message_count = (
+                        SELECT COUNT(*) FROM messages WHERE session_id = ?1
+                    ),
+                    last_activity = ?2,
+                    active = 0
+                WHERE id = ?1
+                "#,
+                params![session.id, session.last_activity.to_rfc3339()],
+            )?;
+            let run_changed = transaction.execute(
+                r#"
+                UPDATE durable_chat_runs
+                SET status = 'completed', auto_resume = 0, last_error = NULL,
+                    updated_at = ?1, completed_at = ?1
+                WHERE id = ?2
+                  AND session_id = ?3
+                  AND native_session_id = ?4
+                  AND status IN ('running', 'recovering')
+                "#,
+                params![now, retry_run_id, session.id, candidate_native_session_id],
+            )?;
+            let rollover_changed = transaction.execute(
+                r#"
+                UPDATE session_context_rollovers
+                SET state = 'active', updated_at = ?1, activated_at = ?1, error = NULL
+                WHERE id = ?2
+                  AND session_id = ?3
+                  AND retry_run_id = ?4
+                  AND candidate_native_session_id = ?5
+                  AND state = 'starting'
+                "#,
+                params![
+                    now,
+                    rollover_id,
+                    session.id,
+                    retry_run_id,
+                    candidate_native_session_id
+                ],
+            )?;
+            if run_changed != 1 || rollover_changed != 1 {
+                return Ok(false);
+            }
+            transaction.commit()?;
+            Ok(true)
+        })
+    }
+
+    pub fn fail_context_rollover(&self, rollover_id: &str, error: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                r#"
+                UPDATE session_context_rollovers
+                SET state = 'failed', error = ?1, updated_at = ?2
+                WHERE id = ?3 AND state = 'starting'
+                "#,
+                params![error, now, rollover_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     pub fn get_durable_chat_run(&self, run_id: &str) -> Result<Option<StoredDurableChatRun>> {
         self.with_connection(|conn| {
             conn.query_row(
@@ -1054,7 +2206,7 @@ impl Storage {
                 r#"
                 UPDATE durable_chat_runs
                 SET native_session_id = ?1, updated_at = ?2
-                WHERE id = ?3
+                WHERE id = ?3 AND status IN ('running', 'recovering')
                 "#,
                 params![native_session_id, now, run_id],
             )?;
@@ -1172,7 +2324,13 @@ impl Storage {
                 r#"
                 UPDATE durable_chat_runs
                 SET status = ?1,
-                    last_error = ?2,
+                    last_error = CASE
+                        WHEN ?2 = 'provider run failed'
+                             AND last_error IS NOT NULL
+                             AND TRIM(last_error) <> ''
+                        THEN last_error
+                        ELSE ?2
+                    END,
                     updated_at = ?3,
                     completed_at = ?3
                 WHERE id = ?4
@@ -1199,8 +2357,59 @@ impl Storage {
         self.mark_durable_chat_run_terminal(run_id, "failed", Some(error))
     }
 
+    pub fn update_durable_chat_run_error(&self, run_id: &str, error: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                "UPDATE durable_chat_runs SET last_error = ?1, updated_at = ?2 WHERE id = ?3",
+                params![error, now, run_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     pub fn append_message(&self, session_id: &str, message: &ChatMessage) -> Result<()> {
         self.with_connection(|conn| insert_message_conn(conn, session_id, message))
+    }
+
+    pub fn materialize_session_messages(
+        &self,
+        session_id: &str,
+        messages: &[ChatMessage],
+    ) -> Result<usize> {
+        self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let mut inserted = 0usize;
+            for message in messages {
+                inserted += transaction.execute(
+                    r#"
+                    INSERT OR IGNORE INTO messages (
+                        id, session_id, role, content, timestamp, metadata
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![
+                        message.id,
+                        session_id,
+                        role_to_str(message.role),
+                        message.content,
+                        message.timestamp.to_rfc3339(),
+                        serde_json::to_string(&message.metadata)?,
+                    ],
+                )?;
+            }
+            transaction.execute(
+                r#"
+                UPDATE sessions
+                SET message_count = (
+                    SELECT COUNT(*) FROM messages WHERE session_id = ?1
+                )
+                WHERE id = ?1
+                "#,
+                params![session_id],
+            )?;
+            transaction.commit()?;
+            Ok(inserted)
+        })
     }
 
     /// Patch the JSON metadata column for an existing message. Pass `Value::Null`
@@ -1318,6 +2527,31 @@ impl Storage {
                 "#,
                 params![session_id],
                 |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    pub fn message_by_id(&self, session_id: &str, message_id: &str) -> Result<Option<ChatMessage>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT id, role, content, timestamp, metadata
+                FROM messages
+                WHERE session_id = ?1 AND id = ?2
+                "#,
+                params![session_id, message_id],
+                |row| {
+                    let metadata_raw: String = row.get(4)?;
+                    Ok(ChatMessage {
+                        id: row.get(0)?,
+                        role: parse_role(&row.get::<_, String>(1)?),
+                        content: row.get(2)?,
+                        timestamp: parse_time_sql(row.get::<_, String>(3)?)?,
+                        metadata: serde_json::from_str(&metadata_raw).unwrap_or(Value::Null),
+                    })
+                },
             )
             .optional()
             .map_err(StorageError::from)
@@ -1533,7 +2767,7 @@ impl Storage {
         self.with_connection(|conn| {
             conn.query_row(
                 r#"
-                SELECT before_message_id, destination_session_id
+                SELECT before_message_id, destination_session_id, replaces_source
                 FROM session_forks
                 WHERE user_id = ?1 AND source_session_id = ?2 AND request_id = ?3
                 "#,
@@ -1542,11 +2776,23 @@ impl Storage {
                     Ok(StoredSessionFork {
                         before_message_id: row.get(0)?,
                         destination_session_id: row.get(1)?,
+                        replaces_source: row.get::<_, i64>(2)? != 0,
                     })
                 },
             )
             .optional()
             .map_err(StorageError::from)
+        })
+    }
+
+    pub fn is_session_fork_destination(&self, session_id: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM session_forks WHERE destination_session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
         })
     }
 
@@ -1561,13 +2807,14 @@ impl Storage {
         messages: &[ChatMessage],
         draft: &str,
         require_source_inactive: bool,
+        replaces_source: bool,
     ) -> Result<CreateSessionForkOutcome> {
         self.with_connection(|conn| {
             let transaction = conn.unchecked_transaction()?;
             let existing = transaction
                 .query_row(
                     r#"
-                    SELECT before_message_id, destination_session_id
+                    SELECT before_message_id, destination_session_id, replaces_source
                     FROM session_forks
                     WHERE user_id = ?1 AND source_session_id = ?2 AND request_id = ?3
                     "#,
@@ -1576,6 +2823,7 @@ impl Storage {
                         Ok(StoredSessionFork {
                             before_message_id: row.get(0)?,
                             destination_session_id: row.get(1)?,
+                            replaces_source: row.get::<_, i64>(2)? != 0,
                         })
                     },
                 )
@@ -1602,6 +2850,40 @@ impl Storage {
                 insert_message_conn(&transaction, &destination.id, message)?;
             }
             let now = Utc::now().to_rfc3339();
+            let usage_baseline = fork_usage_baseline_conn(
+                &transaction,
+                source_session_id,
+                before_message_id,
+                destination,
+                messages,
+            )?;
+            transaction.execute(
+                r#"
+                INSERT INTO session_usage_baselines (
+                    session_id, source_session_id, before_message_id,
+                    total_tokens, input_tokens, output_tokens,
+                    cache_creation_tokens, cache_read_tokens, reasoning_tokens,
+                    cost_usd, partial_attempts, missing_attempts, created_at
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+                )
+                "#,
+                params![
+                    destination.id,
+                    source_session_id,
+                    before_message_id,
+                    usage_baseline.total as i64,
+                    usage_baseline.input as i64,
+                    usage_baseline.output as i64,
+                    usage_baseline.cache_creation as i64,
+                    usage_baseline.cache_read as i64,
+                    usage_baseline.reasoning as i64,
+                    usage_baseline.cost_usd,
+                    usage_baseline.partial_attempts as i64,
+                    usage_baseline.missing_attempts as i64,
+                    now,
+                ],
+            )?;
             transaction.execute(
                 r#"
                 INSERT INTO session_drafts (user_id, session_id, content, updated_at)
@@ -1613,8 +2895,8 @@ impl Storage {
                 r#"
                 INSERT INTO session_forks (
                     user_id, source_session_id, before_message_id, request_id,
-                    destination_session_id, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    destination_session_id, replaces_source, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 "#,
                 params![
                     user_id,
@@ -1622,6 +2904,7 @@ impl Storage {
                     before_message_id,
                     request_id,
                     destination.id,
+                    i64::from(replaces_source),
                     now,
                 ],
             )?;
@@ -1830,9 +3113,16 @@ impl Storage {
                        m.id, m.role, m.content, m.timestamp, m.metadata
                 FROM messages m
                 JOIN sessions s ON s.id = m.session_id
-                WHERE LOWER(m.content) LIKE LOWER(?1) ESCAPE '\'
-                   OR LOWER(s.title) LIKE LOWER(?1) ESCAPE '\'
-                   OR LOWER(s.project_path) LIKE LOWER(?1) ESCAPE '\'
+                WHERE (
+                    LOWER(m.content) LIKE LOWER(?1) ESCAPE '\'
+                    OR LOWER(s.title) LIKE LOWER(?1) ESCAPE '\'
+                    OR LOWER(s.project_path) LIKE LOWER(?1) ESCAPE '\'
+                )
+                  AND CASE
+                      WHEN json_valid(s.metadata)
+                      THEN COALESCE(json_extract(s.metadata, '$.boardSession'), 0)
+                      ELSE 0
+                  END = 0
                 ORDER BY m.timestamp DESC
                 LIMIT ?2
                 "#,
@@ -1855,13 +3145,13 @@ impl Storage {
                         merge_metadata_into(&mut session, parsed);
                     }
                 }
-                let role = parse_role(&row.get::<_, String>(11)?);
-                let metadata_raw: String = row.get(14)?;
+                let role = parse_role(&row.get::<_, String>(10)?);
+                let metadata_raw: String = row.get(13)?;
                 let message = ChatMessage {
                     id: row.get(9)?,
                     role,
-                    content: row.get(12)?,
-                    timestamp: parse_time_sql(row.get::<_, String>(13)?)?,
+                    content: row.get(11)?,
+                    timestamp: parse_time_sql(row.get::<_, String>(12)?)?,
                     metadata: serde_json::from_str::<Value>(&metadata_raw).unwrap_or(Value::Null),
                 };
                 Ok((session, message))
@@ -1869,7 +3159,10 @@ impl Storage {
 
             let mut results = Vec::new();
             for row in rows {
-                results.push(row?);
+                let result = row?;
+                if !result.0.board_session {
+                    results.push(result);
+                }
             }
             Ok(results)
         })
@@ -2637,6 +3930,328 @@ fn insert_durable_chat_run_conn(conn: &Connection, run: &StoredDurableChatRun) -
     Ok(())
 }
 
+fn insert_chat_run_attempt_conn(conn: &Connection, attempt: &StoredChatRunAttempt) -> Result<bool> {
+    let zero = SessionTokenUsage::default();
+    let usage = attempt.usage.as_ref().unwrap_or(&zero);
+    let inserted = conn.execute(
+        r#"
+        INSERT OR IGNORE INTO chat_run_attempts (
+            id, durable_run_id, session_id, user_message_id, provider, runtime,
+            model, native_session_id, status, input_tokens, output_tokens,
+            cache_creation_tokens, cache_read_tokens, reasoning_tokens,
+            total_tokens, cost_usd, raw_usage_json, source, completeness,
+            created_at, updated_at, completed_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+            ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+        )
+        "#,
+        params![
+            attempt.id,
+            attempt.durable_run_id,
+            attempt.session_id,
+            attempt.user_message_id,
+            attempt.provider,
+            attempt.runtime,
+            attempt.model,
+            attempt.native_session_id,
+            attempt.status,
+            usage.input as i64,
+            usage.output as i64,
+            usage.cache_creation as i64,
+            usage.cache_read as i64,
+            usage.reasoning as i64,
+            usage.used as i64,
+            usage.cost_usd,
+            attempt.raw_usage_json,
+            attempt.source,
+            token_usage_completeness_to_str(attempt.completeness),
+            attempt.created_at.to_rfc3339(),
+            attempt.updated_at.to_rfc3339(),
+            attempt.completed_at.map(|time| time.to_rfc3339()),
+        ],
+    )?;
+    Ok(inserted > 0)
+}
+
+fn session_lifetime_token_usage_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<SessionLifetimeTokenUsage> {
+    let attempts = lifetime_attempt_usage_for_session_conn(conn, session_id)?;
+    let baseline = conn
+        .query_row(
+            r#"
+            SELECT total_tokens, input_tokens, output_tokens, cache_creation_tokens,
+                   cache_read_tokens, reasoning_tokens, cost_usd,
+                   partial_attempts, missing_attempts
+            FROM session_usage_baselines
+            WHERE session_id = ?1
+            "#,
+            params![session_id],
+            map_lifetime_usage_row,
+        )
+        .optional()?
+        .unwrap_or_default();
+    Ok(combine_lifetime_usage(baseline, attempts))
+}
+
+fn attach_lifetime_usage_conn(conn: &Connection, sessions: &mut [SessionSummary]) -> Result<()> {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", sessions.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT session_id,
+               COALESCE(SUM(total_tokens), 0),
+               COALESCE(SUM(input_tokens), 0),
+               COALESCE(SUM(output_tokens), 0),
+               COALESCE(SUM(cache_creation_tokens), 0),
+               COALESCE(SUM(cache_read_tokens), 0),
+               COALESCE(SUM(reasoning_tokens), 0),
+               COALESCE(SUM(cost_usd), 0),
+               COALESCE(SUM(partial_attempts), 0),
+               COALESCE(SUM(missing_attempts), 0)
+        FROM (
+            SELECT session_id, total_tokens, input_tokens, output_tokens,
+                   cache_creation_tokens, cache_read_tokens, reasoning_tokens,
+                   cost_usd,
+                   CASE WHEN completeness = 'partial' THEN 1 ELSE 0 END AS partial_attempts,
+                   CASE WHEN completeness = 'missing' THEN 1 ELSE 0 END AS missing_attempts
+            FROM chat_run_attempts
+
+            UNION ALL
+
+            SELECT session_id, total_tokens, input_tokens, output_tokens,
+                   cache_creation_tokens, cache_read_tokens, reasoning_tokens,
+                   cost_usd, partial_attempts, missing_attempts
+            FROM session_usage_baselines
+        ) usage
+        WHERE session_id IN ({placeholders})
+        GROUP BY session_id
+        "#,
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(
+        params_from_iter(sessions.iter().map(|session| session.id.as_str())),
+        |row| Ok((row.get::<_, String>(0)?, map_lifetime_usage_row_at(row, 1)?)),
+    )?;
+    let mut usage_by_session = HashMap::new();
+    for row in rows {
+        let (session_id, usage) = row?;
+        usage_by_session.insert(session_id, usage);
+    }
+    for session in sessions {
+        session.lifetime_token_usage =
+            Some(usage_by_session.remove(&session.id).unwrap_or_default());
+    }
+    Ok(())
+}
+
+fn lifetime_attempt_usage_for_session_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<SessionLifetimeTokenUsage> {
+    conn.query_row(
+        r#"
+        SELECT COALESCE(SUM(total_tokens), 0),
+               COALESCE(SUM(input_tokens), 0),
+               COALESCE(SUM(output_tokens), 0),
+               COALESCE(SUM(cache_creation_tokens), 0),
+               COALESCE(SUM(cache_read_tokens), 0),
+               COALESCE(SUM(reasoning_tokens), 0),
+               COALESCE(SUM(cost_usd), 0),
+               COALESCE(SUM(CASE WHEN completeness = 'partial' THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN completeness = 'missing' THEN 1 ELSE 0 END), 0)
+        FROM chat_run_attempts
+        WHERE session_id = ?1
+        "#,
+        params![session_id],
+        map_lifetime_usage_row,
+    )
+    .map_err(StorageError::from)
+}
+
+fn fork_usage_baseline_conn(
+    conn: &Connection,
+    source_session_id: &str,
+    before_message_id: &str,
+    destination: &SessionSummary,
+    messages: &[ChatMessage],
+) -> Result<SessionLifetimeTokenUsage> {
+    let mut usage_sources = messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .map(|message| usage_source_ref(source_session_id, message))
+        .collect::<Vec<_>>();
+    usage_sources.sort();
+    usage_sources.dedup();
+
+    if usage_sources.is_empty() {
+        return Ok(SessionLifetimeTokenUsage::default());
+    }
+
+    let source_conditions = std::iter::repeat_n(
+        "(a.session_id = ? AND a.user_message_id = ?)",
+        usage_sources.len(),
+    )
+    .collect::<Vec<_>>()
+    .join(" OR ");
+    let baseline_conditions = std::iter::repeat_n(
+        "(f.source_session_id = ? AND f.before_message_id = ?)",
+        usage_sources.len(),
+    )
+    .collect::<Vec<_>>()
+    .join(" OR ");
+    let sql = format!(
+        r#"
+        SELECT COALESCE(SUM(total_tokens), 0),
+               COALESCE(SUM(input_tokens), 0),
+               COALESCE(SUM(output_tokens), 0),
+               COALESCE(SUM(cache_creation_tokens), 0),
+               COALESCE(SUM(cache_read_tokens), 0),
+               COALESCE(SUM(reasoning_tokens), 0),
+               COALESCE(SUM(cost_usd), 0),
+               COALESCE(SUM(partial_attempts), 0),
+               COALESCE(SUM(missing_attempts), 0)
+        FROM (
+            SELECT a.total_tokens, a.input_tokens, a.output_tokens,
+                   a.cache_creation_tokens, a.cache_read_tokens,
+                   a.reasoning_tokens, a.cost_usd,
+                   CASE WHEN a.completeness = 'partial' THEN 1 ELSE 0 END AS partial_attempts,
+                   CASE WHEN a.completeness = 'missing' THEN 1 ELSE 0 END AS missing_attempts
+            FROM chat_run_attempts a
+            WHERE {source_conditions}
+
+            UNION ALL
+
+            SELECT b.total_tokens, b.input_tokens, b.output_tokens,
+                   b.cache_creation_tokens, b.cache_read_tokens,
+                   b.reasoning_tokens, b.cost_usd,
+                   b.partial_attempts, b.missing_attempts
+            FROM session_usage_baselines b
+            JOIN session_forks f ON f.destination_session_id = b.session_id
+            WHERE {baseline_conditions}
+        )
+        "#
+    );
+    let bind_values = usage_sources
+        .iter()
+        .flat_map(|(session_id, message_id)| [session_id.clone(), message_id.clone()])
+        .chain(
+            usage_sources
+                .iter()
+                .flat_map(|(session_id, message_id)| [session_id.clone(), message_id.clone()]),
+        );
+    let mut combined =
+        conn.query_row(&sql, params_from_iter(bind_values), map_lifetime_usage_row)?;
+    combined.completeness = lifetime_usage_completeness(&combined);
+
+    if combined.total == 0
+        && combined.partial_attempts == 0
+        && combined.missing_attempts == 0
+        && destination.lifetime_token_usage.is_some()
+    {
+        return Ok(destination.lifetime_token_usage.clone().unwrap_or_default());
+    }
+
+    let _ = before_message_id;
+    Ok(combined)
+}
+
+fn usage_source_ref(source_session_id: &str, message: &ChatMessage) -> (String, String) {
+    let session_id = message
+        .metadata
+        .get("usageSourceSessionId")
+        .or_else(|| message.metadata.get("forkedFromSessionId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| source_session_id.to_string());
+    let message_id = message
+        .metadata
+        .get("usageSourceMessageId")
+        .or_else(|| message.metadata.get("forkedFromMessageId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| message.id.clone());
+    (session_id, message_id)
+}
+
+fn map_lifetime_usage_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionLifetimeTokenUsage> {
+    map_lifetime_usage_row_at(row, 0)
+}
+
+fn map_lifetime_usage_row_at(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<SessionLifetimeTokenUsage> {
+    let mut usage = SessionLifetimeTokenUsage {
+        total: row_i64_to_u64(row, offset)?,
+        input: row_i64_to_u64(row, offset + 1)?,
+        output: row_i64_to_u64(row, offset + 2)?,
+        cache_creation: row_i64_to_u64(row, offset + 3)?,
+        cache_read: row_i64_to_u64(row, offset + 4)?,
+        reasoning: row_i64_to_u64(row, offset + 5)?,
+        cost_usd: row.get(offset + 6)?,
+        partial_attempts: row_i64_to_u64(row, offset + 7)?,
+        missing_attempts: row_i64_to_u64(row, offset + 8)?,
+        completeness: TokenUsageCompleteness::Complete,
+    };
+    usage.completeness = lifetime_usage_completeness(&usage);
+    Ok(usage)
+}
+
+fn row_i64_to_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let raw = row.get::<_, i64>(index)?;
+    u64::try_from(raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+fn combine_lifetime_usage(
+    mut left: SessionLifetimeTokenUsage,
+    right: SessionLifetimeTokenUsage,
+) -> SessionLifetimeTokenUsage {
+    left.total = left.total.saturating_add(right.total);
+    left.input = left.input.saturating_add(right.input);
+    left.output = left.output.saturating_add(right.output);
+    left.cache_creation = left.cache_creation.saturating_add(right.cache_creation);
+    left.cache_read = left.cache_read.saturating_add(right.cache_read);
+    left.reasoning = left.reasoning.saturating_add(right.reasoning);
+    left.cost_usd += right.cost_usd;
+    left.partial_attempts = left.partial_attempts.saturating_add(right.partial_attempts);
+    left.missing_attempts = left.missing_attempts.saturating_add(right.missing_attempts);
+    left.completeness = lifetime_usage_completeness(&left);
+    left
+}
+
+fn lifetime_usage_completeness(usage: &SessionLifetimeTokenUsage) -> TokenUsageCompleteness {
+    if usage.missing_attempts > 0 && usage.total == 0 {
+        TokenUsageCompleteness::Missing
+    } else if usage.missing_attempts > 0 || usage.partial_attempts > 0 {
+        TokenUsageCompleteness::Partial
+    } else {
+        TokenUsageCompleteness::Complete
+    }
+}
+
+fn token_usage_completeness_to_str(value: TokenUsageCompleteness) -> &'static str {
+    match value {
+        TokenUsageCompleteness::Complete => "complete",
+        TokenUsageCompleteness::Partial => "partial",
+        TokenUsageCompleteness::Missing => "missing",
+    }
+}
+
 fn map_durable_chat_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDurableChatRun> {
     let thinking = row.get::<_, Option<i64>>(10)?.map(|value| value != 0);
     let fast = row.get::<_, Option<i64>>(21)?.map(|value| value != 0);
@@ -2683,6 +4298,52 @@ fn map_durable_chat_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredD
     })
 }
 
+fn map_session_context_rollover_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredSessionContextRollover> {
+    let observed_bytes = row
+        .get::<_, Option<i64>>(11)?
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?;
+    let limit_bytes_raw = row.get::<_, i64>(12)?;
+    let limit_bytes = u64::try_from(limit_bytes_raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            12,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    Ok(StoredSessionContextRollover {
+        id: row.get(0)?,
+        user_id: row.get(1)?,
+        session_id: row.get(2)?,
+        request_id: row.get(3)?,
+        failed_message_id: row.get(4)?,
+        trigger_run_id: row.get(5)?,
+        retry_run_id: row.get(6)?,
+        from_native_session_id: row.get(7)?,
+        candidate_native_session_id: row.get(8)?,
+        state: row.get(9)?,
+        handoff: row.get(10)?,
+        observed_bytes,
+        limit_bytes,
+        error: row.get(13)?,
+        created_at: parse_time_sql(row.get::<_, String>(14)?)?,
+        updated_at: parse_time_sql(row.get::<_, String>(15)?)?,
+        activated_at: row
+            .get::<_, Option<String>>(16)?
+            .map(parse_time_sql)
+            .transpose()?,
+    })
+}
+
 fn map_fcm_token_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredFcmToken> {
     Ok(StoredFcmToken {
         token: row.get(0)?,
@@ -2717,11 +4378,42 @@ fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> 
     Ok(session)
 }
 
+fn get_session_summary_conn(conn: &Connection, session_id: &str) -> Result<Option<SessionSummary>> {
+    conn.query_row(
+        r#"
+        SELECT s.id, s.provider, s.project_path, s.title,
+               COALESCE(m.message_count, s.message_count),
+               s.last_activity, s.active, s.model, s.metadata
+        FROM sessions s
+        LEFT JOIN (
+            SELECT session_id, COUNT(*) AS message_count
+            FROM messages
+            WHERE session_id = ?1
+            GROUP BY session_id
+        ) m ON m.session_id = s.id
+        WHERE s.id = ?1
+        "#,
+        params![session_id],
+        map_session_row,
+    )
+    .optional()
+    .map_err(StorageError::from)
+}
+
 fn serialize_session_metadata(session: &SessionSummary) -> String {
     use serde_json::json;
     let mut value = serde_json::Map::new();
     if session.external {
         value.insert("external".into(), json!(true));
+    }
+    if session.board_session {
+        value.insert("boardSession".into(), json!(true));
+    }
+    if let Some(board_run_id) = session.board_run_id.as_ref() {
+        value.insert("boardRunId".into(), json!(board_run_id));
+    }
+    if let Some(board_task_id) = session.board_task_id.as_ref() {
+        value.insert("boardTaskId".into(), json!(board_task_id));
     }
     if let Some(native_session_id) = session.native_session_id.as_ref() {
         value.insert("nativeSessionId".into(), json!(native_session_id));
@@ -2782,6 +4474,15 @@ fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
     use serde_json::Value;
     if let Some(v) = value.get("external").and_then(Value::as_bool) {
         session.external = v;
+    }
+    if let Some(v) = value.get("boardSession").and_then(Value::as_bool) {
+        session.board_session = v;
+    }
+    if let Some(v) = value.get("boardRunId").and_then(Value::as_str) {
+        session.board_run_id = Some(v.to_string());
+    }
+    if let Some(v) = value.get("boardTaskId").and_then(Value::as_str) {
+        session.board_task_id = Some(v.to_string());
     }
     if let Some(v) = value.get("nativeSessionId").and_then(Value::as_str) {
         session.native_session_id = Some(v.to_string());
@@ -2912,6 +4613,79 @@ fn mask_secret(prefix: &str) -> String {
     format!("{prefix}...")
 }
 
+fn bounded_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn nonnegative_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or_default()
+}
+
+fn nonnegative_u32(value: i64) -> u32 {
+    u32::try_from(value).unwrap_or_default()
+}
+
+fn external_message_state_matches(
+    conn: &Connection,
+    provider: Provider,
+    session_id: &str,
+    file_path: &str,
+    fingerprint: &ExternalHistoryFingerprint<'_>,
+) -> Result<bool> {
+    Ok(
+        external_message_state_total_if_matches(
+            conn,
+            provider,
+            session_id,
+            file_path,
+            fingerprint,
+        )?
+        .is_some(),
+    )
+}
+
+fn external_message_state_total_if_matches(
+    conn: &Connection,
+    provider: Provider,
+    session_id: &str,
+    file_path: &str,
+    fingerprint: &ExternalHistoryFingerprint<'_>,
+) -> Result<Option<usize>> {
+    let state = conn
+        .query_row(
+            r#"
+            SELECT file_identity, file_size, modified_nanos, parser_version,
+                   total_count
+            FROM external_history_message_state
+            WHERE provider = ?1 AND session_id = ?2 AND file_path = ?3
+            "#,
+            params![provider.as_str(), session_id, file_path],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((identity, size, modified_nanos, parser_version, total_count)) = state else {
+        return Ok(None);
+    };
+    if identity.as_deref() != fingerprint.file_identity
+        || nonnegative_u64(size) != fingerprint.file_size
+        || modified_nanos != fingerprint.modified_nanos
+        || nonnegative_u32(parser_version) != fingerprint.parser_version
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        usize::try_from(nonnegative_u64(total_count)).unwrap_or(usize::MAX),
+    ))
+}
+
 fn parse_provider(raw: &str) -> Provider {
     match raw {
         "codex" => Provider::Codex,
@@ -2965,6 +4739,7 @@ fn parse_role(raw: &str) -> MessageRole {
 mod tests {
     use super::*;
     use iowb_protocol::{ChatRuntime, SessionTokenUsage};
+    use std::collections::HashSet;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_storage(label: &str) -> (Storage, PathBuf) {
@@ -3000,6 +4775,128 @@ mod tests {
             timestamp: Utc::now() + chrono::Duration::seconds(seconds),
             metadata: Value::Null,
         }
+    }
+
+    fn test_context_rollover(
+        id: &str,
+        session_id: &str,
+        request_id: &str,
+        trigger_run_id: &str,
+        retry_run_id: &str,
+        failed_message_id: &str,
+        created_at: DateTime<Utc>,
+    ) -> StoredSessionContextRollover {
+        StoredSessionContextRollover {
+            id: id.to_string(),
+            user_id: "user-1".to_string(),
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            failed_message_id: failed_message_id.to_string(),
+            trigger_run_id: trigger_run_id.to_string(),
+            retry_run_id: retry_run_id.to_string(),
+            from_native_session_id: Some("native-poisoned".to_string()),
+            candidate_native_session_id: None,
+            state: "starting".to_string(),
+            handoff: "bounded text-only handoff".to_string(),
+            observed_bytes: Some(19_760_000),
+            limit_bytes: 16 * 1024 * 1024,
+            error: None,
+            created_at,
+            updated_at: created_at,
+            activated_at: None,
+        }
+    }
+
+    #[test]
+    fn external_history_index_and_messages_survive_reopen() {
+        let (storage, root) = temporary_storage("external-history-index");
+        let database = root.join("test.db");
+        let mut summary = test_session("external-session", false);
+        summary.external = true;
+        summary.message_count = 3;
+        let source = StoredExternalHistorySource {
+            provider: Provider::Codex,
+            source_path: "/tmp/state.sqlite".to_string(),
+            file_identity: Some("1:2".to_string()),
+            file_size: 42,
+            modified_nanos: Some(99),
+            scan_offset: 42,
+            parser_version: 1,
+            records: vec![StoredExternalSessionRecord {
+                summary: summary.clone(),
+                file_path: "/tmp/rollout.jsonl".to_string(),
+            }],
+        };
+        storage
+            .upsert_external_history_source(&source)
+            .expect("persist source");
+
+        let messages = vec![
+            test_message("external-0", MessageRole::User, "question", 0),
+            test_message("external-1", MessageRole::Assistant, "answer", 1),
+            test_message("external-2", MessageRole::Tool, "tool", 2),
+        ];
+        let fingerprint = ExternalHistoryFingerprint {
+            file_identity: Some("3:4"),
+            file_size: 123,
+            modified_nanos: Some(456),
+            parser_version: 1,
+        };
+        storage
+            .replace_external_messages(
+                Provider::Codex,
+                &summary.id,
+                "/tmp/rollout.jsonl",
+                &fingerprint,
+                &messages,
+            )
+            .expect("persist messages");
+        drop(storage);
+
+        let reopened = Storage::open(database).expect("reopen storage");
+        let restored = reopened
+            .external_history_source(Provider::Codex, "/tmp/state.sqlite")
+            .expect("load source")
+            .expect("source");
+        assert_eq!(restored.records.len(), 1);
+        assert_eq!(restored.records[0].summary.id, summary.id);
+        assert_eq!(restored.records[0].summary.message_count, 3);
+        let tail = reopened
+            .external_messages_tail_if_current(
+                Provider::Codex,
+                &summary.id,
+                "/tmp/rollout.jsonl",
+                &fingerprint,
+                2,
+            )
+            .expect("load tail")
+            .expect("current tail");
+        assert_eq!(tail.1, 3);
+        assert_eq!(
+            tail.0
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["external-1", "external-2"]
+        );
+        let stale_fingerprint = ExternalHistoryFingerprint {
+            file_size: 124,
+            ..fingerprint
+        };
+        assert!(
+            reopened
+                .external_messages_if_current(
+                    Provider::Codex,
+                    &summary.id,
+                    "/tmp/rollout.jsonl",
+                    &stale_fingerprint,
+                )
+                .expect("stale lookup")
+                .is_none()
+        );
+
+        drop(reopened);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -3147,6 +5044,212 @@ mod tests {
     }
 
     #[test]
+    fn chat_run_attempt_usage_accumulates_lifetime_total() {
+        let (storage, root) = temporary_storage("chat-run-attempt-usage");
+        let session = test_session("session-usage", false);
+        storage.upsert_session(&session).expect("session");
+
+        let mut run = StoredDurableChatRun::new(
+            "run-usage",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            "prompt",
+            session.project_path.clone(),
+        );
+        run.user_message_id = Some("message-usage".to_string());
+        storage.create_durable_chat_run(&run).expect("run");
+
+        let attempt = StoredChatRunAttempt::new(
+            "attempt-usage",
+            run.id.clone(),
+            session.id.clone(),
+            run.user_message_id.clone(),
+            "codex",
+            "native_cli",
+            Some("gpt-test".to_string()),
+            Some("native-1".to_string()),
+        );
+        assert!(
+            storage
+                .create_chat_run_attempt(&attempt)
+                .expect("insert attempt")
+        );
+        assert!(
+            !storage
+                .create_chat_run_attempt(&attempt)
+                .expect("idempotent attempt")
+        );
+        let lifetime = storage
+            .finish_chat_run_attempt(
+                &attempt.id,
+                "completed",
+                Some(&SessionTokenUsage {
+                    used: 42,
+                    input: 30,
+                    output: 12,
+                    cache_creation: 3,
+                    cache_read: 20,
+                    reasoning: 5,
+                    cost_usd: 0.01,
+                }),
+                Some(r#"{"total_tokens":42}"#),
+                Some("test"),
+                TokenUsageCompleteness::Complete,
+            )
+            .expect("finish attempt")
+            .expect("lifetime");
+        assert_eq!(lifetime.total, 42);
+        assert_eq!(lifetime.input, 30);
+        assert_eq!(lifetime.output, 12);
+        assert_eq!(lifetime.cache_read, 20);
+        assert_eq!(lifetime.reasoning, 5);
+        assert_eq!(lifetime.completeness, TokenUsageCompleteness::Complete);
+        let latest = storage
+            .latest_session_token_usage(&session.id)
+            .expect("latest usage query")
+            .expect("latest usage");
+        assert_eq!(latest.used, 42);
+        assert_eq!(latest.input, 30);
+        assert_eq!(latest.output, 12);
+        assert!(
+            storage
+                .get_session_summary(&session.id)
+                .expect("lightweight session")
+                .expect("session")
+                .lifetime_token_usage
+                .is_none(),
+        );
+        assert_eq!(
+            storage
+                .list_sessions()
+                .expect("session list")
+                .into_iter()
+                .find(|listed| listed.id == session.id)
+                .and_then(|listed| listed.lifetime_token_usage)
+                .map(|usage| usage.total),
+            Some(42),
+        );
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn session_fork_usage_baseline_inherits_only_cloned_prefix() {
+        let (storage, root) = temporary_storage("session-fork-usage-baseline");
+        storage
+            .create_user("user-1", "user-1", "test-hash")
+            .expect("create user");
+        let source = test_session("session-source-usage", false);
+        storage.upsert_session(&source).expect("source session");
+        let source_messages = [
+            test_message("source-u1", MessageRole::User, "first prompt", 0),
+            test_message("source-a1", MessageRole::Assistant, "first answer", 1),
+            test_message("source-u2", MessageRole::User, "second prompt", 2),
+        ];
+        for message in &source_messages {
+            storage
+                .append_message(&source.id, message)
+                .expect("source message");
+        }
+        for (run_id, message_id, total) in [
+            ("run-source-1", "source-u1", 100_u64),
+            ("run-source-2", "source-u2", 900_u64),
+        ] {
+            let mut run = StoredDurableChatRun::new(
+                run_id,
+                Some("user-1".to_string()),
+                source.id.clone(),
+                "codex",
+                "prompt",
+                source.project_path.clone(),
+            );
+            run.user_message_id = Some(message_id.to_string());
+            storage.create_durable_chat_run(&run).expect("run");
+            let attempt = StoredChatRunAttempt::new(
+                format!("attempt-{run_id}"),
+                run.id.clone(),
+                source.id.clone(),
+                run.user_message_id.clone(),
+                "codex",
+                "native_cli",
+                None,
+                None,
+            );
+            storage.create_chat_run_attempt(&attempt).expect("attempt");
+            storage
+                .finish_chat_run_attempt(
+                    &attempt.id,
+                    "completed",
+                    Some(&SessionTokenUsage {
+                        used: total,
+                        input: total - 10,
+                        output: 10,
+                        cache_creation: 0,
+                        cache_read: 0,
+                        reasoning: 0,
+                        cost_usd: 0.0,
+                    }),
+                    None,
+                    Some("test"),
+                    TokenUsageCompleteness::Complete,
+                )
+                .expect("finish");
+        }
+
+        let mut destination = test_session("session-destination-usage", false);
+        destination.message_count = 2;
+        let cloned = [
+            ChatMessage {
+                id: "cloned-u1".to_string(),
+                metadata: serde_json::json!({
+                    "forkedFromSessionId": source.id,
+                    "forkedFromMessageId": "source-u1",
+                    "usageSourceSessionId": source.id,
+                    "usageSourceMessageId": "source-u1",
+                }),
+                ..source_messages[0].clone()
+            },
+            ChatMessage {
+                id: "cloned-a1".to_string(),
+                metadata: serde_json::json!({
+                    "forkedFromSessionId": source.id,
+                    "forkedFromMessageId": "source-a1",
+                }),
+                ..source_messages[1].clone()
+            },
+        ];
+        assert_eq!(
+            storage
+                .create_session_fork(
+                    "user-1",
+                    &source.id,
+                    "source-u2",
+                    "request-usage",
+                    &destination,
+                    &cloned,
+                    "second prompt",
+                    true,
+                    false,
+                )
+                .expect("fork"),
+            CreateSessionForkOutcome::Created
+        );
+        let restored = storage
+            .get_session(&destination.id)
+            .expect("session")
+            .expect("destination");
+        let usage = restored.lifetime_token_usage.expect("usage");
+        assert_eq!(usage.total, 100);
+        assert_eq!(usage.input, 90);
+        assert_eq!(usage.output, 10);
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn session_fork_transaction_preserves_prefix_draft_and_idempotency() {
         let (storage, root) = temporary_storage("session-fork");
         storage
@@ -3198,6 +5301,7 @@ mod tests {
                     &cloned,
                     "second prompt",
                     true,
+                    true,
                 )
                 .expect("create fork"),
             CreateSessionForkOutcome::Created
@@ -3239,7 +5343,23 @@ mod tests {
             StoredSessionFork {
                 before_message_id: "source-3".to_string(),
                 destination_session_id: destination.id.clone(),
+                replaces_source: true,
             }
+        );
+        assert_eq!(
+            storage
+                .list_sessions()
+                .expect("sessions while replacement exists")
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![destination.id.clone()]
+        );
+        assert_eq!(
+            storage
+                .list_replaced_source_session_ids()
+                .expect("replaced source ids"),
+            vec![source.id.clone()]
         );
 
         let other_destination = test_session("session-other", false);
@@ -3254,11 +5374,13 @@ mod tests {
                     &[],
                     "different prompt",
                     true,
+                    false,
                 )
                 .expect("idempotent retry"),
             CreateSessionForkOutcome::Existing(StoredSessionFork {
                 before_message_id: "source-3".to_string(),
                 destination_session_id: destination.id.clone(),
+                replaces_source: true,
             })
         );
         assert!(
@@ -3266,6 +5388,26 @@ mod tests {
                 .get_session(&other_destination.id)
                 .expect("other destination lookup")
                 .is_none()
+        );
+        assert!(
+            storage
+                .delete_session(&destination.id)
+                .expect("delete replacement")
+        );
+        assert_eq!(
+            storage
+                .list_sessions()
+                .expect("sessions after deleting replacement")
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![source.id.clone()]
+        );
+        assert!(
+            storage
+                .list_replaced_source_session_ids()
+                .expect("restored source ids")
+                .is_empty()
         );
 
         drop(storage);
@@ -3293,6 +5435,7 @@ mod tests {
                     &[],
                     "prompt",
                     true,
+                    true,
                 )
                 .expect("active outcome"),
             CreateSessionForkOutcome::SourceActive
@@ -3308,6 +5451,883 @@ mod tests {
                 .get_session_fork("user-1", &source.id, "request-active")
                 .expect("fork lookup")
                 .is_none()
+        );
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn non_replacing_session_fork_keeps_source_visible() {
+        let (storage, root) = temporary_storage("session-fork-visible-source");
+        storage
+            .create_user("user-1", "user-1", "test-hash")
+            .expect("create user");
+        let source = test_session("session-source", false);
+        let destination = test_session("session-destination", false);
+        storage.upsert_session(&source).expect("source session");
+
+        assert_eq!(
+            storage
+                .create_session_fork(
+                    "user-1",
+                    &source.id,
+                    "source-message",
+                    "request-visible",
+                    &destination,
+                    &[],
+                    "prompt",
+                    true,
+                    false,
+                )
+                .expect("create fork"),
+            CreateSessionForkOutcome::Created
+        );
+
+        let listed = storage
+            .list_sessions()
+            .expect("sessions")
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            listed,
+            HashSet::from([source.id.clone(), destination.id.clone()])
+        );
+        assert!(
+            storage
+                .list_replaced_source_session_ids()
+                .expect("replaced source ids")
+                .is_empty()
+        );
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn legacy_session_schema_migrates_forks_and_context_rollovers_to_v5() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "iowb-storage-fork-migration-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("storage dir");
+        let database = root.join("test.db");
+        {
+            let connection = Connection::open(&database).expect("legacy database");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE session_forks (
+                        user_id TEXT NOT NULL,
+                        source_session_id TEXT NOT NULL,
+                        before_message_id TEXT NOT NULL,
+                        request_id TEXT NOT NULL,
+                        destination_session_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY(user_id, source_session_id, request_id)
+                    );
+                    "#,
+                )
+                .expect("legacy schema");
+        }
+
+        let storage = Storage::open(&database).expect("migrated storage");
+        storage
+            .with_connection(|connection| {
+                let column_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('session_forks') WHERE name = 'replaces_source'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let index_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_session_forks_replaced_source'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let rollover_table_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_context_rollovers'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let rollover_column_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('session_context_rollovers')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let rollover_session_index_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list('session_context_rollovers') WHERE name = 'idx_session_context_rollovers_session' AND \"unique\" = 0",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let rollover_retry_index_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM pragma_index_list('session_context_rollovers') WHERE name = 'idx_session_context_rollovers_retry_run' AND \"unique\" = 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let rollover_request_unique_count: i64 = connection.query_row(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM pragma_index_list('session_context_rollovers') indexes
+                    WHERE indexes."unique" = 1
+                      AND (
+                          SELECT group_concat(name, ',')
+                          FROM (
+                              SELECT name
+                              FROM pragma_index_info(indexes.name)
+                              ORDER BY seqno
+                          )
+                      ) = 'user_id,session_id,request_id'
+                    "#,
+                    [],
+                    |row| row.get(0),
+                )?;
+                let schema_version: String = connection.query_row(
+                    "SELECT value FROM meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let attempts_table_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'chat_run_attempts'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let baselines_table_count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'session_usage_baselines'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(column_count, 1);
+                assert_eq!(index_count, 1);
+                assert_eq!(rollover_table_count, 1);
+                assert_eq!(rollover_column_count, 17);
+                assert_eq!(rollover_session_index_count, 1);
+                assert_eq!(rollover_retry_index_count, 1);
+                assert_eq!(rollover_request_unique_count, 1);
+                assert_eq!(attempts_table_count, 1);
+                assert_eq!(baselines_table_count, 1);
+                assert_eq!(schema_version, "7");
+                Ok(())
+            })
+            .expect("migration checks");
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn context_rollover_prepare_is_idempotent_and_preserves_chat_across_restart() {
+        let (storage, root) = temporary_storage("context-rollover-restart");
+        let database = root.join("test.db");
+        storage
+            .create_user("user-1", "user-1", "test-hash")
+            .expect("create user");
+        let mut session = test_session("session-rollover", false);
+        session.title = "Keep this visible chat".to_string();
+        session.title_source = Some(SessionTitleSource::Manual);
+        session.native_session_id = Some("native-poisoned".to_string());
+        session.model = Some("gpt-5.4".to_string());
+        session.runtime = Some(ChatRuntime::IoGateway);
+        session.effort = Some("high".to_string());
+        session.mode = Some("default".to_string());
+        session.thinking = Some(true);
+        session.fast = Some(true);
+        session.message_count = 4;
+        storage.upsert_session(&session).expect("upsert session");
+        let messages = vec![
+            test_message("message-1", MessageRole::User, "Earlier question", 0),
+            test_message("message-2", MessageRole::Assistant, "Earlier answer", 1),
+            test_message("message-3", MessageRole::Tool, "Large tool result", 2),
+            test_message("message-failed", MessageRole::User, "Please continue", 3),
+        ];
+        for message in &messages {
+            storage
+                .append_message(&session.id, message)
+                .expect("append visible message");
+        }
+        storage
+            .set_session_draft("user-1", &session.id, "unsent follow-up")
+            .expect("save draft");
+
+        let mut failed_run = StoredDurableChatRun::new(
+            "run-failed",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            "Please continue",
+            session.project_path.clone(),
+        );
+        failed_run.user_message_id = Some("message-failed".to_string());
+        failed_run.native_session_id = Some("native-poisoned".to_string());
+        storage
+            .create_durable_chat_run(&failed_run)
+            .expect("create failed run");
+        storage
+            .mark_durable_chat_run_failed(&failed_run.id, "invalid body")
+            .expect("mark original run failed");
+
+        let created_at = Utc::now();
+        let rollover = test_context_rollover(
+            "rollover-1",
+            &session.id,
+            "request-1",
+            &failed_run.id,
+            "run-retry-1",
+            "message-failed",
+            created_at,
+        );
+        let mut retry_run = StoredDurableChatRun::new(
+            "run-retry-1",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            rollover.handoff.clone(),
+            session.project_path.clone(),
+        );
+        retry_run.user_message_id = Some("message-failed".to_string());
+        retry_run.model = session.model.clone();
+        retry_run.effort = session.effort.clone();
+        retry_run.mode = session.mode.clone();
+        retry_run.thinking = session.thinking;
+        retry_run.fast = session.fast;
+
+        assert!(
+            storage
+                .prepare_context_rollover(&rollover, &retry_run)
+                .expect("prepare rollover")
+        );
+        assert!(
+            !storage
+                .prepare_context_rollover(&rollover, &retry_run)
+                .expect("repeat identical request")
+        );
+        assert_eq!(
+            storage
+                .context_rollover_for_request("user-1", &session.id, "request-1")
+                .expect("request lookup")
+                .expect("stored rollover")
+                .retry_run_id,
+            "run-retry-1"
+        );
+        assert_eq!(
+            storage
+                .get_durable_chat_run(&failed_run.id)
+                .expect("trigger run lookup")
+                .expect("trigger run")
+                .status,
+            "superseded"
+        );
+        let stored_retry = storage
+            .get_durable_chat_run(&retry_run.id)
+            .expect("retry run lookup")
+            .expect("retry run");
+        assert_eq!(stored_retry.native_session_id, None);
+        assert_eq!(
+            stored_retry.user_message_id.as_deref(),
+            Some("message-failed")
+        );
+
+        let stored_session = storage
+            .get_session(&session.id)
+            .expect("session lookup")
+            .expect("stored session");
+        assert_eq!(stored_session.id, session.id);
+        assert_eq!(stored_session.title, "Keep this visible chat");
+        assert_eq!(
+            stored_session.native_session_id.as_deref(),
+            Some("native-poisoned")
+        );
+        assert_eq!(stored_session.runtime, Some(ChatRuntime::IoGateway));
+        assert_eq!(
+            storage
+                .list_messages(&session.id)
+                .expect("messages")
+                .into_iter()
+                .map(|message| (message.id, message.role, message.content))
+                .collect::<Vec<_>>(),
+            messages
+                .iter()
+                .map(|message| { (message.id.clone(), message.role, message.content.clone(),) })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            storage
+                .get_session_draft("user-1", &session.id)
+                .expect("draft")
+                .content,
+            "unsent follow-up"
+        );
+
+        drop(storage);
+        let reopened = Storage::open(&database).expect("reopen storage");
+        assert!(
+            reopened
+                .has_context_rollover(&session.id)
+                .expect("rollover presence")
+        );
+        assert_eq!(
+            reopened
+                .context_rollover_for_retry_run(&retry_run.id)
+                .expect("retry linkage")
+                .expect("rollover after restart")
+                .id,
+            rollover.id
+        );
+        let recoverable_retry = reopened
+            .list_recoverable_durable_chat_runs(3, 10)
+            .expect("recoverable retry")
+            .into_iter()
+            .find(|run| run.id == retry_run.id)
+            .expect("retry remains recoverable");
+        assert_eq!(recoverable_retry.native_session_id, None);
+        assert_eq!(
+            reopened
+                .list_messages(&session.id)
+                .expect("messages")
+                .into_iter()
+                .map(|message| (message.id, message.role, message.content))
+                .collect::<Vec<_>>(),
+            messages
+                .iter()
+                .map(|message| { (message.id.clone(), message.role, message.content.clone(),) })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reopened
+                .get_session_draft("user-1", &session.id)
+                .expect("draft")
+                .content,
+            "unsent follow-up"
+        );
+
+        drop(reopened);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn failed_context_rollover_allows_fresh_request_without_duplicate_prompt() {
+        let (storage, root) = temporary_storage("context-rollover-failed-retry");
+        storage
+            .create_user("user-1", "user-1", "test-hash")
+            .expect("create user");
+        let mut session = test_session("session-rollover-retry", false);
+        session.native_session_id = Some("native-poisoned".to_string());
+        session.message_count = 1;
+        storage.upsert_session(&session).expect("upsert session");
+        let failed_message = test_message(
+            "message-failed",
+            MessageRole::User,
+            "Retry this exact prompt",
+            0,
+        );
+        storage
+            .append_message(&session.id, &failed_message)
+            .expect("append failed prompt");
+
+        let mut trigger_run = StoredDurableChatRun::new(
+            "run-trigger",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            failed_message.content.clone(),
+            session.project_path.clone(),
+        );
+        trigger_run.user_message_id = Some(failed_message.id.clone());
+        trigger_run.native_session_id = Some("native-poisoned".to_string());
+        storage
+            .create_durable_chat_run(&trigger_run)
+            .expect("create trigger run");
+        storage
+            .mark_durable_chat_run_failed(&trigger_run.id, "invalid body")
+            .expect("mark trigger failed");
+
+        let first = test_context_rollover(
+            "rollover-first",
+            &session.id,
+            "request-first",
+            &trigger_run.id,
+            "run-retry-first",
+            &failed_message.id,
+            Utc::now(),
+        );
+        let mut first_retry = StoredDurableChatRun::new(
+            "run-retry-first",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            first.handoff.clone(),
+            session.project_path.clone(),
+        );
+        first_retry.user_message_id = Some(failed_message.id.clone());
+        assert!(
+            storage
+                .prepare_context_rollover(&first, &first_retry)
+                .expect("prepare first rollover")
+        );
+        assert!(
+            storage
+                .fail_context_rollover(&first.id, "clean context launch failed")
+                .expect("fail first rollover")
+        );
+        assert!(
+            storage
+                .mark_durable_chat_run_failed(&first_retry.id, "clean context launch failed")
+                .expect("fail first retry run")
+        );
+        assert!(
+            !storage
+                .prepare_context_rollover(&first, &first_retry)
+                .expect("same request remains idempotent")
+        );
+
+        let second = test_context_rollover(
+            "rollover-second",
+            &session.id,
+            "request-second",
+            &first_retry.id,
+            "run-retry-second",
+            &failed_message.id,
+            Utc::now() + chrono::Duration::milliseconds(1),
+        );
+        let mut second_retry = StoredDurableChatRun::new(
+            "run-retry-second",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            second.handoff.clone(),
+            session.project_path.clone(),
+        );
+        second_retry.user_message_id = Some(failed_message.id.clone());
+        assert!(
+            storage
+                .prepare_context_rollover(&second, &second_retry)
+                .expect("prepare fresh request")
+        );
+
+        assert_eq!(
+            storage
+                .context_rollover_for_request("user-1", &session.id, "request-first")
+                .expect("first request lookup")
+                .expect("first rollover")
+                .state,
+            "failed"
+        );
+        assert_eq!(
+            storage
+                .latest_context_rollover(&session.id)
+                .expect("latest rollover lookup")
+                .expect("latest rollover")
+                .request_id,
+            "request-second"
+        );
+        assert_eq!(
+            storage
+                .get_durable_chat_run(&first_retry.id)
+                .expect("first retry lookup")
+                .expect("first retry")
+                .status,
+            "superseded"
+        );
+        assert_eq!(
+            storage
+                .get_session(&session.id)
+                .expect("session lookup")
+                .expect("session")
+                .native_session_id
+                .as_deref(),
+            Some("native-poisoned")
+        );
+        let visible_messages = storage
+            .list_messages(&session.id)
+            .expect("visible messages");
+        assert_eq!(visible_messages.len(), 1);
+        assert_eq!(visible_messages[0].id, failed_message.id);
+        assert_eq!(visible_messages[0].role, failed_message.role);
+        assert_eq!(visible_messages[0].content, failed_message.content);
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn context_rollover_completion_is_atomic_scoped_and_idempotent() {
+        let (storage, root) = temporary_storage("context-rollover-completion");
+        storage
+            .create_user("user-1", "user-1", "test-hash")
+            .expect("create user");
+        let mut session = test_session("session-rollover-completion", false);
+        session.title = "Stable visible chat".to_string();
+        session.title_source = Some(SessionTitleSource::Manual);
+        session.native_session_id = Some("native-poisoned".to_string());
+        session.runtime = Some(ChatRuntime::IoGateway);
+        session.model = Some("gpt-5.4".to_string());
+        session.effort = Some("high".to_string());
+        session.mode = Some("default".to_string());
+        session.thinking = Some(true);
+        session.fast = Some(true);
+        session.message_count = 2;
+        storage.upsert_session(&session).expect("upsert session");
+        let prior_assistant = test_message(
+            "message-prior-assistant",
+            MessageRole::Assistant,
+            "Earlier answer remains visible",
+            0,
+        );
+        let failed_message = test_message(
+            "message-failed",
+            MessageRole::User,
+            "Continue after compacting",
+            1,
+        );
+        for message in [&prior_assistant, &failed_message] {
+            storage
+                .append_message(&session.id, message)
+                .expect("append existing message");
+        }
+        storage
+            .set_session_draft("user-1", &session.id, "draft stays untouched")
+            .expect("save draft");
+
+        let mut trigger_run = StoredDurableChatRun::new(
+            "run-trigger-completion",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            failed_message.content.clone(),
+            session.project_path.clone(),
+        );
+        trigger_run.user_message_id = Some(failed_message.id.clone());
+        trigger_run.native_session_id = Some("native-poisoned".to_string());
+        storage
+            .create_durable_chat_run(&trigger_run)
+            .expect("create trigger run");
+        storage
+            .mark_durable_chat_run_failed(&trigger_run.id, "invalid body")
+            .expect("mark trigger failed");
+
+        let rollover = test_context_rollover(
+            "rollover-completion",
+            &session.id,
+            "request-completion",
+            &trigger_run.id,
+            "run-retry-completion",
+            &failed_message.id,
+            Utc::now(),
+        );
+        let mut retry_run = StoredDurableChatRun::new(
+            "run-retry-completion",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            rollover.handoff.clone(),
+            session.project_path.clone(),
+        );
+        retry_run.user_message_id = Some(failed_message.id.clone());
+        assert!(
+            storage
+                .prepare_context_rollover(&rollover, &retry_run)
+                .expect("prepare rollover")
+        );
+
+        assert!(
+            !storage
+                .set_context_rollover_candidate(
+                    &rollover.id,
+                    "run-from-another-response",
+                    "native-clean",
+                )
+                .expect("reject mismatched retry run")
+        );
+        assert_eq!(
+            storage
+                .context_rollover_for_retry_run(&retry_run.id)
+                .expect("rollover lookup")
+                .expect("rollover")
+                .candidate_native_session_id,
+            None
+        );
+        assert_eq!(
+            storage
+                .get_durable_chat_run(&retry_run.id)
+                .expect("retry lookup")
+                .expect("retry")
+                .native_session_id,
+            None
+        );
+        assert!(
+            storage
+                .set_context_rollover_candidate(&rollover.id, &retry_run.id, "native-clean")
+                .expect("stage clean candidate")
+        );
+        assert!(
+            !storage
+                .set_context_rollover_candidate(
+                    &rollover.id,
+                    &retry_run.id,
+                    "native-late-conflict",
+                )
+                .expect("reject conflicting late candidate")
+        );
+
+        let activated_at = Utc::now() + chrono::Duration::seconds(2);
+        let mut completed_session = session.clone();
+        completed_session.native_session_id = Some("native-clean".to_string());
+        completed_session.external = false;
+        completed_session.active = true;
+        completed_session.last_activity = activated_at;
+        let marker = ChatMessage {
+            id: "message-compaction-marker".to_string(),
+            role: MessageRole::System,
+            content: "Context compacted here".to_string(),
+            timestamp: activated_at,
+            metadata: serde_json::json!({
+                "kind": "context_compaction",
+                "rolloverId": rollover.id,
+                "toNativeSessionId": "native-clean",
+            }),
+        };
+        let assistant = test_message(
+            "message-clean-assistant",
+            MessageRole::Assistant,
+            "Completed in the clean context",
+            3,
+        );
+
+        assert!(
+            !storage
+                .complete_context_rollover(
+                    &rollover.id,
+                    "run-from-another-response",
+                    "native-clean",
+                    &completed_session,
+                    &marker,
+                    Some(&assistant),
+                    None,
+                )
+                .expect("reject mismatched completion run")
+        );
+        assert!(
+            !storage
+                .complete_context_rollover(
+                    &rollover.id,
+                    &retry_run.id,
+                    "native-late-conflict",
+                    &completed_session,
+                    &marker,
+                    Some(&assistant),
+                    None,
+                )
+                .expect("reject mismatched completion candidate")
+        );
+        let mut invalid_follow_up = StoredDurableChatRun::new(
+            "run-follow-up-invalid",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            failed_message.content.clone(),
+            session.project_path.clone(),
+        );
+        invalid_follow_up.user_message_id = Some(failed_message.id.clone());
+        invalid_follow_up.native_session_id = Some("native-late-conflict".to_string());
+        assert!(
+            !storage
+                .complete_context_rollover(
+                    &rollover.id,
+                    &retry_run.id,
+                    "native-clean",
+                    &completed_session,
+                    &marker,
+                    None,
+                    Some(&invalid_follow_up),
+                )
+                .expect("reject mismatched follow-up run")
+        );
+        let duplicate_assistant = ChatMessage {
+            id: failed_message.id.clone(),
+            role: MessageRole::Assistant,
+            content: "must roll back".to_string(),
+            timestamp: activated_at + chrono::Duration::seconds(1),
+            metadata: Value::Null,
+        };
+        assert!(
+            storage
+                .complete_context_rollover(
+                    &rollover.id,
+                    &retry_run.id,
+                    "native-clean",
+                    &completed_session,
+                    &marker,
+                    Some(&duplicate_assistant),
+                    None,
+                )
+                .is_err(),
+            "a persistence error must abort the entire activation"
+        );
+
+        let before_success = storage
+            .get_session(&session.id)
+            .expect("session lookup after rollback")
+            .expect("session after rollback");
+        assert_eq!(
+            before_success.native_session_id.as_deref(),
+            Some("native-poisoned")
+        );
+        assert_eq!(before_success.message_count, 2);
+        assert!(
+            storage
+                .message_by_id(&session.id, &marker.id)
+                .expect("marker lookup after rollback")
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .context_rollover_for_retry_run(&retry_run.id)
+                .expect("rollover after rollback")
+                .expect("rollover")
+                .state,
+            "starting"
+        );
+        assert_eq!(
+            storage
+                .get_durable_chat_run(&retry_run.id)
+                .expect("retry after rollback")
+                .expect("retry")
+                .status,
+            "running"
+        );
+
+        let mut follow_up_run = StoredDurableChatRun::new(
+            "run-follow-up-completion",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            failed_message.content.clone(),
+            session.project_path.clone(),
+        );
+        follow_up_run.user_message_id = Some(failed_message.id.clone());
+        follow_up_run.native_session_id = Some("native-clean".to_string());
+        follow_up_run.model = completed_session.model.clone();
+        follow_up_run.effort = completed_session.effort.clone();
+        follow_up_run.mode = completed_session.mode.clone();
+        follow_up_run.thinking = completed_session.thinking;
+        follow_up_run.fast = completed_session.fast;
+        assert!(
+            storage
+                .complete_context_rollover(
+                    &rollover.id,
+                    &retry_run.id,
+                    "native-clean",
+                    &completed_session,
+                    &marker,
+                    None,
+                    Some(&follow_up_run),
+                )
+                .expect("complete rollover")
+        );
+        let completed = storage
+            .get_session(&session.id)
+            .expect("completed session lookup")
+            .expect("completed session");
+        assert_eq!(completed.id, session.id);
+        assert_eq!(completed.title, "Stable visible chat");
+        assert_eq!(completed.title_source, Some(SessionTitleSource::Manual));
+        assert_eq!(completed.native_session_id.as_deref(), Some("native-clean"));
+        assert_eq!(completed.runtime, Some(ChatRuntime::IoGateway));
+        assert!(!completed.active);
+        assert_eq!(completed.message_count, 3);
+        assert_eq!(
+            storage
+                .list_messages(&session.id)
+                .expect("completed transcript")
+                .into_iter()
+                .map(|message| message.id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                prior_assistant.id.clone(),
+                failed_message.id.clone(),
+                marker.id.clone(),
+            ])
+        );
+        assert_eq!(
+            storage
+                .get_session_draft("user-1", &session.id)
+                .expect("draft after activation")
+                .content,
+            "draft stays untouched"
+        );
+        let completed_rollover = storage
+            .context_rollover_for_retry_run(&retry_run.id)
+            .expect("completed rollover lookup")
+            .expect("completed rollover");
+        assert_eq!(completed_rollover.state, "active");
+        assert_eq!(
+            completed_rollover.candidate_native_session_id.as_deref(),
+            Some("native-clean")
+        );
+        assert!(completed_rollover.activated_at.is_some());
+        let completed_run = storage
+            .get_durable_chat_run(&retry_run.id)
+            .expect("completed run lookup")
+            .expect("completed run");
+        assert_eq!(completed_run.status, "completed");
+        assert!(!completed_run.auto_resume);
+        assert!(completed_run.completed_at.is_some());
+        let completed_follow_up = storage
+            .get_durable_chat_run(&follow_up_run.id)
+            .expect("follow-up run lookup")
+            .expect("follow-up run");
+        assert_eq!(completed_follow_up.status, "running");
+        assert_eq!(
+            completed_follow_up.user_message_id.as_deref(),
+            Some(failed_message.id.as_str())
+        );
+        assert_eq!(
+            completed_follow_up.native_session_id.as_deref(),
+            Some("native-clean")
+        );
+        assert_eq!(completed_follow_up.prompt, failed_message.content);
+
+        assert!(
+            !storage
+                .complete_context_rollover(
+                    &rollover.id,
+                    &retry_run.id,
+                    "native-clean",
+                    &completed_session,
+                    &marker,
+                    None,
+                    Some(&follow_up_run),
+                )
+                .expect("repeat completion is a no-op")
+        );
+        assert!(
+            !storage
+                .set_context_rollover_candidate(
+                    &rollover.id,
+                    &retry_run.id,
+                    "native-after-completion",
+                )
+                .expect("late thread event is ignored")
+        );
+        assert_eq!(
+            storage
+                .list_messages(&session.id)
+                .expect("final transcript")
+                .len(),
+            3
+        );
+        assert_eq!(
+            storage
+                .get_session(&session.id)
+                .expect("final session lookup")
+                .expect("final session")
+                .native_session_id
+                .as_deref(),
+            Some("native-clean")
         );
 
         drop(storage);
@@ -3342,6 +6362,7 @@ mod tests {
                 output: 2_700,
                 cache_creation: 0,
                 cache_read: 121,
+                reasoning: 0,
                 cost_usd: 0.0,
             }),
             ..Default::default()
@@ -3364,6 +6385,85 @@ mod tests {
         let api_value = serde_json::to_value(&restored).expect("serialize session");
         assert_eq!(api_value["token_usage"]["used"], 4_321);
         assert_eq!(api_value["fast"], true);
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn board_scope_round_trips_but_is_hidden_from_discovery_and_search() {
+        let (storage, root) = temporary_storage("board-session-scope");
+        let mut ordinary = test_session("ordinary-session", true);
+        ordinary.title = "ordinary searchable conversation".to_string();
+        let mut board = test_session("board-session", true);
+        board.title = "board searchable conversation".to_string();
+        board.board_session = true;
+        board.board_run_id = Some("run-1".to_string());
+        board.board_task_id = Some("task-1".to_string());
+        for session in [&ordinary, &board] {
+            storage.upsert_session(session).expect("upsert session");
+            storage
+                .append_message(
+                    &session.id,
+                    &test_message(
+                        &format!("{}-message", session.id),
+                        MessageRole::User,
+                        &format!("{} searchable", session.id),
+                        0,
+                    ),
+                )
+                .expect("append message");
+        }
+
+        let restored = storage
+            .get_session(&board.id)
+            .expect("board query")
+            .expect("board session");
+        assert!(restored.board_session);
+        assert_eq!(restored.board_run_id.as_deref(), Some("run-1"));
+        assert_eq!(restored.board_task_id.as_deref(), Some("task-1"));
+        assert_eq!(
+            storage
+                .list_sessions()
+                .expect("visible sessions")
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![ordinary.id.clone()]
+        );
+        assert!(
+            storage
+                .list_sessions_including_board()
+                .expect("raw sessions")
+                .iter()
+                .any(|session| session.id == board.id)
+        );
+        assert_eq!(
+            storage
+                .list_sessions_for_project("/tmp/project")
+                .expect("project sessions")
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![ordinary.id.clone()]
+        );
+        assert_eq!(
+            storage
+                .search_messages("searchable", 10)
+                .expect("conversation search")
+                .into_iter()
+                .map(|(session, _)| session.id)
+                .collect::<Vec<_>>(),
+            vec![ordinary.id]
+        );
+
+        // A newer board hit must not consume the result limit and hide an
+        // older ordinary conversation from user-facing search.
+        let limited = storage
+            .search_messages("searchable", 1)
+            .expect("limited conversation search");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].0.id, "ordinary-session");
 
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");
@@ -3837,6 +6937,26 @@ mod tests {
         assert_eq!(failed.status, "failed");
         assert_eq!(failed.last_error.as_deref(), Some("provider exited"));
         assert!(failed.completed_at.is_some());
+
+        assert!(
+            storage
+                .update_durable_chat_run_error("failed", "invalid body")
+                .expect("persist structured provider error")
+        );
+        assert!(
+            storage
+                .mark_durable_chat_run_failed("failed", "provider run failed")
+                .expect("repeat generic failure finalization")
+        );
+        let failed = storage
+            .get_durable_chat_run("failed")
+            .expect("get re-finalized failure")
+            .expect("re-finalized failed run");
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("invalid body"),
+            "generic terminalization must not erase the actionable provider error"
+        );
 
         assert!(
             storage

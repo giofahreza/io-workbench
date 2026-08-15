@@ -224,6 +224,205 @@ mod tests {
     }
 
     #[test]
+    fn chat_context_recovery_blocks_normal_send_and_retries_with_a_fresh_request() {
+        let source = asset_text("app.js");
+        let remember_recovery = source
+            .split_once("function rememberChatRecovery(sessionId, recovery) {")
+            .map(|(_, rest)| rest)
+            .expect("chat recovery state helper")
+            .split_once("\n}\n")
+            .map(|(body, _)| body)
+            .expect("chat recovery state helper end");
+        let submit_handler = source
+            .split_once("qs(\"#chat-form\").addEventListener(\"submit\", async (event) => {")
+            .map(|(_, rest)| rest)
+            .expect("chat submit handler");
+
+        assert!(source.contains(
+            "return Boolean(recovery && [\"required\", \"failed\", \"starting\"].includes(recovery.state));"
+        ));
+        assert!(source.contains("const requestId = chatRecoveryRequestId();"));
+        assert!(source.contains("recovery.requestId = requestId;"));
+        assert!(!source.contains("recovery.requestId ||= chatRecoveryRequestId();"));
+        assert!(source.contains(
+            "const attemptIsCurrent = () => state.chatRecoveryBySession[sid] === recovery"
+        ));
+        assert_eq!(
+            source.matches("if (!attemptIsCurrent()) return;").count(),
+            2
+        );
+        assert!(source.contains("if (responseState === \"failed\") {"));
+        assert!(source.contains("if (responseState !== \"starting\") {"));
+        assert!(source.contains("scheduleCompletedChatReconciliation(sid);"));
+        let recovery_request = source
+            .split_once("async function compactAndRetryChatContext(sessionId, button = null) {")
+            .map(|(_, rest)| rest)
+            .expect("compact and retry handler")
+            .split_once("\n}\n\nfunction chatEventSessionIds()")
+            .map(|(body, _)| body)
+            .expect("compact and retry handler end");
+        let starting_branch = recovery_request
+            .split_once("if (responseState !== \"starting\") {")
+            .map(|(_, rest)| rest)
+            .expect("non-starting response branch")
+            .split_once("ensureChatProcessing({ provider: \"codex\", sessionId: sid });")
+            .map(|(_, tail)| tail)
+            .expect("starting processing branch");
+        assert!(starting_branch.contains("updateProcessingLabel(\"Compacting context\");"));
+        assert!(source.contains("Clean-context retry failed"));
+        assert!(source.contains("Your original context mapping is still intact."));
+        assert!(remember_recovery.contains("clearChatProcessing();"));
+        assert!(remember_recovery.contains(
+            "rememberCurrentChatSession({ sessionId: sid, live: false, status: \"failed\" });"
+        ));
+        assert!(submit_handler.contains("if (chatRecoveryBlocksNormalSend(recovery)) {"));
+        assert!(
+            submit_handler.contains("Compact & retry this chat before sending another message.")
+        );
+        assert!(source.contains("function chatRecoveryMatchesResponse(recovery, payload = {})"));
+        assert!(source.contains("return Boolean(expected && observed && expected === observed);"));
+        assert!(source.contains("sessionRecovery?.state === \"starting\" && chatRecoveryMatchesResponse(sessionRecovery, payload)"));
+        assert!(source.contains(
+            "async function reconcileSelectedChatRecoverySnapshot(generation = state.wsGeneration)"
+        ));
+        assert!(source.contains("/snapshot?limit=1`"));
+        assert!(
+            source.contains("reconcileSelectedChatRecoverySnapshot(generation).catch((error) => {")
+        );
+        assert!(source.contains("function chatRecoveryHasOptimisticTimelineState(sessionId)"));
+        assert!(source.contains("function handleChatRecoveryRequired(payload = {})"));
+        assert!(source.contains("writeLocalChatPromptDraft(rejectedPrompt, sessionId);"));
+        assert!(source.contains("scheduleChatPromptDraftSave();"));
+        assert!(source.contains(
+            "loadChatHistoryForSession(sessionId, { forceBottom: true }).catch((error) => {"
+        ));
+        assert!(source.contains("handleChatRecoveryRequired(payload);"));
+    }
+
+    #[test]
+    fn edit_from_here_stages_locally_and_replaces_only_on_submit() {
+        let source = asset_text("app.js");
+
+        assert!(source.contains("state.chatEditFromHere.staged = staged;"));
+        assert!(source.contains("renderStagedChatEdit(staged);"));
+        assert!(source.contains("const stagedEdit = stagedChatEdit();"));
+        assert!(source.contains("replace: true,"));
+        assert!(source.contains("draftContent,"));
+        assert!(source.contains("if (replacement.sourceHidden === true)"));
+        assert!(!source.contains("Create a new chat before this prompt?"));
+    }
+
+    #[test]
+    fn web_chat_sidebar_regressions_stay_fixed() {
+        let source = asset_text("app.js");
+        let project_sessions = source
+            .split_once("function sidebarProjectSessions(project) {")
+            .map(|(_, rest)| rest)
+            .expect("sidebar project sessions helper")
+            .split_once("\n}\n")
+            .map(|(body, _)| body)
+            .expect("sidebar project sessions helper end");
+
+        assert!(source.contains("function clearChatPromptInput()"));
+        assert!(source.contains("input.style.removeProperty(\"height\");"));
+        assert!(source.matches("clearChatPromptInput();").count() >= 2);
+        assert!(project_sessions.contains("(project.sessions || [])"));
+        assert!(!project_sessions.contains("state.sessions"));
+        assert!(!project_sessions.contains("slice(0, 12)"));
+    }
+
+    #[test]
+    fn board_task_chats_open_explicit_snapshots_without_joining_chat_history() {
+        let source = asset_text("app.js");
+        let opener = source
+            .split_once("async function openBoardTaskChat(taskId) {")
+            .map(|(_, rest)| rest)
+            .expect("board task chat opener")
+            .split_once("\n}\n\nfunction renderBoardCard")
+            .map(|(body, _)| body)
+            .expect("board task chat opener end");
+        let snapshot_merge = source
+            .split_once("async function loadChatHistoryForSession(sessionId, opts = {}) {")
+            .map(|(_, rest)| rest)
+            .expect("chat snapshot loader")
+            .split_once("\n}\n\nfunction scheduleChatReconciliation")
+            .map(|(body, _)| body)
+            .expect("chat snapshot loader end");
+
+        assert!(source.contains("task?.providerSessionId"));
+        assert!(source.contains("task?.provider_session_id"));
+        assert!(source.contains("data-board-open-chat"));
+        assert!(opener.contains("boardSession: true"));
+        assert!(opener.contains("forceSnapshot: true"));
+        assert!(source.contains("provider !== \"cursor\""));
+        assert!(
+            snapshot_merge
+                .contains("const boardSession = isBoardChatSession(snapshotSession, sessionId);")
+        );
+        assert!(snapshot_merge.contains("hideBoardChatSessionsFromLists();"));
+        assert!(source.contains("state.sessions = (payload.sessions || []).filter((session) => !isBoardChatSession(session));"));
+        assert!(source.contains(
+            "state.boardChatSessionIds.has(sessionId) && !isActiveChatSessionEvent({ sessionId })"
+        ));
+        assert!(source.contains("if (state.boardChatSessionIds.has(sessionId)) return false;"));
+        assert!(source.contains(
+            "state.projects = payload.projects || [];\n      hideBoardChatSessionsFromLists();"
+        ));
+        assert!(source.contains(
+            "state.projects = body.projects || [];\n  hideBoardChatSessionsFromLists();"
+        ));
+        assert!(source.contains("sessionIds: boardSessionId ? [boardSessionId] : []"));
+        assert!(
+            source
+                .contains("setBoardChatWsSubscription(options.boardSession === true ? id : \"\");")
+        );
+        assert!(source.contains(
+            "if (view !== \"chat\" && state.boardWsSessionId) setBoardChatWsSubscription(\"\");"
+        ));
+        assert!(source.contains("if (isSelectedBoardChatSession()) {\n      setBoardChatWsSubscription(state.chatSessionId);"));
+        assert!(source.contains("setBoardChatWsSubscription(destination.id);"));
+        assert!(
+            source.contains("if (payload.sessionId && !isActiveChatSessionEvent(payload)) return;")
+        );
+    }
+
+    #[test]
+    fn openapi_documents_board_scope_and_direct_snapshot_access() {
+        let source = asset_text("openapi.json");
+
+        assert!(source.contains("\"boardSession\""));
+        assert!(source.contains("\"boardRunId\""));
+        assert!(source.contains("\"boardTaskId\""));
+        assert!(source.contains("\"/api/sessions/{session_id}/snapshot\""));
+        assert!(source.contains("excluded from ordinary project/session discovery"));
+    }
+
+    #[test]
+    fn pinned_chat_sync_accepts_authoritative_empty_and_refreshes_live() {
+        let source = asset_text("app.js");
+
+        assert!(source.contains("response?.initialized === true"));
+        assert!(source.contains("response?.initialized == null && remotePinned.length > 0"));
+        assert!(source.contains("state.pinnedChatSessionsDirty"));
+        assert!(source.contains("if (state.pinnedChatSessionsDirty) {"));
+        assert!(source.contains("loadGeneration === state.pinnedChatSessionsLoadGeneration"));
+        assert!(source.contains("state.pinnedChatSessionsSaveChain"));
+        assert!(source.contains("document.addEventListener(\"visibilitychange\""));
+        assert!(source.contains("if (opening) {"));
+    }
+
+    #[test]
+    fn mobile_chat_composer_cannot_expand_past_viewport() {
+        let styles = asset_text("styles.css");
+
+        assert!(styles.contains("grid-template-columns: minmax(0, 1fr);"));
+        assert!(styles.contains(".chat-composer {"));
+        assert!(styles.contains("max-width: 100%;"));
+        assert!(styles.contains(".chat-controls > label:first-child {"));
+        assert!(styles.contains("grid-column: 1 / -1;"));
+    }
+
+    #[test]
     fn chat_override_options_match_mobile_order() {
         let html = asset_text("index.html");
 
@@ -253,6 +452,30 @@ mod tests {
             2
         );
         assert!(source.contains(r#"fast: chatFastValue(),"#));
+    }
+
+    #[test]
+    fn io_gateway_settings_match_the_mobile_configuration_contract() {
+        let html = asset_text("index.html");
+        let source = asset_text("app.js");
+
+        for id in [
+            "io-gateway-enabled",
+            "io-gateway-url",
+            "io-gateway-api-key",
+            "io-gateway-otp-secret",
+            "save-direct-ai",
+        ] {
+            assert!(html.contains(&format!(r#"id="{id}""#)), "missing {id}");
+        }
+        assert!(source.contains("/api/settings/direct-ai?revealSecrets=true"));
+        assert!(source.contains("API key is required when IO Gateway is selected."));
+        assert!(source.contains("Gateway URL must start with http:// or https://."));
+        assert!(source.contains("Secret OTP must be a valid Base32 TOTP secret."));
+        assert!(source.contains("mode: \"aiproxy\""));
+        assert!(source.contains("chatRuntime: useIoGateway ? \"io_gateway\" : \"native_cli\""));
+        assert!(source.contains("baseUrl: `${normalizedUrl}/claude`"));
+        assert!(source.contains("gatewayUrl: normalizedUrl"));
     }
 
     #[test]

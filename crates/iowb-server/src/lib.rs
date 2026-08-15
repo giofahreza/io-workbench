@@ -10,8 +10,11 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     env,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant, SystemTime},
 };
 
 use axum::{
@@ -30,7 +33,6 @@ use axum::{
     },
     routing::{any, delete, get, patch, post, put},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use iowb_core::{
@@ -42,7 +44,8 @@ use iowb_fs::FsError;
 use iowb_process::{ProcessError, ProcessEvent};
 use iowb_protocol::{
     ApiErrorBody, AuthStatusResponse, BatchCopyFileRequest, BatchDeleteFileRequest,
-    BatchRenameFileRequest, BrowseFilesystemResponse, ChatMessage, ChatRuntime, CopyFileRequest,
+    BatchRenameFileRequest, BrowseFilesystemResponse, ChatMessage, ChatRuntime,
+    CompactSessionContextRequest, CompactSessionContextResponse, CopyFileRequest,
     CreateFileRequest, CreateProjectRequest, CreateWorkspaceRequest, DeleteFcmTokenRequest,
     DeleteFileRequest, FcmTokenResponse, FileContentResponse, FileEntry, ForkSessionRequest,
     ForkSessionResponse, HealthResponse, HealthStatus, LoginRequest, MessageRole, MessagesResponse,
@@ -66,6 +69,7 @@ use tokio::{
 };
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, warn};
+use walkdir::WalkDir;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SESSION_MODEL_LENGTH: usize = 200;
@@ -73,6 +77,26 @@ const MAX_SESSION_TITLE_LENGTH: usize = 500;
 const MAX_UPLOAD_FILES: usize = 20;
 const MAX_UPLOAD_FILE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_UPLOAD_IMAGES: usize = 5;
+const PROJECT_WATCH_MAX_DIRECTORIES_PER_PROJECT: usize = 4_096;
+const PROJECT_WATCH_MAX_DIRECTORIES_TOTAL: usize = 12_000;
+const PROJECT_WATCH_EXCLUDED_DIRECTORIES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".gradle",
+    ".idea",
+    ".venv",
+    ".cache",
+    ".next",
+    ".io-workbench",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    "venv",
+    "Pods",
+    "DerivedData",
+];
 const MAX_UPLOAD_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_HISTORY: usize = 50;
@@ -98,10 +122,44 @@ const IO_GATEWAY_API_KEY_CREDENTIAL: &str = "io-workbench-io-gateway-api-key";
 const IO_GATEWAY_API_KEY_CREDENTIAL_TYPE: &str = "io_gateway_api_key";
 const IO_GATEWAY_OTP_CREDENTIAL: &str = "io-workbench-io-gateway-otp";
 const IO_GATEWAY_OTP_CREDENTIAL_TYPE: &str = "io_gateway_otp";
+const CODEX_TOKEN_USAGE_TAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const CODEX_TOKEN_USAGE_CACHE_MAX_ENTRIES: usize = 64;
+
+#[derive(Clone)]
+struct CachedCodexTokenUsage {
+    file_len: u64,
+    modified_at: Option<SystemTime>,
+    last_access: Instant,
+    snapshot: TokenUsageSnapshot,
+}
+
+#[derive(Default)]
+struct CodexTokenUsageCache {
+    entries: HashMap<PathBuf, CachedCodexTokenUsage>,
+    file_locks: HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
+}
+
+static CODEX_TOKEN_USAGE_CACHE: OnceLock<tokio::sync::Mutex<CodexTokenUsageCache>> =
+    OnceLock::new();
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let addr = config.socket_addr();
     let state = AppState::initialize(config).await?;
+    // This upgrade migration must finish before recovery can publish events
+    // and before the listener can serve ordinary project/session discovery.
+    agentic_board::backfill_legacy_board_sessions(&state)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                error
+                    .body
+                    .details
+                    .as_deref()
+                    .filter(|details| !details.is_empty())
+                    .map(|details| format!("{}: {details}", error.body.error))
+                    .unwrap_or(error.body.error)
+            )
+        })?;
     recover_interrupted_chat_runs(&state).await?;
     spawn_process_event_bridge(state.clone());
     spawn_project_watch_bridge(state.clone());
@@ -240,7 +298,7 @@ async fn synthesize_legacy_durable_runs(state: &AppState) -> anyhow::Result<()> 
 
     for session in state
         .storage
-        .list_sessions()?
+        .list_sessions_including_board()?
         .into_iter()
         .filter(|session| session.active && !durable_session_ids.contains(&session.id))
     {
@@ -362,6 +420,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/sessions/{session_id}/prompts", get(session_prompts))
         .route("/api/sessions/{session_id}/snapshot", get(session_snapshot))
         .route("/api/sessions/{session_id}/fork", post(fork_session))
+        .route(
+            "/api/sessions/{session_id}/compact-and-retry",
+            post(compact_and_retry_session_context),
+        )
         .route(
             "/api/sessions/{session_id}/draft",
             get(get_session_draft)
@@ -647,7 +709,10 @@ async fn runtime_metrics(State(state): State<AppState>) -> Result<Json<Value>> {
 }
 
 async fn runtime_metrics_payload(state: &AppState) -> Result<Value> {
-    let projects = state.projects.list(&state.sessions).await?;
+    // Metrics only needs the project count. Hydrating every project's external
+    // sessions here made a lightweight mobile connection perform a history
+    // synchronization before the UI requested any chat list.
+    let projects = state.storage.list_projects()?;
     let active_sessions = state.sessions.list_active().await;
     let processes = state.processes.list().await;
     let resources = system_resource_metrics(&state.config.workspace_root).await;
@@ -2257,9 +2322,11 @@ async fn files_upload(
 }
 
 async fn upload_images(
-    AxumPath(_project_name): AxumPath<String>,
+    State(state): State<AppState>,
+    AxumPath(project_name): AxumPath<String>,
     multipart: Multipart,
 ) -> Result<Json<Value>> {
+    let project = state.projects.find_by_name(&project_name)?;
     let (_fields, files) =
         collect_multipart_files(multipart, MAX_UPLOAD_IMAGES, MAX_UPLOAD_IMAGE_BYTES).await?;
     if files.is_empty() {
@@ -2269,6 +2336,7 @@ async fn upload_images(
         ));
     }
 
+    let upload_root = PathBuf::from(".io-workbench/chat-images");
     let mut images = Vec::new();
     for file in files {
         let mime_type = file
@@ -2281,10 +2349,20 @@ async fn upload_images(
                 "Invalid file type. Only JPEG, PNG, GIF, WebP, and SVG are allowed.",
             ));
         }
-        let data = BASE64_STANDARD.encode(&file.bytes);
+        let extension = Path::new(&file.file_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!(".{extension}"))
+            .unwrap_or_default();
+        let safe_name = format!("{}{}", new_id("chat-image"), extension);
+        let destination = upload_root.join(safe_name);
+        let entry = state
+            .files
+            .write_bytes(&project.path, &destination, &file.bytes)
+            .await?;
         images.push(serde_json::json!({
             "name": file.file_name,
-            "data": format!("data:{mime_type};base64,{data}"),
+            "path": entry.path,
             "size": file.bytes.len(),
             "mimeType": mime_type,
         }));
@@ -2863,10 +2941,11 @@ async fn get_sidebar_active_sessions(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<Value>> {
-    let pinned_sessions = load_sidebar_active_sessions(&state, &user.0.id)?;
+    let (pinned_sessions, initialized) = load_sidebar_active_sessions(&state, &user.0.id)?;
     Ok(Json(serde_json::json!({
         "success": true,
         "pinnedSessions": pinned_sessions,
+        "initialized": initialized,
     })))
 }
 
@@ -2875,10 +2954,14 @@ async fn set_sidebar_active_sessions(
     Extension(user): Extension<AuthenticatedUser>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>> {
-    let pinned_sessions = body
-        .get("pinnedSessions")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([]));
+    let pinned_sessions = filter_sidebar_active_sessions(
+        &state,
+        normalize_sidebar_active_sessions(
+            body.get("pinnedSessions")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        ),
+    )?;
     state
         .storage
         .set_setting(SIDEBAR_ACTIVE_SESSIONS_KEY, &pinned_sessions)?;
@@ -2889,102 +2972,81 @@ async fn set_sidebar_active_sessions(
     Ok(Json(serde_json::json!({
         "success": true,
         "pinnedSessions": pinned_sessions,
+        "initialized": true,
     })))
 }
 
 const SIDEBAR_ACTIVE_SESSIONS_KEY: &str = "sidebar-active-sessions";
 
-fn load_sidebar_active_sessions(state: &AppState, user_id: &str) -> Result<Value> {
+fn load_sidebar_active_sessions(state: &AppState, user_id: &str) -> Result<(Value, bool)> {
     let user_key = user_setting_key(user_id, SIDEBAR_ACTIVE_SESSIONS_KEY);
-    let user_key_suffix = format!(":{SIDEBAR_ACTIVE_SESSIONS_KEY}");
-
-    let mut candidates: Vec<_> = state
-        .storage
-        .list_settings()?
-        .into_iter()
-        .filter(|setting| {
-            setting.key == SIDEBAR_ACTIVE_SESSIONS_KEY
-                || setting.key == user_key
-                || (setting.key.starts_with("user:") && setting.key.ends_with(&user_key_suffix))
-        })
-        .filter(|setting| !sidebar_active_sessions_empty(&setting.value))
-        .collect();
-    candidates.sort_by(|a, b| {
-        (b.key == user_key)
-            .cmp(&(a.key == user_key))
-            .then_with(|| b.updated_at.cmp(&a.updated_at))
-    });
-
-    let pinned_sessions =
-        merge_sidebar_active_sessions(candidates.into_iter().map(|setting| setting.value));
-    if !sidebar_active_sessions_empty(&pinned_sessions) {
-        state
-            .storage
-            .set_setting(SIDEBAR_ACTIVE_SESSIONS_KEY, &pinned_sessions)?;
-        return Ok(pinned_sessions);
+    if let Some(value) = state.storage.get_setting(&user_key)? {
+        let pinned_sessions =
+            filter_sidebar_active_sessions(state, normalize_sidebar_active_sessions(value))?;
+        state.storage.set_setting(&user_key, &pinned_sessions)?;
+        return Ok((pinned_sessions, true));
     }
 
-    Ok(serde_json::json!([]))
+    if let Some(value) = state.storage.get_setting(SIDEBAR_ACTIVE_SESSIONS_KEY)? {
+        let pinned_sessions =
+            filter_sidebar_active_sessions(state, normalize_sidebar_active_sessions(value))?;
+        state.storage.set_setting(&user_key, &pinned_sessions)?;
+        return Ok((pinned_sessions, true));
+    }
+
+    Ok((serde_json::json!([]), false))
 }
 
-fn merge_sidebar_active_sessions(sources: impl IntoIterator<Item = Value>) -> Value {
-    let mut merged = Vec::new();
-    let mut seen = HashSet::new();
-    let mut fallback = None;
-
-    for source in sources {
-        match source {
-            Value::Array(items) => {
-                for item in items {
-                    if seen.insert(sidebar_active_session_key(&item)) {
-                        merged.push(item);
-                    }
-                }
-            }
-            value if fallback.is_none() => fallback = Some(value),
-            _ => {}
-        }
-    }
-
-    if merged.is_empty() {
-        fallback.unwrap_or_else(|| serde_json::json!([]))
-    } else {
-        Value::Array(merged)
-    }
-}
-
-fn sidebar_active_session_key(value: &Value) -> String {
-    let provider = value
-        .get("provider")
-        .or_else(|| value.get("cli"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let project_path = value
-        .get("projectPath")
-        .or_else(|| value.get("project_path"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+fn sidebar_active_session_key(value: &Value) -> Option<String> {
     let session_id = value
         .get("sessionId")
         .or_else(|| value.get("session_id"))
         .or_else(|| value.get("id"))
         .and_then(Value::as_str)
-        .unwrap_or("");
+        .or_else(|| value.as_str())
+        .unwrap_or("")
+        .trim();
 
-    if !session_id.is_empty() {
-        format!("{provider}\u{1f}{project_path}\u{1f}{session_id}")
-    } else {
-        value.to_string()
-    }
+    (!session_id.is_empty()).then(|| session_id.to_string())
 }
 
-fn sidebar_active_sessions_empty(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::Array(items) => items.is_empty(),
-        Value::Object(map) => map.is_empty(),
-        _ => false,
+fn normalize_sidebar_active_sessions(value: Value) -> Value {
+    let Value::Array(items) = value else {
+        return serde_json::json!([]);
+    };
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for item in items {
+        let Some(key) = sidebar_active_session_key(&item) else {
+            continue;
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        normalized.push(item);
     }
+    Value::Array(normalized)
+}
+
+fn filter_sidebar_active_sessions(state: &AppState, value: Value) -> Result<Value> {
+    let Value::Array(items) = value else {
+        return Ok(serde_json::json!([]));
+    };
+    let mut visible = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(session_id) = sidebar_active_session_key(&item) else {
+            continue;
+        };
+        if state
+            .storage
+            .get_session_summary(&session_id)?
+            .is_some_and(|session| session.board_session)
+        {
+            continue;
+        }
+        visible.push(item);
+    }
+    Ok(Value::Array(visible))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -3049,12 +3111,6 @@ struct ChatModelsQuery {
     provider: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GatewayChatModel {
-    value: String,
-    label: String,
-}
-
 /// Per-provider model catalog used by the chat UI's model picker. Native CLI
 /// mode reads local/fallback models, while IO Gateway mode reads the
 /// configured gateway catalog without failing the picker when unavailable.
@@ -3070,17 +3126,13 @@ async fn chat_provider_models(
     let runtime = configured_chat_runtime(&state, &user.0.id);
     let mut models: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    let mut gateway_labels = std::collections::BTreeMap::new();
     let mut gateway_available = true;
 
     if runtime == ChatRuntime::IoGateway && matches!(provider, Provider::Codex | Provider::Claude) {
         if let Some(gateway_models) = direct_ai_models_for_user(&state, &user.0.id, provider).await
         {
             for model in gateway_models {
-                gateway_labels
-                    .entry(model.value.trim().to_ascii_lowercase())
-                    .or_insert(model.label);
-                push_chat_model(&mut models, &mut seen, model.value);
+                push_chat_model(&mut models, &mut seen, model);
             }
         } else {
             gateway_available = false;
@@ -3114,13 +3166,9 @@ async fn chat_provider_models(
         }));
     }
     model_values.extend(models.into_iter().map(|value| {
-        let label = gateway_labels
-            .get(&value.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_else(|| value.clone());
         serde_json::json!({
+            "label": value.clone(),
             "value": value,
-            "label": label,
         })
     }));
 
@@ -3229,16 +3277,16 @@ async fn direct_ai_models_for_user(
     state: &AppState,
     user_id: &str,
     provider: Provider,
-) -> Option<Vec<GatewayChatModel>> {
+) -> Option<Vec<String>> {
     let config = chat_ai_config_for_user(state, user_id, provider);
     let raw = fetch_direct_ai_models(&config).await.unwrap_or_default();
     if raw.is_empty() {
         return None;
     }
-    let ids: Vec<GatewayChatModel> = raw
+    let ids: Vec<String> = raw
         .into_iter()
         .filter_map(|model| {
-            let value = model
+            model
                 .get("value")
                 .and_then(Value::as_str)
                 .map(str::to_string)
@@ -3247,13 +3295,7 @@ async fn direct_ai_models_for_user(
                         .get("label")
                         .and_then(Value::as_str)
                         .map(str::to_string)
-                })?;
-            let label = model
-                .get("label")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| value.clone());
-            Some(GatewayChatModel { value, label })
+                })
         })
         .collect();
     if ids.is_empty() { None } else { Some(ids) }
@@ -4191,8 +4233,7 @@ async fn session_messages(
     let limit = query
         .limit
         .unwrap_or(SESSION_HISTORY_DEFAULT_MESSAGES)
-        .max(1)
-        .min(SESSION_HISTORY_MAX_MESSAGES);
+        .clamp(1, SESSION_HISTORY_MAX_MESSAGES);
     let use_tail = query.tail || (query.limit.is_none() && query.offset.is_none());
     if use_tail {
         let (messages, total_count) = state
@@ -4228,8 +4269,7 @@ async fn session_prompts(
     let limit = query
         .limit
         .unwrap_or(SESSION_PROMPT_HISTORY_DEFAULT)
-        .max(1)
-        .min(SESSION_PROMPT_HISTORY_MAX);
+        .clamp(1, SESSION_PROMPT_HISTORY_MAX);
     let before = match (
         query.before_timestamp.as_deref(),
         query.before_id.as_deref(),
@@ -4253,7 +4293,7 @@ async fn session_prompts(
         .user_prompts_page_including_external(&session_id, limit, before)
         .await?;
     let oldest_cursor = prompts.first().map(|prompt| PromptHistoryCursor {
-        timestamp: prompt.timestamp.clone(),
+        timestamp: prompt.timestamp,
         id: prompt.id.clone(),
     });
     Ok(Json(PromptHistoryResponse {
@@ -4282,14 +4322,13 @@ async fn session_snapshot(
     let limit = query
         .limit
         .unwrap_or(SESSION_HISTORY_DEFAULT_MESSAGES)
-        .max(1)
-        .min(SESSION_HISTORY_MAX_MESSAGES);
+        .clamp(1, SESSION_HISTORY_MAX_MESSAGES);
     let session_before = state.sessions.get(&session_id).await?;
     let (mut messages, mut total_count) = state
         .sessions
         .messages_tail_including_external(&session_id, limit)
         .await?;
-    let session = state.sessions.get(&session_id).await?;
+    let mut session = state.sessions.get(&session_id).await?;
     // Finishing a run persists the assistant reply before marking the
     // session inactive. If that transition happened between the two reads,
     // fetch the messages once more so an inactive snapshot can never omit
@@ -4302,12 +4341,60 @@ async fn session_snapshot(
         messages = refreshed.0;
         total_count = refreshed.1;
     }
+    session.message_count = total_count;
     Ok(Json(SessionSnapshotResponse {
         session,
         has_more: messages.len() < total_count,
         messages: bound_session_messages_for_response(messages),
         total_count,
+        recovery: state.context_recovery(&session_id).await?,
     }))
+}
+
+async fn compact_and_retry_session_context(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<CompactSessionContextRequest>,
+) -> Result<(StatusCode, Json<CompactSessionContextResponse>)> {
+    validate_session_id(&session_id)?;
+    let request_id = request.request_id.trim();
+    if request_id.is_empty()
+        || request_id.len() > 200
+        || !request_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "requestId must be a non-empty stable identifier",
+        ));
+    }
+    let failed_message_id = request.failed_message_id.trim();
+    if failed_message_id.is_empty() || failed_message_id.len() > 1_000 {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "failedMessageId must be a non-empty message id",
+        ));
+    }
+    let session = state.sessions.get(&session_id).await?;
+    let runtime = session
+        .runtime
+        .unwrap_or_else(|| configured_chat_runtime(&state, &user.0.id));
+    let direct_ai_config = (runtime == ChatRuntime::IoGateway)
+        .then(|| direct_ai_runtime_config_for_user(&state, &user.0.id, Provider::Codex))
+        .flatten();
+    let response = state
+        .compact_and_retry_session_context(
+            &user.0.id,
+            &session_id,
+            failed_message_id,
+            request_id,
+            direct_ai_config,
+        )
+        .await?;
+    publish_projects(&state).await;
+    Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 async fn fork_session(
@@ -4336,8 +4423,25 @@ async fn fork_session(
             "requestId must be a non-empty stable identifier",
         ));
     }
+    if request
+        .draft_content
+        .as_ref()
+        .is_some_and(|content| content.len() > SESSION_DRAFT_MAX_BYTES)
+    {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            format!("draftContent exceeds {SESSION_DRAFT_MAX_BYTES} bytes"),
+        ));
+    }
     let response = state
-        .fork_session_before_message(&user.0.id, &session_id, before_message_id, request_id)
+        .fork_session_before_message(
+            &user.0.id,
+            &session_id,
+            before_message_id,
+            request_id,
+            request.replace,
+            request.draft_content.as_deref(),
+        )
         .await?;
     publish_projects(&state).await;
     Ok(Json(response))
@@ -4584,14 +4688,43 @@ async fn session_token_usage(
         })));
     }
 
-    let native_session_id = session
-        .native_session_id
-        .as_deref()
-        .unwrap_or(session.id.as_str());
-    let snapshot = match provider {
-        Provider::Codex => codex_token_usage(native_session_id).await?,
-        Provider::Claude => claude_token_usage(&session.project_path, native_session_id).await?,
-        Provider::Gemini => unreachable!(),
+    let persisted_usage = state
+        .storage
+        .latest_session_token_usage(&session.id)?
+        .or_else(|| session.token_usage.clone());
+    let snapshot = if let Some(usage) = persisted_usage {
+        TokenUsageSnapshot {
+            usage,
+            total: match provider {
+                Provider::Claude => env::var("CONTEXT_WINDOW")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(160_000),
+                Provider::Codex => 200_000,
+                Provider::Gemini => 0,
+            },
+        }
+    } else {
+        match provider {
+            Provider::Codex => {
+                let session_file = state
+                    .sessions
+                    .external_session_file(&session.id)
+                    .await
+                    .ok_or_else(|| {
+                        ServerError::new(StatusCode::NOT_FOUND, "Codex session file not found")
+                    })?;
+                codex_token_usage(&session_file).await?
+            }
+            Provider::Claude => {
+                let native_session_id = session
+                    .native_session_id
+                    .as_deref()
+                    .unwrap_or(session.id.as_str());
+                claude_token_usage(&session.project_path, native_session_id).await?
+            }
+            Provider::Gemini => unreachable!(),
+        }
     };
 
     state
@@ -4686,6 +4819,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
     let (direct_tx, mut direct_rx) =
         mpsc::channel::<WsServerEvent>(iowb_protocol::WS_EVENT_CHANNEL_CAPACITY);
     let mut hub_rx = state.ws_hub.subscribe();
+    let mut board_session_subscriptions = HashSet::<String>::new();
 
     let reader_connection_id = connection_id.clone();
     tokio::spawn(async move {
@@ -4730,17 +4864,31 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
     loop {
         tokio::select! {
             Some(command) = command_rx.recv() => {
-                handle_ws_command(&state, &direct_tx, &user, command).await;
+                handle_ws_command(
+                    &state,
+                    &direct_tx,
+                    &user,
+                    command,
+                    &mut board_session_subscriptions,
+                ).await;
             }
             Some(event) = direct_rx.recv() => {
-                if send_ws_event(&mut sender, event).await.is_err() {
+                if ws_event_visible_to_connection(
+                    &state,
+                    &event,
+                    &board_session_subscriptions,
+                ) && send_ws_event(&mut sender, event).await.is_err() {
                     break;
                 }
             }
             event = hub_rx.recv() => {
                 match event {
                     Ok(event) => {
-                        if send_ws_event(&mut sender, event).await.is_err() {
+                        if ws_event_visible_to_connection(
+                            &state,
+                            &event,
+                            &board_session_subscriptions,
+                        ) && send_ws_event(&mut sender, event).await.is_err() {
                             break;
                         }
                     }
@@ -4748,6 +4896,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
                         let warning = WsServerEvent::Error {
                             message: "websocket client fell behind".to_string(),
                             details: Some(format!("skipped {skipped} events")),
+                            session_id: None,
                         };
                         if send_ws_event(&mut sender, warning).await.is_err() {
                             break;
@@ -4768,6 +4917,7 @@ async fn handle_ws_command(
     direct_tx: &mpsc::Sender<WsServerEvent>,
     user: &iowb_protocol::UserProfile,
     command: WsClientCommand,
+    board_session_subscriptions: &mut HashSet<String>,
 ) {
     match command {
         WsClientCommand::Ping { nonce } => {
@@ -4778,14 +4928,23 @@ async fn handle_ws_command(
                 })
                 .await;
         }
-        WsClientCommand::Subscribe { .. } => {
+        WsClientCommand::Subscribe { session_ids, .. } => {
+            *board_session_subscriptions =
+                validated_board_session_subscriptions(state, session_ids);
             let _ = direct_tx
                 .send(WsServerEvent::ActiveSessions {
                     sessions: state.sessions.list_active().await,
                 })
                 .await;
             for event in state.replay_agent_events().await {
-                let _ = direct_tx.send(event).await;
+                if ws_event_visible_to_connection(state, &event, board_session_subscriptions) {
+                    // This command is handled by the same task that drains
+                    // `direct_tx`. Waiting on a full channel here would
+                    // deadlock a reconnect with many active replays.
+                    if direct_tx.try_send(event).is_err() {
+                        break;
+                    }
+                }
             }
         }
         WsClientCommand::StartSession {
@@ -4816,6 +4975,7 @@ async fn handle_ws_command(
             let direct_ai_config = (runtime == ChatRuntime::IoGateway)
                 .then(|| direct_ai_runtime_config_for_user(state, &user.id, provider))
                 .flatten();
+            let requested_session_id = session_id.clone();
             if let Err(error) = state
                 .start_agent_session(
                     provider,
@@ -4833,12 +4993,39 @@ async fn handle_ws_command(
                 )
                 .await
             {
-                let _ = direct_tx
-                    .send(WsServerEvent::Error {
-                        message: "failed to start session".to_string(),
-                        details: Some(error.to_string()),
-                    })
-                    .await;
+                let mut recovery_sent = false;
+                if let Some(session_id) = requested_session_id.as_deref() {
+                    match state.context_recovery(session_id).await {
+                        Ok(Some(recovery)) => {
+                            recovery_sent = direct_tx
+                                .send(WsServerEvent::ChatRecoveryRequired {
+                                    provider,
+                                    session_id: session_id.to_string(),
+                                    response_id: None,
+                                    recovery,
+                                })
+                                .await
+                                .is_ok();
+                        }
+                        Ok(None) => {}
+                        Err(recovery_error) => {
+                            warn!(
+                                session_id,
+                                error = %recovery_error,
+                                "failed to inspect chat context recovery after session start error"
+                            );
+                        }
+                    }
+                }
+                if !recovery_sent {
+                    let _ = direct_tx
+                        .send(WsServerEvent::Error {
+                            message: "failed to start session".to_string(),
+                            details: Some(error.to_string()),
+                            session_id: requested_session_id,
+                        })
+                        .await;
+                }
             }
         }
         WsClientCommand::AbortSession {
@@ -4851,6 +5038,7 @@ async fn handle_ws_command(
                     .send(WsServerEvent::Error {
                         message: "failed to abort session".to_string(),
                         details: Some(error.to_string()),
+                        session_id: Some(session_id),
                     })
                     .await;
             }
@@ -4865,6 +5053,7 @@ async fn handle_ws_command(
                     .send(WsServerEvent::Error {
                         message: "failed to write process input".to_string(),
                         details: Some(error.to_string()),
+                        session_id: None,
                     })
                     .await;
             }
@@ -4883,11 +5072,50 @@ async fn handle_ws_command(
                     .send(WsServerEvent::Error {
                         message: "failed to resize process".to_string(),
                         details: Some(error.to_string()),
+                        session_id: None,
                     })
                     .await;
             }
         }
     }
+}
+
+fn validated_board_session_subscriptions(
+    state: &AppState,
+    session_ids: Vec<String>,
+) -> HashSet<String> {
+    session_ids
+        .into_iter()
+        .map(|session_id| session_id.trim().to_string())
+        .filter(|session_id| !session_id.is_empty())
+        .filter(|session_id| state.sessions.is_board_session_cached(session_id))
+        .collect()
+}
+
+fn ws_event_session_id(event: &WsServerEvent) -> Option<&str> {
+    match event {
+        WsServerEvent::Error {
+            session_id: Some(session_id),
+            ..
+        }
+        | WsServerEvent::ChatRecoveryRequired { session_id, .. }
+        | WsServerEvent::SessionStatus { session_id, .. }
+        | WsServerEvent::SessionMetadata { session_id, .. }
+        | WsServerEvent::Output { session_id, .. } => Some(session_id),
+        _ => None,
+    }
+}
+
+fn ws_event_visible_to_connection(
+    state: &AppState,
+    event: &WsServerEvent,
+    board_session_subscriptions: &HashSet<String>,
+) -> bool {
+    let Some(session_id) = ws_event_session_id(event) else {
+        return true;
+    };
+    let board_session = state.sessions.is_board_session_cached(session_id);
+    !board_session || board_session_subscriptions.contains(session_id)
 }
 
 fn resolve_session_chat_runtime(
@@ -4900,8 +5128,8 @@ fn resolve_session_chat_runtime(
     if provider == Provider::Gemini {
         return ChatRuntime::NativeCli;
     }
-    if let Some(session) =
-        session_id.and_then(|session_id| state.storage.get_session(session_id).ok().flatten())
+    if let Some(session) = session_id
+        .and_then(|session_id| state.storage.get_session_summary(session_id).ok().flatten())
     {
         return session.runtime.unwrap_or_else(|| {
             if model
@@ -5145,6 +5373,11 @@ async fn send_fcm_chat_completed(
     latest_user_prompt: Option<&str>,
 ) -> anyhow::Result<()> {
     let session = state.sessions.get(session_id).await.ok();
+    if !chat_completion_push_allowed(session.as_ref()) {
+        // Board task activity is intentionally absent from ordinary chat
+        // navigation/history, so it must not create an ordinary chat push.
+        return Ok(());
+    }
     let run = state
         .storage
         .latest_durable_chat_run_for_session(session_id)?;
@@ -5206,6 +5439,10 @@ async fn send_fcm_chat_completed(
     Ok(())
 }
 
+fn chat_completion_push_allowed(session: Option<&SessionSummary>) -> bool {
+    !session.is_some_and(|session| session.board_session)
+}
+
 fn truncate_notification_text(value: &str, max_chars: usize) -> String {
     let mut output = String::new();
     for (index, ch) in value.chars().enumerate() {
@@ -5242,6 +5479,7 @@ fn spawn_process_event_bridge(state: AppState) {
                 }) => hub.publish(WsServerEvent::Error {
                     message: format!("process {process_id} failed"),
                     details: Some(message),
+                    session_id: None,
                 }),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "process event bridge lagged");
@@ -5253,12 +5491,11 @@ fn spawn_process_event_bridge(state: AppState) {
 }
 
 fn spawn_project_watch_bridge(state: AppState) {
-    let (tx, mut rx) = mpsc::channel::<(String, notify::Result<notify::Event>)>(256);
+    let (tx, mut rx) = mpsc::channel::<notify::Result<notify::Event>>(256);
     let debounce = Duration::from_millis(state.watch.debounce_ms());
 
     tokio::spawn(async move {
-        let mut watchers: HashMap<String, RecommendedWatcher> = HashMap::new();
-        let mut failed_watchers = HashMap::<String, Instant>::new();
+        let mut registration: Option<ProjectWatchRegistration> = None;
         let mut discovery = tokio::time::interval(Duration::from_secs(5));
         discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut pending_updates = HashMap::<String, HashSet<String>>::new();
@@ -5266,22 +5503,22 @@ fn spawn_project_watch_bridge(state: AppState) {
         loop {
             tokio::select! {
                 _ = discovery.tick() => {
-                    refresh_project_watchers(
-                        &state,
-                        &tx,
-                        &mut watchers,
-                        &mut failed_watchers,
-                    ).await;
+                    refresh_project_watcher(&state, &tx, &mut registration);
                 }
-                Some((project_path, event)) = rx.recv() => {
+                Some(event) = rx.recv() => {
                     match event {
                         Ok(event) => {
-                            let paths = interesting_project_watch_paths(&project_path, &event);
-                            if !paths.is_empty() {
-                                pending_updates
-                                    .entry(project_path)
-                                    .or_default()
-                                    .extend(paths);
+                            if let Some(registration) = registration.as_mut() {
+                                registration.watch_new_directories(&event);
+                                for (project_path, event) in registration.events_by_project(&event) {
+                                    let paths = interesting_project_watch_paths(&project_path, &event);
+                                    if !paths.is_empty() {
+                                        pending_updates
+                                            .entry(project_path)
+                                            .or_default()
+                                            .extend(paths);
+                                    }
+                                }
                             }
                         }
                         Err(error) => warn!(error = %error, "project watcher error"),
@@ -5303,101 +5540,231 @@ fn spawn_project_watch_bridge(state: AppState) {
     });
 }
 
-async fn refresh_project_watchers(
+struct ProjectWatchRegistration {
+    watcher: RecommendedWatcher,
+    project_roots: Vec<PathBuf>,
+    broad_roots: HashSet<PathBuf>,
+    watched_directories: HashSet<PathBuf>,
+}
+
+impl ProjectWatchRegistration {
+    fn events_by_project(&self, event: &notify::Event) -> Vec<(String, notify::Event)> {
+        let mut paths_by_project = HashMap::<PathBuf, Vec<PathBuf>>::new();
+        for path in &event.paths {
+            let Some(project_root) = self
+                .project_roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+            else {
+                continue;
+            };
+            paths_by_project
+                .entry(project_root.clone())
+                .or_default()
+                .push(path.clone());
+        }
+        paths_by_project
+            .into_iter()
+            .map(|(project_root, paths)| {
+                let mut scoped = event.clone();
+                scoped.paths = paths;
+                (project_root.display().to_string(), scoped)
+            })
+            .collect()
+    }
+
+    fn watch_new_directories(&mut self, event: &notify::Event) {
+        if !matches!(event.kind, notify::EventKind::Create(_)) {
+            return;
+        }
+        for path in &event.paths {
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(project_root) = self
+                .project_roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .cloned()
+            else {
+                continue;
+            };
+            if self.broad_roots.contains(&project_root)
+                || project_relative_path_is_excluded(&project_root, path)
+            {
+                continue;
+            }
+            register_filtered_project_tree(
+                &mut self.watcher,
+                &project_root,
+                path,
+                &mut self.watched_directories,
+            );
+        }
+    }
+}
+
+fn refresh_project_watcher(
     state: &AppState,
-    tx: &mpsc::Sender<(String, notify::Result<notify::Event>)>,
-    watchers: &mut HashMap<String, RecommendedWatcher>,
-    failed_watchers: &mut HashMap<String, Instant>,
+    tx: &mpsc::Sender<notify::Result<notify::Event>>,
+    registration: &mut Option<ProjectWatchRegistration>,
 ) {
-    let projects = match state.storage.list_projects() {
+    let mut project_roots = match state.storage.list_projects() {
         Ok(projects) => projects,
         Err(error) => {
             warn!(error = %error, "failed to load projects for watcher refresh");
             return;
         }
+    }
+    .into_iter()
+    .map(|project| PathBuf::from(project.path))
+    .filter(|path| path.is_dir())
+    .collect::<Vec<_>>();
+    project_roots.sort();
+    project_roots.dedup();
+    if registration
+        .as_ref()
+        .is_some_and(|current| current.project_roots == project_roots)
+    {
+        return;
+    }
+
+    let event_tx = tx.clone();
+    let Ok(mut watcher) = notify::recommended_watcher(move |event| {
+        // Registration can emit many events synchronously. Never wait for the
+        // async bridge while the notify thread is building its watch set.
+        let _ = event_tx.try_send(event);
+    }) else {
+        warn!("failed to create shared project watcher");
+        return;
     };
-    let desired = projects
+
+    let home_dir = env::var_os("HOME").map(PathBuf::from);
+    let broad_roots = project_roots
         .iter()
-        .map(|project| project.path.clone())
+        .filter(|project_root| {
+            project_watch_is_broad_root(
+                project_root,
+                &state.config.workspace_root,
+                home_dir.as_deref(),
+            )
+        })
+        .cloned()
         .collect::<HashSet<_>>();
-
-    watchers.retain(|path, _| desired.contains(path));
-    failed_watchers.retain(|path, _| desired.contains(path));
-
-    for project in projects {
-        if watchers.contains_key(&project.path) {
+    let mut watched_directories = HashSet::new();
+    for project_root in &project_roots {
+        if watched_directories.len() >= PROJECT_WATCH_MAX_DIRECTORIES_TOTAL {
+            warn!(
+                max_directories = PROJECT_WATCH_MAX_DIRECTORIES_TOTAL,
+                "project watch directory budget reached"
+            );
+            break;
+        }
+        if broad_roots.contains(project_root) {
+            if watcher
+                .watch(project_root, RecursiveMode::NonRecursive)
+                .is_ok()
+            {
+                watched_directories.insert(project_root.clone());
+            }
+            info!(
+                project_path = %project_root.display(),
+                "using root-only watch for broad project"
+            );
             continue;
         }
-        if failed_watchers
-            .get(&project.path)
-            .is_some_and(|retry_at| *retry_at > Instant::now())
+        register_filtered_project_tree(
+            &mut watcher,
+            project_root,
+            project_root,
+            &mut watched_directories,
+        );
+    }
+
+    info!(
+        projects = project_roots.len(),
+        directories = watched_directories.len(),
+        "project watcher index ready"
+    );
+    *registration = Some(ProjectWatchRegistration {
+        watcher,
+        project_roots,
+        broad_roots,
+        watched_directories,
+    });
+}
+
+fn register_filtered_project_tree(
+    watcher: &mut RecommendedWatcher,
+    project_root: &Path,
+    start: &Path,
+    watched_directories: &mut HashSet<PathBuf>,
+) {
+    let remaining_total =
+        PROJECT_WATCH_MAX_DIRECTORIES_TOTAL.saturating_sub(watched_directories.len());
+    let limit = PROJECT_WATCH_MAX_DIRECTORIES_PER_PROJECT.min(remaining_total);
+    if limit == 0 {
+        return;
+    }
+    let mut registered = 0usize;
+    let walker = WalkDir::new(start)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry.file_type().is_dir()
+                || !project_watch_directory_is_excluded(entry.file_name())
+        });
+    for entry in walker.filter_map(std::result::Result::ok) {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let path = entry.into_path();
+        if project_relative_path_is_excluded(project_root, &path)
+            || !watched_directories.insert(path.clone())
         {
             continue;
         }
-        let project_path = PathBuf::from(&project.path);
-        if !project_path.is_dir() {
+        if let Err(error) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+            watched_directories.remove(&path);
+            warn!(path = %path.display(), %error, "failed to watch project directory");
             continue;
         }
-        let broad_ancestor = state.config.workspace_root.starts_with(&project_path)
-            && state.config.workspace_root != project_path;
-        let requested_mode = if broad_ancestor {
-            RecursiveMode::NonRecursive
-        } else {
-            RecursiveMode::Recursive
-        };
-
-        let event_tx = tx.clone();
-        let event_project_path = project.path.clone();
-        match notify::recommended_watcher(move |event| {
-            // Watch registration can synchronously emit hundreds of events.
-            // Never block the notify thread waiting for this task to finish
-            // registering the watcher, otherwise a broad project can deadlock
-            // the entire server runtime.
-            let _ = event_tx.try_send((event_project_path.clone(), event));
-        }) {
-            Ok(mut watcher) => {
-                if broad_ancestor {
-                    warn!(
-                        project_path = %project_path.display(),
-                        workspace_root = %state.config.workspace_root.display(),
-                        "project is an ancestor of the workspace root; using root-only watch"
-                    );
-                }
-                if let Err(recursive_error) = watcher.watch(&project_path, requested_mode) {
-                    match watcher.watch(&project_path, RecursiveMode::NonRecursive) {
-                        Ok(()) => {
-                            warn!(
-                                project_path = %project_path.display(),
-                                error = %recursive_error,
-                                "recursive project watch unavailable; using root-only watch"
-                            );
-                        }
-                        Err(fallback_error) => {
-                            warn!(
-                                project_path = %project_path.display(),
-                                recursive_error = %recursive_error,
-                                fallback_error = %fallback_error,
-                                "failed to watch project"
-                            );
-                            failed_watchers
-                                .insert(project.path, Instant::now() + Duration::from_secs(5 * 60));
-                            continue;
-                        }
-                    }
-                }
-                failed_watchers.remove(&project.path);
-                watchers.insert(project.path, watcher);
-            }
-            Err(error) => {
-                warn!(
-                    project_path = %project_path.display(),
-                    error = %error,
-                    "failed to create project watcher"
-                );
-                failed_watchers.insert(project.path, Instant::now() + Duration::from_secs(5 * 60));
-            }
+        registered += 1;
+        if registered >= limit {
+            warn!(
+                project_path = %project_root.display(),
+                max_directories = limit,
+                "project watch directory budget reached for project"
+            );
+            break;
         }
     }
+}
+
+fn project_watch_directory_is_excluded(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| PROJECT_WATCH_EXCLUDED_DIRECTORIES.contains(&name))
+}
+
+fn project_watch_is_broad_root(
+    project_root: &Path,
+    workspace_root: &Path,
+    home_dir: Option<&Path>,
+) -> bool {
+    home_dir.is_some_and(|home| project_root == home)
+        || (workspace_root.starts_with(project_root) && workspace_root != project_root)
+}
+
+fn project_relative_path_is_excluded(project_root: &Path, path: &Path) -> bool {
+    path.strip_prefix(project_root)
+        .ok()
+        .into_iter()
+        .flat_map(Path::components)
+        .any(|component| project_watch_directory_is_excluded(component.as_os_str()))
 }
 
 fn is_interesting_watch_event(event: &notify::Event) -> bool {
@@ -6568,53 +6935,121 @@ async fn claude_token_usage(project_path: &str, session_id: &str) -> Result<Toke
     })
 }
 
-async fn codex_token_usage(session_id: &str) -> Result<TokenUsageSnapshot> {
-    let home = home_dir()
-        .ok_or_else(|| ServerError::new(StatusCode::NOT_FOUND, "home directory not found"))?;
-    let sessions_dir = home.join(".codex").join("sessions");
-    let session_id = session_id.to_string();
-    let session_file = tokio::task::spawn_blocking(move || {
-        walkdir::WalkDir::new(sessions_dir)
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-            .find(|entry| {
-                entry.file_type().is_file()
-                    && entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.contains(&session_id) && name.ends_with(".jsonl"))
-            })
-            .map(|entry| entry.into_path())
+async fn codex_token_usage(session_file: &Path) -> Result<TokenUsageSnapshot> {
+    let metadata = tokio::fs::metadata(session_file).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ServerError::with_details(
+                StatusCode::NOT_FOUND,
+                "Session file not found",
+                session_file.display().to_string(),
+            )
+        } else {
+            ServerError::with_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to inspect session token usage",
+                error.to_string(),
+            )
+        }
+    })?;
+    let file_len = metadata.len();
+    let modified_at = metadata.modified().ok();
+    let path = session_file.to_path_buf();
+    let cache = CODEX_TOKEN_USAGE_CACHE
+        .get_or_init(|| tokio::sync::Mutex::new(CodexTokenUsageCache::default()));
+    let file_lock = {
+        let mut cache = cache.lock().await;
+        if let Some(cached) = cache
+            .entries
+            .get_mut(session_file)
+            .filter(|cached| cached.file_len == file_len && cached.modified_at == modified_at)
+        {
+            cached.last_access = Instant::now();
+            return Ok(cached.snapshot.clone());
+        }
+        cache
+            .file_locks
+            .entry(path.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+
+    // Serialize reads of the same rollout while allowing unrelated sessions
+    // to load concurrently. Recheck after waiting so all duplicate requests
+    // reuse the first completed read.
+    let _file_guard = file_lock.lock().await;
+    {
+        let mut cache = cache.lock().await;
+        if let Some(cached) = cache
+            .entries
+            .get_mut(session_file)
+            .filter(|cached| cached.file_len == file_len && cached.modified_at == modified_at)
+        {
+            cached.last_access = Instant::now();
+            return Ok(cached.snapshot.clone());
+        }
+    }
+
+    let read_path = path.clone();
+    let content = tokio::task::spawn_blocking(move || {
+        read_file_tail(&read_path, CODEX_TOKEN_USAGE_TAIL_MAX_BYTES)
     })
     .await
     .map_err(|error| {
         ServerError::with_details(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to search Codex sessions",
+            "Failed to read session token usage",
             error.to_string(),
         )
     })?
-    .ok_or_else(|| ServerError::new(StatusCode::NOT_FOUND, "Codex session file not found"))?;
+    .map_err(|error| {
+        ServerError::with_details(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to read session token usage",
+            error.to_string(),
+        )
+    })?;
+    let snapshot = parse_codex_usage(&content);
+    let mut cache = cache.lock().await;
+    if cache.entries.len() >= CODEX_TOKEN_USAGE_CACHE_MAX_ENTRIES
+        && !cache.entries.contains_key(&path)
+    {
+        if let Some(oldest) = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_access)
+            .map(|(path, _)| path.clone())
+        {
+            cache.entries.remove(&oldest);
+            cache.file_locks.remove(&oldest);
+        }
+    }
+    cache.entries.insert(
+        path,
+        CachedCodexTokenUsage {
+            file_len,
+            modified_at,
+            last_access: Instant::now(),
+            snapshot: snapshot.clone(),
+        },
+    );
+    Ok(snapshot)
+}
 
-    let content = tokio::fs::read_to_string(&session_file)
-        .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ServerError::with_details(
-                    StatusCode::NOT_FOUND,
-                    "Session file not found",
-                    session_file.display().to_string(),
-                )
-            } else {
-                ServerError::with_details(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to read session token usage",
-                    error.to_string(),
-                )
-            }
-        })?;
-
-    Ok(parse_codex_usage(&content))
+fn read_file_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let start = file_len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(file_len.saturating_sub(start) as usize);
+    file.read_to_end(&mut bytes)?;
+    if start > 0 {
+        if let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=first_newline);
+        } else {
+            bytes.clear();
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn token_usage_response(snapshot: &TokenUsageSnapshot) -> Value {
@@ -6692,6 +7127,7 @@ fn parse_claude_usage(content: &str) -> SessionTokenUsage {
                 output,
                 cache_creation,
                 cache_read,
+                reasoning: 0,
                 cost_usd: usage
                     .get("cost_usd")
                     .or_else(|| usage.get("costUsd"))
@@ -6758,6 +7194,11 @@ fn parse_codex_usage(content: &str) -> TokenUsageSnapshot {
                     .unwrap_or(0),
                 cache_read: usage
                     .get("cached_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                reasoning: usage
+                    .get("reasoning_output_tokens")
+                    .or_else(|| usage.get("reasoning_tokens"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
                 cost_usd: usage
@@ -7656,6 +8097,491 @@ fn compat_path_key(path: &str) -> String {
 mod tests {
     use super::*;
 
+    async fn board_scope_test_state() -> (PathBuf, AppState) {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-server-board-ws-scope-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).expect("config directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+        (root, state)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn websocket_board_events_require_exact_validated_subscription() {
+        let (root, state) = board_scope_test_state().await;
+        let now = Utc::now();
+        for session in [
+            SessionSummary {
+                id: "board-chat".to_string(),
+                provider: Provider::Codex,
+                project_path: "/tmp/project".to_string(),
+                title: "Board chat".to_string(),
+                last_activity: now,
+                board_session: true,
+                board_run_id: Some("run-1".to_string()),
+                board_task_id: Some("task-1".to_string()),
+                ..Default::default()
+            },
+            SessionSummary {
+                id: "ordinary-chat".to_string(),
+                provider: Provider::Codex,
+                project_path: "/tmp/project".to_string(),
+                title: "Ordinary chat".to_string(),
+                last_activity: now,
+                ..Default::default()
+            },
+        ] {
+            state
+                .storage
+                .upsert_session(&session)
+                .expect("persist session");
+            state
+                .sessions
+                .remember_persisted_session(session)
+                .await
+                .expect("cache session");
+        }
+
+        let board_output = WsServerEvent::Output {
+            provider: Provider::Codex,
+            session_id: "board-chat".to_string(),
+            response_id: Some("response-board".to_string()),
+            sequence: Some(1),
+            content: "board output".to_string(),
+            done: false,
+        };
+        let board_error = WsServerEvent::Error {
+            message: "board error".to_string(),
+            details: None,
+            session_id: Some("board-chat".to_string()),
+        };
+        let ordinary_output = WsServerEvent::Output {
+            provider: Provider::Codex,
+            session_id: "ordinary-chat".to_string(),
+            response_id: Some("response-ordinary".to_string()),
+            sequence: Some(1),
+            content: "ordinary output".to_string(),
+            done: false,
+        };
+
+        let none = HashSet::new();
+        assert!(!ws_event_visible_to_connection(
+            &state,
+            &board_output,
+            &none
+        ));
+        assert!(!ws_event_visible_to_connection(&state, &board_error, &none));
+        assert!(ws_event_visible_to_connection(
+            &state,
+            &ordinary_output,
+            &none
+        ));
+
+        let accepted = validated_board_session_subscriptions(
+            &state,
+            vec![
+                " board-chat ".to_string(),
+                "ordinary-chat".to_string(),
+                "missing-chat".to_string(),
+            ],
+        );
+        assert_eq!(accepted, HashSet::from(["board-chat".to_string()]));
+        assert!(ws_event_visible_to_connection(
+            &state,
+            &board_output,
+            &accepted
+        ));
+        assert!(ws_event_visible_to_connection(
+            &state,
+            &board_error,
+            &accepted
+        ));
+
+        drop(state);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_websocket_send_returns_context_recovery_descriptor() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-server-context-recovery-ws-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+
+        let now = Utc::now();
+        let session_id = "session-needs-recovery";
+        let failed_message_id = "message-failed";
+        let session = SessionSummary {
+            id: session_id.to_string(),
+            provider: Provider::Codex,
+            project_path: project.display().to_string(),
+            title: "Recover this chat".to_string(),
+            message_count: 1,
+            last_activity: now,
+            active: false,
+            runtime: Some(ChatRuntime::IoGateway),
+            ..Default::default()
+        };
+        state
+            .storage
+            .upsert_session(&session)
+            .expect("persist session");
+        state
+            .sessions
+            .remember_persisted_session(session)
+            .await
+            .expect("cache session");
+        state
+            .storage
+            .append_message(
+                session_id,
+                &ChatMessage {
+                    id: failed_message_id.to_string(),
+                    role: MessageRole::User,
+                    content: "continue".to_string(),
+                    timestamp: now,
+                    metadata: Value::Null,
+                },
+            )
+            .expect("persist failed prompt");
+        let mut failed_run = iowb_storage::StoredDurableChatRun::new(
+            "run-failed",
+            Some("user-1".to_string()),
+            session_id,
+            Provider::Codex.as_str(),
+            "continue",
+            project.display().to_string(),
+        );
+        failed_run.user_message_id = Some(failed_message_id.to_string());
+        state
+            .storage
+            .create_durable_chat_run(&failed_run)
+            .expect("persist failed run");
+        state
+            .storage
+            .mark_durable_chat_run_failed(&failed_run.id, "invalid body")
+            .expect("mark run failed");
+
+        let (direct_tx, mut direct_rx) = mpsc::channel(4);
+        let mut board_session_subscriptions = HashSet::new();
+        handle_ws_command(
+            &state,
+            &direct_tx,
+            &iowb_protocol::UserProfile {
+                id: "user-1".to_string(),
+                username: "test-user".to_string(),
+                email: None,
+                created_at: now,
+            },
+            WsClientCommand::StartSession {
+                provider: Provider::Codex,
+                project_path: project.display().to_string(),
+                prompt: "another message".to_string(),
+                session_id: Some(session_id.to_string()),
+                model: Some("cod:gpt-5.6-sol".to_string()),
+                effort: None,
+                mode: None,
+                thinking: None,
+                fast: None,
+            },
+            &mut board_session_subscriptions,
+        )
+        .await;
+
+        let event = direct_rx.recv().await.expect("recovery event");
+        match event {
+            WsServerEvent::ChatRecoveryRequired {
+                provider,
+                session_id: observed_session_id,
+                response_id,
+                recovery,
+            } => {
+                assert_eq!(provider, Provider::Codex);
+                assert_eq!(observed_session_id, session_id);
+                assert_eq!(response_id, None);
+                assert_eq!(recovery.state, "required");
+                assert_eq!(recovery.failed_message_id, failed_message_id);
+            }
+            other => panic!("expected chat recovery event, got {other:?}"),
+        }
+        assert!(
+            direct_rx.try_recv().is_err(),
+            "generic error must be suppressed"
+        );
+
+        drop(state);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_image_upload_writes_project_file_and_returns_path_only() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-server-chat-image-upload-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+        state.projects.add_project(&project).expect("add project");
+        let project_name = project
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("project name")
+            .to_string();
+
+        let boundary = "iowb-chat-image-boundary";
+        let image_bytes = b"\x89PNG\r\n\x1a\nnot-real-but-path-safe";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"screen.png\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(image_bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_state = state.clone();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, build_router(server_state)).await });
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/api/projects/{project_name}/upload-images"
+            ))
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .expect("upload response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let response_bytes = response.bytes().await.expect("response bytes");
+        let payload: Value = serde_json::from_slice(&response_bytes).expect("response json");
+        let images = payload
+            .get("images")
+            .and_then(Value::as_array)
+            .expect("images array");
+        assert_eq!(images.len(), 1);
+        let image = &images[0];
+        let returned_path = image
+            .get("path")
+            .and_then(Value::as_str)
+            .expect("returned image path");
+        assert!(returned_path.starts_with(".io-workbench/chat-images/chat-image_"));
+        assert!(returned_path.ends_with(".png"));
+        assert!(!returned_path.starts_with("data:"));
+        assert!(image.get("data").is_none());
+        assert!(image.get("base64").is_none());
+        assert!(!String::from_utf8_lossy(&response_bytes).contains(";base64,"));
+        assert_eq!(
+            std::fs::read(project.join(returned_path)).expect("saved image"),
+            image_bytes
+        );
+
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sidebar_active_sessions_preserve_order_and_deduplicate_by_session_id() {
+        let normalized = normalize_sidebar_active_sessions(serde_json::json!([
+            {"sessionId": "session-b", "projectPath": "/work/b", "provider": "codex"},
+            {"sessionId": "session-a", "projectPath": "/work/a", "provider": "claude"},
+            {"sessionId": "session-b", "projectPath": "/other", "provider": "gemini"},
+            {"projectPath": "/missing-id"},
+            "session-c"
+        ]));
+
+        let sessions = normalized.as_array().expect("normalized pinned sessions");
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(
+            sessions
+                .iter()
+                .filter_map(sidebar_active_session_key)
+                .collect::<Vec<_>>(),
+            ["session-b", "session-a", "session-c"]
+        );
+        assert_eq!(
+            sessions[0].get("projectPath").and_then(Value::as_str),
+            Some("/work/b")
+        );
+    }
+
+    #[test]
+    fn board_chat_completion_does_not_create_ordinary_push_notification() {
+        let ordinary = SessionSummary {
+            id: "ordinary-chat".to_string(),
+            ..Default::default()
+        };
+        let board = SessionSummary {
+            id: "board-chat".to_string(),
+            board_session: true,
+            board_run_id: Some("run-1".to_string()),
+            ..Default::default()
+        };
+
+        assert!(chat_completion_push_allowed(None));
+        assert!(chat_completion_push_allowed(Some(&ordinary)));
+        assert!(!chat_completion_push_allowed(Some(&board)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sidebar_active_sessions_treat_user_empty_as_authoritative() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-server-sidebar-active-sessions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).expect("config directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+        state
+            .storage
+            .set_setting(
+                SIDEBAR_ACTIVE_SESSIONS_KEY,
+                &serde_json::json!([{"sessionId": "legacy-global"}]),
+            )
+            .expect("global setting");
+        state
+            .storage
+            .set_setting(
+                &user_setting_key("mobile-user", SIDEBAR_ACTIVE_SESSIONS_KEY),
+                &serde_json::json!([]),
+            )
+            .expect("user setting");
+
+        let (pinned_sessions, initialized) =
+            load_sidebar_active_sessions(&state, "mobile-user").expect("pinned sessions");
+
+        assert!(initialized);
+        assert_eq!(pinned_sessions, serde_json::json!([]));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sidebar_active_sessions_drop_board_chats() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-server-sidebar-board-sessions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).expect("config directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+        let session = SessionSummary {
+            id: "board-chat".to_string(),
+            provider: Provider::Codex,
+            project_path: "/tmp/project".to_string(),
+            title: "Board chat".to_string(),
+            last_activity: Utc::now(),
+            board_session: true,
+            board_run_id: Some("run-1".to_string()),
+            ..Default::default()
+        };
+        state
+            .storage
+            .upsert_session(&session)
+            .expect("board session");
+        state
+            .storage
+            .set_setting(
+                &user_setting_key("mobile-user", SIDEBAR_ACTIVE_SESSIONS_KEY),
+                &serde_json::json!([
+                    {"sessionId": "normal-chat"},
+                    {"sessionId": "board-chat"}
+                ]),
+            )
+            .expect("sidebar setting");
+
+        let (pinned, initialized) =
+            load_sidebar_active_sessions(&state, "mobile-user").expect("pinned sessions");
+        assert!(initialized);
+        assert_eq!(pinned, serde_json::json!([{"sessionId": "normal-chat"}]));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn bounds_pathological_history_for_clients_and_prioritizes_newest_messages() {
         let now = Utc::now();
@@ -7987,10 +8913,10 @@ mod tests {
         assert_eq!(
             model_values,
             [
-                ("gpt-5.6-sol", "GPT-5.6-Sol"),
-                ("cod:gpt-5.6-sol", "GPT-5.6-Sol (alias)"),
+                ("gpt-5.6-sol", "gpt-5.6-sol"),
+                ("cod:gpt-5.6-sol", "cod:gpt-5.6-sol"),
             ],
-            "gateway model ids must remain byte-for-byte selectable"
+            "gateway model ids must remain byte-for-byte visible and selectable"
         );
         assert_eq!(
             body.get("gatewayAvailable").and_then(Value::as_bool),
@@ -8222,6 +9148,28 @@ mod tests {
     }
 
     #[test]
+    fn bounded_codex_tail_keeps_complete_recent_token_record() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-codex-token-tail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temporary directory");
+        let path = root.join("rollout.jsonl");
+        let token_line = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"output_tokens":12,"total_tokens":42},"model_context_window":2000}}}"#;
+        std::fs::write(
+            &path,
+            format!("{}\n{token_line}\n{{}}\n", "x".repeat(32 * 1024)),
+        )
+        .expect("rollout");
+
+        let tail = read_file_tail(&path, token_line.len() as u64 + 128).expect("tail");
+        assert!(tail.len() < 1024);
+        let snapshot = parse_codex_usage(&tail);
+        assert_eq!(snapshot.usage.used, 42);
+        assert_eq!(snapshot.total, 2000);
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn sanitizes_repository_names() {
         assert_eq!(
             repository_name("https://github.com/example/io-workbench.git"),
@@ -8257,6 +9205,34 @@ mod tests {
             project_relative_watch_path(root, Path::new("/tmp/another/file.txt")),
             None,
         );
+    }
+
+    #[test]
+    fn project_watcher_bounds_home_and_generated_directories() {
+        let home = Path::new("/home/tester");
+        assert!(project_watch_is_broad_root(home, home, Some(home)));
+        assert!(project_watch_is_broad_root(
+            Path::new("/home"),
+            home,
+            Some(home),
+        ));
+        assert!(!project_watch_is_broad_root(
+            Path::new("/home/tester/project"),
+            home,
+            Some(home),
+        ));
+        assert!(project_relative_path_is_excluded(
+            Path::new("/work/project"),
+            Path::new("/work/project/target/debug/build"),
+        ));
+        assert!(project_relative_path_is_excluded(
+            Path::new("/work/project"),
+            Path::new("/work/project/web/node_modules/package"),
+        ));
+        assert!(!project_relative_path_is_excluded(
+            Path::new("/work/project"),
+            Path::new("/work/project/src/features"),
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -266,8 +266,41 @@ pub struct SessionTokenUsage {
     pub cache_creation: u64,
     #[serde(rename = "cacheRead")]
     pub cache_read: u64,
+    #[serde(rename = "reasoning")]
+    pub reasoning: u64,
     #[serde(rename = "costUsd")]
     pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenUsageCompleteness {
+    #[default]
+    Complete,
+    Partial,
+    Missing,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionLifetimeTokenUsage {
+    pub total: u64,
+    #[serde(rename = "input")]
+    pub input: u64,
+    #[serde(rename = "output")]
+    pub output: u64,
+    #[serde(rename = "cacheCreation")]
+    pub cache_creation: u64,
+    #[serde(rename = "cacheRead")]
+    pub cache_read: u64,
+    pub reasoning: u64,
+    #[serde(rename = "costUsd")]
+    pub cost_usd: f64,
+    pub completeness: TokenUsageCompleteness,
+    #[serde(rename = "partialAttempts")]
+    pub partial_attempts: u64,
+    #[serde(rename = "missingAttempts")]
+    pub missing_attempts: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -348,6 +381,22 @@ pub struct SessionSummary {
     pub provider: Provider,
     #[serde(default)]
     pub external: bool,
+    /// Sessions created by the agentic Kanban board are directly addressable
+    /// chats, but are kept out of ordinary project/session discovery.
+    #[serde(default, rename = "boardSession")]
+    pub board_session: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "boardRunId"
+    )]
+    pub board_run_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "boardTaskId"
+    )]
+    pub board_task_id: Option<String>,
     /// Native CLI thread/session id associated with an internal workbench
     /// session. This is persisted by the server but intentionally omitted
     /// from API payloads.
@@ -395,6 +444,12 @@ pub struct SessionSummary {
     pub received_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<SessionTokenUsage>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "lifetimeTokenUsage"
+    )]
+    pub lifetime_token_usage: Option<SessionLifetimeTokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -454,6 +509,63 @@ pub struct SessionSnapshotResponse {
     pub messages: Vec<ChatMessage>,
     pub has_more: bool,
     pub total_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ChatContextRecovery>,
+}
+
+impl SessionSnapshotResponse {
+    pub fn without_recovery(
+        session: SessionSummary,
+        messages: Vec<ChatMessage>,
+        has_more: bool,
+        total_count: usize,
+    ) -> Self {
+        Self {
+            session,
+            messages,
+            has_more,
+            total_count,
+            recovery: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatContextRecovery {
+    pub code: String,
+    pub state: String,
+    pub message: String,
+    #[serde(rename = "failedMessageId")]
+    pub failed_message_id: String,
+    #[serde(
+        rename = "observedBytes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_bytes: Option<u64>,
+    #[serde(rename = "limitBytes")]
+    pub limit_bytes: u64,
+    #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactSessionContextRequest {
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    #[serde(rename = "failedMessageId")]
+    pub failed_message_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactSessionContextResponse {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    #[serde(rename = "responseId")]
+    pub response_id: String,
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -477,6 +589,14 @@ pub struct ForkSessionRequest {
     pub before_message_id: String,
     #[serde(rename = "requestId")]
     pub request_id: String,
+    #[serde(default)]
+    pub replace: bool,
+    #[serde(
+        rename = "draftContent",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub draft_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,6 +611,8 @@ pub struct ForkSessionResponse {
     pub native_forked: bool,
     #[serde(rename = "filesUnchanged")]
     pub files_unchanged: bool,
+    #[serde(rename = "sourceHidden")]
+    pub source_hidden: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1410,6 +1532,11 @@ pub enum WsClientCommand {
     Subscribe {
         #[serde(default)]
         topics: Vec<String>,
+        /// Board-owned chats are excluded from the ordinary session stream.
+        /// A client must name the exact board session it has opened before
+        /// live or replayed chat events for that session are delivered.
+        #[serde(default, rename = "sessionIds")]
+        session_ids: Vec<String>,
     },
     StartSession {
         provider: Provider,
@@ -1463,6 +1590,17 @@ pub enum WsServerEvent {
         message: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<String>,
+        #[serde(rename = "sessionId", default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    ChatRecoveryRequired {
+        provider: Provider,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "responseId", skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        #[serde(flatten)]
+        recovery: ChatContextRecovery,
     },
     LoadingProgress {
         message: String,
@@ -1521,6 +1659,8 @@ pub enum WsServerEvent {
         first_user_at: Option<DateTime<Utc>>,
         #[serde(rename = "tokenUsage", skip_serializing_if = "Option::is_none")]
         token_usage: Option<SessionTokenUsage>,
+        #[serde(rename = "lifetimeTokenUsage", skip_serializing_if = "Option::is_none")]
+        lifetime_token_usage: Option<SessionLifetimeTokenUsage>,
         #[serde(
             rename = "responseId",
             default,
@@ -1609,7 +1749,9 @@ fn default_terminal_rows() -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionMode, SessionSummary, WsClientCommand, session_title_from_prompt};
+    use super::{
+        ForkSessionRequest, SessionMode, SessionSummary, WsClientCommand, session_title_from_prompt,
+    };
     use serde_json::json;
 
     #[test]
@@ -1641,6 +1783,36 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_board_session_scope_uses_camel_case_and_defaults_empty() {
+        let scoped: WsClientCommand = serde_json::from_value(json!({
+            "type": "subscribe",
+            "topics": ["sessions"],
+            "sessionIds": ["board-session"]
+        }))
+        .expect("deserialize scoped subscription");
+        match scoped {
+            WsClientCommand::Subscribe {
+                topics,
+                session_ids,
+            } => {
+                assert_eq!(topics, ["sessions"]);
+                assert_eq!(session_ids, ["board-session"]);
+            }
+            _ => panic!("expected subscribe"),
+        }
+
+        let ordinary: WsClientCommand = serde_json::from_value(json!({
+            "type": "subscribe",
+            "topics": ["sessions"]
+        }))
+        .expect("deserialize ordinary subscription");
+        match ordinary {
+            WsClientCommand::Subscribe { session_ids, .. } => assert!(session_ids.is_empty()),
+            _ => panic!("expected subscribe"),
+        }
+    }
+
+    #[test]
     fn session_summary_serializes_explicit_fast_state() {
         let enabled = SessionSummary {
             fast: Some(true),
@@ -1666,6 +1838,41 @@ mod tests {
                 .get("fast")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn board_session_summary_uses_camel_case_scope_fields() {
+        let summary = SessionSummary {
+            board_session: true,
+            board_run_id: Some("run-1".to_string()),
+            board_task_id: Some("task-1".to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(summary).expect("serialize board session");
+        assert_eq!(value["boardSession"], true);
+        assert_eq!(value["boardRunId"], "run-1");
+        assert_eq!(value["boardTaskId"], "task-1");
+    }
+
+    #[test]
+    fn fork_session_request_defaults_to_non_replacing_and_accepts_edited_draft() {
+        let legacy: ForkSessionRequest = serde_json::from_value(json!({
+            "beforeMessageId": "message-1",
+            "requestId": "request-1"
+        }))
+        .expect("legacy fork request");
+        assert!(!legacy.replace);
+        assert_eq!(legacy.draft_content, None);
+
+        let replacement: ForkSessionRequest = serde_json::from_value(json!({
+            "beforeMessageId": "message-1",
+            "requestId": "request-2",
+            "replace": true,
+            "draftContent": "edited prompt"
+        }))
+        .expect("replacement fork request");
+        assert!(replacement.replace);
+        assert_eq!(replacement.draft_content.as_deref(), Some("edited prompt"));
     }
 
     #[test]

@@ -7,7 +7,7 @@
     <meta name="theme-color" content="#0f766e" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20260812-06" />
+    <link rel="stylesheet" href="/styles.css?v=20260814-08" />
   </head>
   <body class="auth-pending">
     <aside class="sidebar">
@@ -739,15 +739,52 @@
               </section>
 
               <section class="settings-tab-panel" data-settings-panel="direct-ai">
-                <article class="settings-card">
+                <article class="settings-card io-gateway-card">
                   <header class="settings-card-header">
                     <h3>IO Gateway</h3>
-                    <span>Gateway configuration and available model metadata.</span>
+                    <span>Effective gateway and authentication status.</span>
                   </header>
-                  <div class="settings-action-grid">
-                    <button id="load-direct-ai" type="button">IO Gateway</button>
-                    <button id="load-direct-ai-models" type="button">AI Models</button>
-                  </div>
+                  <dl id="io-gateway-summary" class="io-gateway-summary" aria-live="polite">
+                    <div><dt>Chat runtime</dt><dd>Loading</dd></div>
+                    <div><dt>Mode</dt><dd>Loading</dd></div>
+                    <div><dt>Gateway URL</dt><dd>Loading</dd></div>
+                    <div><dt>API Key</dt><dd>Loading</dd></div>
+                    <div><dt>Secret OTP</dt><dd>Loading</dd></div>
+                    <div><dt>Model</dt><dd>Loading</dd></div>
+                    <div><dt>Runtime</dt><dd>Loading</dd></div>
+                  </dl>
+                  <form id="io-gateway-form" class="stack-form io-gateway-form">
+                    <label class="toolbar-check io-gateway-runtime-toggle">
+                      <input id="io-gateway-enabled" type="checkbox" />
+                      <span>Use IO Gateway for chat</span>
+                    </label>
+                    <div class="io-gateway-connection">
+                      <h4>Connection</h4>
+                      <label>
+                        <span>Gateway URL</span>
+                        <input id="io-gateway-url" name="gatewayUrl" inputmode="url" autocomplete="url" placeholder="https://gateway.example.com" />
+                      </label>
+                      <label>
+                        <span>API Key</span>
+                        <span class="io-gateway-secret-field">
+                          <input id="io-gateway-api-key" name="gatewayApiKey" type="password" autocomplete="off" placeholder="Gateway API key" />
+                          <button id="io-gateway-api-key-toggle" class="icon-button" type="button" data-io-gateway-secret="gatewayApiKey" data-symbol="eye" aria-label="Show API Key" title="Show API Key"></button>
+                        </span>
+                      </label>
+                      <label>
+                        <span>Secret OTP</span>
+                        <span class="io-gateway-secret-field">
+                          <input id="io-gateway-otp-secret" name="gatewayOtpSecret" type="password" autocomplete="off" placeholder="Base32 TOTP secret" />
+                          <button id="io-gateway-otp-secret-toggle" class="icon-button" type="button" data-io-gateway-secret="gatewayOtpSecret" data-symbol="eye" aria-label="Show Secret OTP" title="Show Secret OTP"></button>
+                        </span>
+                      </label>
+                    </div>
+                    <div class="io-gateway-actions">
+                      <button id="load-direct-ai" class="icon-button" type="button" data-symbol="refresh" aria-label="Reload IO Gateway" title="Reload IO Gateway"></button>
+                      <button id="load-direct-ai-models" class="secondary-action" type="button">AI Models</button>
+                      <button id="save-direct-ai" class="primary-action" type="submit">Save IO Gateway</button>
+                    </div>
+                  </form>
                 </article>
               </section>
 
@@ -961,6 +998,6 @@
     </nav>
     <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
-    <script src="/app.js?v=20260812-06" type="module"></script>
+    <script src="/app.js?v=20260814-08" type="module"></script>
   </body>
 </html>

@@ -1,4 +1,4 @@
-const APP_VERSION = "20260812-06";
+const APP_VERSION = "20260814-08";
 const CACHE_NAME = `io-workbench-web-${APP_VERSION}`;
 const CORE_ASSETS = [
   "/",
