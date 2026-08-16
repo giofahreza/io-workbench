@@ -689,7 +689,10 @@
           "lastMessageAt": { "type": ["string", "null"], "format": "date-time" },
           "firstUserAt": { "type": ["string", "null"], "format": "date-time" },
           "receivedAt": { "type": ["string", "null"], "format": "date-time" },
-          "token_usage": { "type": ["object", "null"], "additionalProperties": true }
+          "token_usage": { "type": ["object", "null"], "additionalProperties": true },
+          "lifetimeTokenUsage": { "type": ["object", "null"], "additionalProperties": true },
+          "contextTokenUsage": { "type": ["object", "null"], "additionalProperties": true },
+          "spentTokenUsage": { "type": ["object", "null"], "additionalProperties": true }
         },
         "additionalProperties": true
       },

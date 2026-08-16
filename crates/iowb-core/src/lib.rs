@@ -810,6 +810,7 @@ impl AppState {
             token_usage: None,
             lifetime_token_usage: None,
             context_token_usage: None,
+            spent_token_usage: None,
         };
 
         let outcome = self.storage.create_session_fork(
@@ -1799,6 +1800,7 @@ impl AppState {
             token_usage: session.token_usage,
             lifetime_token_usage: session.lifetime_token_usage,
             context_token_usage: session.context_token_usage,
+            spent_token_usage: session.spent_token_usage,
             response_id,
             sequence: None,
         });
@@ -2314,6 +2316,7 @@ impl SessionManager {
                 token_usage: None,
                 lifetime_token_usage: None,
                 context_token_usage: None,
+                spent_token_usage: None,
                 native_session_id: None,
                 title_source: Some(SessionTitleSource::Prompt),
             });
@@ -2690,6 +2693,7 @@ impl SessionManager {
                     let thinking = existing.thinking;
                     let token_usage = existing.token_usage.clone();
                     let lifetime_token_usage = existing.lifetime_token_usage.clone();
+                    let spent_token_usage = existing.spent_token_usage.clone();
                     *existing = external_summary;
                     existing.active = active;
                     if preserve_local_title {
@@ -2702,6 +2706,7 @@ impl SessionManager {
                     existing.thinking = thinking;
                     existing.token_usage = token_usage;
                     existing.lifetime_token_usage = lifetime_token_usage;
+                    existing.spent_token_usage = spent_token_usage;
                 }
             } else {
                 sessions.push(external_summary);
@@ -5101,6 +5106,18 @@ impl AgentRuntimeManager {
                 error
             })
             .ok();
+        let spent_token_usage = context
+            .storage
+            .session_spent_token_usage(&context.session_id)
+            .map_err(|error| {
+                warn!(
+                    error = %error,
+                    session_id = %context.session_id,
+                    "failed to load spent chat token usage"
+                );
+                error
+            })
+            .ok();
 
         if !rollover_completed_atomically && let Some(run_id) = context.durable_run_id.as_deref() {
             let terminal_result = match status {
@@ -5178,6 +5195,7 @@ impl AgentRuntimeManager {
                     context_token_usage: context_token_usage
                         .clone()
                         .or(snapshot.context_token_usage),
+                    spent_token_usage: spent_token_usage.clone().or(snapshot.spent_token_usage),
                     response_id: Some(context.response_id.clone()),
                     sequence: Some(context.next_sequence()),
                 },
@@ -12128,6 +12146,7 @@ mod tests {
             token_usage: None,
             lifetime_token_usage: None,
             context_token_usage: None,
+            spent_token_usage: None,
             native_session_id: Some("native-session".to_string()),
             title_source: Some(SessionTitleSource::Manual),
         };

@@ -3896,7 +3896,26 @@ function formatLifetimeTokenUsage(value) {
   return `${prefix}${compactTokenCount(total)} tokens`;
 }
 
+function formatSpentTokenUsage(value, includeZero = false) {
+  if (!value || typeof value !== "object") return "";
+  const total = Number(value.total) || 0;
+  const missing = Number(value.missingAttempts) || 0;
+  const partial = Number(value.partialAttempts) || 0;
+  const completeness = String(value.completeness || "").toLowerCase();
+  if (!total && (missing || completeness === "missing")) return "Unknown tokens";
+  if (!total) return includeZero ? "0 tokens" : "";
+  const prefix = missing || partial || completeness === "partial" ? ">=" : "";
+  return `${prefix}${compactTokenCount(total)} tokens`;
+}
+
 function formatSessionDisplayTokenUsage(session) {
+  const spent = session?.spentTokenUsage;
+  if (spent) {
+    const scoped = spent.sinceCompact || spent.wholeSession;
+    const includeZero = Boolean(spent.sinceCompact);
+    const formatted = formatSpentTokenUsage(scoped, includeZero);
+    if (formatted) return formatted;
+  }
   const scoped = session?.contextTokenUsage;
   if (scoped?.afterCompact) {
     return formatLifetimeTokenUsage(scoped) || `${compactTokenCount(scoped.total)} tokens`;
@@ -3905,6 +3924,9 @@ function formatSessionDisplayTokenUsage(session) {
 }
 
 function sessionDisplayTokenUsageTitle(session) {
+  if (session?.spentTokenUsage) {
+    return session.spentTokenUsage.sinceCompact ? "Tokens spent since compact" : "Tokens spent whole session";
+  }
   return session?.contextTokenUsage?.afterCompact ? "Token usage after compact" : "Lifetime token usage";
 }
 
@@ -10034,12 +10056,13 @@ function connectWs() {
         if (prev.sentAt) entry.elapsed = formatElapsed(prev.sentAt, receivedAt);
         all[sid] = entry;
         writeSessionOverrides(all);
-        if (payload.lifetimeTokenUsage || payload.contextTokenUsage) {
+        if (payload.lifetimeTokenUsage || payload.contextTokenUsage || payload.spentTokenUsage) {
           const patchSession = (session) => session?.id === sid
             ? {
               ...session,
               lifetimeTokenUsage: payload.lifetimeTokenUsage || session.lifetimeTokenUsage,
               contextTokenUsage: payload.contextTokenUsage || session.contextTokenUsage,
+              spentTokenUsage: payload.spentTokenUsage || session.spentTokenUsage,
             }
             : session;
           state.sessions = (state.sessions || []).map(patchSession);

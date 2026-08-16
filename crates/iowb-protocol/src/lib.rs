@@ -329,6 +329,17 @@ pub struct SessionContextTokenUsage {
     pub compacted_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionSpentTokenUsage {
+    #[serde(rename = "wholeSession")]
+    pub whole_session: SessionLifetimeTokenUsage,
+    #[serde(rename = "sinceCompact", skip_serializing_if = "Option::is_none")]
+    pub since_compact: Option<SessionLifetimeTokenUsage>,
+    #[serde(rename = "compactedAt", skip_serializing_if = "Option::is_none")]
+    pub compacted_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionMode {
@@ -482,6 +493,12 @@ pub struct SessionSummary {
         rename = "contextTokenUsage"
     )]
     pub context_token_usage: Option<SessionContextTokenUsage>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "spentTokenUsage"
+    )]
+    pub spent_token_usage: Option<SessionSpentTokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -1701,6 +1718,8 @@ pub enum WsServerEvent {
         lifetime_token_usage: Option<SessionLifetimeTokenUsage>,
         #[serde(rename = "contextTokenUsage", skip_serializing_if = "Option::is_none")]
         context_token_usage: Option<SessionContextTokenUsage>,
+        #[serde(rename = "spentTokenUsage", skip_serializing_if = "Option::is_none")]
+        spent_token_usage: Option<SessionSpentTokenUsage>,
         #[serde(
             rename = "responseId",
             default,
@@ -1790,8 +1809,10 @@ fn default_terminal_rows() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ForkSessionRequest, SessionMode, SessionSummary, WsClientCommand, session_title_from_prompt,
+        ForkSessionRequest, SessionLifetimeTokenUsage, SessionMode, SessionSpentTokenUsage,
+        SessionSummary, WsClientCommand, session_title_from_prompt,
     };
+    use chrono::{DateTime, Utc};
     use serde_json::json;
 
     #[test]
@@ -1892,6 +1913,39 @@ mod tests {
         assert_eq!(value["boardSession"], true);
         assert_eq!(value["boardRunId"], "run-1");
         assert_eq!(value["boardTaskId"], "task-1");
+    }
+
+    #[test]
+    fn session_summary_serializes_spent_token_usage_scope_fields() {
+        let summary = SessionSummary {
+            spent_token_usage: Some(SessionSpentTokenUsage {
+                whole_session: SessionLifetimeTokenUsage {
+                    total: 1_000,
+                    input: 700,
+                    output: 300,
+                    ..Default::default()
+                },
+                since_compact: Some(SessionLifetimeTokenUsage {
+                    total: 250,
+                    input: 175,
+                    output: 75,
+                    ..Default::default()
+                }),
+                compacted_at: Some(
+                    DateTime::parse_from_rfc3339("2026-08-16T00:00:00Z")
+                        .expect("timestamp")
+                        .with_timezone(&Utc),
+                ),
+            }),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(summary).expect("serialize session");
+        assert_eq!(value["spentTokenUsage"]["wholeSession"]["total"], 1_000);
+        assert_eq!(value["spentTokenUsage"]["sinceCompact"]["total"], 250);
+        assert_eq!(
+            value["spentTokenUsage"]["compactedAt"],
+            "2026-08-16T00:00:00Z"
+        );
     }
 
     #[test]

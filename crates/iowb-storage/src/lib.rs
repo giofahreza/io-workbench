@@ -9,8 +9,8 @@ use iowb_protocol::{
     ChatMessage, DatabaseConnectionInput, DatabaseConnectionProfile, DatabaseTestStatus,
     DatabaseTransferJob, MessageRole, ProjectSummary, PromptHistoryCursor, PromptHistoryEntry,
     Provider, SessionContextTokenUsage, SessionDraftResponse, SessionLifetimeTokenUsage,
-    SessionSummary, SessionTitleSource, SessionTokenUsage, SettingEntry, SupportedDatabaseType,
-    TokenUsageCompleteness, session_title_from_prompt,
+    SessionSpentTokenUsage, SessionSummary, SessionTitleSource, SessionTokenUsage, SettingEntry,
+    SupportedDatabaseType, TokenUsageCompleteness, session_title_from_prompt,
 };
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
@@ -1763,6 +1763,8 @@ impl Storage {
                         Some(session_lifetime_token_usage_conn(conn, &session.id)?);
                     session.context_token_usage =
                         Some(session_context_token_usage_conn(conn, &session.id)?);
+                    session.spent_token_usage =
+                        Some(session_spent_token_usage_conn(conn, &session.id)?);
                     Ok(session)
                 })
                 .transpose()
@@ -1923,6 +1925,10 @@ impl Storage {
         session_id: &str,
     ) -> Result<SessionContextTokenUsage> {
         self.with_connection(|conn| session_context_token_usage_conn(conn, session_id))
+    }
+
+    pub fn session_spent_token_usage(&self, session_id: &str) -> Result<SessionSpentTokenUsage> {
+        self.with_connection(|conn| session_spent_token_usage_conn(conn, session_id))
     }
 
     pub fn latest_session_token_usage(
@@ -4206,21 +4212,48 @@ fn session_lifetime_token_usage_conn(
     session_id: &str,
 ) -> Result<SessionLifetimeTokenUsage> {
     let attempts = lifetime_attempt_usage_for_session_conn(conn, session_id)?;
-    let baseline = conn
-        .query_row(
-            r#"
-            SELECT total_tokens, input_tokens, output_tokens, cache_creation_tokens,
-                   cache_read_tokens, reasoning_tokens, cost_usd,
-                   partial_attempts, missing_attempts
-            FROM session_usage_baselines
-            WHERE session_id = ?1
-            "#,
-            params![session_id],
-            map_lifetime_usage_row,
-        )
-        .optional()?
-        .unwrap_or_default();
+    let baseline = session_usage_baseline_conn(conn, session_id)?;
     Ok(combine_lifetime_usage(baseline, attempts))
+}
+
+fn session_spent_token_usage_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<SessionSpentTokenUsage> {
+    let provider = session_provider_conn(conn, session_id)?;
+    let compacted_at = latest_active_context_compacted_at_conn(conn, session_id)?;
+    let whole_session = session_spent_token_usage_scope_conn(conn, session_id, &provider, None)?;
+    let since_compact = compacted_at
+        .map(|compacted_at| {
+            session_spent_token_usage_scope_conn(conn, session_id, &provider, Some(compacted_at))
+        })
+        .transpose()?;
+    Ok(SessionSpentTokenUsage {
+        whole_session,
+        since_compact,
+        compacted_at,
+    })
+}
+
+fn session_spent_token_usage_scope_conn(
+    conn: &Connection,
+    session_id: &str,
+    provider: &str,
+    created_after: Option<DateTime<Utc>>,
+) -> Result<SessionLifetimeTokenUsage> {
+    let attempts = if provider == Provider::Codex.as_str() {
+        codex_spent_attempt_usage_conn(conn, session_id, created_after)?
+    } else {
+        attempt_spent_usage_for_session_conn(conn, session_id, created_after)?
+    };
+    if created_after.is_some() {
+        Ok(attempts)
+    } else {
+        Ok(combine_lifetime_usage(
+            session_usage_baseline_conn(conn, session_id)?,
+            attempts,
+        ))
+    }
 }
 
 fn session_context_token_usage_conn(
@@ -4252,6 +4285,26 @@ fn session_context_token_usage_conn(
         true,
         Some(compacted_at),
     ))
+}
+
+fn session_usage_baseline_conn(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<SessionLifetimeTokenUsage> {
+    conn.query_row(
+        r#"
+        SELECT total_tokens, input_tokens, output_tokens, cache_creation_tokens,
+               cache_read_tokens, reasoning_tokens, cost_usd,
+               partial_attempts, missing_attempts
+        FROM session_usage_baselines
+        WHERE session_id = ?1
+        "#,
+        params![session_id],
+        map_lifetime_usage_row,
+    )
+    .optional()
+    .map(|value| value.unwrap_or_default())
+    .map_err(StorageError::from)
 }
 
 fn session_provider_conn(conn: &Connection, session_id: &str) -> Result<String> {
@@ -4312,6 +4365,162 @@ fn attempt_usage_since_compact_conn(
         map_lifetime_usage_row,
     )
     .map_err(StorageError::from)
+}
+
+fn attempt_spent_usage_for_session_conn(
+    conn: &Connection,
+    session_id: &str,
+    created_after: Option<DateTime<Utc>>,
+) -> Result<SessionLifetimeTokenUsage> {
+    let after_filter = if created_after.is_some() {
+        "AND created_at > ?2"
+    } else {
+        ""
+    };
+    let sql = format!(
+        r#"
+        SELECT COALESCE(SUM(total_tokens), 0),
+               COALESCE(SUM(input_tokens), 0),
+               COALESCE(SUM(output_tokens), 0),
+               COALESCE(SUM(cache_creation_tokens), 0),
+               COALESCE(SUM(cache_read_tokens), 0),
+               COALESCE(SUM(reasoning_tokens), 0),
+               COALESCE(SUM(cost_usd), 0),
+               COALESCE(SUM(CASE WHEN completeness = 'partial' THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN completeness = 'missing' THEN 1 ELSE 0 END), 0)
+        FROM chat_run_attempts
+        WHERE session_id = ?1
+          {after_filter}
+          AND COALESCE(source, '') <> 'codex_app_server'
+        "#
+    );
+    let created_after = created_after.map(|value| value.to_rfc3339());
+    let mut usage = match created_after.as_deref() {
+        Some(created_after) => conn.query_row(
+            &sql,
+            params![session_id, created_after],
+            map_lifetime_usage_row,
+        ),
+        None => conn.query_row(&sql, params![session_id], map_lifetime_usage_row),
+    }
+    .map_err(StorageError::from)?;
+    usage.completeness = lifetime_usage_completeness(&usage);
+    Ok(usage)
+}
+
+#[derive(Debug)]
+struct CodexUsageSnapshot {
+    native_session_id: Option<String>,
+    usage: SessionLifetimeTokenUsage,
+}
+
+fn codex_spent_attempt_usage_conn(
+    conn: &Connection,
+    session_id: &str,
+    created_after: Option<DateTime<Utc>>,
+) -> Result<SessionLifetimeTokenUsage> {
+    let created_after = created_after.map(|value| value.to_rfc3339());
+    let mut previous_by_native = created_after
+        .as_deref()
+        .map(|created_after| codex_usage_baselines_before_conn(conn, session_id, created_after))
+        .transpose()?
+        .unwrap_or_default();
+    let snapshots = codex_usage_snapshots_conn(conn, session_id, created_after.as_deref())?;
+    let mut spent = SessionLifetimeTokenUsage::default();
+    for snapshot in snapshots {
+        let key = snapshot.native_session_id.clone();
+        let delta = match previous_by_native.get(&key) {
+            Some(previous) if snapshot.usage.total >= previous.total => {
+                subtract_lifetime_usage(snapshot.usage.clone(), previous.clone())
+            }
+            _ => snapshot.usage.clone(),
+        };
+        spent = combine_lifetime_usage(spent, delta);
+        previous_by_native.insert(key, snapshot.usage);
+    }
+    let (partial_attempts, missing_attempts) =
+        attempt_completeness_counts_conn(conn, session_id, created_after.as_deref())?;
+    spent.partial_attempts = partial_attempts;
+    spent.missing_attempts = missing_attempts;
+    spent.completeness = lifetime_usage_completeness(&spent);
+    Ok(spent)
+}
+
+fn codex_usage_baselines_before_conn(
+    conn: &Connection,
+    session_id: &str,
+    created_before_or_at: &str,
+) -> Result<HashMap<Option<String>, SessionLifetimeTokenUsage>> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT native_session_id, total_tokens, input_tokens, output_tokens,
+               cache_creation_tokens, cache_read_tokens, reasoning_tokens, cost_usd, 0, 0
+        FROM chat_run_attempts
+        WHERE session_id = ?1
+          AND provider = 'codex'
+          AND completed_at IS NOT NULL
+          AND created_at <= ?2
+          AND completeness <> 'missing'
+          AND total_tokens > 0
+          AND COALESCE(source, '') <> 'codex_app_server'
+        ORDER BY completed_at ASC, created_at ASC, id ASC
+        "#,
+    )?;
+    let rows = statement.query_map(params![session_id, created_before_or_at], |row| {
+        Ok(CodexUsageSnapshot {
+            native_session_id: row.get(0)?,
+            usage: map_lifetime_usage_row_at(row, 1)?,
+        })
+    })?;
+    let mut baselines = HashMap::new();
+    for row in rows {
+        let snapshot = row?;
+        baselines.insert(snapshot.native_session_id, snapshot.usage);
+    }
+    Ok(baselines)
+}
+
+fn codex_usage_snapshots_conn(
+    conn: &Connection,
+    session_id: &str,
+    created_after: Option<&str>,
+) -> Result<Vec<CodexUsageSnapshot>> {
+    let after_filter = if created_after.is_some() {
+        "AND created_at > ?2"
+    } else {
+        ""
+    };
+    let sql = format!(
+        r#"
+        SELECT native_session_id, total_tokens, input_tokens, output_tokens,
+               cache_creation_tokens, cache_read_tokens, reasoning_tokens, cost_usd, 0, 0
+        FROM chat_run_attempts
+        WHERE session_id = ?1
+          AND provider = 'codex'
+          AND completed_at IS NOT NULL
+          {after_filter}
+          AND completeness <> 'missing'
+          AND total_tokens > 0
+          AND COALESCE(source, '') <> 'codex_app_server'
+        ORDER BY completed_at ASC, created_at ASC, id ASC
+        "#
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let mapper = |row: &rusqlite::Row<'_>| {
+        Ok(CodexUsageSnapshot {
+            native_session_id: row.get(0)?,
+            usage: map_lifetime_usage_row_at(row, 1)?,
+        })
+    };
+    let rows = match created_after {
+        Some(created_after) => statement.query_map(params![session_id, created_after], mapper)?,
+        None => statement.query_map(params![session_id], mapper)?,
+    };
+    let mut snapshots = Vec::new();
+    for row in rows {
+        snapshots.push(row?);
+    }
+    Ok(snapshots)
 }
 
 fn codex_context_usage_delta_conn(
@@ -4531,6 +4740,7 @@ fn attach_session_usage_conn(conn: &Connection, sessions: &mut [SessionSummary])
         session.lifetime_token_usage =
             Some(usage_by_session.remove(&session.id).unwrap_or_default());
         session.context_token_usage = Some(session_context_token_usage_conn(conn, &session.id)?);
+        session.spent_token_usage = Some(session_spent_token_usage_conn(conn, &session.id)?);
     }
     Ok(())
 }
@@ -5272,6 +5482,29 @@ mod tests {
         usage: SessionTokenUsage,
         source: &str,
     ) {
+        insert_completed_usage_attempt_with_native(
+            storage,
+            session,
+            attempt_id,
+            run_id,
+            created_at,
+            usage,
+            source,
+            Some("native-1"),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_completed_usage_attempt_with_native(
+        storage: &Storage,
+        session: &SessionSummary,
+        attempt_id: &str,
+        run_id: &str,
+        created_at: DateTime<Utc>,
+        usage: SessionTokenUsage,
+        source: &str,
+        native_session_id: Option<&str>,
+    ) {
         let mut run = StoredDurableChatRun::new(
             run_id,
             Some("user-1".to_string()),
@@ -5292,7 +5525,7 @@ mod tests {
             "codex",
             "native_cli",
             Some("gpt-test".to_string()),
-            Some("native-1".to_string()),
+            native_session_id.map(str::to_string),
         );
         attempt.status = "completed".to_string();
         attempt.usage = Some(usage.clone());
@@ -5819,6 +6052,180 @@ mod tests {
             .expect("listed context usage");
         assert_eq!(listed.total, 1_200);
         assert!(listed.after_compact);
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn codex_spent_token_usage_uses_cumulative_deltas_for_whole_and_compacted_scope() {
+        let (storage, root) = temporary_storage("codex-spent-usage-delta");
+        let session = test_session("session-spent-usage", false);
+        storage.upsert_session(&session).expect("session");
+        let compacted_at = Utc::now();
+        insert_completed_usage_attempt(
+            &storage,
+            &session,
+            "attempt-spent-before-1",
+            "run-spent-before-1",
+            compacted_at - chrono::Duration::seconds(30),
+            SessionTokenUsage {
+                used: 10_000,
+                input: 9_000,
+                output: 1_000,
+                cache_creation: 0,
+                cache_read: 7_000,
+                reasoning: 100,
+                cost_usd: 0.20,
+            },
+            "codex.turn.completed.usage",
+        );
+        insert_completed_usage_attempt(
+            &storage,
+            &session,
+            "attempt-spent-before-2",
+            "run-spent-before-2",
+            compacted_at - chrono::Duration::seconds(20),
+            SessionTokenUsage {
+                used: 10_500,
+                input: 9_400,
+                output: 1_100,
+                cache_creation: 0,
+                cache_read: 7_200,
+                reasoning: 120,
+                cost_usd: 0.24,
+            },
+            "codex.turn.completed.usage",
+        );
+        let mut compact_run = StoredDurableChatRun::new(
+            "run-spent-compact",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            "compact",
+            session.project_path.clone(),
+        );
+        compact_run.status = "completed".to_string();
+        compact_run.completed_at = Some(compacted_at);
+        storage
+            .create_durable_chat_run(&compact_run)
+            .expect("compact run");
+        let mut rollover = test_context_rollover(
+            "rollover-spent-usage",
+            &session.id,
+            "request-spent-usage",
+            "run-spent-compact",
+            "run-spent-compact",
+            "",
+            compacted_at,
+        );
+        rollover.kind = "manual".to_string();
+        rollover.state = "active".to_string();
+        rollover.candidate_native_session_id = Some("native-2".to_string());
+        rollover.activated_at = Some(compacted_at);
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO session_context_rollovers (
+                        id, user_id, session_id, request_id, kind, failed_message_id,
+                        trigger_run_id, retry_run_id, from_native_session_id,
+                        candidate_native_session_id, state, handoff, observed_bytes,
+                        limit_bytes, error, created_at, updated_at, activated_at
+                    ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14, ?15, ?16, ?17, ?18
+                    )
+                    "#,
+                    params![
+                        rollover.id,
+                        rollover.user_id,
+                        rollover.session_id,
+                        rollover.request_id,
+                        rollover.kind,
+                        rollover.failed_message_id,
+                        rollover.trigger_run_id,
+                        rollover.retry_run_id,
+                        rollover.from_native_session_id,
+                        rollover.candidate_native_session_id,
+                        rollover.state,
+                        rollover.handoff,
+                        rollover.observed_bytes.map(|value| value as i64),
+                        rollover.limit_bytes as i64,
+                        rollover.error,
+                        rollover.created_at.to_rfc3339(),
+                        rollover.updated_at.to_rfc3339(),
+                        rollover.activated_at.map(|time| time.to_rfc3339()),
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("rollover");
+        insert_completed_usage_attempt_with_native(
+            &storage,
+            &session,
+            "attempt-spent-after-1",
+            "run-spent-after-1",
+            compacted_at + chrono::Duration::seconds(10),
+            SessionTokenUsage {
+                used: 600,
+                input: 500,
+                output: 100,
+                cache_creation: 0,
+                cache_read: 200,
+                reasoning: 20,
+                cost_usd: 0.04,
+            },
+            "codex.turn.completed.usage",
+            Some("native-2"),
+        );
+        insert_completed_usage_attempt_with_native(
+            &storage,
+            &session,
+            "attempt-spent-after-2",
+            "run-spent-after-2",
+            compacted_at + chrono::Duration::seconds(20),
+            SessionTokenUsage {
+                used: 1_200,
+                input: 1_000,
+                output: 200,
+                cache_creation: 0,
+                cache_read: 500,
+                reasoning: 50,
+                cost_usd: 0.10,
+            },
+            "codex.turn.completed.usage",
+            Some("native-2"),
+        );
+
+        let spent = storage
+            .session_spent_token_usage(&session.id)
+            .expect("spent usage");
+        assert_eq!(spent.compacted_at, Some(compacted_at));
+        assert_eq!(spent.whole_session.total, 11_700);
+        assert_eq!(spent.whole_session.input, 10_400);
+        assert_eq!(spent.whole_session.output, 1_300);
+        let since_compact = spent.since_compact.expect("since compact");
+        assert_eq!(since_compact.total, 1_200);
+        assert_eq!(since_compact.input, 1_000);
+        assert_eq!(since_compact.output, 200);
+        assert_eq!(since_compact.cache_read, 500);
+        assert_eq!(since_compact.reasoning, 50);
+        assert_eq!(since_compact.completeness, TokenUsageCompleteness::Complete);
+
+        let listed = storage
+            .list_sessions()
+            .expect("session list")
+            .into_iter()
+            .find(|listed| listed.id == session.id)
+            .expect("listed session")
+            .spent_token_usage
+            .expect("listed spent usage");
+        assert_eq!(listed.whole_session.total, 11_700);
+        assert_eq!(
+            listed.since_compact.expect("listed since compact").total,
+            1_200
+        );
 
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");
