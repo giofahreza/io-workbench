@@ -175,11 +175,12 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
 
 async fn recover_interrupted_chat_runs(state: &AppState) -> anyhow::Result<()> {
     synthesize_legacy_durable_runs(state).await?;
+    let reconciled_manual_sessions = reconcile_stale_manual_context_rollovers(state).await?;
     let mut active_runs = state.storage.list_active_durable_chat_runs()?;
     if active_runs.is_empty() {
         state
             .sessions
-            .mark_unrecovered_active_sessions_interrupted(&HashSet::new())
+            .mark_unrecovered_active_sessions_interrupted(&reconciled_manual_sessions)
             .await?;
         return Ok(());
     }
@@ -272,6 +273,8 @@ async fn recover_interrupted_chat_runs(state: &AppState) -> anyhow::Result<()> {
         }
     }
 
+    recovered_session_ids.extend(reconciled_manual_sessions);
+    recovered_session_ids.extend(reconcile_stale_manual_context_rollovers(state).await?);
     let interrupted = state
         .sessions
         .mark_unrecovered_active_sessions_interrupted(&recovered_session_ids)
@@ -282,6 +285,22 @@ async fn recover_interrupted_chat_runs(state: &AppState) -> anyhow::Result<()> {
         "reconciled chat runs after server restart"
     );
     Ok(())
+}
+
+async fn reconcile_stale_manual_context_rollovers(
+    state: &AppState,
+) -> anyhow::Result<HashSet<String>> {
+    let session_ids = state.storage.reconcile_stale_manual_context_rollovers()?;
+    for session_id in &session_ids {
+        state.sessions.set_active(session_id, false).await?;
+    }
+    if !session_ids.is_empty() {
+        info!(
+            sessions = session_ids.len(),
+            "reconciled stale manual context compactions after server restart"
+        );
+    }
+    Ok(session_ids.into_iter().collect())
 }
 
 async fn synthesize_legacy_durable_runs(state: &AppState) -> anyhow::Result<()> {
@@ -9346,6 +9365,139 @@ mod tests {
                 .expect("session exists")
                 .active
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_reconciles_stale_manual_context_compaction() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-server-manual-compact-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_dir = root.join("config");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("project directory");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("state initializes");
+        state
+            .storage
+            .create_user("manual-user", "manual-user", "test-hash")
+            .expect("create user");
+        let session = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                None,
+                false,
+                None,
+                Some(ChatRuntime::NativeCli),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .set_native_session_id(&session.id, "native-manual-stale")
+            .await
+            .expect("native session");
+        state
+            .sessions
+            .set_active(&session.id, true)
+            .await
+            .expect("active session");
+        let now = Utc::now();
+        let rollover = iowb_storage::StoredSessionContextRollover {
+            id: "rollover-manual-startup-stale".to_string(),
+            user_id: "manual-user".to_string(),
+            session_id: session.id.clone(),
+            request_id: "request-manual-startup-stale".to_string(),
+            kind: "manual".to_string(),
+            failed_message_id: String::new(),
+            trigger_run_id: "run-manual-startup-stale".to_string(),
+            retry_run_id: "run-manual-startup-stale".to_string(),
+            from_native_session_id: Some("native-manual-stale".to_string()),
+            candidate_native_session_id: Some("native-manual-stale".to_string()),
+            state: "starting".to_string(),
+            handoff: "Native Codex context compaction".to_string(),
+            observed_bytes: Some(18 * 1024 * 1024),
+            limit_bytes: 16 * 1024 * 1024,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            activated_at: None,
+        };
+        let mut compact_run = iowb_storage::StoredDurableChatRun::new(
+            "run-manual-startup-stale",
+            Some("manual-user".to_string()),
+            session.id.clone(),
+            "codex",
+            rollover.handoff.clone(),
+            project.display().to_string(),
+        );
+        compact_run.native_session_id = Some("native-manual-stale".to_string());
+        compact_run.auto_resume = false;
+        state
+            .storage
+            .prepare_manual_context_rollover(&rollover, &compact_run)
+            .expect("prepare manual rollover");
+        state
+            .storage
+            .create_chat_run_attempt(&iowb_storage::StoredChatRunAttempt::new(
+                "attempt-manual-startup-stale",
+                compact_run.id.clone(),
+                session.id.clone(),
+                None,
+                "codex",
+                "codex_app_server",
+                None,
+                Some("native-manual-stale".to_string()),
+            ))
+            .expect("create compact attempt");
+        state
+            .storage
+            .mark_durable_chat_run_interrupted(
+                &compact_run.id,
+                Some("automatic recovery is disabled"),
+            )
+            .expect("terminal compact run");
+
+        recover_interrupted_chat_runs(&state)
+            .await
+            .expect("startup reconciliation");
+
+        let stored_rollover = state
+            .storage
+            .context_rollover_for_retry_run(&compact_run.id)
+            .expect("rollover lookup")
+            .expect("rollover");
+        assert_eq!(stored_rollover.state, "failed");
+        assert!(
+            !state
+                .storage
+                .get_session(&session.id)
+                .expect("read session")
+                .expect("session exists")
+                .active
+        );
+        assert!(state.sessions.list_active().await.is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }

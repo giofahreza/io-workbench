@@ -39,6 +39,12 @@ pub(crate) struct CodexAppServerClient {
     request_timeout: Duration,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CodexAppServerLaunchOptions {
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
+}
+
 impl CodexAppServerClient {
     pub(crate) fn new(command: impl Into<OsString>, request_timeout: Duration) -> Self {
         Self {
@@ -48,6 +54,14 @@ impl CodexAppServerClient {
     }
 
     pub(crate) async fn read_thread(&self, thread_id: &str) -> Result<CodexThreadSnapshot> {
+        self.read_thread_with_options(thread_id, None).await
+    }
+
+    pub(crate) async fn read_thread_with_options(
+        &self,
+        thread_id: &str,
+        launch_options: Option<&CodexAppServerLaunchOptions>,
+    ) -> Result<CodexThreadSnapshot> {
         let result = self
             .request(
                 "thread/read",
@@ -55,12 +69,23 @@ impl CodexAppServerClient {
                     "threadId": thread_id,
                     "includeTurns": true,
                 }),
+                launch_options,
             )
             .await?;
         parse_thread_snapshot(&result)
     }
 
     pub(crate) async fn fork_thread(&self, thread_id: &str, last_turn_id: &str) -> Result<String> {
+        self.fork_thread_with_options(thread_id, last_turn_id, None)
+            .await
+    }
+
+    pub(crate) async fn fork_thread_with_options(
+        &self,
+        thread_id: &str,
+        last_turn_id: &str,
+        launch_options: Option<&CodexAppServerLaunchOptions>,
+    ) -> Result<String> {
         let result = self
             .request(
                 "thread/fork",
@@ -68,6 +93,7 @@ impl CodexAppServerClient {
                     "threadId": thread_id,
                     "lastTurnId": last_turn_id,
                 }),
+                launch_options,
             )
             .await?;
         result
@@ -84,12 +110,16 @@ impl CodexAppServerClient {
     }
 
     pub(crate) async fn delete_thread(&self, thread_id: &str) -> Result<()> {
-        self.request("thread/delete", json!({ "threadId": thread_id }))
+        self.request("thread/delete", json!({ "threadId": thread_id }), None)
             .await?;
         Ok(())
     }
 
-    pub(crate) async fn compact_thread_and_wait(&self, thread_id: &str) -> Result<()> {
+    pub(crate) async fn compact_thread_and_wait_with_options(
+        &self,
+        thread_id: &str,
+        launch_options: Option<&CodexAppServerLaunchOptions>,
+    ) -> Result<()> {
         let thread_id = thread_id.trim().to_string();
         if thread_id.is_empty() {
             return Err(CoreError::InvalidInput(
@@ -97,12 +127,11 @@ impl CodexAppServerClient {
             ));
         }
         let command = self.command.clone();
+        let launch_options = launch_options.cloned().unwrap_or_default();
         let compact_timeout = self.request_timeout.max(Duration::from_secs(120));
         timeout(compact_timeout, async move {
-            let mut child = Command::new(&command)
-                .arg("app-server")
-                .arg("--stdio")
-                .env("PATH", augmented_user_path())
+            let mut child_command = app_server_command(&command, &launch_options);
+            let mut child = child_command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -178,14 +207,18 @@ impl CodexAppServerClient {
         })?
     }
 
-    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        launch_options: Option<&CodexAppServerLaunchOptions>,
+    ) -> Result<Value> {
         let method = method.to_string();
         let command = self.command.clone();
+        let launch_options = launch_options.cloned().unwrap_or_default();
         timeout(self.request_timeout, async move {
-            let mut child = Command::new(&command)
-                .arg("app-server")
-                .arg("--stdio")
-                .env("PATH", augmented_user_path())
+            let mut child_command = app_server_command(&command, &launch_options);
+            let mut child = child_command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -249,6 +282,20 @@ impl CodexAppServerClient {
             ))
         })?
     }
+}
+
+fn app_server_command(command: &OsString, launch_options: &CodexAppServerLaunchOptions) -> Command {
+    let mut child_command = Command::new(command);
+    if launch_options.args.is_empty() {
+        child_command.arg("app-server").arg("--stdio");
+    } else {
+        child_command.args(&launch_options.args);
+    }
+    child_command.env("PATH", augmented_user_path());
+    for (key, value) in &launch_options.env {
+        child_command.env(key, value);
+    }
+    child_command
 }
 
 async fn write_json_line(stdin: &mut tokio::process::ChildStdin, value: &Value) -> Result<()> {
@@ -560,7 +607,7 @@ mod tests {
 
         let client = CodexAppServerClient::new(script.as_os_str(), Duration::from_secs(2));
         client
-            .compact_thread_and_wait("thread-1")
+            .compact_thread_and_wait_with_options("thread-1", None)
             .await
             .expect("compact thread");
         let requests = std::fs::read_to_string(log).expect("requests");

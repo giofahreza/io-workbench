@@ -48,7 +48,7 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use codex_app_server::{CodexAppServerClient, CodexThreadSnapshot};
+use codex_app_server::{CodexAppServerClient, CodexAppServerLaunchOptions, CodexThreadSnapshot};
 use external_sessions::{
     EXTERNAL_MESSAGE_PARSER_VERSION, ExternalSessionRecord, external_file_fingerprint,
     load_external_messages, looks_like_codex_live_transcript, same_project_path,
@@ -1285,10 +1285,12 @@ impl AppState {
             .native_rollout_size(session_id)
             .await
             .filter(|size| *size > 0);
-        let visible_messages = sanitize_context_materialization_messages(
+        let visible_messages = context_materialization_messages(
+            session_id,
             self.sessions
                 .messages_including_external(session_id)
                 .await?,
+            &[failed_message_id],
         );
         let handoff =
             build_context_rollover_handoff(visible_messages.clone(), &failed_message.content);
@@ -1428,7 +1430,7 @@ impl AppState {
         user_id: &str,
         session_id: &str,
         request_id: &str,
-        _direct_ai_config: Option<DirectAiRuntimeConfig>,
+        direct_ai_config: Option<DirectAiRuntimeConfig>,
     ) -> Result<CompactSessionContextResponse> {
         if let Some(existing) = self
             .storage
@@ -1448,7 +1450,7 @@ impl AppState {
             });
         }
 
-        let mut session = self.sessions.get(session_id).await?;
+        let session = self.sessions.get(session_id).await?;
         if session.provider != Provider::Codex {
             return Err(CoreError::InvalidInput(
                 "manual context compaction is currently available only for Codex sessions"
@@ -1476,10 +1478,12 @@ impl AppState {
                 )
             })?;
 
-        let visible_messages = sanitize_context_materialization_messages(
+        let visible_messages = context_materialization_messages(
+            session_id,
             self.sessions
                 .messages_including_external(session_id)
                 .await?,
+            &[],
         );
         if !context_handoff_has_retainable_text(&visible_messages) {
             return Err(CoreError::InvalidInput(
@@ -1531,6 +1535,9 @@ impl AppState {
         compact_run.fast = session.fast;
         compact_run.native_session_id = Some(native_session_id.clone());
         compact_run.auto_resume = false;
+        let runtime = session.runtime.unwrap_or(ChatRuntime::NativeCli);
+        let app_server_options =
+            codex_app_server_launch_options(runtime, direct_ai_config.as_ref())?;
 
         self.storage
             .replace_session_messages(session_id, &visible_messages)?;
@@ -1558,7 +1565,6 @@ impl AppState {
             });
         }
         self.sessions.set_active(session_id, true).await?;
-        let runtime = session.runtime.unwrap_or(ChatRuntime::NativeCli);
         self.storage
             .create_chat_run_attempt(&StoredChatRunAttempt::new(
                 attempt_id.clone(),
@@ -1589,21 +1595,51 @@ impl AppState {
         self.ws_hub.publish(WsServerEvent::ActiveSessions {
             sessions: self.sessions.list_active().await,
         });
+        let task = ManualContextCompactionTask {
+            session,
+            rollover_id: rollover_id.clone(),
+            retry_run_id: compact_run_id.clone(),
+            attempt_id,
+            native_session_id,
+            handoff,
+            compact_run,
+            runtime,
+            app_server_options,
+        };
+        let state = self.clone();
+        tokio::spawn(async move {
+            state.run_manual_context_compaction(task).await;
+        });
+
+        Ok(CompactSessionContextResponse {
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            response_id: compact_run_id,
+            state: "starting".to_string(),
+        })
+    }
+
+    async fn run_manual_context_compaction(&self, task: ManualContextCompactionTask) {
         let compact_result = {
             let _mutation = self.codex_app_server_mutation.lock().await;
             self.codex_app_server
-                .compact_thread_and_wait(&native_session_id)
+                .compact_thread_and_wait_with_options(
+                    &task.native_session_id,
+                    task.app_server_options.as_ref(),
+                )
                 .await
         };
         if let Err(error) = compact_result {
             let message = error.to_string();
-            let _ = self.storage.fail_context_rollover(&rollover_id, &message);
             let _ = self
                 .storage
-                .mark_durable_chat_run_failed(&compact_run_id, &message);
-            let _ = self.sessions.set_active(session_id, false).await;
+                .fail_context_rollover(&task.rollover_id, &message);
+            let _ = self
+                .storage
+                .mark_durable_chat_run_failed(&task.retry_run_id, &message);
+            let _ = self.sessions.set_active(&task.session.id, false).await;
             let _ = self.storage.finish_chat_run_attempt(
-                &attempt_id,
+                &task.attempt_id,
                 runtime_status_label(iowb_protocol::SessionRuntimeStatus::Failed),
                 None,
                 None,
@@ -1613,40 +1649,47 @@ impl AppState {
             self.ws_hub.publish(WsServerEvent::Error {
                 message: "Codex context compaction failed".to_string(),
                 details: Some(message),
-                session_id: Some(session_id.to_string()),
+                session_id: Some(task.session.id.clone()),
             });
             self.ws_hub.publish(WsServerEvent::SessionStatus {
                 provider: Provider::Codex,
-                session_id: session_id.to_string(),
+                session_id: task.session.id.clone(),
                 status: iowb_protocol::SessionRuntimeStatus::Failed,
-                response_id: Some(compact_run_id.clone()),
+                response_id: Some(task.retry_run_id.clone()),
                 sequence: None,
                 latest_user_prompt: None,
             });
             self.ws_hub.publish(WsServerEvent::ActiveSessions {
                 sessions: self.sessions.list_active().await,
             });
-            return Err(error);
+            warn!(
+                error = %error,
+                session_id = %task.session.id,
+                rollover_id = %task.rollover_id,
+                "manual Codex context compaction failed"
+            );
+            return;
         }
-        session.native_session_id = Some(native_session_id.clone());
+        let mut session = task.session.clone();
+        session.native_session_id = Some(task.native_session_id.clone());
         session.external = false;
         let context = AgentStartContext {
             provider: Provider::Codex,
-            session_id: session_id.to_string(),
-            durable_run_id: Some(compact_run_id.clone()),
-            attempt_id: Some(attempt_id.clone()),
-            response_id: compact_run_id.clone(),
+            session_id: task.session.id.clone(),
+            durable_run_id: Some(task.retry_run_id.clone()),
+            attempt_id: Some(task.attempt_id.clone()),
+            response_id: task.retry_run_id.clone(),
             sequence: Arc::new(AtomicU64::new(0)),
             project_path: PathBuf::from(&session.project_path),
-            prompt: handoff,
-            model: compact_run.model.clone(),
-            runtime,
-            effort: compact_run.effort.clone(),
-            mode: compact_run.mode.clone(),
-            thinking: compact_run.thinking,
-            fast: compact_run.fast,
-            native_resume_session_id: Some(native_session_id.clone()),
-            context_rollover_id: Some(rollover_id.clone()),
+            prompt: task.handoff.clone(),
+            model: task.compact_run.model.clone(),
+            runtime: task.runtime,
+            effort: task.compact_run.effort.clone(),
+            mode: task.compact_run.mode.clone(),
+            thinking: task.compact_run.thinking,
+            fast: task.compact_run.fast,
+            native_resume_session_id: Some(task.native_session_id.clone()),
+            context_rollover_id: Some(task.rollover_id.clone()),
             direct_ai_config: None,
             direct_ai_messages: Vec::new(),
             sessions: self.sessions.clone(),
@@ -1654,16 +1697,18 @@ impl AppState {
             hub: self.ws_hub.clone(),
         };
         if let Err(error) =
-            activate_completed_context_rollover(&context, &rollover_id, Utc::now()).await
+            activate_completed_context_rollover(&context, &task.rollover_id, Utc::now()).await
         {
             let message = format!("failed to activate native Codex compaction: {error}");
-            let _ = self.storage.fail_context_rollover(&rollover_id, &message);
             let _ = self
                 .storage
-                .mark_durable_chat_run_failed(&compact_run_id, &message);
-            let _ = self.sessions.set_active(session_id, false).await;
+                .fail_context_rollover(&task.rollover_id, &message);
+            let _ = self
+                .storage
+                .mark_durable_chat_run_failed(&task.retry_run_id, &message);
+            let _ = self.sessions.set_active(&task.session.id, false).await;
             let _ = self.storage.finish_chat_run_attempt(
-                &attempt_id,
+                &task.attempt_id,
                 runtime_status_label(iowb_protocol::SessionRuntimeStatus::Failed),
                 None,
                 None,
@@ -1673,23 +1718,29 @@ impl AppState {
             self.ws_hub.publish(WsServerEvent::Error {
                 message: "Codex context compaction could not be activated".to_string(),
                 details: Some(message),
-                session_id: Some(session_id.to_string()),
+                session_id: Some(task.session.id.clone()),
             });
             self.ws_hub.publish(WsServerEvent::SessionStatus {
                 provider: Provider::Codex,
-                session_id: session_id.to_string(),
+                session_id: task.session.id.clone(),
                 status: iowb_protocol::SessionRuntimeStatus::Failed,
-                response_id: Some(compact_run_id.clone()),
+                response_id: Some(task.retry_run_id.clone()),
                 sequence: None,
                 latest_user_prompt: None,
             });
             self.ws_hub.publish(WsServerEvent::ActiveSessions {
                 sessions: self.sessions.list_active().await,
             });
-            return Err(error);
+            warn!(
+                error = %error,
+                session_id = %task.session.id,
+                rollover_id = %task.rollover_id,
+                "manual Codex context compaction activation failed"
+            );
+            return;
         }
         let _ = self.storage.finish_chat_run_attempt(
-            &attempt_id,
+            &task.attempt_id,
             runtime_status_label(iowb_protocol::SessionRuntimeStatus::Completed),
             None,
             None,
@@ -1698,26 +1749,15 @@ impl AppState {
         );
         self.ws_hub.publish(WsServerEvent::SessionStatus {
             provider: Provider::Codex,
-            session_id: session_id.to_string(),
+            session_id: task.session.id.clone(),
             status: iowb_protocol::SessionRuntimeStatus::Completed,
-            response_id: Some(compact_run_id.clone()),
+            response_id: Some(task.retry_run_id.clone()),
             sequence: None,
             latest_user_prompt: None,
         });
         self.ws_hub.publish(WsServerEvent::ActiveSessions {
             sessions: self.sessions.list_active().await,
         });
-
-        Ok(CompactSessionContextResponse {
-            session_id: session_id.to_string(),
-            request_id: request_id.to_string(),
-            response_id: compact_run_id,
-            state: self
-                .storage
-                .context_rollover_for_retry_run(&rollover.retry_run_id)?
-                .map(|stored| stored.state)
-                .unwrap_or_else(|| "starting".to_string()),
-        })
     }
 
     async fn codex_native_session_id_for_compaction(
@@ -3696,6 +3736,78 @@ fn sanitize_context_materialization_messages(messages: Vec<ChatMessage>) -> Vec<
         .collect()
 }
 
+fn context_materialization_messages(
+    session_id: &str,
+    messages: Vec<ChatMessage>,
+    preserved_message_ids: &[&str],
+) -> Vec<ChatMessage> {
+    let preserved_message_ids = preserved_message_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut used_message_ids = HashSet::new();
+    sanitize_context_materialization_messages(messages)
+        .into_iter()
+        .map(|message| {
+            if preserved_message_ids.contains(message.id.as_str())
+                && used_message_ids.insert(message.id.clone())
+            {
+                return message;
+            }
+            clone_context_materialized_message(session_id, &message, &mut used_message_ids)
+        })
+        .collect()
+}
+
+fn clone_context_materialized_message(
+    session_id: &str,
+    source: &ChatMessage,
+    used_message_ids: &mut HashSet<String>,
+) -> ChatMessage {
+    let source_message_id = source.id.clone();
+    let mut metadata = source.metadata.as_object().cloned().unwrap_or_default();
+    let usage_source_session_id = metadata
+        .get("usageSourceSessionId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(session_id)
+        .to_string();
+    let usage_source_message_id = metadata
+        .get("usageSourceMessageId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&source_message_id)
+        .to_string();
+    metadata.insert(
+        "contextMaterializedFromSessionId".to_string(),
+        Value::String(session_id.to_string()),
+    );
+    metadata.insert(
+        "contextMaterializedFromMessageId".to_string(),
+        Value::String(source_message_id),
+    );
+    metadata.insert(
+        "usageSourceSessionId".to_string(),
+        Value::String(usage_source_session_id),
+    );
+    metadata.insert(
+        "usageSourceMessageId".to_string(),
+        Value::String(usage_source_message_id),
+    );
+
+    let mut id = new_id("msg");
+    while !used_message_ids.insert(id.clone()) {
+        id = new_id("msg");
+    }
+    ChatMessage {
+        id,
+        role: source.role,
+        content: source.content.clone(),
+        timestamp: source.timestamp,
+        metadata: Value::Object(metadata),
+    }
+}
+
 fn is_persisted_codex_live_transcript_message(message: &ChatMessage) -> bool {
     if message.role != MessageRole::Assistant || !looks_like_codex_live_transcript(&message.content)
     {
@@ -3934,6 +4046,19 @@ struct AgentStartContext {
     sessions: SessionManager,
     storage: iowb_storage::Storage,
     hub: WsHub,
+}
+
+#[derive(Clone)]
+struct ManualContextCompactionTask {
+    session: SessionSummary,
+    rollover_id: String,
+    retry_run_id: String,
+    attempt_id: String,
+    native_session_id: String,
+    handoff: String,
+    compact_run: StoredDurableChatRun,
+    runtime: ChatRuntime,
+    app_server_options: Option<CodexAppServerLaunchOptions>,
 }
 
 #[derive(Clone)]
@@ -7307,6 +7432,30 @@ fn apply_codex_cli_io_gateway_args(args: &mut Vec<String>, base_url: &str) {
     );
 }
 
+fn codex_app_server_launch_options(
+    runtime: ChatRuntime,
+    config: Option<&DirectAiRuntimeConfig>,
+) -> Result<Option<CodexAppServerLaunchOptions>> {
+    if runtime != ChatRuntime::IoGateway {
+        return Ok(None);
+    }
+    let config = config.ok_or_else(|| {
+        CoreError::InvalidInput(
+            "IO Gateway is not configured for Codex context compaction".to_string(),
+        )
+    })?;
+    let mut args = vec!["app-server".to_string()];
+    apply_codex_cli_io_gateway_args(&mut args, &config.base_url);
+    args.push("--stdio".to_string());
+    Ok(Some(CodexAppServerLaunchOptions {
+        args,
+        env: vec![(
+            IO_WORKBENCH_GATEWAY_KEY_ENV.to_string(),
+            config.api_key.clone(),
+        )],
+    }))
+}
+
 /// Keep `-c key=value` overrides before the `resume` positional so Codex
 /// applies the ephemeral provider configuration to resumed turns.
 fn push_codex_provider_override(args: &mut Vec<String>, provider: &str) {
@@ -9394,6 +9543,30 @@ mod tests {
         (state, root, project)
     }
 
+    async fn wait_for_context_rollover_state(
+        state: &AppState,
+        retry_run_id: &str,
+        expected_state: &str,
+    ) -> StoredSessionContextRollover {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(rollover) = state
+                    .storage
+                    .context_rollover_for_retry_run(retry_run_id)
+                    .expect("rollover lookup")
+                    && rollover.state == expected_state
+                {
+                    return rollover;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("context rollover did not reach state {expected_state} for {retry_run_id}")
+        })
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn edit_from_here_first_prompt_creates_empty_fork_with_unsent_draft() {
         let (state, root, project) = temporary_app_state("fork-first-prompt").await;
@@ -11041,6 +11214,8 @@ mod tests {
             &script,
             format!(
                 "#!/bin/sh\n\
+                 printf '%s\\n' \"args:$*\" >> '{}'\n\
+                 printf '%s\\n' \"gateway:${{IOWB_IO_GATEWAY_API_KEY:-}}\" >> '{}'\n\
                  read first\nprintf '%s\\n' \"$first\" >> '{}'\n\
                  printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\"}}}}'\n\
                  read second\nprintf '%s\\n' \"$second\" >> '{}'\n\
@@ -11049,6 +11224,8 @@ mod tests {
                  read fourth\nprintf '%s\\n' \"$fourth\" >> '{}'\n\
                  printf '%s\\n' '{{\"id\":3,\"result\":{{}}}}'\n\
                  printf '%s\\n' '{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"native-compact\",\"item\":{{\"type\":\"contextCompaction\",\"id\":\"item-compact\"}}}}}}'\n",
+                log.display(),
+                log.display(),
                 log.display(),
                 log.display(),
                 log.display(),
@@ -11070,7 +11247,7 @@ mod tests {
                 Some("session-native-manual-compact".to_string()),
                 false,
                 None,
-                Some(ChatRuntime::NativeCli),
+                Some(ChatRuntime::IoGateway),
                 None,
                 None,
                 None,
@@ -11119,11 +11296,33 @@ mod tests {
             .expect("idle session");
 
         let response = state
-            .compact_session_context("user-1", &session.id, "request-native-compact", None)
+            .compact_session_context(
+                "user-1",
+                &session.id,
+                "request-native-compact",
+                Some(DirectAiRuntimeConfig {
+                    base_url: "https://gateway.example.com/codex/".to_string(),
+                    api_key: "test-secret".to_string(),
+                    max_tokens: None,
+                }),
+            )
             .await
             .expect("manual compact");
-        assert_eq!(response.state, "active");
+        assert_eq!(response.state, "starting");
+        wait_for_context_rollover_state(&state, &response.response_id, "active").await;
         let requests = std::fs::read_to_string(log).expect("requests");
+        assert!(requests.contains("args:app-server"));
+        assert!(requests.contains("model_provider=iowb_gateway"));
+        assert!(
+            requests.contains(
+                "model_providers.iowb_gateway.base_url=\"https://gateway.example.com/codex\""
+            ),
+            "{requests}"
+        );
+        assert!(
+            requests.contains("model_providers.iowb_gateway.env_key=\"IOWB_IO_GATEWAY_API_KEY\"")
+        );
+        assert!(requests.contains("gateway:test-secret"));
         assert!(requests.contains("\"method\":\"thread/resume\""));
         assert!(requests.contains("\"method\":\"thread/compact/start\""));
 
@@ -11162,6 +11361,303 @@ mod tests {
             Some("native-compact")
         );
         assert!(!stored_run.auto_resume);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_compaction_returns_before_slow_app_server_finishes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut state, root, project) = temporary_app_state("native-manual-compact-async").await;
+        let script = root.join("compact-codex.sh");
+        let log = root.join("compact-requests.log");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 read first\nprintf '%s\\n' \"$first\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\"}}}}'\n\
+                 read second\nprintf '%s\\n' \"$second\" >> '{}'\n\
+                 read third\nprintf '%s\\n' \"$third\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"native-slow-compact\"}}}}}}'\n\
+                 read fourth\nprintf '%s\\n' \"$fourth\" >> '{}'\n\
+                 sleep 2\n\
+                 printf '%s\\n' '{{\"id\":3,\"result\":{{}}}}'\n\
+                 printf '%s\\n' '{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"native-slow-compact\",\"item\":{{\"type\":\"contextCompaction\",\"id\":\"item-compact\"}}}}}}'\n",
+                log.display(),
+                log.display(),
+                log.display(),
+                log.display(),
+            ),
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("permissions");
+        state.codex_app_server =
+            CodexAppServerClient::new(script.as_os_str(), Duration::from_secs(4));
+
+        let session = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("session-native-slow-manual-compact".to_string()),
+                false,
+                None,
+                Some(ChatRuntime::NativeCli),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .set_native_session_id(&session.id, "native-slow-compact")
+            .await
+            .expect("native id");
+        state
+            .sessions
+            .append_message(
+                &session.id,
+                MessageRole::User,
+                "Question before slow compact",
+            )
+            .await
+            .expect("user message");
+        state
+            .sessions
+            .append_message(
+                &session.id,
+                MessageRole::Assistant,
+                "Answer before slow compact",
+            )
+            .await
+            .expect("assistant message");
+        state
+            .sessions
+            .set_active(&session.id, false)
+            .await
+            .expect("idle session");
+
+        let response = timeout(
+            Duration::from_secs(1),
+            state.compact_session_context(
+                "user-1",
+                &session.id,
+                "request-native-slow-compact",
+                None,
+            ),
+        )
+        .await
+        .expect("manual compact should return before app-server compaction completes")
+        .expect("manual compact");
+        assert_eq!(response.state, "starting");
+        assert_eq!(
+            state
+                .storage
+                .get_durable_chat_run(&response.response_id)
+                .expect("run lookup")
+                .expect("run")
+                .status,
+            "running"
+        );
+
+        wait_for_context_rollover_state(&state, &response.response_id, "active").await;
+        assert_eq!(
+            state
+                .storage
+                .get_durable_chat_run(&response.response_id)
+                .expect("run lookup")
+                .expect("run")
+                .status,
+            "completed"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_compaction_rekeys_external_projection_messages_before_replace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut state, root, project) = temporary_app_state("native-manual-compact-rekey").await;
+        state.sessions.external_home = Arc::new(root.clone());
+        let native_id = "99999999-9999-4999-8999-999999999999";
+        let script = root.join("compact-codex.sh");
+        let log = root.join("compact-requests.log");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 read first\nprintf '%s\\n' \"$first\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\"}}}}'\n\
+                 read second\nprintf '%s\\n' \"$second\" >> '{}'\n\
+                 read third\nprintf '%s\\n' \"$third\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"{native_id}\"}}}}}}'\n\
+                 read fourth\nprintf '%s\\n' \"$fourth\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":3,\"result\":{{}}}}'\n\
+                 printf '%s\\n' '{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"{native_id}\",\"item\":{{\"type\":\"contextCompaction\",\"id\":\"item-compact\"}}}}}}'\n",
+                log.display(),
+                log.display(),
+                log.display(),
+                log.display(),
+            ),
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("permissions");
+        state.codex_app_server =
+            CodexAppServerClient::new(script.as_os_str(), Duration::from_secs(2));
+
+        let now = Utc::now();
+        let rollout = root
+            .join(".codex/sessions/2026/08/15")
+            .join(format!("rollout-2026-08-15T00-00-00-{native_id}.jsonl"));
+        std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("rollout dir");
+        std::fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": now,
+                    "type": "session_meta",
+                    "payload": {"id": native_id, "cwd": project}
+                }),
+                serde_json::json!({
+                    "timestamp": now + chrono::Duration::milliseconds(1),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "Native prompt to compact",
+                        "kind": "plain"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": now + chrono::Duration::milliseconds(2),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "native-answer",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "Native answer to keep."}]
+                    }
+                })
+            ),
+        )
+        .expect("rollout");
+
+        let session = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("session-native-manual-compact-rekey".to_string()),
+                false,
+                None,
+                Some(ChatRuntime::NativeCli),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .set_native_session_id(&session.id, native_id)
+            .await
+            .expect("native id");
+        let visible_before = state
+            .sessions
+            .messages_including_external(&session.id)
+            .await
+            .expect("visible messages before compact");
+        let external_user_id = visible_before
+            .iter()
+            .find(|message| message.content == "Native prompt to compact")
+            .map(|message| message.id.clone())
+            .expect("external user message");
+        assert!(
+            visible_before
+                .iter()
+                .any(|message| message.id == external_user_id),
+            "{visible_before:#?}"
+        );
+        let other = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("session-with-existing-external-id".to_string()),
+                false,
+                None,
+                Some(ChatRuntime::NativeCli),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("other session");
+        state
+            .storage
+            .append_message(
+                &other.id,
+                &ChatMessage {
+                    id: external_user_id.clone(),
+                    role: MessageRole::User,
+                    content: "Existing materialized native prompt".to_string(),
+                    timestamp: now,
+                    metadata: Value::Null,
+                },
+            )
+            .expect("colliding message");
+        state
+            .sessions
+            .set_active(&session.id, false)
+            .await
+            .expect("idle session");
+
+        let response = state
+            .compact_session_context("user-1", &session.id, "request-native-rekey-compact", None)
+            .await
+            .expect("manual compact");
+        assert_eq!(response.state, "starting");
+        wait_for_context_rollover_state(&state, &response.response_id, "active").await;
+
+        let stored = state
+            .storage
+            .list_messages(&session.id)
+            .expect("stored messages after compact");
+        let user = stored
+            .iter()
+            .find(|message| message.content == "Native prompt to compact")
+            .expect("materialized user message");
+        assert_ne!(user.id, external_user_id);
+        assert!(user.id.starts_with("msg_"));
+        assert_eq!(
+            user.metadata["contextMaterializedFromMessageId"],
+            external_user_id
+        );
+        assert_eq!(user.metadata["usageSourceMessageId"], external_user_id);
+        assert!(
+            stored
+                .iter()
+                .any(|message| message.content == "Native answer to keep.")
+        );
+        assert!(stored.iter().all(|message| {
+            !message
+                .id
+                .starts_with(&format!("external_codex_{native_id}_"))
+        }));
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -2251,6 +2251,118 @@ impl Storage {
         })
     }
 
+    pub fn reconcile_stale_manual_context_rollovers(&self) -> Result<Vec<String>> {
+        struct StaleManualRollover {
+            id: String,
+            retry_run_id: String,
+            session_id: String,
+            run_status: String,
+            run_error: Option<String>,
+        }
+
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let stale = {
+                let mut statement = transaction.prepare(
+                    r#"
+                    SELECT r.id, r.retry_run_id, r.session_id, d.status, d.last_error
+                    FROM session_context_rollovers r
+                    JOIN durable_chat_runs d
+                      ON d.id = r.retry_run_id
+                     AND d.session_id = r.session_id
+                    WHERE r.kind = 'manual'
+                      AND r.state = 'starting'
+                      AND d.status NOT IN ('running', 'recovering')
+                    ORDER BY r.created_at ASC, r.id ASC
+                    "#,
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok(StaleManualRollover {
+                        id: row.get(0)?,
+                        retry_run_id: row.get(1)?,
+                        session_id: row.get(2)?,
+                        run_status: row.get(3)?,
+                        run_error: row.get(4)?,
+                    })
+                })?;
+                let mut stale = Vec::new();
+                for row in rows {
+                    stale.push(row?);
+                }
+                stale
+            };
+
+            let mut inactive_session_ids = Vec::new();
+            let mut seen_inactive_session_ids = HashSet::new();
+            for rollover in stale {
+                let detail = rollover
+                    .run_error
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|error| !error.is_empty())
+                    .unwrap_or(rollover.run_status.as_str());
+                let error = format!("manual context compaction ended before activation: {detail}");
+                transaction.execute(
+                    r#"
+                    UPDATE session_context_rollovers
+                    SET state = 'failed', error = ?1, updated_at = ?2
+                    WHERE id = ?3 AND state = 'starting'
+                    "#,
+                    params![error, now, rollover.id],
+                )?;
+                transaction.execute(
+                    r#"
+                    UPDATE chat_run_attempts
+                    SET status = 'failed',
+                        input_tokens = 0,
+                        output_tokens = 0,
+                        cache_creation_tokens = 0,
+                        cache_read_tokens = 0,
+                        reasoning_tokens = 0,
+                        total_tokens = 0,
+                        cost_usd = 0,
+                        raw_usage_json = NULL,
+                        source = COALESCE(source, 'startup_recovery'),
+                        completeness = 'missing',
+                        updated_at = ?1,
+                        completed_at = ?1
+                    WHERE durable_run_id = ?2
+                      AND completed_at IS NULL
+                      AND status IN ('starting', 'running', 'recovering', 'waiting_for_input')
+                    "#,
+                    params![now, rollover.retry_run_id],
+                )?;
+                let active_runs: i64 = transaction.query_row(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM durable_chat_runs
+                    WHERE session_id = ?1
+                      AND status IN ('running', 'recovering')
+                    "#,
+                    params![rollover.session_id],
+                    |row| row.get(0),
+                )?;
+                if active_runs == 0 {
+                    transaction.execute(
+                        r#"
+                        UPDATE sessions
+                        SET active = 0, last_activity = ?1
+                        WHERE id = ?2 AND active = 1
+                        "#,
+                        params![now, rollover.session_id],
+                    )?;
+                    if seen_inactive_session_ids.insert(rollover.session_id.clone()) {
+                        inactive_session_ids.push(rollover.session_id);
+                    }
+                }
+            }
+
+            transaction.commit()?;
+            Ok(inactive_session_ids)
+        })
+    }
+
     pub fn get_durable_chat_run(&self, run_id: &str) -> Result<Option<StoredDurableChatRun>> {
         self.with_connection(|conn| {
             conn.query_row(
@@ -6076,6 +6188,110 @@ mod tests {
         assert_eq!(visible_messages[0].id, failed_message.id);
         assert_eq!(visible_messages[0].role, failed_message.role);
         assert_eq!(visible_messages[0].content, failed_message.content);
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn stale_manual_context_rollover_reconciliation_clears_processing_state() {
+        let (storage, root) = temporary_storage("manual-context-rollover-reconcile");
+        storage
+            .create_user("user-1", "user-1", "test-hash")
+            .expect("create user");
+        let mut session = test_session("session-manual-reconcile", true);
+        session.native_session_id = Some("native-existing".to_string());
+        storage.upsert_session(&session).expect("upsert session");
+
+        let mut rollover = test_context_rollover(
+            "rollover-manual-stale",
+            &session.id,
+            "request-manual-stale",
+            "run-manual-stale",
+            "run-manual-stale",
+            "",
+            Utc::now(),
+        );
+        rollover.kind = "manual".to_string();
+        rollover.from_native_session_id = Some("native-existing".to_string());
+        rollover.candidate_native_session_id = Some("native-existing".to_string());
+        let mut compact_run = StoredDurableChatRun::new(
+            "run-manual-stale",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            "codex",
+            rollover.handoff.clone(),
+            session.project_path.clone(),
+        );
+        compact_run.native_session_id = Some("native-existing".to_string());
+        compact_run.auto_resume = false;
+        assert!(
+            storage
+                .prepare_manual_context_rollover(&rollover, &compact_run)
+                .expect("prepare manual rollover")
+        );
+        let attempt = StoredChatRunAttempt::new(
+            "attempt-manual-stale",
+            compact_run.id.clone(),
+            session.id.clone(),
+            None,
+            "codex",
+            "codex_app_server",
+            None,
+            Some("native-existing".to_string()),
+        );
+        assert!(
+            storage
+                .create_chat_run_attempt(&attempt)
+                .expect("create compact attempt")
+        );
+        assert!(
+            storage
+                .mark_durable_chat_run_interrupted(
+                    &compact_run.id,
+                    Some("automatic recovery is disabled"),
+                )
+                .expect("interrupt compact run")
+        );
+
+        let inactive = storage
+            .reconcile_stale_manual_context_rollovers()
+            .expect("reconcile stale manual rollover");
+        assert_eq!(inactive, vec![session.id.clone()]);
+        let reconciled_rollover = storage
+            .context_rollover_for_retry_run(&compact_run.id)
+            .expect("rollover lookup")
+            .expect("rollover");
+        assert_eq!(reconciled_rollover.state, "failed");
+        assert_eq!(
+            reconciled_rollover.error.as_deref(),
+            Some(
+                "manual context compaction ended before activation: automatic recovery is disabled"
+            )
+        );
+        let stored_session = storage
+            .get_session(&session.id)
+            .expect("session lookup")
+            .expect("session");
+        assert!(!stored_session.active);
+        let (attempt_status, attempt_completed_at): (String, Option<String>) = storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT status, completed_at FROM chat_run_attempts WHERE id = ?1",
+                    params![attempt.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(StorageError::from)
+            })
+            .expect("attempt lookup");
+        assert_eq!(attempt_status, "failed");
+        assert!(attempt_completed_at.is_some());
+        assert!(
+            storage
+                .reconcile_stale_manual_context_rollovers()
+                .expect("repeat reconciliation")
+                .is_empty()
+        );
 
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");
