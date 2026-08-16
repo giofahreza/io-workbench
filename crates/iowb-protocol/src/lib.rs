@@ -303,6 +303,32 @@ pub struct SessionLifetimeTokenUsage {
     pub missing_attempts: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionContextTokenUsage {
+    pub total: u64,
+    #[serde(rename = "input")]
+    pub input: u64,
+    #[serde(rename = "output")]
+    pub output: u64,
+    #[serde(rename = "cacheCreation")]
+    pub cache_creation: u64,
+    #[serde(rename = "cacheRead")]
+    pub cache_read: u64,
+    pub reasoning: u64,
+    #[serde(rename = "costUsd")]
+    pub cost_usd: f64,
+    pub completeness: TokenUsageCompleteness,
+    #[serde(rename = "partialAttempts")]
+    pub partial_attempts: u64,
+    #[serde(rename = "missingAttempts")]
+    pub missing_attempts: u64,
+    #[serde(rename = "afterCompact")]
+    pub after_compact: bool,
+    #[serde(rename = "compactedAt", skip_serializing_if = "Option::is_none")]
+    pub compacted_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SessionMode {
@@ -450,6 +476,12 @@ pub struct SessionSummary {
         rename = "lifetimeTokenUsage"
     )]
     pub lifetime_token_usage: Option<SessionLifetimeTokenUsage>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "contextTokenUsage"
+    )]
+    pub context_token_usage: Option<SessionContextTokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -1667,6 +1699,8 @@ pub enum WsServerEvent {
         token_usage: Option<SessionTokenUsage>,
         #[serde(rename = "lifetimeTokenUsage", skip_serializing_if = "Option::is_none")]
         lifetime_token_usage: Option<SessionLifetimeTokenUsage>,
+        #[serde(rename = "contextTokenUsage", skip_serializing_if = "Option::is_none")]
+        context_token_usage: Option<SessionContextTokenUsage>,
         #[serde(
             rename = "responseId",
             default,

@@ -809,6 +809,7 @@ impl AppState {
                 .map(|message| message.timestamp),
             token_usage: None,
             lifetime_token_usage: None,
+            context_token_usage: None,
         };
 
         let outcome = self.storage.create_session_fork(
@@ -1747,6 +1748,12 @@ impl AppState {
             Some("codex_app_server"),
             TokenUsageCompleteness::Missing,
         );
+        self.publish_session_metadata_snapshot(
+            Provider::Codex,
+            &task.session.id,
+            Some(task.retry_run_id.clone()),
+        )
+        .await;
         self.ws_hub.publish(WsServerEvent::SessionStatus {
             provider: Provider::Codex,
             session_id: task.session.id.clone(),
@@ -1757,6 +1764,43 @@ impl AppState {
         });
         self.ws_hub.publish(WsServerEvent::ActiveSessions {
             sessions: self.sessions.list_active().await,
+        });
+    }
+
+    async fn publish_session_metadata_snapshot(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        response_id: Option<String>,
+    ) {
+        let session = match self.storage.get_session(session_id) {
+            Ok(Some(session)) => session,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    session_id,
+                    "failed to load session metadata snapshot"
+                );
+                return;
+            }
+        };
+        self.ws_hub.publish(WsServerEvent::SessionMetadata {
+            provider,
+            session_id: session.id,
+            model: session.model,
+            effort: session.effort,
+            mode: session.mode,
+            thinking: session.thinking,
+            fast: session.fast,
+            received_at: session.received_at.unwrap_or_else(Utc::now),
+            last_message_at: session.last_message_at,
+            first_user_at: session.first_user_at,
+            token_usage: session.token_usage,
+            lifetime_token_usage: session.lifetime_token_usage,
+            context_token_usage: session.context_token_usage,
+            response_id,
+            sequence: None,
         });
     }
 
@@ -2269,6 +2313,7 @@ impl SessionManager {
                 received_at: None,
                 token_usage: None,
                 lifetime_token_usage: None,
+                context_token_usage: None,
                 native_session_id: None,
                 title_source: Some(SessionTitleSource::Prompt),
             });
@@ -5044,6 +5089,18 @@ impl AgentRuntimeManager {
         }
 
         let lifetime_token_usage = persist_run_attempt_usage(context, status, usage.as_ref()).await;
+        let context_token_usage = context
+            .storage
+            .session_context_token_usage(&context.session_id)
+            .map_err(|error| {
+                warn!(
+                    error = %error,
+                    session_id = %context.session_id,
+                    "failed to load scoped chat token usage"
+                );
+                error
+            })
+            .ok();
 
         if !rollover_completed_atomically && let Some(run_id) = context.durable_run_id.as_deref() {
             let terminal_result = match status {
@@ -5118,6 +5175,9 @@ impl AgentRuntimeManager {
                     lifetime_token_usage: lifetime_token_usage
                         .clone()
                         .or(snapshot.lifetime_token_usage),
+                    context_token_usage: context_token_usage
+                        .clone()
+                        .or(snapshot.context_token_usage),
                     response_id: Some(context.response_id.clone()),
                     sequence: Some(context.next_sequence()),
                 },
@@ -11294,6 +11354,7 @@ mod tests {
             .set_active(&session.id, false)
             .await
             .expect("idle session");
+        let mut metadata_rx = state.ws_hub.subscribe();
 
         let response = state
             .compact_session_context(
@@ -11310,6 +11371,25 @@ mod tests {
             .expect("manual compact");
         assert_eq!(response.state, "starting");
         wait_for_context_rollover_state(&state, &response.response_id, "active").await;
+        let metadata_usage = timeout(Duration::from_secs(2), async {
+            loop {
+                if let WsServerEvent::SessionMetadata {
+                    session_id,
+                    response_id,
+                    context_token_usage,
+                    ..
+                } = metadata_rx.recv().await.expect("metadata event")
+                    && session_id == session.id
+                    && response_id.as_deref() == Some(response.response_id.as_str())
+                {
+                    break context_token_usage.expect("context token usage");
+                }
+            }
+        })
+        .await
+        .expect("manual compact metadata");
+        assert!(metadata_usage.after_compact);
+        assert_eq!(metadata_usage.total, 0);
         let requests = std::fs::read_to_string(log).expect("requests");
         assert!(requests.contains("args:app-server"));
         assert!(requests.contains("model_provider=iowb_gateway"));
@@ -12047,6 +12127,7 @@ mod tests {
             received_at: None,
             token_usage: None,
             lifetime_token_usage: None,
+            context_token_usage: None,
             native_session_id: Some("native-session".to_string()),
             title_source: Some(SessionTitleSource::Manual),
         };

@@ -1323,7 +1323,8 @@ function sidebarSessionCardHtml(session, options = {}) {
   const messageCount = Number(session.messageCount || 0);
   const messageCountLabel = session.external ? "history" : String(messageCount);
   const messageCountTitle = session.external ? "External CLI history" : `${messageCount} messages`;
-  const lifetimeTokens = formatLifetimeTokenUsage(session.lifetimeTokenUsage);
+  const displayTokens = formatSessionDisplayTokenUsage(session);
+  const displayTokensTitle = sessionDisplayTokenUsageTitle(session);
   const pending = session.pending ? "true" : "false";
   const status = sidebarSessionStatus(session);
   const statusLabel = status === "running" ? "Running" : status === "completed" ? "Completed" : status === "failed" ? "Failed" : "";
@@ -1341,7 +1342,7 @@ function sidebarSessionCardHtml(session, options = {}) {
         <span class="meta-time">${escapeHtml(relative || "never")}</span>
         <span class="meta-right">
           <span class="meta-count" title="${escapeHtml(messageCountTitle)}">${escapeHtml(messageCountLabel)}</span>
-          ${lifetimeTokens ? `<span class="meta-count" title="Lifetime token usage">${escapeHtml(lifetimeTokens)}</span>` : ""}
+          ${displayTokens ? `<span class="meta-count" title="${escapeHtml(displayTokensTitle)}">${escapeHtml(displayTokens)}</span>` : ""}
           <span class="cli-badge ${escapeHtml(cli)}" aria-label="${escapeHtml(cliLabel)}" title="${escapeHtml(cliLabel)}">
             <img src="${escapeHtml(cliIcon)}" alt="" aria-hidden="true" loading="lazy" decoding="async" />
           </span>
@@ -3895,6 +3896,18 @@ function formatLifetimeTokenUsage(value) {
   return `${prefix}${compactTokenCount(total)} tokens`;
 }
 
+function formatSessionDisplayTokenUsage(session) {
+  const scoped = session?.contextTokenUsage;
+  if (scoped?.afterCompact) {
+    return formatLifetimeTokenUsage(scoped) || `${compactTokenCount(scoped.total)} tokens`;
+  }
+  return formatLifetimeTokenUsage(scoped) || formatLifetimeTokenUsage(session?.lifetimeTokenUsage);
+}
+
+function sessionDisplayTokenUsageTitle(session) {
+  return session?.contextTokenUsage?.afterCompact ? "Token usage after compact" : "Lifetime token usage";
+}
+
 function normalizeMessageMeta(raw) {
   if (!raw || typeof raw !== "object") return {};
   const meta = { ...raw };
@@ -4493,13 +4506,13 @@ function renderSessions() {
   renderVirtualList(list, "sessions", sessions, {
     rowHeight: 104,
     render: (session) => {
-      const lifetimeTokens = formatLifetimeTokenUsage(session.lifetimeTokenUsage);
+      const displayTokens = formatSessionDisplayTokenUsage(session);
       return `<article class="row">
       <strong>${escapeHtml(session.title || session.id)}</strong>
       <span>${escapeHtml(session.provider)} · ${escapeHtml(session.projectPath)}</span>
       <span class="meta">${escapeHtml([
         session.external ? "External CLI history" : `${session.messageCount} messages`,
-        lifetimeTokens,
+        displayTokens,
       ].filter(Boolean).join(" · "))}</span>
       <div class="row-actions">
         <button type="button" data-session-use="${escapeHtml(session.id)}">Use</button>
@@ -10021,9 +10034,13 @@ function connectWs() {
         if (prev.sentAt) entry.elapsed = formatElapsed(prev.sentAt, receivedAt);
         all[sid] = entry;
         writeSessionOverrides(all);
-        if (payload.lifetimeTokenUsage) {
+        if (payload.lifetimeTokenUsage || payload.contextTokenUsage) {
           const patchSession = (session) => session?.id === sid
-            ? { ...session, lifetimeTokenUsage: payload.lifetimeTokenUsage }
+            ? {
+              ...session,
+              lifetimeTokenUsage: payload.lifetimeTokenUsage || session.lifetimeTokenUsage,
+              contextTokenUsage: payload.contextTokenUsage || session.contextTokenUsage,
+            }
             : session;
           state.sessions = (state.sessions || []).map(patchSession);
           state.projects = (state.projects || []).map((project) => ({
