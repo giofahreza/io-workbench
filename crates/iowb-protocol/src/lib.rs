@@ -11,7 +11,7 @@ pub const ENV_PREFIX: &str = "IO_WORKBENCH_";
 
 pub const WS_COMMAND_CHANNEL_CAPACITY: usize = 128;
 pub const WS_EVENT_CHANNEL_CAPACITY: usize = 512;
-pub const AUTO_SESSION_TITLE_MAX_CHARS: usize = 50;
+pub const AUTO_SESSION_TITLE_MAX_CHARS: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1809,6 +1809,7 @@ fn default_terminal_rows() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
+        AUTO_SESSION_TITLE_MAX_CHARS,
         ForkSessionRequest, SessionLifetimeTokenUsage, SessionMode, SessionSpentTokenUsage,
         SessionSummary, WsClientCommand, session_title_from_prompt,
     };
@@ -1991,11 +1992,17 @@ mod tests {
 
     #[test]
     fn session_title_truncates_by_unicode_characters() {
-        let prompt = "界".repeat(60);
+        let prompt = "界".repeat(110);
         assert_eq!(
             session_title_from_prompt(&prompt),
-            Some(format!("{}...", "界".repeat(50)))
+            Some(format!("{}...", "界".repeat(AUTO_SESSION_TITLE_MAX_CHARS)))
         );
+    }
+
+    #[test]
+    fn session_title_preserves_two_line_display_budget() {
+        let prompt = "Design a compact mobile chat session list title that uses the full two line area before truncating";
+        assert_eq!(session_title_from_prompt(prompt), Some(prompt.to_string()));
     }
 
     #[test]

@@ -9591,6 +9591,7 @@ fn user_to_profile(user: &iowb_storage::StoredUser) -> UserProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iowb_protocol::AUTO_SESSION_TITLE_MAX_CHARS;
     use tokio::net::TcpListener;
     use tokio::time::{Duration, sleep, timeout};
 
@@ -10272,10 +10273,10 @@ mod tests {
 
     #[test]
     fn summary_truncates_long_prompts() {
-        let prompt = "a".repeat(80);
+        let prompt = "a".repeat(AUTO_SESSION_TITLE_MAX_CHARS + 30);
         assert_eq!(
             session_title_from_prompt(&prompt),
-            Some(format!("{}...", "a".repeat(50)))
+            Some(format!("{}...", "a".repeat(AUTO_SESSION_TITLE_MAX_CHARS)))
         );
     }
 
