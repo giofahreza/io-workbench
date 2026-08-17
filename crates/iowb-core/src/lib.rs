@@ -120,6 +120,71 @@ pub enum CoreError {
 
 pub type Result<T> = std::result::Result<T, CoreError>;
 
+struct RetryContextRolloverSource {
+    recovery_run: StoredDurableChatRun,
+    failed_prompt: String,
+}
+
+fn resolve_retry_context_rollover_source(
+    storage: &Storage,
+    session_id: &str,
+    failed_message_id: &str,
+) -> Result<RetryContextRolloverSource> {
+    let failed_message = match storage.message_by_id(session_id, failed_message_id)? {
+        Some(message) if message.role == MessageRole::User => Some(message),
+        Some(_) => {
+            return Err(CoreError::InvalidInput(
+                "failed message was not a user message".to_string(),
+            ));
+        }
+        None => None,
+    };
+    let original_run = storage.durable_chat_run_for_user_message(session_id, failed_message_id)?;
+    let recovery_run = if let Some(run) = original_run
+        .as_ref()
+        .filter(|run| run.status == "failed")
+        .cloned()
+    {
+        run
+    } else {
+        let latest_rollover = storage
+            .latest_context_rollover(session_id)?
+            .filter(|rollover| {
+                rollover.kind == CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN
+                    && rollover.state == "failed"
+                    && rollover.failed_message_id == failed_message_id
+            })
+            .ok_or_else(|| {
+                CoreError::Conflict(
+                    "the selected user message does not belong to a failed turn".to_string(),
+                )
+            })?;
+        storage
+            .get_durable_chat_run(&latest_rollover.retry_run_id)?
+            .filter(|run| run.status == "failed")
+            .ok_or_else(|| {
+                CoreError::Conflict(
+                    "the selected clean-context retry is no longer failed".to_string(),
+                )
+            })?
+    };
+    let latest_run = storage.latest_durable_chat_run_for_session(session_id)?;
+    if latest_run.as_ref().map(|run| run.id.as_str()) != Some(recovery_run.id.as_str()) {
+        return Err(CoreError::Conflict(
+            "only the latest failed turn can be retried with a clean context".to_string(),
+        ));
+    }
+    let failed_prompt = failed_message
+        .as_ref()
+        .map(|message| message.content.clone())
+        .or_else(|| original_run.as_ref().map(|run| run.prompt.clone()))
+        .unwrap_or_else(|| recovery_run.prompt.clone());
+    Ok(RetryContextRolloverSource {
+        recovery_run,
+        failed_prompt,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub host: IpAddr,
@@ -1257,30 +1322,8 @@ impl AppState {
                 "stop the active response before compacting this chat".to_string(),
             ));
         }
-        let failed_message = self
-            .storage
-            .message_by_id(session_id, failed_message_id)?
-            .filter(|message| message.role == MessageRole::User)
-            .ok_or_else(|| {
-                CoreError::InvalidInput("failed user message was not found".to_string())
-            })?;
-        let failed_run = self
-            .storage
-            .durable_chat_run_for_user_message(session_id, failed_message_id)?
-            .filter(|run| run.status == "failed")
-            .ok_or_else(|| {
-                CoreError::Conflict(
-                    "the selected user message does not belong to a failed turn".to_string(),
-                )
-            })?;
-        let latest_run = self
-            .storage
-            .latest_durable_chat_run_for_session(session_id)?;
-        if latest_run.as_ref().map(|run| run.id.as_str()) != Some(failed_run.id.as_str()) {
-            return Err(CoreError::Conflict(
-                "only the latest failed turn can be retried with a clean context".to_string(),
-            ));
-        }
+        let recovery_source =
+            resolve_retry_context_rollover_source(&self.storage, session_id, failed_message_id)?;
 
         let observed_bytes = self
             .sessions
@@ -1294,8 +1337,10 @@ impl AppState {
                 .await?,
             &[failed_message_id],
         );
-        let handoff =
-            build_context_rollover_handoff(visible_messages.clone(), &failed_message.content);
+        let handoff = build_context_rollover_handoff(
+            visible_messages.clone(),
+            &recovery_source.failed_prompt,
+        );
         let rollover_id = new_id("rollover");
         let compact_run_id = new_id("run");
         let now = Utc::now();
@@ -1306,7 +1351,7 @@ impl AppState {
             request_id: request_id.to_string(),
             kind: CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN.to_string(),
             failed_message_id: failed_message_id.to_string(),
-            trigger_run_id: failed_run.id.clone(),
+            trigger_run_id: recovery_source.recovery_run.id.clone(),
             retry_run_id: compact_run_id.clone(),
             from_native_session_id: session.native_session_id.clone(),
             candidate_native_session_id: None,
@@ -1327,11 +1372,23 @@ impl AppState {
             handoff.clone(),
             session.project_path.clone(),
         );
-        compact_run.model = failed_run.model.clone().or(session.model.clone());
-        compact_run.effort = failed_run.effort.clone().or(session.effort.clone());
-        compact_run.mode = failed_run.mode.clone().or(session.mode.clone());
-        compact_run.thinking = failed_run.thinking.or(session.thinking);
-        compact_run.fast = failed_run.fast.or(session.fast);
+        compact_run.model = recovery_source
+            .recovery_run
+            .model
+            .clone()
+            .or(session.model.clone());
+        compact_run.effort = recovery_source
+            .recovery_run
+            .effort
+            .clone()
+            .or(session.effort.clone());
+        compact_run.mode = recovery_source
+            .recovery_run
+            .mode
+            .clone()
+            .or(session.mode.clone());
+        compact_run.thinking = recovery_source.recovery_run.thinking.or(session.thinking);
+        compact_run.fast = recovery_source.recovery_run.fast.or(session.fast);
         compact_run.native_session_id = None;
 
         self.storage
@@ -7814,26 +7871,35 @@ async fn activate_completed_context_rollover(
             "unknown context rollover kind".to_string(),
         ));
     }
-    let failed_message = context
+    let follow_up_run = match context
         .storage
         .message_by_id(&context.session_id, &rollover.failed_message_id)?
-        .filter(|message| message.role == MessageRole::User)
-        .ok_or_else(|| CoreError::InvalidInput("failed user message was not found".to_string()))?;
-    let mut follow_up_run = StoredDurableChatRun::new(
-        new_id("run"),
-        Some(rollover.user_id.clone()),
-        session.id.clone(),
-        context.provider.as_str(),
-        failed_message.content.clone(),
-        session.project_path.clone(),
-    );
-    follow_up_run.user_message_id = Some(failed_message.id.clone());
-    follow_up_run.native_session_id = Some(candidate.clone());
-    follow_up_run.model = context.model.clone();
-    follow_up_run.effort = context.effort.clone();
-    follow_up_run.mode = context.mode.clone();
-    follow_up_run.thinking = context.thinking;
-    follow_up_run.fast = context.fast;
+    {
+        Some(message) if message.role == MessageRole::User => {
+            let mut run = StoredDurableChatRun::new(
+                new_id("run"),
+                Some(rollover.user_id.clone()),
+                session.id.clone(),
+                context.provider.as_str(),
+                message.content.clone(),
+                session.project_path.clone(),
+            );
+            run.user_message_id = Some(message.id.clone());
+            run.native_session_id = Some(candidate.clone());
+            run.model = context.model.clone();
+            run.effort = context.effort.clone();
+            run.mode = context.mode.clone();
+            run.thinking = context.thinking;
+            run.fast = context.fast;
+            Some(run)
+        }
+        Some(_) => {
+            return Err(CoreError::InvalidInput(
+                "failed message was not a user message".to_string(),
+            ));
+        }
+        None => None,
+    };
     if !context.storage.complete_context_rollover(
         rollover_id,
         retry_run_id,
@@ -7841,7 +7907,7 @@ async fn activate_completed_context_rollover(
         &session,
         &marker,
         None,
-        Some(&follow_up_run),
+        follow_up_run.as_ref(),
     )? {
         return Err(CoreError::Conflict(
             "clean context rollover is no longer pending".to_string(),
@@ -7859,9 +7925,18 @@ async fn activate_completed_context_rollover(
         session_id = %context.session_id,
         rollover_id,
         native_session_id = %candidate,
-        "activated clean native context and staged original prompt"
+        retry_staged = follow_up_run.is_some(),
+        "activated clean native context"
     );
-    Ok(Some(ContextRolloverFollowUp { run: follow_up_run }))
+    if follow_up_run.is_none() {
+        warn!(
+            session_id = %context.session_id,
+            rollover_id,
+            failed_message_id = %rollover.failed_message_id,
+            "clean context activated without retrying missing failed prompt"
+        );
+    }
+    Ok(follow_up_run.map(|run| ContextRolloverFollowUp { run }))
 }
 
 fn human_byte_size(bytes: u64) -> String {
@@ -11276,6 +11351,366 @@ mod tests {
                 .expect("rollover")
                 .state,
             "failed"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_context_rollover_activates_without_follow_up_when_failed_message_row_is_missing()
+    {
+        let (state, root, project) = temporary_app_state("rollover-missing-failed-message").await;
+        let mut session = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("session-rollover-missing-failed-message".to_string()),
+                false,
+                Some("gpt-5.4".to_string()),
+                Some(ChatRuntime::IoGateway),
+                Some("high".to_string()),
+                Some("default".to_string()),
+                Some(true),
+                Some(false),
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .set_native_session_id(&session.id, "native-poisoned")
+            .await
+            .expect("old native session");
+        let prior = state
+            .sessions
+            .append_message(
+                &session.id,
+                MessageRole::Assistant,
+                "Visible history survives",
+            )
+            .await
+            .expect("prior message");
+        let failed_message = state
+            .sessions
+            .append_message(
+                &session.id,
+                MessageRole::User,
+                "Retry prompt row disappears before activation",
+            )
+            .await
+            .expect("failed prompt");
+        state
+            .sessions
+            .set_active(&session.id, false)
+            .await
+            .expect("inactive session");
+        session = state
+            .sessions
+            .get(&session.id)
+            .await
+            .expect("stored session");
+
+        let mut trigger_run = StoredDurableChatRun::new(
+            "run-rollover-missing-trigger",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            Provider::Codex.as_str(),
+            failed_message.content.clone(),
+            project.display().to_string(),
+        );
+        trigger_run.user_message_id = Some(failed_message.id.clone());
+        trigger_run.native_session_id = Some("native-poisoned".to_string());
+        state
+            .storage
+            .create_durable_chat_run(&trigger_run)
+            .expect("trigger run");
+        state
+            .storage
+            .mark_durable_chat_run_failed(&trigger_run.id, "invalid body")
+            .expect("failed trigger");
+
+        let now = Utc::now();
+        let rollover = StoredSessionContextRollover {
+            id: "rollover-missing-failed-message".to_string(),
+            user_id: "user-1".to_string(),
+            session_id: session.id.clone(),
+            request_id: "request-rollover-missing-failed-message".to_string(),
+            kind: CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN.to_string(),
+            failed_message_id: failed_message.id.clone(),
+            trigger_run_id: trigger_run.id.clone(),
+            retry_run_id: "run-rollover-missing-retry".to_string(),
+            from_native_session_id: Some("native-poisoned".to_string()),
+            candidate_native_session_id: None,
+            state: "starting".to_string(),
+            handoff: "bounded clean-context handoff".to_string(),
+            observed_bytes: Some(CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES),
+            limit_bytes: CODEX_GATEWAY_BODY_LIMIT_BYTES,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            activated_at: None,
+        };
+        let mut retry_run = StoredDurableChatRun::new(
+            rollover.retry_run_id.clone(),
+            Some("user-1".to_string()),
+            session.id.clone(),
+            Provider::Codex.as_str(),
+            rollover.handoff.clone(),
+            project.display().to_string(),
+        );
+        retry_run.model = session.model.clone();
+        retry_run.effort = session.effort.clone();
+        retry_run.mode = session.mode.clone();
+        retry_run.thinking = session.thinking;
+        retry_run.fast = session.fast;
+        assert!(
+            state
+                .storage
+                .prepare_context_rollover(&rollover, &retry_run)
+                .expect("prepare rollover")
+        );
+        assert!(
+            state
+                .storage
+                .set_context_rollover_candidate(&rollover.id, &retry_run.id, "native-clean")
+                .expect("stage clean candidate")
+        );
+        state
+            .storage
+            .replace_session_messages(&session.id, std::slice::from_ref(&prior))
+            .expect("simulate projection without failed row");
+        assert!(
+            state
+                .storage
+                .message_by_id(&session.id, &failed_message.id)
+                .expect("failed prompt lookup")
+                .is_none()
+        );
+
+        let context = AgentStartContext {
+            provider: Provider::Codex,
+            session_id: session.id.clone(),
+            durable_run_id: Some(retry_run.id.clone()),
+            attempt_id: None,
+            response_id: retry_run.id.clone(),
+            sequence: Arc::new(AtomicU64::new(0)),
+            project_path: project.clone(),
+            prompt: rollover.handoff.clone(),
+            model: session.model.clone(),
+            runtime: ChatRuntime::IoGateway,
+            effort: session.effort.clone(),
+            mode: session.mode.clone(),
+            thinking: session.thinking,
+            fast: session.fast,
+            native_resume_session_id: Some("native-clean".to_string()),
+            context_rollover_id: Some(rollover.id.clone()),
+            direct_ai_config: None,
+            direct_ai_messages: Vec::new(),
+            sessions: state.sessions.clone(),
+            storage: state.storage.clone(),
+            hub: WsHub::new(),
+        };
+
+        let follow_up = activate_completed_context_rollover(
+            &context,
+            &rollover.id,
+            now + chrono::Duration::seconds(1),
+        )
+        .await
+        .expect("activate compact-only rollover");
+
+        assert!(follow_up.is_none());
+        assert!(
+            state
+                .storage
+                .has_active_context_rollover(&session.id)
+                .expect("active rollover")
+        );
+        let completed_retry = state
+            .storage
+            .get_durable_chat_run(&retry_run.id)
+            .expect("retry lookup")
+            .expect("retry run");
+        assert_eq!(completed_retry.status, "completed");
+        assert!(
+            state
+                .storage
+                .list_active_durable_chat_runs()
+                .expect("active durable runs")
+                .is_empty()
+        );
+        let stored_session = state
+            .storage
+            .get_session(&session.id)
+            .expect("session lookup")
+            .expect("session");
+        assert_eq!(
+            stored_session.native_session_id.as_deref(),
+            Some("native-clean")
+        );
+        let messages = state.storage.list_messages(&session.id).expect("messages");
+        assert!(messages.iter().any(|message| message.id == prior.id));
+        assert!(messages.iter().any(|message| {
+            message.role == MessageRole::System
+                && message.content.starts_with("Context compacted here")
+                && message.metadata["failedMessageId"] == failed_message.id
+        }));
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.id != failed_message.id)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_compaction_start_allows_missing_failed_message_after_failed_rollover() {
+        let (state, root, project) = temporary_app_state("rollover-second-retry-missing-row").await;
+        let mut session = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("session-rollover-second-retry-missing-row".to_string()),
+                false,
+                Some("gpt-5.4".to_string()),
+                Some(ChatRuntime::IoGateway),
+                Some("high".to_string()),
+                Some("default".to_string()),
+                Some(true),
+                Some(false),
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .set_native_session_id(&session.id, "native-poisoned")
+            .await
+            .expect("old native session");
+        let prior = state
+            .sessions
+            .append_message(
+                &session.id,
+                MessageRole::Assistant,
+                "Visible history before failed retry",
+            )
+            .await
+            .expect("prior message");
+        let failed_message = state
+            .sessions
+            .append_message(
+                &session.id,
+                MessageRole::User,
+                "Second clean-context retry should compact only",
+            )
+            .await
+            .expect("failed prompt");
+        state
+            .sessions
+            .set_active(&session.id, false)
+            .await
+            .expect("inactive session");
+        session = state
+            .sessions
+            .get(&session.id)
+            .await
+            .expect("stored session");
+
+        let mut trigger_run = StoredDurableChatRun::new(
+            "run-rollover-second-trigger",
+            Some("user-1".to_string()),
+            session.id.clone(),
+            Provider::Codex.as_str(),
+            failed_message.content.clone(),
+            project.display().to_string(),
+        );
+        trigger_run.user_message_id = Some(failed_message.id.clone());
+        trigger_run.native_session_id = Some("native-poisoned".to_string());
+        state
+            .storage
+            .create_durable_chat_run(&trigger_run)
+            .expect("trigger run");
+        state
+            .storage
+            .mark_durable_chat_run_failed(&trigger_run.id, "invalid body")
+            .expect("failed trigger");
+
+        let now = Utc::now();
+        let previous_rollover = StoredSessionContextRollover {
+            id: "rollover-second-previous".to_string(),
+            user_id: "user-1".to_string(),
+            session_id: session.id.clone(),
+            request_id: "request-rollover-second-previous".to_string(),
+            kind: CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN.to_string(),
+            failed_message_id: failed_message.id.clone(),
+            trigger_run_id: trigger_run.id.clone(),
+            retry_run_id: "run-rollover-second-previous-retry".to_string(),
+            from_native_session_id: Some("native-poisoned".to_string()),
+            candidate_native_session_id: None,
+            state: "starting".to_string(),
+            handoff: "previous bounded handoff".to_string(),
+            observed_bytes: Some(CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES),
+            limit_bytes: CODEX_GATEWAY_BODY_LIMIT_BYTES,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            activated_at: None,
+        };
+        let mut previous_retry_run = StoredDurableChatRun::new(
+            previous_rollover.retry_run_id.clone(),
+            Some("user-1".to_string()),
+            session.id.clone(),
+            Provider::Codex.as_str(),
+            previous_rollover.handoff.clone(),
+            project.display().to_string(),
+        );
+        previous_retry_run.model = session.model.clone();
+        previous_retry_run.effort = session.effort.clone();
+        previous_retry_run.mode = session.mode.clone();
+        previous_retry_run.thinking = session.thinking;
+        previous_retry_run.fast = session.fast;
+        assert!(
+            state
+                .storage
+                .prepare_context_rollover(&previous_rollover, &previous_retry_run)
+                .expect("prepare previous rollover")
+        );
+        state
+            .storage
+            .fail_context_rollover(
+                &previous_rollover.id,
+                "failed to activate clean context: failed user message was not found",
+            )
+            .expect("fail previous rollover");
+        state
+            .storage
+            .mark_durable_chat_run_failed(&previous_retry_run.id, "provider run failed")
+            .expect("fail previous retry run");
+        state
+            .storage
+            .replace_session_messages(&session.id, std::slice::from_ref(&prior))
+            .expect("simulate projection without failed row");
+        state
+            .sessions
+            .set_active(&session.id, false)
+            .await
+            .expect("inactive after failed rollover");
+
+        let error = state
+            .compact_and_retry_session_context(
+                "user-1",
+                &session.id,
+                &failed_message.id,
+                "request-rollover-second-new",
+                None,
+            )
+            .await
+            .expect_err("missing IO Gateway config should stop after retry validation");
+
+        assert_eq!(
+            error.to_string(),
+            "IO Gateway is not configured for this session"
         );
 
         let _ = std::fs::remove_dir_all(root);
