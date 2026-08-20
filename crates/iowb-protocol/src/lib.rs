@@ -435,10 +435,17 @@ pub struct SessionSummary {
     )]
     pub board_task_id: Option<String>,
     /// Native CLI thread/session id associated with an internal workbench
-    /// session. This is persisted by the server but intentionally omitted
-    /// from API payloads.
-    #[serde(skip)]
+    /// session. Clients use this to offer a direct `codex resume` command.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "nativeSessionId"
+    )]
     pub native_session_id: Option<String>,
+    /// True when the native provider rollout is owned by the provider runtime
+    /// and Workbench's stored transcript is the user-visible source of truth.
+    #[serde(skip)]
+    pub native_rollout_owned_by_provider: bool,
     #[serde(skip)]
     pub title_source: Option<SessionTitleSource>,
     #[serde(rename = "projectPath")]
@@ -1592,6 +1599,15 @@ pub enum WsClientCommand {
         /// live or replayed chat events for that session are delivered.
         #[serde(default, rename = "sessionIds")]
         session_ids: Vec<String>,
+        /// Ordinary chat output remains broadcast to legacy clients when this
+        /// field is absent. Mobile clients send an explicit list so hidden
+        /// chat sessions do not stream into the visible UI.
+        #[serde(
+            default,
+            rename = "chatSessionIds",
+            skip_serializing_if = "Option::is_none"
+        )]
+        chat_session_ids: Option<Vec<String>>,
     },
     StartSession {
         provider: Provider,
@@ -1706,6 +1722,12 @@ pub enum WsServerEvent {
         thinking: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fast: Option<bool>,
+        #[serde(
+            rename = "nativeSessionId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        native_session_id: Option<String>,
         #[serde(rename = "receivedAt")]
         received_at: DateTime<Utc>,
         #[serde(rename = "lastMessageAt", skip_serializing_if = "Option::is_none")]
@@ -1809,9 +1831,8 @@ fn default_terminal_rows() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTO_SESSION_TITLE_MAX_CHARS,
-        ForkSessionRequest, SessionLifetimeTokenUsage, SessionMode, SessionSpentTokenUsage,
-        SessionSummary, WsClientCommand, session_title_from_prompt,
+        AUTO_SESSION_TITLE_MAX_CHARS, ForkSessionRequest, SessionLifetimeTokenUsage, SessionMode,
+        SessionSpentTokenUsage, SessionSummary, WsClientCommand, session_title_from_prompt,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
@@ -1856,9 +1877,11 @@ mod tests {
             WsClientCommand::Subscribe {
                 topics,
                 session_ids,
+                chat_session_ids,
             } => {
                 assert_eq!(topics, ["sessions"]);
                 assert_eq!(session_ids, ["board-session"]);
+                assert_eq!(chat_session_ids, None);
             }
             _ => panic!("expected subscribe"),
         }
@@ -1869,7 +1892,40 @@ mod tests {
         }))
         .expect("deserialize ordinary subscription");
         match ordinary {
-            WsClientCommand::Subscribe { session_ids, .. } => assert!(session_ids.is_empty()),
+            WsClientCommand::Subscribe {
+                session_ids,
+                chat_session_ids,
+                ..
+            } => {
+                assert!(session_ids.is_empty());
+                assert_eq!(chat_session_ids, None);
+            }
+            _ => panic!("expected subscribe"),
+        }
+
+        let mobile_scoped: WsClientCommand = serde_json::from_value(json!({
+            "type": "subscribe",
+            "topics": ["sessions"],
+            "chatSessionIds": ["ordinary-session"]
+        }))
+        .expect("deserialize mobile-scoped subscription");
+        match mobile_scoped {
+            WsClientCommand::Subscribe {
+                chat_session_ids, ..
+            } => assert_eq!(chat_session_ids, Some(vec!["ordinary-session".to_string()])),
+            _ => panic!("expected subscribe"),
+        }
+
+        let mobile_hidden: WsClientCommand = serde_json::from_value(json!({
+            "type": "subscribe",
+            "topics": ["sessions"],
+            "chatSessionIds": []
+        }))
+        .expect("deserialize hidden mobile subscription");
+        match mobile_hidden {
+            WsClientCommand::Subscribe {
+                chat_session_ids, ..
+            } => assert_eq!(chat_session_ids, Some(Vec::new())),
             _ => panic!("expected subscribe"),
         }
     }
@@ -1908,12 +1964,14 @@ mod tests {
             board_session: true,
             board_run_id: Some("run-1".to_string()),
             board_task_id: Some("task-1".to_string()),
+            native_session_id: Some("native-1".to_string()),
             ..Default::default()
         };
         let value = serde_json::to_value(summary).expect("serialize board session");
         assert_eq!(value["boardSession"], true);
         assert_eq!(value["boardRunId"], "run-1");
         assert_eq!(value["boardTaskId"], "task-1");
+        assert_eq!(value["nativeSessionId"], "native-1");
     }
 
     #[test]

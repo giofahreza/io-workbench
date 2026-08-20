@@ -323,6 +323,33 @@
     "/api/git/commit-diff": {
       "get": { "tags": ["Git"], "summary": "Read a commit diff" }
     },
+    "/api/git/stashes": {
+      "get": { "tags": ["Git"], "summary": "List stashes" }
+    },
+    "/api/git/stash": {
+      "post": { "tags": ["Git"], "summary": "Create a stash" }
+    },
+    "/api/git/stash/apply": {
+      "post": { "tags": ["Git"], "summary": "Apply a stash" }
+    },
+    "/api/git/stash/pop": {
+      "post": { "tags": ["Git"], "summary": "Pop a stash" }
+    },
+    "/api/git/stash/drop": {
+      "post": { "tags": ["Git"], "summary": "Drop a stash" }
+    },
+    "/api/git/tags": {
+      "get": { "tags": ["Git"], "summary": "List tags" }
+    },
+    "/api/git/tag": {
+      "post": { "tags": ["Git"], "summary": "Create a tag" }
+    },
+    "/api/git/tag/delete": {
+      "post": { "tags": ["Git"], "summary": "Delete a tag" }
+    },
+    "/api/git/tag/push": {
+      "post": { "tags": ["Git"], "summary": "Push a tag" }
+    },
     "/api/git/generate-commit-message": {
       "post": { "tags": ["Git"], "summary": "Generate a commit message" }
     },
@@ -672,6 +699,10 @@
           },
           "boardRunId": { "type": ["string", "null"] },
           "boardTaskId": { "type": ["string", "null"] },
+          "nativeSessionId": {
+            "type": ["string", "null"],
+            "description": "Native Codex/CLI thread id for resuming this Workbench chat in the provider CLI."
+          },
           "projectPath": { "type": "string" },
           "title": { "type": "string" },
           "messageCount": { "type": "integer", "minimum": 0 },

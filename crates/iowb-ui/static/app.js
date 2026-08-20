@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260815-01";
+const APP_VERSION = "20260819-01";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -96,6 +96,7 @@ const state = {
   fileCreating: null,
   fileRenamingPath: "",
   fileContextMenu: null,
+  sessionContextMenu: null,
   fileUploadTargetPath: "",
   fileViewMode: window.localStorage.getItem("iowb.fileViewMode") || "detailed",
   editorSearch: {
@@ -974,6 +975,22 @@ function sessionProvider(session) {
   return String(session?.provider || session?.__provider || "codex").toLowerCase();
 }
 
+function nativeSessionId(session) {
+  return String(session?.nativeSessionId || session?.native_session_id || "").trim();
+}
+
+function shellSingleQuote(value) {
+  return `'${String(value || "").replaceAll("'", "'\\''")}'`;
+}
+
+function codexResumeCommand(session, projectPath = "") {
+  const nativeId = nativeSessionId(session);
+  if (!nativeId || sessionProvider(session) !== "codex") return "";
+  const path = sessionProjectPath(session, projectPath);
+  const resume = `codex resume ${shellSingleQuote(nativeId)}`;
+  return path ? `cd ${shellSingleQuote(path)} && ${resume}` : resume;
+}
+
 function isChatSessionPinned(session, projectPath = "") {
   const path = sessionProjectPath(session, projectPath);
   const provider = sessionProvider(session);
@@ -1331,7 +1348,7 @@ function sidebarSessionCardHtml(session, options = {}) {
   const projectLabel = showProject
     ? (options.projectName || session.projectName || projectPath || "")
     : "";
-  return `<article class="sidebar-history-item${isActive ? " active" : ""}${pinned ? " pinned" : ""}${reorderable ? " pinned-reorderable" : ""}${status ? ` is-${escapeHtml(status)}` : ""}" data-sidebar-session-card="${escapeHtml(session.id)}"${reorderable ? ` data-sidebar-pinned-key="${escapeHtml(pinKey)}"` : ""} data-pending="${pending}" data-status="${escapeHtml(status)}">
+  return `<article class="sidebar-history-item${isActive ? " active" : ""}${pinned ? " pinned" : ""}${reorderable ? " pinned-reorderable" : ""}${status ? ` is-${escapeHtml(status)}` : ""}" data-sidebar-session-card="${escapeHtml(session.id)}" data-sidebar-card-provider="${escapeHtml(cli)}" data-sidebar-card-project-path="${escapeHtml(projectPath)}"${reorderable ? ` data-sidebar-pinned-key="${escapeHtml(pinKey)}"` : ""} data-pending="${pending}" data-status="${escapeHtml(status)}">
     <button type="button" class="sidebar-history-main" data-sidebar-session="${escapeHtml(session.id)}" data-sidebar-provider="${escapeHtml(cli)}" data-sidebar-project-path="${escapeHtml(projectPath)}" data-pending="${pending}">
       <div class="session-title-row">
         ${status ? `<span class="session-status-icon" aria-label="${escapeHtml(statusLabel)}" title="${escapeHtml(statusLabel)}"></span>` : ""}
@@ -1500,6 +1517,79 @@ async function deleteChatSession(sessionId, projectPath = "", button = null) {
   removeLocal();
   await loadProjects().catch(() => {});
   showToast("Chat session deleted", "ok");
+}
+
+function sessionContextMenuHtml(session, projectPath = "") {
+  const id = session?.id || "";
+  const path = sessionProjectPath(session, projectPath);
+  const provider = sessionProvider(session);
+  const pinned = isChatSessionPinned(session, path);
+  const resumeCommand = codexResumeCommand(session, path);
+  return `<div id="session-context-menu" class="file-context-menu session-context-menu" role="menu" aria-label="Session actions">
+    <button type="button" data-symbol="open" data-session-context-action="open" data-session-context-id="${escapeHtml(id)}" data-session-context-project-path="${escapeHtml(path)}">Open Chat</button>
+    ${resumeCommand ? `<button type="button" data-symbol="copy" data-session-context-action="copy-codex-resume" data-session-context-id="${escapeHtml(id)}" data-session-context-project-path="${escapeHtml(path)}">Copy Codex Resume Command</button>` : ""}
+    <button type="button" data-symbol="copy" data-session-context-action="copy-session-id" data-session-context-id="${escapeHtml(id)}">Copy Workbench Session ID</button>
+    <hr />
+    <button type="button" data-symbol="pin" data-session-context-action="toggle-pin" data-session-context-id="${escapeHtml(id)}" data-session-context-provider="${escapeHtml(provider)}" data-session-context-project-path="${escapeHtml(path)}">${pinned ? "Unpin Chat" : "Pin Chat"}</button>
+    ${session?.pending ? "" : `<button type="button" class="danger" data-symbol="trash" data-session-context-action="delete" data-session-context-id="${escapeHtml(id)}" data-session-context-project-path="${escapeHtml(path)}">Delete Chat</button>`}
+  </div>`;
+}
+
+function closeSessionContextMenu() {
+  state.sessionContextMenu = null;
+  qs("#session-context-menu")?.remove();
+}
+
+function openSessionContextMenu(session, projectPath, x, y) {
+  if (!session?.id || isBoardChatSession(session)) return;
+  closeFileContextMenu();
+  closeSessionContextMenu();
+  state.sessionContextMenu = { sessionId: session.id };
+  document.body.insertAdjacentHTML("beforeend", sessionContextMenuHtml(session, projectPath));
+  const menu = qs("#session-context-menu");
+  const left = Math.min(Math.max(8, x), window.innerWidth - menu.offsetWidth - 8);
+  const top = Math.min(Math.max(8, y), window.innerHeight - menu.offsetHeight - 8);
+  menu.style.left = `${Math.round(left)}px`;
+  menu.style.top = `${Math.round(top)}px`;
+  menu.querySelectorAll("[data-session-context-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      handleSessionContextAction(
+        button.dataset.sessionContextAction,
+        button.dataset.sessionContextId,
+        button.dataset.sessionContextProjectPath || projectPath || "",
+        button.dataset.sessionContextProvider || sessionProvider(session),
+      ).catch(showError);
+    });
+  });
+}
+
+function openSessionContextMenuFromRow(row, x, y) {
+  const sessionId = row?.dataset.sidebarSessionCard || "";
+  const session = findChatSession(sessionId);
+  if (!session) return;
+  openSessionContextMenu(session, row.dataset.sidebarCardProjectPath || session.projectPath || "", x, y);
+}
+
+async function handleSessionContextAction(action, sessionId, projectPath = "", provider = "") {
+  const session = findChatSession(sessionId);
+  closeSessionContextMenu();
+  if (!session && !["copy-session-id"].includes(action)) return;
+  if (action === "open") {
+    if (provider) setChatProvider(provider);
+    await pickChatSession(sessionId, projectPath);
+  } else if (action === "copy-codex-resume") {
+    const command = codexResumeCommand(session, projectPath);
+    if (!command) return;
+    await copyText(command);
+    showToast("Codex resume command copied", "ok");
+  } else if (action === "copy-session-id") {
+    await copyText(sessionId);
+    showToast("Workbench session ID copied", "ok");
+  } else if (action === "toggle-pin") {
+    togglePinnedChatSession(sessionId, projectPath, provider);
+  } else if (action === "delete") {
+    await deleteChatSession(sessionId, projectPath).catch(showError);
+  }
 }
 
 function updatePendingChatProvider(provider) {
@@ -2367,10 +2457,40 @@ function chooseNewChatProvider(provider) {
 }
 
 function bindSidebarSessionActions(target) {
+  target.querySelectorAll("[data-sidebar-session-card]").forEach((row) => {
+    row.addEventListener("contextmenu", (event) => {
+      if (event.target.closest("[data-sidebar-session-pin], [data-sidebar-session-delete], [data-sidebar-pinned-drag-handle]")) return;
+      event.preventDefault();
+      openSessionContextMenuFromRow(row, event.clientX, event.clientY);
+    });
+    let longPressTimer = null;
+    const cancelLongPress = () => {
+      window.clearTimeout(longPressTimer);
+      longPressTimer = null;
+    };
+    row.addEventListener("pointerdown", (event) => {
+      if (event.pointerType === "mouse") return;
+      if (event.target.closest("[data-sidebar-session-pin], [data-sidebar-session-delete], [data-sidebar-pinned-drag-handle]")) return;
+      cancelLongPress();
+      longPressTimer = window.setTimeout(() => {
+        hapticFeedback(8);
+        row.dataset.sidebarSuppressClick = "true";
+        openSessionContextMenuFromRow(row, event.clientX, event.clientY);
+      }, 540);
+    });
+    row.addEventListener("pointerup", cancelLongPress);
+    row.addEventListener("pointercancel", cancelLongPress);
+    row.addEventListener("pointerleave", cancelLongPress);
+  });
   target.querySelectorAll("[data-sidebar-session]").forEach((button) => {
     button.addEventListener("click", async (event) => {
       event.stopPropagation();
       event.preventDefault();
+      const row = button.closest("[data-sidebar-session-card]");
+      if (row?.dataset.sidebarSuppressClick === "true") {
+        row.dataset.sidebarSuppressClick = "false";
+        return;
+      }
       hapticFeedback(6);
       if (button.dataset.sidebarProvider) setChatProvider(button.dataset.sidebarProvider);
       await pickChatSession(
@@ -5947,6 +6067,7 @@ function closeFileContextMenu() {
 
 function openFileContextMenu(entry, x, y) {
   closeFileContextMenu();
+  closeSessionContextMenu();
   state.fileContextMenu = { path: entry.path };
   document.body.insertAdjacentHTML("beforeend", fileContextMenuHtml(entry));
   const menu = qs("#file-context-menu");
@@ -10056,10 +10177,18 @@ function connectWs() {
         if (prev.sentAt) entry.elapsed = formatElapsed(prev.sentAt, receivedAt);
         all[sid] = entry;
         writeSessionOverrides(all);
-        if (payload.lifetimeTokenUsage || payload.contextTokenUsage || payload.spentTokenUsage) {
+        if (
+          payload.nativeSessionId ||
+          payload.native_session_id ||
+          payload.lifetimeTokenUsage ||
+          payload.contextTokenUsage ||
+          payload.spentTokenUsage
+        ) {
+          const nativeId = nativeSessionId(payload);
           const patchSession = (session) => session?.id === sid
             ? {
               ...session,
+              nativeSessionId: nativeId || session.nativeSessionId,
               lifetimeTokenUsage: payload.lifetimeTokenUsage || session.lifetimeTokenUsage,
               contextTokenUsage: payload.contextTokenUsage || session.contextTokenUsage,
               spentTokenUsage: payload.spentTokenUsage || session.spentTokenUsage,
@@ -11342,6 +11471,9 @@ function bindForms() {
   document.addEventListener("click", (event) => {
     if (state.fileContextMenu && !event.target.closest("#file-context-menu") && !event.target.closest("[data-file-menu]")) {
       closeFileContextMenu();
+    }
+    if (state.sessionContextMenu && !event.target.closest("#session-context-menu") && !event.target.closest("[data-sidebar-session-card]")) {
+      closeSessionContextMenu();
     }
     if (state.openProjectMenuPath && !event.target.closest(".project-menu-wrap")) {
       state.openProjectMenuPath = "";

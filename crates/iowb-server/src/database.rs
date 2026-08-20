@@ -3437,6 +3437,8 @@ async fn execute_postgres_query(
         .map(|description| postgres_columns(description.columns()))
         .unwrap_or_default();
     let mut rows = Vec::new();
+    let mut observed_rows = 0usize;
+    let mut result_truncated = false;
     let mut affected_rows = 0u64;
     let mut stream = sqlx::raw_sql(sql).fetch_many(&mut *database);
     while let Some(step) = stream.next().await {
@@ -3444,7 +3446,15 @@ async fn execute_postgres_query(
             Either::Left(result) => {
                 affected_rows = affected_rows.saturating_add(result.rows_affected());
             }
-            Either::Right(row) => rows.push(row),
+            Either::Right(row) => {
+                observed_rows = observed_rows.saturating_add(1);
+                if rows.len() < max_rows {
+                    rows.push(row);
+                } else {
+                    result_truncated = true;
+                    break;
+                }
+            }
         }
     }
     drop(stream);
@@ -3457,12 +3467,10 @@ async fn execute_postgres_query(
     let row_count = if columns.is_empty() {
         usize::try_from(affected_rows).unwrap_or(usize::MAX)
     } else {
-        rows.len()
+        observed_rows
     };
-    let result_truncated = rows.len() > max_rows;
     let output = rows
         .into_iter()
-        .take(max_rows)
         .map(|row| postgres_row_to_json_map(&row))
         .collect::<Vec<_>>();
     let returned_row_count = output.len();
@@ -3481,6 +3489,7 @@ async fn execute_postgres_query(
             returned_row_count,
             result_truncated,
             max_rows,
+            !result_truncated,
             None,
         )),
         database_name: None,
@@ -3502,6 +3511,8 @@ async fn execute_mysql_query(
         .map(|description| mysql_columns(description.columns()))
         .unwrap_or_default();
     let mut rows = Vec::new();
+    let mut observed_rows = 0usize;
+    let mut result_truncated = false;
     let mut affected_rows = 0u64;
     let mut last_insert_id = 0u64;
     let mut stream = sqlx::raw_sql(sql).fetch_many(&mut *database);
@@ -3511,7 +3522,15 @@ async fn execute_mysql_query(
                 affected_rows = affected_rows.saturating_add(result.rows_affected());
                 last_insert_id = result.last_insert_id();
             }
-            Either::Right(row) => rows.push(row),
+            Either::Right(row) => {
+                observed_rows = observed_rows.saturating_add(1);
+                if rows.len() < max_rows {
+                    rows.push(row);
+                } else {
+                    result_truncated = true;
+                    break;
+                }
+            }
         }
     }
     drop(stream);
@@ -3523,14 +3542,12 @@ async fn execute_mysql_query(
         .unwrap_or(described_columns);
     let has_row_set = !columns.is_empty();
     let row_count = if has_row_set {
-        rows.len()
+        observed_rows
     } else {
         usize::try_from(affected_rows).unwrap_or(usize::MAX)
     };
-    let result_truncated = rows.len() > max_rows;
     let output = rows
         .into_iter()
-        .take(max_rows)
         .map(|row| mysql_row_to_json_map(&row))
         .collect::<Vec<_>>();
     let returned_row_count = output.len();
@@ -3577,6 +3594,7 @@ async fn execute_mysql_query(
             returned_row_count,
             result_truncated,
             max_rows,
+            !result_truncated,
             extra_meta,
         )),
         database_name: None,
@@ -4694,6 +4712,7 @@ fn execute_sqlite_query(
                 0,
                 false,
                 max_rows,
+                true,
                 Some(serde_json::json!({
                     "changes": changed,
                     "lastInsertRowid": last_insert_row_id,
@@ -4724,14 +4743,17 @@ fn execute_sqlite_query(
     let mut rows = stmt.query([]).map_err(sqlite_server_error)?;
     let mut output = Vec::new();
     let mut row_count = 0usize;
+    let mut result_truncated = false;
     while let Some(row) = rows.next().map_err(sqlite_server_error)? {
         row_count += 1;
         if output.len() < max_rows {
             output.push(row_to_json_map(row, &column_names)?);
+        } else {
+            result_truncated = true;
+            break;
         }
     }
     let returned_row_count = output.len();
-    let result_truncated = row_count > returned_row_count;
 
     Ok(DatabaseQueryResult {
         sql: sql.to_string(),
@@ -4748,6 +4770,7 @@ fn execute_sqlite_query(
             returned_row_count,
             result_truncated,
             max_rows,
+            !result_truncated,
             None,
         )),
         database_name: None,
@@ -4759,6 +4782,7 @@ fn query_result_meta(
     returned_row_count: usize,
     result_truncated: bool,
     max_rows: usize,
+    row_count_exact: bool,
     extra: Option<Value>,
 ) -> Value {
     let mut meta = match extra {
@@ -4771,6 +4795,7 @@ fn query_result_meta(
     );
     meta.insert("resultTruncated".to_string(), Value::Bool(result_truncated));
     meta.insert("maxRows".to_string(), Value::from(max_rows));
+    meta.insert("rowCountExact".to_string(), Value::Bool(row_count_exact));
     Value::Object(meta)
 }
 
@@ -6655,10 +6680,17 @@ mod tests {
             "X'000102ff'"
         );
 
-        let meta = query_result_meta(2, true, 2, Some(serde_json::json!({ "driver": "sqlite" })));
+        let meta = query_result_meta(
+            2,
+            true,
+            2,
+            false,
+            Some(serde_json::json!({ "driver": "sqlite" })),
+        );
         assert_eq!(meta["returnedRowCount"], Value::from(2));
         assert_eq!(meta["resultTruncated"], Value::Bool(true));
         assert_eq!(meta["maxRows"], Value::from(2));
+        assert_eq!(meta["rowCountExact"], Value::Bool(false));
         assert_eq!(meta["driver"], Value::String("sqlite".to_string()));
     }
 
@@ -6684,12 +6716,12 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_query_row_count_tracks_all_rows_before_truncation() {
+    fn sqlite_query_stops_after_requested_rows_plus_one() {
         let path = env::temp_dir().join(format!("{}.sqlite", new_id("database-query-test")));
         let sqlite = Connection::open(&path).expect("open query test database");
         sqlite
             .execute_batch(
-                "CREATE TABLE records (id INTEGER PRIMARY KEY); INSERT INTO records VALUES (1), (2), (3);",
+                "CREATE TABLE records (id INTEGER PRIMARY KEY); INSERT INTO records VALUES (1), (2), (3), (4), (5);",
             )
             .expect("seed query test database");
         drop(sqlite);
@@ -6704,6 +6736,10 @@ mod tests {
         assert_eq!(result.returned_row_count, 2);
         assert!(result.result_truncated);
         assert_eq!(result.rows.len(), 2);
+        assert_eq!(
+            result.meta.expect("query metadata")["rowCountExact"],
+            Value::Bool(false)
+        );
 
         let _ = std::fs::remove_file(path);
     }

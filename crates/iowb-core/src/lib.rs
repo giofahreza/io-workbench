@@ -48,7 +48,11 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use codex_app_server::{CodexAppServerClient, CodexAppServerLaunchOptions, CodexThreadSnapshot};
+use codex_app_server::{
+    CodexAppServerClient, CodexAppServerLaunchOptions, CodexAppServerLiveTurnEvent,
+    CodexAppServerLiveTurnOutcome, CodexAppServerLiveTurnParams, CodexAppServerTurnTerminalStatus,
+    CodexThreadSnapshot,
+};
 use external_sessions::{
     EXTERNAL_MESSAGE_PARSER_VERSION, ExternalSessionRecord, external_file_fingerprint,
     load_external_messages, looks_like_codex_live_transcript, same_project_path,
@@ -80,6 +84,8 @@ const DURABLE_AGENT_SCOPE_ENV: &str = "IO_WORKBENCH_DURABLE_RUN_SCOPE";
 const DURABLE_AGENT_OWNER_PID_ENV: &str = "IO_WORKBENCH_DURABLE_OWNER_PID";
 const DURABLE_AGENT_OWNER_START_ENV: &str = "IO_WORKBENCH_DURABLE_OWNER_START";
 const IO_WORKBENCH_GATEWAY_KEY_ENV: &str = "IOWB_IO_GATEWAY_API_KEY";
+const CODEX_APP_SERVER_LIVE_ENV: &str = "IO_WORKBENCH_CODEX_APP_SERVER_LIVE";
+const CODEX_APP_SERVER_LIVE_IO_GATEWAY_ENV: &str = "IO_WORKBENCH_CODEX_APP_SERVER_LIVE_IO_GATEWAY";
 pub const DURABLE_CHAT_RUN_MAX_RECOVERY_ATTEMPTS: u32 = 3;
 const DURABLE_CHAT_RUN_RECOVERY_PROMPT_LIMIT: usize = 6_000;
 const CODEX_GATEWAY_BODY_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
@@ -303,16 +309,7 @@ impl AppState {
             path_validator,
             watch: WatchManager::new(),
             ws_hub: WsHub::new(),
-            codex_app_server: CodexAppServerClient::new(
-                configured_codex_command(),
-                Duration::from_secs(
-                    env::var("IO_WORKBENCH_CODEX_APP_SERVER_TIMEOUT_SECS")
-                        .ok()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(15)
-                        .clamp(1, 120),
-                ),
-            ),
+            codex_app_server: default_codex_app_server_client(),
             codex_app_server_mutation: Arc::new(Mutex::new(())),
         };
 
@@ -697,6 +694,7 @@ impl AppState {
                 thinking,
                 fast,
                 native_resume_session_id,
+                native_rollout_owned_by_provider: false,
                 context_rollover_id: None,
                 direct_ai_config,
                 direct_ai_messages,
@@ -849,6 +847,7 @@ impl AppState {
             board_run_id: source.board_run_id.clone(),
             board_task_id: source.board_task_id.clone(),
             native_session_id: native_forked_thread_id.clone(),
+            native_rollout_owned_by_provider: source.native_rollout_owned_by_provider,
             title_source: Some(SessionTitleSource::Prompt),
             project_path: source.project_path.clone(),
             title: session_title_from_prompt(draft_content)
@@ -1214,6 +1213,7 @@ impl AppState {
                 thinking: run.thinking,
                 fast: run.fast,
                 native_resume_session_id,
+                native_rollout_owned_by_provider: false,
                 context_rollover_id: context_rollover
                     .as_ref()
                     .map(|rollover| rollover.id.clone()),
@@ -1454,6 +1454,7 @@ impl AppState {
                 thinking: compact_run.thinking,
                 fast: compact_run.fast,
                 native_resume_session_id: None,
+                native_rollout_owned_by_provider: false,
                 context_rollover_id: Some(rollover_id.clone()),
                 direct_ai_config,
                 direct_ai_messages: Vec::new(),
@@ -1748,6 +1749,7 @@ impl AppState {
             thinking: task.compact_run.thinking,
             fast: task.compact_run.fast,
             native_resume_session_id: Some(task.native_session_id.clone()),
+            native_rollout_owned_by_provider: false,
             context_rollover_id: Some(task.rollover_id.clone()),
             direct_ai_config: None,
             direct_ai_messages: Vec::new(),
@@ -1851,6 +1853,7 @@ impl AppState {
             mode: session.mode,
             thinking: session.thinking,
             fast: session.fast,
+            native_session_id: session.native_session_id,
             received_at: session.received_at.unwrap_or_else(Utc::now),
             last_message_at: session.last_message_at,
             first_user_at: session.first_user_at,
@@ -2375,6 +2378,7 @@ impl SessionManager {
                 context_token_usage: None,
                 spent_token_usage: None,
                 native_session_id: None,
+                native_rollout_owned_by_provider: false,
                 title_source: Some(SessionTitleSource::Prompt),
             });
 
@@ -2639,6 +2643,41 @@ impl SessionManager {
         Ok(session.clone())
     }
 
+    pub async fn set_native_rollout_owned_by_provider(
+        &self,
+        session_id: &str,
+        owned: bool,
+    ) -> Result<SessionSummary> {
+        let mut sessions = self.sessions.write().await;
+        if !sessions.contains_key(session_id)
+            && let Some(stored) = self.storage.get_session_summary(session_id)?
+        {
+            sessions.insert(session_id.to_string(), stored);
+        }
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
+        if session.native_rollout_owned_by_provider != owned {
+            session.native_rollout_owned_by_provider = owned;
+            self.storage.upsert_session(session)?;
+        }
+        Ok(session.clone())
+    }
+
+    async fn has_provider_owned_native_rollout(&self, session_id: &str) -> Result<bool> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).cloned()
+        }
+        .or_else(|| self.storage.get_session_summary(session_id).ok().flatten());
+        Ok(session.is_some_and(|session| {
+            !session.external
+                && session.provider == Provider::Codex
+                && session.native_session_id.is_some()
+                && session.native_rollout_owned_by_provider
+        }))
+    }
+
     async fn infer_native_session_id(
         &self,
         session_id: &str,
@@ -2793,6 +2832,7 @@ impl SessionManager {
             }
         } else if session.provider == Provider::Codex
             && session.native_session_id.is_some()
+            && !session.native_rollout_owned_by_provider
             && !self.storage.has_active_context_rollover(&session.id)?
         {
             if let Some(record) = self.external_record_for_messages(&session.id).await {
@@ -3262,6 +3302,9 @@ impl SessionManager {
         &self,
         session_id: &str,
     ) -> Result<Option<Vec<ChatMessage>>> {
+        if self.has_provider_owned_native_rollout(session_id).await? {
+            return Ok(None);
+        }
         let Some(record) = self.external_record_for_messages(session_id).await else {
             return Ok(None);
         };
@@ -3312,6 +3355,9 @@ impl SessionManager {
         session_id: &str,
         limit: usize,
     ) -> Result<Option<(Vec<ChatMessage>, usize)>> {
+        if self.has_provider_owned_native_rollout(session_id).await? {
+            return Ok(None);
+        }
         let Some(record) = self.external_record_for_messages(session_id).await else {
             return Ok(None);
         };
@@ -4117,6 +4163,7 @@ fn ws_event_estimated_bytes(event: &WsServerEvent) -> usize {
 #[derive(Clone)]
 pub struct AgentRuntimeManager {
     runs: Arc<RwLock<HashMap<String, AgentRuntimeRecord>>>,
+    codex_app_server: CodexAppServerClient,
     max_runs: usize,
     max_replay_events: usize,
     max_replay_bytes: usize,
@@ -4147,6 +4194,7 @@ struct AgentStartContext {
     thinking: Option<bool>,
     fast: Option<bool>,
     native_resume_session_id: Option<String>,
+    native_rollout_owned_by_provider: bool,
     context_rollover_id: Option<String>,
     direct_ai_config: Option<DirectAiRuntimeConfig>,
     direct_ai_messages: Vec<DirectAiConversationMessage>,
@@ -4236,6 +4284,23 @@ struct CodexLiveOutputNormalizer {
     final_usage: Option<NormalizedRunUsage>,
 }
 
+#[derive(Default)]
+struct CodexAppServerLiveOutputNormalizer {
+    pending_agent_message: Option<String>,
+    streamed_agent_items: HashSet<String>,
+    streamed_agent_text: HashMap<String, String>,
+    emitted_agent_stream: bool,
+    emitted_reasoning_stream: bool,
+    command_output: HashMap<String, String>,
+    completed_items: HashSet<String>,
+    final_assistant_message: Option<String>,
+    tool_messages: Vec<NormalizedToolMessage>,
+    tool_message_bytes: usize,
+    last_error: Option<CodexTurnError>,
+    final_usage: Option<NormalizedRunUsage>,
+    emitted_visible_turn_output: bool,
+}
+
 #[derive(Debug, Clone)]
 struct NormalizedToolMessage {
     name: String,
@@ -4253,6 +4318,7 @@ impl AgentRuntimeManager {
     pub fn new(max_runs: usize) -> Self {
         Self {
             runs: Arc::new(RwLock::new(HashMap::new())),
+            codex_app_server: default_codex_app_server_client(),
             max_runs,
             max_replay_events: 256,
             max_replay_bytes: AGENT_REPLAY_MAX_BYTES,
@@ -4273,6 +4339,9 @@ impl AgentRuntimeManager {
             };
             if should_use_direct_ai_gateway_runtime(context.provider, context.model.as_deref()) {
                 return self.start_direct_ai(context).await;
+            }
+            if codex_app_server_live_enabled(&context) {
+                return self.start_codex_app_server_live(context).await;
             }
 
             let mut command = match resolve_agent_command(
@@ -4694,6 +4763,190 @@ impl AgentRuntimeManager {
 
             Ok(())
         })
+    }
+
+    async fn start_codex_app_server_live(&self, mut context: AgentStartContext) -> Result<()> {
+        context.native_rollout_owned_by_provider = true;
+        let key = agent_run_key(context.provider, &context.session_id);
+        let (abort_tx, abort_rx) = oneshot::channel();
+
+        self.register(key.clone(), abort_tx).await;
+
+        self.publish(
+            &context.hub,
+            &key,
+            WsServerEvent::SessionStatus {
+                provider: context.provider,
+                session_id: context.session_id.clone(),
+                status: iowb_protocol::SessionRuntimeStatus::Starting,
+                response_id: Some(context.response_id.clone()),
+                sequence: Some(context.next_sequence()),
+                latest_user_prompt: Some(context.prompt.clone()),
+            },
+        )
+        .await;
+
+        let launch_options = match codex_app_server_launch_options(
+            context.runtime,
+            context.direct_ai_config.as_ref(),
+        ) {
+            Ok(options) => options,
+            Err(error) => {
+                let error_message = error.to_string();
+                self.publish(
+                    &context.hub,
+                    &key,
+                    WsServerEvent::Error {
+                        message: "failed to prepare Codex app-server".to_string(),
+                        details: Some(error_message.clone()),
+                        session_id: Some(context.session_id.clone()),
+                    },
+                )
+                .await;
+                self.finish(
+                    &key,
+                    &context,
+                    iowb_protocol::SessionRuntimeStatus::Failed,
+                    Some(error_message),
+                    None,
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        let turn_params = codex_app_server_live_turn_params(&context);
+        let client = self.codex_app_server.clone();
+        let manager = self.clone();
+        let (event_tx, mut event_rx) = mpsc::channel::<CodexAppServerLiveTurnEvent>(256);
+
+        self.publish(
+            &context.hub,
+            &key,
+            WsServerEvent::SessionStatus {
+                provider: context.provider,
+                session_id: context.session_id.clone(),
+                status: iowb_protocol::SessionRuntimeStatus::Running,
+                response_id: Some(context.response_id.clone()),
+                sequence: Some(context.next_sequence()),
+                latest_user_prompt: Some(context.prompt.clone()),
+            },
+        )
+        .await;
+
+        tokio::spawn(async move {
+            let mut output = String::new();
+            let mut normalizer = CodexAppServerLiveOutputNormalizer::default();
+            let mut runner = tokio::spawn(async move {
+                client
+                    .run_live_turn_with_options(
+                        turn_params,
+                        launch_options.as_ref(),
+                        abort_rx,
+                        event_tx,
+                    )
+                    .await
+            });
+
+            let outcome = loop {
+                tokio::select! {
+                    Some(event) = event_rx.recv() => {
+                        process_codex_app_server_live_event(
+                            &manager,
+                            &context,
+                            &key,
+                            event,
+                            &mut normalizer,
+                            &mut output,
+                        ).await;
+                    }
+                    result = &mut runner => {
+                        while let Some(event) = event_rx.recv().await {
+                            process_codex_app_server_live_event(
+                                &manager,
+                                &context,
+                                &key,
+                                event,
+                                &mut normalizer,
+                                &mut output,
+                            ).await;
+                        }
+                        break result;
+                    }
+                }
+            };
+
+            let visible = normalizer.finish();
+            publish_agent_output(&manager, &context, &key, &mut output, visible).await;
+            let run_usage = normalizer.take_final_usage();
+            let final_assistant = normalizer.take_final_assistant_message();
+            let codex_error = normalizer.take_error();
+            persist_normalized_tool_messages(&context, normalizer.take_tool_messages()).await;
+
+            match outcome {
+                Ok(Ok(outcome)) => {
+                    persist_native_session_id(&context, Some(outcome.thread_id.clone())).await;
+                    finish_codex_app_server_outcome(
+                        &manager,
+                        &key,
+                        &context,
+                        outcome,
+                        final_assistant,
+                        &output,
+                        run_usage,
+                        codex_error,
+                    )
+                    .await;
+                }
+                Ok(Err(error)) => {
+                    let error_message = error.to_string();
+                    manager
+                        .publish(
+                            &context.hub,
+                            &key,
+                            WsServerEvent::Error {
+                                message: "Codex app-server live turn failed".to_string(),
+                                details: Some(error_message.clone()),
+                                session_id: Some(context.session_id.clone()),
+                            },
+                        )
+                        .await;
+                    manager
+                        .finish(
+                            &key,
+                            &context,
+                            iowb_protocol::SessionRuntimeStatus::Failed,
+                            Some(error_message),
+                            run_usage,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    let error_message = format!("Codex app-server task failed: {error}");
+                    manager
+                        .publish(
+                            &context.hub,
+                            &key,
+                            WsServerEvent::Error {
+                                message: "Codex app-server task failed".to_string(),
+                                details: Some(error_message.clone()),
+                                session_id: Some(context.session_id.clone()),
+                            },
+                        )
+                        .await;
+                    manager
+                        .finish(
+                            &key,
+                            &context,
+                            iowb_protocol::SessionRuntimeStatus::Failed,
+                            Some(error_message),
+                            run_usage,
+                        )
+                        .await;
+                }
+            }
+        });
+
+        Ok(())
     }
 
     async fn start_direct_ai(&self, context: AgentStartContext) -> Result<()> {
@@ -5120,6 +5373,7 @@ impl AgentRuntimeManager {
                 }
                 if matches!(status, iowb_protocol::SessionRuntimeStatus::Completed)
                     && context.provider == Provider::Codex
+                    && !context.native_rollout_owned_by_provider
                 {
                     let native_prompt = resolve_cli_slash_prompt(Provider::Codex, &context.prompt)
                         .unwrap_or_else(|_| context.prompt.clone());
@@ -5242,6 +5496,7 @@ impl AgentRuntimeManager {
                     mode: snapshot.mode,
                     thinking: snapshot.thinking,
                     fast: snapshot.fast,
+                    native_session_id: snapshot.native_session_id,
                     received_at,
                     last_message_at: snapshot.last_message_at,
                     first_user_at: snapshot.first_user_at,
@@ -5407,6 +5662,7 @@ impl AgentRuntimeManager {
             thinking: run.thinking,
             fast: run.fast,
             native_resume_session_id: run.native_session_id.clone(),
+            native_rollout_owned_by_provider: false,
             context_rollover_id: None,
             direct_ai_config: context.direct_ai_config.clone(),
             direct_ai_messages,
@@ -6564,6 +6820,54 @@ fn normalize_codex_run_usage(value: &Value) -> NormalizedRunUsage {
     )
 }
 
+fn normalize_codex_app_server_token_usage(value: &Value) -> NormalizedRunUsage {
+    let usage = value.get("last").unwrap_or(value);
+    let input = usage_u64(usage, &["input_tokens", "inputTokens", "input"]);
+    let output = usage_u64(usage, &["output_tokens", "outputTokens", "output"]);
+    let cache_creation = usage_u64(
+        usage,
+        &[
+            "cache_write_input_tokens",
+            "cacheWriteInputTokens",
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_creation",
+            "cacheCreation",
+        ],
+    );
+    let cache_read = usage_u64(
+        usage,
+        &[
+            "cached_input_tokens",
+            "cachedInputTokens",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "cache_read",
+            "cacheRead",
+        ],
+    );
+    let reasoning = usage_u64(
+        usage,
+        &[
+            "reasoning_output_tokens",
+            "reasoningOutputTokens",
+            "reasoning_tokens",
+            "reasoningTokens",
+            "reasoning",
+        ],
+    );
+    normalized_run_usage(
+        usage,
+        "codex.app_server.turn.usage",
+        input,
+        output,
+        cache_creation,
+        cache_read,
+        reasoning,
+        None,
+    )
+}
+
 fn normalize_claude_run_usage(event: &Value) -> NormalizedRunUsage {
     let usage = event
         .get("modelUsage")
@@ -7220,6 +7524,19 @@ fn configured_codex_command() -> String {
         .unwrap_or_else(|| default_agent_command(Provider::Codex))
 }
 
+fn default_codex_app_server_client() -> CodexAppServerClient {
+    CodexAppServerClient::new(
+        configured_codex_command(),
+        Duration::from_secs(
+            env::var("IO_WORKBENCH_CODEX_APP_SERVER_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(15)
+                .clamp(1, 120),
+        ),
+    )
+}
+
 fn preferred_user_command(command: &str) -> Option<String> {
     let home = env::var_os("HOME").map(PathBuf::from)?;
     let candidate = home.join(".local").join("bin").join(command);
@@ -7589,6 +7906,160 @@ fn codex_app_server_launch_options(
             config.api_key.clone(),
         )],
     }))
+}
+
+fn codex_app_server_live_enabled(context: &AgentStartContext) -> bool {
+    codex_app_server_live_enabled_for(
+        context.provider,
+        context.runtime,
+        env_bool(CODEX_APP_SERVER_LIVE_ENV, false),
+        env_bool(CODEX_APP_SERVER_LIVE_IO_GATEWAY_ENV, false),
+        codex_app_server_live_cli_override_configured(),
+    )
+}
+
+fn codex_app_server_live_enabled_for(
+    provider: Provider,
+    runtime: ChatRuntime,
+    live_enabled: bool,
+    io_gateway_enabled: bool,
+    cli_override_configured: bool,
+) -> bool {
+    if provider != Provider::Codex || !live_enabled {
+        return false;
+    }
+    if cli_override_configured {
+        return false;
+    }
+    match runtime {
+        ChatRuntime::NativeCli => true,
+        ChatRuntime::IoGateway => io_gateway_enabled,
+    }
+}
+
+fn codex_app_server_live_cli_override_configured() -> bool {
+    [
+        "IO_WORKBENCH_CODEX_ARGS_JSON",
+        "IO_WORKBENCH_AGENT_ARGS_JSON",
+    ]
+    .into_iter()
+    .any(env_var_nonempty)
+        || env_bool("IO_WORKBENCH_CODEX_STDIN", false)
+        || env_bool("IO_WORKBENCH_AGENT_STDIN", false)
+}
+
+fn env_var_nonempty(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn codex_app_server_live_turn_params(context: &AgentStartContext) -> CodexAppServerLiveTurnParams {
+    let selected_model = context
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|model| agent_cli_model_arg(Provider::Codex, model));
+    let effort = effective_codex_reasoning_effort(
+        context.effort.as_deref(),
+        context.thinking.unwrap_or(false),
+    )
+    .map(str::to_string);
+    let service_tier = context.fast.map(|fast| {
+        if fast {
+            "fast".to_string()
+        } else {
+            "default".to_string()
+        }
+    });
+    let client_user_message_id = context
+        .durable_run_id
+        .as_deref()
+        .and_then(|run_id| context.storage.get_durable_chat_run(run_id).ok().flatten())
+        .and_then(|run| run.user_message_id);
+    CodexAppServerLiveTurnParams {
+        thread_id: context.native_resume_session_id.clone(),
+        cwd: context.project_path.clone(),
+        input: codex_app_server_prompt_input(&context.prompt, &context.project_path),
+        client_user_message_id,
+        model: selected_model,
+        effort,
+        service_tier,
+        approval_policy: Some(serde_json::json!("never")),
+        sandbox_policy: codex_app_server_sandbox_policy(
+            context.mode.as_deref(),
+            &context.project_path,
+        ),
+    }
+}
+
+fn codex_app_server_sandbox_policy(mode: Option<&str>, project_path: &Path) -> Option<Value> {
+    match mode.and_then(normalize_agent_mode) {
+        Some("bypass") => Some(serde_json::json!({ "type": "dangerFullAccess" })),
+        Some("accept-edits") => Some(serde_json::json!({
+            "type": "workspaceWrite",
+            "writableRoots": [project_path.display().to_string()],
+            "networkAccess": false,
+        })),
+        Some("plan") | Some("read-only") => Some(serde_json::json!({
+            "type": "readOnly",
+            "networkAccess": false,
+        })),
+        _ => None,
+    }
+}
+
+fn codex_app_server_prompt_input(prompt: &str, project_path: &Path) -> Vec<Value> {
+    let mut text_lines = Vec::new();
+    let mut image_paths = Vec::new();
+    for line in prompt.lines() {
+        if let Some(marker_path) = parse_attached_image_marker(line)
+            && let Some(path) = resolve_prompt_local_image_path(marker_path, project_path)
+        {
+            image_paths.push(path);
+            continue;
+        }
+        text_lines.push(line);
+    }
+    let mut input = Vec::new();
+    let text = text_lines.join("\n").trim().to_string();
+    if !text.is_empty() {
+        input.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+    for path in image_paths {
+        input.push(serde_json::json!({
+            "type": "localImage",
+            "path": path.display().to_string(),
+        }));
+    }
+    if input.is_empty() {
+        input.push(serde_json::json!({ "type": "text", "text": prompt.trim() }));
+    }
+    input
+}
+
+fn parse_attached_image_marker(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix("Attached image file: `")?;
+    let (path, _) = rest.split_once('`')?;
+    let path = path.trim();
+    (!path.is_empty()).then_some(path)
+}
+
+fn resolve_prompt_local_image_path(path: &str, project_path: &Path) -> Option<PathBuf> {
+    let candidate = PathBuf::from(path);
+    let candidate = if candidate.is_absolute() {
+        candidate
+    } else {
+        project_path.join(candidate)
+    };
+    let project = std::fs::canonicalize(project_path).ok()?;
+    let candidate = std::fs::canonicalize(candidate).ok()?;
+    if candidate.is_file() && candidate.starts_with(project) {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 /// Keep `-c key=value` overrides before the `resume` positional so Codex
@@ -8122,6 +8593,150 @@ async fn flush_gemini_live_output(
     publish_agent_output(manager, context, key, output, visible).await;
 }
 
+async fn process_codex_app_server_live_event(
+    manager: &AgentRuntimeManager,
+    context: &AgentStartContext,
+    key: &str,
+    event: CodexAppServerLiveTurnEvent,
+    normalizer: &mut CodexAppServerLiveOutputNormalizer,
+    output: &mut String,
+) {
+    match event {
+        CodexAppServerLiveTurnEvent::ThreadAssociated { thread_id } => {
+            persist_native_session_id(context, Some(thread_id)).await;
+        }
+        CodexAppServerLiveTurnEvent::TurnAssociated { turn_id } => {
+            debug_assert!(!turn_id.trim().is_empty());
+        }
+        CodexAppServerLiveTurnEvent::Notification { method, params } => {
+            let visible = normalizer.push_notification(&method, &params);
+            publish_agent_output(manager, context, key, output, visible).await;
+        }
+    }
+}
+
+async fn finish_codex_app_server_outcome(
+    manager: &AgentRuntimeManager,
+    key: &str,
+    context: &AgentStartContext,
+    outcome: CodexAppServerLiveTurnOutcome,
+    final_assistant: Option<String>,
+    output: &str,
+    usage: Option<NormalizedRunUsage>,
+    error: Option<CodexTurnError>,
+) {
+    let CodexAppServerLiveTurnOutcome {
+        status,
+        turn,
+        turn_id,
+        ..
+    } = outcome;
+    debug_assert!(turn_id.as_deref().is_none_or(|id| !id.trim().is_empty()));
+    match status {
+        CodexAppServerTurnTerminalStatus::Completed => {
+            if context.context_rollover_id.is_some() {
+                let follow_up = manager
+                    .finish(
+                        key,
+                        context,
+                        iowb_protocol::SessionRuntimeStatus::Completed,
+                        None,
+                        usage,
+                    )
+                    .await;
+                if let Some(follow_up) = follow_up {
+                    manager
+                        .start_context_rollover_follow_up(context, follow_up)
+                        .await;
+                }
+                return;
+            }
+            match select_completed_agent_output(Provider::Codex, final_assistant, output, true) {
+                Ok(persisted_output) => {
+                    manager
+                        .finish(
+                            key,
+                            context,
+                            iowb_protocol::SessionRuntimeStatus::Completed,
+                            Some(persisted_output),
+                            usage,
+                        )
+                        .await;
+                }
+                Err(error_output) => {
+                    manager
+                        .publish(
+                            &context.hub,
+                            key,
+                            WsServerEvent::Error {
+                                message:
+                                    "Codex completed without a final assistant response"
+                                        .to_string(),
+                                details: Some(
+                                    "The Codex app-server turn completed, but its event stream did not contain a final assistant message. The accumulated transcript was not saved as the reply."
+                                        .to_string(),
+                                ),
+                                session_id: Some(context.session_id.clone()),
+                            },
+                        )
+                        .await;
+                    manager
+                        .finish(
+                            key,
+                            context,
+                            iowb_protocol::SessionRuntimeStatus::Failed,
+                            Some(error_output),
+                            usage,
+                        )
+                        .await;
+                }
+            }
+        }
+        CodexAppServerTurnTerminalStatus::Interrupted => {
+            manager
+                .finish(
+                    key,
+                    context,
+                    iowb_protocol::SessionRuntimeStatus::Aborted,
+                    final_assistant
+                        .or_else(|| (!output.trim().is_empty()).then(|| output.to_string())),
+                    usage,
+                )
+                .await;
+        }
+        CodexAppServerTurnTerminalStatus::Failed => {
+            let turn_error = error.or_else(|| {
+                let turn = turn.as_ref()?;
+                let message = app_server_turn_failure_message(turn)
+                    .unwrap_or_else(|| "Codex app-server turn failed".to_string());
+                Some(codex_app_server_turn_error(turn, &message))
+            });
+            if let Some(error) = turn_error.as_ref() {
+                if let Some(run_id) = context.durable_run_id.as_deref() {
+                    let _ = context
+                        .storage
+                        .update_durable_chat_run_error(run_id, &error.message);
+                }
+                manager
+                    .publish_context_recovery_if_needed(key, context, error)
+                    .await;
+            }
+            let persisted_output = final_assistant
+                .or_else(|| (!output.trim().is_empty()).then(|| output.to_string()))
+                .or_else(|| turn_error.as_ref().map(|error| error.message.clone()));
+            manager
+                .finish(
+                    key,
+                    context,
+                    iowb_protocol::SessionRuntimeStatus::Failed,
+                    persisted_output,
+                    usage,
+                )
+                .await;
+        }
+    }
+}
+
 async fn persist_codex_tool_messages(
     context: &AgentStartContext,
     normalizer: &mut Option<CodexLiveOutputNormalizer>,
@@ -8137,7 +8752,17 @@ async fn persist_codex_tool_messages(
         normalizer.take_tool_messages();
         return;
     }
-    for tool in normalizer.take_tool_messages() {
+    persist_normalized_tool_messages(context, normalizer.take_tool_messages()).await;
+}
+
+async fn persist_normalized_tool_messages(
+    context: &AgentStartContext,
+    tool_messages: Vec<NormalizedToolMessage>,
+) {
+    if context.context_rollover_id.is_some() {
+        return;
+    }
+    for tool in tool_messages {
         let metadata = serde_json::json!({
             "kind": "tool_output",
             "toolName": tool.name,
@@ -8169,6 +8794,7 @@ async fn persist_native_session_id(context: &AgentStartContext, native_session_i
         return;
     };
     if let Some(rollover_id) = context.context_rollover_id.as_deref() {
+        persist_attempt_native_session_id(context, &native_session_id);
         let Some(run_id) = context.durable_run_id.as_deref() else {
             warn!(
                 session_id = %context.session_id,
@@ -8239,6 +8865,7 @@ async fn persist_native_session_id(context: &AgentStartContext, native_session_i
             }
         }
     }
+    persist_attempt_native_session_id(context, &native_session_id);
     if let Some(run_id) = context.durable_run_id.as_deref()
         && let Err(error) = context
             .storage
@@ -8257,12 +8884,28 @@ async fn persist_native_session_id(context: &AgentStartContext, native_session_i
         .set_native_session_id(&context.session_id, native_session_id.clone())
         .await
     {
-        Ok(_) => info!(
-            session_id = %context.session_id,
-            native_session_id = %native_session_id,
-            provider = context.provider.as_str(),
-            "associated workbench session with native provider thread"
-        ),
+        Ok(_) => {
+            if context.native_rollout_owned_by_provider
+                && let Err(error) = context
+                    .sessions
+                    .set_native_rollout_owned_by_provider(&context.session_id, true)
+                    .await
+            {
+                warn!(
+                    error = %error,
+                    session_id = %context.session_id,
+                    native_session_id = %native_session_id,
+                    provider = context.provider.as_str(),
+                    "failed to persist provider-owned native rollout marker"
+                );
+            }
+            info!(
+                session_id = %context.session_id,
+                native_session_id = %native_session_id,
+                provider = context.provider.as_str(),
+                "associated workbench session with native provider thread"
+            );
+        }
         Err(error) => warn!(
             error = %error,
             session_id = %context.session_id,
@@ -8270,6 +8913,22 @@ async fn persist_native_session_id(context: &AgentStartContext, native_session_i
             provider = context.provider.as_str(),
             "failed to persist native provider thread id"
         ),
+    }
+}
+
+fn persist_attempt_native_session_id(context: &AgentStartContext, native_session_id: &str) {
+    if let Some(attempt_id) = context.attempt_id.as_deref()
+        && let Err(error) = context
+            .storage
+            .update_chat_run_attempt_native_session_id(attempt_id, native_session_id)
+    {
+        warn!(
+            error = %error,
+            attempt_id,
+            session_id = %context.session_id,
+            native_session_id = %native_session_id,
+            "failed to persist native provider thread id on chat run attempt"
+        );
     }
 }
 
@@ -8311,6 +8970,592 @@ async fn publish_agent_output(
             )
             .await;
     }
+}
+
+impl CodexAppServerLiveOutputNormalizer {
+    fn push_notification(&mut self, method: &str, params: &Value) -> String {
+        if method == "thread/tokenUsage/updated" {
+            return self.normalize_token_usage(params);
+        }
+        let visible = match method {
+            "item/agentMessage/delta" => self.push_agent_message_delta(params),
+            "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                self.push_reasoning_delta(params)
+            }
+            "item/commandExecution/outputDelta" => self.push_command_output_delta(params),
+            "item/completed" => {
+                let item = params.get("item").unwrap_or(params);
+                self.normalize_completed_item(item)
+            }
+            "turn/completed" => self.normalize_turn_completed(params),
+            "turn/plan/updated" => self.normalize_plan(params),
+            "turn/diff/updated" => self.normalize_diff(params),
+            "error" => self.normalize_error(params),
+            "warning" | "configWarning" => self.normalize_warning(params),
+            "item/started"
+            | "turn/started"
+            | "thread/status/changed"
+            | "serverRequest/resolved"
+            | "thread/settings/updated" => String::new(),
+            _ => String::new(),
+        };
+        if !visible.trim().is_empty() {
+            self.emitted_visible_turn_output = true;
+        }
+        visible
+    }
+
+    fn finish(&mut self) -> String {
+        self.take_pending_agent_message(false)
+    }
+
+    fn push_agent_message_delta(&mut self, params: &Value) -> String {
+        let delta = params
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if delta.is_empty() {
+            return String::new();
+        }
+        let item_id = app_server_item_id(params).unwrap_or_else(|| "agent".to_string());
+        self.streamed_agent_items.insert(item_id.clone());
+        let entry = self.streamed_agent_text.entry(item_id).or_default();
+        entry.push_str(delta);
+        self.final_assistant_message = Some(bound_agent_text(
+            entry.trim(),
+            AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
+            "assistant response",
+        ));
+        let prefix = if self.emitted_agent_stream {
+            ""
+        } else if self.emitted_reasoning_stream {
+            "\n\ncodex\n"
+        } else {
+            "codex\n"
+        };
+        self.emitted_agent_stream = true;
+        format!("{prefix}{delta}")
+    }
+
+    fn push_reasoning_delta(&mut self, params: &Value) -> String {
+        let delta = params
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if delta.is_empty() {
+            return String::new();
+        }
+        let prefix = if self.emitted_reasoning_stream {
+            ""
+        } else {
+            self.emitted_reasoning_stream = true;
+            "thinking\n"
+        };
+        format!("{prefix}{delta}")
+    }
+
+    fn push_command_output_delta(&mut self, params: &Value) -> String {
+        let delta = params
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if delta.trim().is_empty() {
+            return String::new();
+        }
+        if let Some(item_id) = app_server_item_id(params) {
+            self.command_output
+                .entry(item_id)
+                .or_default()
+                .push_str(delta);
+        }
+        let mut output = String::new();
+        append_live_section(
+            &mut output,
+            &format!("exec / Details\n```text\n{}\n```", delta.trim_end()),
+        );
+        output
+    }
+
+    fn normalize_turn_completed(&mut self, params: &Value) -> String {
+        let turn = params.get("turn").unwrap_or(params);
+        let mut output = String::new();
+        for item in turn
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            append_live_section(&mut output, &self.normalize_completed_item(item));
+        }
+        match turn
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed")
+        {
+            "completed" => {
+                append_live_section(&mut output, &self.take_pending_agent_message(false));
+            }
+            "failed" => {
+                append_live_section(&mut output, &self.take_pending_agent_message(true));
+                let message = app_server_turn_failure_message(turn)
+                    .unwrap_or_else(|| "Codex app-server turn failed".to_string());
+                self.last_error = Some(codex_app_server_turn_error(turn, &message));
+                append_live_section(&mut output, &format!("ERROR: {message}"));
+            }
+            "interrupted" => {
+                append_live_section(&mut output, &self.take_pending_agent_message(true));
+            }
+            _ => {}
+        }
+        output
+    }
+
+    fn normalize_completed_item(&mut self, item: &Value) -> String {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        if !item_id.is_empty() && !self.completed_items.insert(item_id.to_string()) {
+            if item_type == "agentMessage" {
+                self.capture_agent_message_final(item);
+            }
+            return String::new();
+        }
+
+        match item_type {
+            "agentMessage" => self.normalize_agent_message_item(item),
+            "reasoning" => {
+                let text = app_server_reasoning_text(item);
+                if text.trim().is_empty() {
+                    String::new()
+                } else {
+                    let mut output = String::new();
+                    append_live_section(&mut output, &format!("thinking\n{}", text.trim()));
+                    output
+                }
+            }
+            "plan" => item
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| {
+                    let mut output = String::new();
+                    append_live_section(&mut output, &format!("thinking\n{}", text.trim()));
+                    output
+                })
+                .unwrap_or_default(),
+            "commandExecution" => {
+                let formatted = self.format_command_execution(item);
+                self.record_tool_message("command_execution", &formatted);
+                formatted
+            }
+            "fileChange" => {
+                let formatted = format_codex_live_file_change(item);
+                self.record_tool_message("file_change", &formatted);
+                formatted
+            }
+            "mcpToolCall" => {
+                let name = item
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("mcp_tool_call");
+                let formatted = format_codex_live_named_tool(
+                    name,
+                    item.get("arguments"),
+                    item.get("result").or_else(|| item.get("error")),
+                );
+                self.record_tool_message(name, &formatted);
+                formatted
+            }
+            "dynamicToolCall" => {
+                let name = item
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("dynamic_tool_call");
+                let formatted = format_codex_live_named_tool(
+                    name,
+                    item.get("arguments"),
+                    item.get("contentItems").or_else(|| item.get("error")),
+                );
+                self.record_tool_message(name, &formatted);
+                formatted
+            }
+            "webSearch" => {
+                let formatted = format_codex_live_named_tool(
+                    "web_search",
+                    item.get("query"),
+                    item.get("results"),
+                );
+                self.record_tool_message("web_search", &formatted);
+                formatted
+            }
+            "imageView" => {
+                let formatted = format_codex_live_named_tool("image_view", item.get("path"), None);
+                self.record_tool_message("image_view", &formatted);
+                formatted
+            }
+            "exitedReviewMode" => item
+                .get("review")
+                .and_then(Value::as_str)
+                .filter(|review| !review.trim().is_empty())
+                .map(|review| {
+                    self.final_assistant_message = Some(bound_agent_text(
+                        review.trim(),
+                        AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
+                        "assistant response",
+                    ));
+                    let mut output = String::new();
+                    append_live_section(&mut output, &format!("codex\n{}", review.trim()));
+                    output
+                })
+                .unwrap_or_default(),
+            "contextCompaction" | "userMessage" | "enteredReviewMode" | "" => String::new(),
+            _ => {
+                let formatted = format_codex_live_named_tool(item_type, Some(item), None);
+                if is_codex_app_server_tool_item_type(item_type) {
+                    self.record_tool_message(item_type, &formatted);
+                }
+                formatted
+            }
+        }
+    }
+
+    fn normalize_agent_message_item(&mut self, item: &Value) -> String {
+        let content = item
+            .get("text")
+            .map(display_codex_live_value)
+            .unwrap_or_default();
+        if content.trim().is_empty() {
+            return String::new();
+        }
+        self.capture_agent_message_final(item);
+        let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        if !item_id.is_empty() && self.streamed_agent_items.contains(item_id) {
+            return String::new();
+        }
+        match item.get("phase").and_then(Value::as_str) {
+            Some("commentary") => {
+                let mut output = self.take_pending_agent_message(true);
+                append_live_section(&mut output, &format!("thinking\n{}", content.trim()));
+                output
+            }
+            Some("final_answer") => {
+                let mut output = self.take_pending_agent_message(true);
+                append_live_section(&mut output, &format!("codex\n{}", content.trim()));
+                output
+            }
+            _ => {
+                let previous = self.take_pending_agent_message(true);
+                self.pending_agent_message = Some(content.trim().to_string());
+                previous
+            }
+        }
+    }
+
+    fn capture_agent_message_final(&mut self, item: &Value) {
+        let Some(text) = item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            return;
+        };
+        if item.get("phase").and_then(Value::as_str) == Some("commentary") {
+            return;
+        }
+        self.final_assistant_message = Some(bound_agent_text(
+            text,
+            AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
+            "assistant response",
+        ));
+    }
+
+    fn format_command_execution(&mut self, item: &Value) -> String {
+        let mut normalized = item.clone();
+        if let Some(object) = normalized.as_object_mut() {
+            if !object.contains_key("aggregated_output")
+                && let Some(value) = object.get("aggregatedOutput").cloned()
+            {
+                object.insert("aggregated_output".to_string(), value);
+            }
+            if !object.contains_key("exit_code")
+                && let Some(value) = object.get("exitCode").cloned()
+            {
+                object.insert("exit_code".to_string(), value);
+            }
+            if !object.contains_key("aggregated_output")
+                && let Some(item_id) = object.get("id").and_then(Value::as_str)
+                && let Some(output) = self.command_output.get(item_id)
+            {
+                object.insert(
+                    "aggregated_output".to_string(),
+                    Value::String(output.clone()),
+                );
+            }
+        }
+        format_codex_live_command(&normalized)
+    }
+
+    fn normalize_token_usage(&mut self, params: &Value) -> String {
+        let Some(token_usage) = params
+            .get("tokenUsage")
+            .or_else(|| params.get("token_usage"))
+        else {
+            return String::new();
+        };
+        self.final_usage = Some(normalize_codex_app_server_token_usage(token_usage));
+        if !self.emitted_visible_turn_output {
+            return String::new();
+        }
+        let mut output = String::new();
+        append_live_section(
+            &mut output,
+            &format!(
+                "tokens used\n{}",
+                serde_json::to_string_pretty(token_usage)
+                    .unwrap_or_else(|_| token_usage.to_string())
+            ),
+        );
+        output
+    }
+
+    fn normalize_plan(&mut self, params: &Value) -> String {
+        let mut plan_text = String::new();
+        if let Some(explanation) = params
+            .get("explanation")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            plan_text.push_str(explanation.trim());
+        }
+        for item in params
+            .get("plan")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let step = item
+                .get("step")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if step.is_empty() {
+                continue;
+            }
+            if !plan_text.is_empty() {
+                plan_text.push('\n');
+            }
+            let status = item
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending");
+            plan_text.push_str(&format!("- [{status}] {step}"));
+        }
+        if plan_text.trim().is_empty() {
+            return String::new();
+        }
+        let mut output = String::new();
+        append_live_section(&mut output, &format!("thinking\n{}", plan_text.trim()));
+        output
+    }
+
+    fn normalize_diff(&mut self, params: &Value) -> String {
+        let Some(diff) = params
+            .get("diff")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return String::new();
+        };
+        let formatted = bound_agent_text(
+            &format!("diff / Details\n```diff\n{}\n```", diff.trim()),
+            AGENT_TOOL_MESSAGE_MAX_BYTES,
+            "tool output",
+        );
+        self.record_tool_message("diff", &formatted);
+        let mut output = String::new();
+        append_live_section(&mut output, &formatted);
+        output
+    }
+
+    fn normalize_error(&mut self, params: &Value) -> String {
+        let message = app_server_error_message(params)
+            .unwrap_or_else(|| "Codex app-server reported an error".to_string());
+        self.last_error = Some(codex_app_server_turn_error(params, &message));
+        let mut output = String::new();
+        append_live_section(&mut output, &format!("ERROR: {message}"));
+        output
+    }
+
+    fn normalize_warning(&mut self, params: &Value) -> String {
+        let message = params
+            .get("message")
+            .or_else(|| params.get("summary"))
+            .map(display_codex_live_value)
+            .unwrap_or_default();
+        if message.trim().is_empty() {
+            return String::new();
+        }
+        let mut output = String::new();
+        append_live_section(&mut output, &format!("WARNING: {}", message.trim()));
+        output
+    }
+
+    fn take_pending_agent_message(&mut self, thinking: bool) -> String {
+        self.pending_agent_message
+            .take()
+            .map(|content| {
+                if thinking {
+                    format!("thinking\n{content}")
+                } else {
+                    self.final_assistant_message = Some(bound_agent_text(
+                        &content,
+                        AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
+                        "assistant response",
+                    ));
+                    format!("codex\n{content}")
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    fn record_tool_message(&mut self, name: &str, content: &str) {
+        if self.tool_messages.len() >= AGENT_TOOL_MESSAGES_MAX_COUNT
+            || self.tool_message_bytes >= AGENT_TOOL_MESSAGES_MAX_TOTAL_BYTES
+        {
+            return;
+        }
+        let remaining = AGENT_TOOL_MESSAGES_MAX_TOTAL_BYTES - self.tool_message_bytes;
+        let max_bytes = AGENT_TOOL_MESSAGE_MAX_BYTES.min(remaining);
+        let content = bound_agent_text(content, max_bytes, "tool output");
+        if content.is_empty() {
+            return;
+        }
+        self.tool_message_bytes += content.len();
+        self.tool_messages.push(NormalizedToolMessage {
+            name: name.to_string(),
+            content,
+        });
+    }
+
+    fn take_tool_messages(&mut self) -> Vec<NormalizedToolMessage> {
+        self.tool_message_bytes = 0;
+        std::mem::take(&mut self.tool_messages)
+    }
+
+    fn take_final_assistant_message(&mut self) -> Option<String> {
+        self.final_assistant_message.take()
+    }
+
+    fn take_final_usage(&mut self) -> Option<NormalizedRunUsage> {
+        self.final_usage.take()
+    }
+
+    fn take_error(&mut self) -> Option<CodexTurnError> {
+        self.last_error.take()
+    }
+}
+
+fn app_server_item_id(value: &Value) -> Option<String> {
+    value
+        .get("itemId")
+        .or_else(|| value.get("item_id"))
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn app_server_reasoning_text(item: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(text) = item.get("text").and_then(Value::as_str) {
+        parts.push(text.to_string());
+    }
+    for key in ["summary", "content"] {
+        match item.get(key) {
+            Some(Value::Array(items)) => {
+                parts.extend(items.iter().filter_map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .or_else(|| item.get("text").and_then(Value::as_str).map(str::to_string))
+                }));
+            }
+            Some(Value::String(text)) => parts.push(text.clone()),
+            _ => {}
+        }
+    }
+    parts
+        .into_iter()
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_codex_app_server_tool_item_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "commandExecution"
+            | "fileChange"
+            | "mcpToolCall"
+            | "dynamicToolCall"
+            | "webSearch"
+            | "imageView"
+            | "collabAgentToolCall"
+            | "subAgentActivity"
+            | "imageGeneration"
+    )
+}
+
+fn app_server_turn_failure_message(turn: &Value) -> Option<String> {
+    turn.pointer("/error/message")
+        .or_else(|| turn.get("error"))
+        .map(display_codex_live_value)
+        .map(|message| message.trim().to_string())
+        .filter(|message| !message.is_empty())
+}
+
+fn app_server_error_message(value: &Value) -> Option<String> {
+    value
+        .pointer("/error/message")
+        .or_else(|| value.get("message"))
+        .or_else(|| value.get("error"))
+        .map(display_codex_live_value)
+        .map(|message| message.trim().to_string())
+        .filter(|message| !message.is_empty())
+}
+
+fn codex_app_server_turn_error(event: &Value, message: &str) -> CodexTurnError {
+    CodexTurnError {
+        message: message.to_string(),
+        code: app_server_error_code(event),
+        limit_bytes: app_server_error_u64(event, "limit_bytes")
+            .or_else(|| app_server_error_u64(event, "limitBytes")),
+        observed_bytes: app_server_error_u64(event, "content_length_bytes")
+            .or_else(|| app_server_error_u64(event, "contentLengthBytes")),
+    }
+}
+
+fn app_server_error_code(value: &Value) -> Option<String> {
+    value
+        .pointer("/error/code")
+        .or_else(|| value.pointer("/error/codexErrorInfo"))
+        .or_else(|| value.pointer("/error/codex_error_info"))
+        .or_else(|| value.get("code"))
+        .or_else(|| value.get("codexErrorInfo"))
+        .and_then(|code| match code {
+            Value::String(code) => Some(code.clone()),
+            Value::Object(object) => object.keys().next().cloned(),
+            _ => None,
+        })
+}
+
+fn app_server_error_u64(value: &Value, key: &str) -> Option<u64> {
+    value
+        .pointer(&format!("/error/details/{key}"))
+        .or_else(|| value.pointer(&format!("/error/additionalDetails/{key}")))
+        .or_else(|| value.pointer(&format!("/details/{key}")))
+        .and_then(Value::as_u64)
 }
 
 impl CodexLiveOutputNormalizer {
@@ -8577,6 +9822,7 @@ fn codex_turn_error(event: &Value, message: &str) -> CodexTurnError {
 
 fn is_request_body_too_large_error(error: &CodexTurnError) -> bool {
     error.code.as_deref() == Some("request_body_too_large")
+        || error.code.as_deref() == Some("contextWindowExceeded")
         || error.message.to_ascii_lowercase().contains("http 413")
         || error.message.to_ascii_lowercase().contains("payload too large")
         // Compatibility with gateways deployed before the structured 413 fix.
@@ -10623,6 +11869,577 @@ mod tests {
     }
 
     #[test]
+    fn codex_app_server_prompt_input_converts_safe_image_markers() {
+        let root = env::temp_dir().join(format!("iowb-app-server-input-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("uploads")).expect("temp dir");
+        let image = root.join("uploads/screenshot.png");
+        std::fs::write(&image, b"png").expect("image");
+
+        let input = codex_app_server_prompt_input(
+            "What is this?\nAttached image file: `uploads/screenshot.png` (screenshot.png, image/png)",
+            &root,
+        );
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(
+            input[0],
+            serde_json::json!({"type": "text", "text": "What is this?"})
+        );
+        assert_eq!(
+            input[1].get("type").and_then(Value::as_str),
+            Some("localImage")
+        );
+        assert_eq!(
+            input[1].get("path").and_then(Value::as_str),
+            Some(
+                std::fs::canonicalize(&image)
+                    .expect("canonical image")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+
+        let unsafe_input = codex_app_server_prompt_input(
+            "Attached image file: `../outside.png` (outside.png, image/png)",
+            &root,
+        );
+        assert_eq!(unsafe_input.len(), 1);
+        assert_eq!(
+            unsafe_input[0].get("type").and_then(Value::as_str),
+            Some("text")
+        );
+        assert!(
+            unsafe_input[0]
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("../outside.png")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_app_server_prompt_input_handles_multiple_and_image_only_markers() {
+        let root = env::temp_dir().join(format!("iowb-app-server-input-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("uploads")).expect("temp dir");
+        let first = root.join("uploads/first.png");
+        let second = root.join("uploads/second.jpg");
+        std::fs::write(&first, b"png").expect("first image");
+        std::fs::write(&second, b"jpg").expect("second image");
+
+        let input = codex_app_server_prompt_input(
+            "Compare these\nAttached image file: `uploads/first.png` (first.png, image/png)\nAttached image file: `uploads/second.jpg` (second.jpg, image/jpeg)",
+            &root,
+        );
+        assert_eq!(input.len(), 3);
+        assert_eq!(
+            input[0],
+            serde_json::json!({"type": "text", "text": "Compare these"})
+        );
+        assert_eq!(
+            input[1].get("type").and_then(Value::as_str),
+            Some("localImage")
+        );
+        assert_eq!(
+            input[2].get("type").and_then(Value::as_str),
+            Some("localImage")
+        );
+        assert_eq!(
+            input[1].get("path").and_then(Value::as_str),
+            Some(
+                std::fs::canonicalize(&first)
+                    .expect("first canonical")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            input[2].get("path").and_then(Value::as_str),
+            Some(
+                std::fs::canonicalize(&second)
+                    .expect("second canonical")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+
+        let image_only = codex_app_server_prompt_input(
+            "Attached image file: `uploads/first.png` (first.png, image/png)",
+            &root,
+        );
+        assert_eq!(image_only.len(), 1);
+        assert_eq!(
+            image_only[0].get("type").and_then(Value::as_str),
+            Some("localImage")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_app_server_prompt_input_keeps_prompt_only_and_missing_images_as_text() {
+        let root = env::temp_dir().join(format!("iowb-app-server-input-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp dir");
+
+        let prompt_only = codex_app_server_prompt_input("Just text", &root);
+        assert_eq!(
+            prompt_only,
+            vec![serde_json::json!({"type": "text", "text": "Just text"})]
+        );
+
+        let missing = codex_app_server_prompt_input(
+            "Attached image file: `missing.png` (missing.png, image/png)",
+            &root,
+        );
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].get("type").and_then(Value::as_str), Some("text"));
+        assert!(
+            missing[0]
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("missing.png")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_app_server_live_flag_gates_native_gateway_and_overrides() {
+        assert!(!codex_app_server_live_enabled_for(
+            Provider::Codex,
+            ChatRuntime::NativeCli,
+            false,
+            false,
+            false,
+        ));
+        assert!(codex_app_server_live_enabled_for(
+            Provider::Codex,
+            ChatRuntime::NativeCli,
+            true,
+            false,
+            false,
+        ));
+        assert!(!codex_app_server_live_enabled_for(
+            Provider::Codex,
+            ChatRuntime::NativeCli,
+            true,
+            false,
+            true,
+        ));
+        assert!(!codex_app_server_live_enabled_for(
+            Provider::Claude,
+            ChatRuntime::NativeCli,
+            true,
+            false,
+            false,
+        ));
+        assert!(!codex_app_server_live_enabled_for(
+            Provider::Codex,
+            ChatRuntime::IoGateway,
+            true,
+            false,
+            false,
+        ));
+        assert!(codex_app_server_live_enabled_for(
+            Provider::Codex,
+            ChatRuntime::IoGateway,
+            true,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn normalizes_codex_app_server_live_notifications() {
+        let mut normalizer = CodexAppServerLiveOutputNormalizer::default();
+        let mut output = String::new();
+        output.push_str(&normalizer.push_notification(
+            "item/reasoning/summaryTextDelta",
+            &serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "reason-1",
+                "delta": "Inspecting files",
+            }),
+        ));
+        output.push_str(&normalizer.push_notification(
+            "item/commandExecution/outputDelta",
+            &serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "cmd-1",
+                "delta": "/tmp/project\n",
+            }),
+        ));
+        output.push_str(&normalizer.push_notification(
+            "item/completed",
+            &serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "commandExecution",
+                    "id": "cmd-1",
+                    "command": "pwd",
+                    "cwd": "/tmp/project",
+                    "commandActions": [],
+                    "aggregatedOutput": "/tmp/project\n",
+                    "exitCode": 0,
+                    "status": "completed"
+                }
+            }),
+        ));
+        output.push_str(&normalizer.push_notification(
+            "thread/tokenUsage/updated",
+            &serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 20,
+                        "cachedInputTokens": 5,
+                        "cacheWriteInputTokens": 2,
+                        "outputTokens": 8,
+                        "reasoningOutputTokens": 3,
+                        "totalTokens": 28
+                    },
+                    "total": {
+                        "inputTokens": 20,
+                        "cachedInputTokens": 5,
+                        "outputTokens": 8,
+                        "reasoningOutputTokens": 3,
+                        "totalTokens": 28
+                    }
+                }
+            }),
+        ));
+        output.push_str(&normalizer.push_notification(
+            "item/agentMessage/delta",
+            &serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "msg-1",
+                "delta": "Done.",
+            }),
+        ));
+        output.push_str(&normalizer.push_notification(
+            "turn/completed",
+            &serde_json::json!({
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "id": "msg-1",
+                            "text": "Done.",
+                            "phase": "final_answer"
+                        }
+                    ],
+                    "error": null
+                }
+            }),
+        ));
+        output.push_str(&normalizer.finish());
+
+        assert!(output.contains("thinking\nInspecting files"), "{output}");
+        assert!(output.contains("exec / Details"), "{output}");
+        assert!(output.contains("exec / Parameters"), "{output}");
+        assert!(output.contains("### Command\n```sh\npwd"), "{output}");
+        assert!(output.contains("tokens used"), "{output}");
+        assert!(output.contains("codex\nDone."), "{output}");
+        assert_eq!(output.matches("codex\nDone.").count(), 1);
+        assert_eq!(
+            normalizer.take_final_assistant_message().as_deref(),
+            Some("Done.")
+        );
+        let usage = normalizer.take_final_usage().expect("usage");
+        assert_eq!(usage.source, "codex.app_server.turn.usage");
+        assert_eq!(usage.usage.used, 28);
+        assert_eq!(usage.usage.cache_read, 5);
+        assert_eq!(usage.usage.cache_creation, 2);
+        let tools = normalizer.take_tool_messages();
+        assert!(tools.iter().any(|tool| tool.name == "command_execution"));
+    }
+
+    #[test]
+    fn codex_app_server_normalizer_suppresses_usage_until_visible_output() {
+        let mut normalizer = CodexAppServerLiveOutputNormalizer::default();
+        let stale = normalizer.push_notification(
+            "thread/tokenUsage/updated",
+            &serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": { "inputTokens": 10, "outputTokens": 1, "totalTokens": 11 },
+                    "total": { "inputTokens": 10, "outputTokens": 1, "totalTokens": 11 }
+                }
+            }),
+        );
+        assert_eq!(stale, "");
+
+        let mut output = String::new();
+        output.push_str(&normalizer.push_notification(
+            "item/agentMessage/delta",
+            &serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "msg-1",
+                "delta": "Done.",
+            }),
+        ));
+        output.push_str(&normalizer.push_notification(
+            "thread/tokenUsage/updated",
+            &serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": { "inputTokens": 20, "outputTokens": 2, "totalTokens": 22 },
+                    "total": { "inputTokens": 20, "outputTokens": 2, "totalTokens": 22 }
+                }
+            }),
+        ));
+
+        assert!(output.contains("codex\nDone."), "{output}");
+        assert!(output.contains("tokens used"), "{output}");
+        let usage = normalizer.take_final_usage().expect("usage");
+        assert_eq!(usage.usage.used, 22);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_app_server_live_runtime_persists_assistant_and_thread_id() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut state, root, project) = temporary_app_state("app-server-live-runtime").await;
+        state.sessions.external_home = Arc::new(root.clone());
+        let script = root.join("live-codex.sh");
+        let log = root.join("live-requests.log");
+        let rollout = root
+            .join(".codex/sessions/2026/08/19")
+            .join("rollout-2026-08-19T00-00-00-thread-runtime.jsonl");
+        std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("rollout dir");
+        std::fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": Utc::now(),
+                    "type": "session_meta",
+                    "payload": {"id": "thread-runtime", "cwd": project}
+                }),
+                serde_json::json!({
+                    "timestamp": Utc::now(),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "native prompt before Workbench",
+                        "kind": "plain"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": Utc::now(),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "native answer before Workbench"}]
+                    }
+                })
+            ),
+        )
+        .expect("rollout");
+        let original_rollout = std::fs::read_to_string(&rollout).expect("original rollout");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 read first\nprintf '%s\\n' \"$first\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\"}}}}'\n\
+                 read second\nprintf '%s\\n' \"$second\" >> '{}'\n\
+                 read third\nprintf '%s\\n' \"$third\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-runtime\"}}}}}}'\n\
+                 read fourth\nprintf '%s\\n' \"$fourth\" >> '{}'\n\
+                 printf '%s\\n' '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-runtime\",\"status\":\"inProgress\",\"items\":[]}}}}}}'\n\
+                 printf '%s\\n' '{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"threadId\":\"thread-runtime\",\"turnId\":\"turn-runtime\",\"itemId\":\"msg-runtime\",\"delta\":\"runtime answer\"}}}}'\n\
+                 printf '%s\\n' '{{\"method\":\"turn/completed\",\"params\":{{\"threadId\":\"thread-runtime\",\"turn\":{{\"id\":\"turn-runtime\",\"status\":\"completed\",\"items\":[{{\"type\":\"agentMessage\",\"id\":\"msg-runtime\",\"text\":\"runtime answer\",\"phase\":\"final_answer\"}}]}}}}}}'\n",
+                log.display(),
+                log.display(),
+                log.display(),
+                log.display(),
+            ),
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("permissions");
+
+        let session = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("session-app-server-live-runtime".to_string()),
+                false,
+                None,
+                Some(ChatRuntime::NativeCli),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .append_message(&session.id, MessageRole::User, "hello runtime")
+            .await
+            .expect("user message");
+        let run_id = "run-app-server-live-runtime".to_string();
+        let attempt_id = "attempt-app-server-live-runtime".to_string();
+        let durable_run = StoredDurableChatRun::new(
+            run_id.clone(),
+            None,
+            session.id.clone(),
+            Provider::Codex.as_str(),
+            "hello runtime",
+            project.display().to_string(),
+        );
+        state
+            .storage
+            .create_durable_chat_run(&durable_run)
+            .expect("durable run");
+        state
+            .storage
+            .create_chat_run_attempt(&StoredChatRunAttempt::new(
+                attempt_id.clone(),
+                run_id.clone(),
+                session.id.clone(),
+                None,
+                Provider::Codex.as_str(),
+                runtime_label(ChatRuntime::NativeCli),
+                None,
+                None,
+            ))
+            .expect("attempt");
+
+        let mut manager = AgentRuntimeManager::new(10);
+        manager.codex_app_server =
+            CodexAppServerClient::new(script.as_os_str(), Duration::from_secs(2));
+        manager
+            .start_codex_app_server_live(AgentStartContext {
+                provider: Provider::Codex,
+                session_id: session.id.clone(),
+                durable_run_id: Some(run_id.clone()),
+                attempt_id: Some(attempt_id.clone()),
+                response_id: "response-runtime".to_string(),
+                sequence: Arc::new(AtomicU64::new(0)),
+                project_path: project.clone(),
+                prompt: "hello runtime".to_string(),
+                model: None,
+                runtime: ChatRuntime::NativeCli,
+                effort: None,
+                mode: None,
+                thinking: None,
+                fast: None,
+                native_resume_session_id: None,
+                native_rollout_owned_by_provider: false,
+                context_rollover_id: None,
+                direct_ai_config: None,
+                direct_ai_messages: Vec::new(),
+                sessions: state.sessions.clone(),
+                storage: state.storage.clone(),
+                hub: state.ws_hub.clone(),
+            })
+            .await
+            .expect("start app-server runtime");
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let messages = state.storage.list_messages(&session.id).expect("messages");
+                if messages
+                    .iter()
+                    .any(|message| message.role == MessageRole::Assistant)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("assistant persisted");
+
+        let messages = state.storage.list_messages(&session.id).expect("messages");
+        assert!(
+            messages.iter().any(|message| {
+                message.role == MessageRole::Assistant && message.content == "runtime answer"
+            }),
+            "{messages:?}"
+        );
+        let stored = state
+            .storage
+            .get_session_summary(&session.id)
+            .expect("session lookup")
+            .expect("session");
+        assert!(!stored.active);
+        assert_eq!(stored.native_session_id.as_deref(), Some("thread-runtime"));
+        assert!(stored.native_rollout_owned_by_provider);
+        let visible_messages = state
+            .sessions
+            .messages_including_external(&session.id)
+            .await
+            .expect("visible messages");
+        assert_eq!(
+            visible_messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["hello runtime", "runtime answer"],
+            "app-server-owned native rollout context must not leak into Workbench messages"
+        );
+        let (tail_messages, tail_total) = state
+            .sessions
+            .messages_tail_including_external(&session.id, 20)
+            .await
+            .expect("visible tail");
+        assert_eq!(tail_total, 2);
+        assert_eq!(
+            tail_messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["hello runtime", "runtime answer"],
+            "app-server-owned native rollout context must not leak into Workbench message tail"
+        );
+        let durable = state
+            .storage
+            .get_durable_chat_run(&run_id)
+            .expect("durable lookup")
+            .expect("durable run");
+        assert_eq!(durable.native_session_id.as_deref(), Some("thread-runtime"));
+        assert_eq!(
+            state
+                .storage
+                .chat_run_attempt_native_session_id(&attempt_id)
+                .expect("attempt lookup")
+                .as_deref(),
+            Some("thread-runtime")
+        );
+        let requests = std::fs::read_to_string(log).expect("requests");
+        assert!(requests.contains("\"method\":\"thread/start\""));
+        assert!(requests.contains("\"method\":\"turn/start\""));
+        assert!(requests.contains("\"approvalPolicy\":\"never\""));
+        assert_eq!(
+            original_rollout,
+            std::fs::read_to_string(&rollout).expect("rollout after app-server live turn"),
+            "app-server-owned native rollout must not be appended by legacy Workbench sync"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn normalizes_codex_agent_messages_and_apply_patch_without_duplicates() {
         let mut normalizer = CodexLiveOutputNormalizer::default();
         let output = normalizer.push(concat!(
@@ -11298,6 +13115,7 @@ mod tests {
             thinking: None,
             fast: None,
             native_resume_session_id: None,
+            native_rollout_owned_by_provider: false,
             context_rollover_id: Some(rollover.id.clone()),
             direct_ai_config: None,
             direct_ai_messages: Vec::new(),
@@ -11503,6 +13321,7 @@ mod tests {
             thinking: session.thinking,
             fast: session.fast,
             native_resume_session_id: Some("native-clean".to_string()),
+            native_rollout_owned_by_provider: false,
             context_rollover_id: Some(rollover.id.clone()),
             direct_ai_config: None,
             direct_ai_messages: Vec::new(),
@@ -11907,6 +13726,7 @@ mod tests {
         let (mut state, root, project) = temporary_app_state("native-manual-compact-async").await;
         let script = root.join("compact-codex.sh");
         let log = root.join("compact-requests.log");
+        let release = root.join("release-compact");
         std::fs::write(
             &script,
             format!(
@@ -11917,13 +13737,14 @@ mod tests {
                  read third\nprintf '%s\\n' \"$third\" >> '{}'\n\
                  printf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"native-slow-compact\"}}}}}}'\n\
                  read fourth\nprintf '%s\\n' \"$fourth\" >> '{}'\n\
-                 sleep 2\n\
+                 while [ ! -f '{}' ]; do sleep 0.05; done\n\
                  printf '%s\\n' '{{\"id\":3,\"result\":{{}}}}'\n\
                  printf '%s\\n' '{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"native-slow-compact\",\"item\":{{\"type\":\"contextCompaction\",\"id\":\"item-compact\"}}}}}}'\n",
                 log.display(),
                 log.display(),
                 log.display(),
                 log.display(),
+                release.display(),
             ),
         )
         .expect("script");
@@ -11979,7 +13800,7 @@ mod tests {
             .expect("idle session");
 
         let response = timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(5),
             state.compact_session_context(
                 "user-1",
                 &session.id,
@@ -12001,6 +13822,7 @@ mod tests {
             "running"
         );
 
+        std::fs::write(&release, b"release").expect("release fake app-server");
         wait_for_context_rollover_state(&state, &response.response_id, "active").await;
         assert_eq!(
             state
@@ -12584,6 +14406,7 @@ mod tests {
             context_token_usage: None,
             spent_token_usage: None,
             native_session_id: Some("native-session".to_string()),
+            native_rollout_owned_by_provider: false,
             title_source: Some(SessionTitleSource::Manual),
         };
         storage
@@ -12779,7 +14602,7 @@ mod tests {
             .expect("stored session");
         assert_eq!(stored.native_session_id.as_deref(), Some(native_id));
         let api_json = serde_json::to_value(&stored).expect("session JSON");
-        assert!(api_json.get("nativeSessionId").is_none());
+        assert_eq!(api_json["nativeSessionId"], native_id);
 
         let existing_rollout = std::fs::read_to_string(&rollout).expect("read rollout");
         std::fs::write(

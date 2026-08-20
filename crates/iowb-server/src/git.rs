@@ -45,7 +45,14 @@ pub fn router() -> Router<AppState> {
         .route("/api/git/commits", get(commits))
         .route("/api/git/commit-diff", get(commit_diff))
         .route("/api/git/stashes", get(stashes))
+        .route("/api/git/stash", post(create_stash))
+        .route("/api/git/stash/apply", post(apply_stash))
+        .route("/api/git/stash/pop", post(pop_stash))
+        .route("/api/git/stash/drop", post(drop_stash))
         .route("/api/git/tags", get(tags))
+        .route("/api/git/tag", post(create_tag))
+        .route("/api/git/tag/delete", post(delete_tag))
+        .route("/api/git/tag/push", post(push_tag))
         .route(
             "/api/git/generate-commit-message",
             post(generate_commit_message),
@@ -187,6 +194,61 @@ struct RemoteBody {
 }
 
 impl RemoteBody {
+    fn project_ref(&self) -> Result<&str> {
+        self.project
+            .as_deref()
+            .or(self.project_path.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| ServerError::new(StatusCode::BAD_REQUEST, "Project name is required"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StashBody {
+    project: Option<String>,
+    #[serde(rename = "projectPath")]
+    project_path: Option<String>,
+    message: Option<String>,
+}
+
+impl StashBody {
+    fn project_ref(&self) -> Result<&str> {
+        self.project
+            .as_deref()
+            .or(self.project_path.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| ServerError::new(StatusCode::BAD_REQUEST, "Project name is required"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StashRefBody {
+    project: Option<String>,
+    #[serde(rename = "projectPath")]
+    project_path: Option<String>,
+    reference: String,
+}
+
+impl StashRefBody {
+    fn project_ref(&self) -> Result<&str> {
+        self.project
+            .as_deref()
+            .or(self.project_path.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| ServerError::new(StatusCode::BAD_REQUEST, "Project name is required"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TagBody {
+    project: Option<String>,
+    #[serde(rename = "projectPath")]
+    project_path: Option<String>,
+    tag: String,
+    message: Option<String>,
+}
+
+impl TagBody {
     fn project_ref(&self) -> Result<&str> {
         self.project
             .as_deref()
@@ -884,6 +946,66 @@ async fn stashes(
     Ok(Json(GitStashesResponse { stashes }))
 }
 
+async fn create_stash(
+    State(state): State<AppState>,
+    Json(body): Json<StashBody>,
+) -> Result<Json<GitOperationResponse>> {
+    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    validate_git_repository(&project_path).await?;
+    let message = validate_optional_git_message(body.message.as_deref())?;
+    let output = if let Some(message) = message {
+        git(&project_path, ["stash", "push", "-u", "-m", &message]).await?
+    } else {
+        git(&project_path, ["stash", "push", "-u"]).await?
+    };
+    Ok(Json(GitOperationResponse::success(join_output_or(
+        &output,
+        "Stash saved successfully",
+    ))))
+}
+
+async fn apply_stash(
+    State(state): State<AppState>,
+    Json(body): Json<StashRefBody>,
+) -> Result<Json<GitOperationResponse>> {
+    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    validate_git_repository(&project_path).await?;
+    let reference = validate_stash_ref(&body.reference)?;
+    let output = git(&project_path, ["stash", "apply", &reference]).await?;
+    Ok(Json(GitOperationResponse::success(join_output_or(
+        &output,
+        "Stash applied successfully",
+    ))))
+}
+
+async fn pop_stash(
+    State(state): State<AppState>,
+    Json(body): Json<StashRefBody>,
+) -> Result<Json<GitOperationResponse>> {
+    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    validate_git_repository(&project_path).await?;
+    let reference = validate_stash_ref(&body.reference)?;
+    let output = git(&project_path, ["stash", "pop", &reference]).await?;
+    Ok(Json(GitOperationResponse::success(join_output_or(
+        &output,
+        "Stash popped successfully",
+    ))))
+}
+
+async fn drop_stash(
+    State(state): State<AppState>,
+    Json(body): Json<StashRefBody>,
+) -> Result<Json<GitOperationResponse>> {
+    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    validate_git_repository(&project_path).await?;
+    let reference = validate_stash_ref(&body.reference)?;
+    let output = git(&project_path, ["stash", "drop", &reference]).await?;
+    Ok(Json(GitOperationResponse::success(join_output_or(
+        &output,
+        "Stash dropped successfully",
+    ))))
+}
+
 async fn tags(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
@@ -906,6 +1028,60 @@ async fn tags(
         .filter_map(parse_tag_summary)
         .collect::<Vec<_>>();
     Ok(Json(GitTagsResponse { tags }))
+}
+
+async fn create_tag(
+    State(state): State<AppState>,
+    Json(body): Json<TagBody>,
+) -> Result<Json<GitOperationResponse>> {
+    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    validate_git_repository(&project_path).await?;
+    let tag = validate_tag_name(&body.tag)?;
+    let message = validate_optional_git_message(body.message.as_deref())?;
+    let output = if let Some(message) = message {
+        git(&project_path, ["tag", "-a", &tag, "-m", &message]).await?
+    } else {
+        git(&project_path, ["tag", &tag]).await?
+    };
+    Ok(Json(GitOperationResponse::success(join_output_or(
+        &output,
+        "Tag created successfully",
+    ))))
+}
+
+async fn delete_tag(
+    State(state): State<AppState>,
+    Json(body): Json<TagBody>,
+) -> Result<Json<GitOperationResponse>> {
+    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    validate_git_repository(&project_path).await?;
+    let tag = validate_tag_name(&body.tag)?;
+    let output = git(&project_path, ["tag", "-d", &tag]).await?;
+    Ok(Json(GitOperationResponse::success(join_output_or(
+        &output,
+        "Tag deleted successfully",
+    ))))
+}
+
+async fn push_tag(
+    State(state): State<AppState>,
+    Json(body): Json<TagBody>,
+) -> Result<Json<GitOperationResponse>> {
+    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    validate_git_repository(&project_path).await?;
+    let tag = validate_tag_name(&body.tag)?;
+    let remote_name = first_remote(&project_path).await?.ok_or_else(|| {
+        ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "No remote repository configured. Add a remote first.",
+        )
+    })?;
+    validate_remote_name(&remote_name)?;
+    let output = git(&project_path, ["push", &remote_name, &tag]).await?;
+    let mut response =
+        GitOperationResponse::success(join_output_or(&output, "Tag pushed successfully"));
+    response.remote_name = Some(remote_name);
+    Ok(Json(response))
 }
 
 fn parse_stash_summary(line: &str) -> Option<GitStashSummary> {
@@ -2061,6 +2237,29 @@ fn validate_branch_name(branch: &str) -> Result<String> {
     })
 }
 
+fn validate_tag_name(tag: &str) -> Result<String> {
+    validate_pattern(tag, "Invalid tag name", |character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '/' | '-')
+    })
+}
+
+fn validate_stash_ref(reference: &str) -> Result<String> {
+    let trimmed = reference.trim();
+    let valid = trimmed
+        .strip_prefix("stash@{")
+        .and_then(|value| value.strip_suffix('}'))
+        .is_some_and(|index| {
+            !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
+        });
+    if !valid {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid stash reference",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 fn validate_remote_name(remote: &str) -> Result<String> {
     validate_pattern(remote, "Invalid remote name", |character| {
         character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
@@ -2076,6 +2275,23 @@ fn validate_remote_url(url: &str) -> Result<String> {
         ));
     }
     Ok(trimmed.to_string())
+}
+
+fn validate_optional_git_message(message: Option<&str>) -> Result<Option<String>> {
+    let Some(message) = message else {
+        return Ok(None);
+    };
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.contains('\0') || trimmed.len() > 500 {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid git message",
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn validate_hunk_operation(operation: &str) -> Result<&str> {

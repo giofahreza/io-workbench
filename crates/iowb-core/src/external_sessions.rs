@@ -1940,9 +1940,13 @@ fn extract_text(value: Option<&Value>) -> String {
 
 pub(crate) fn visible_user_text(text: &str) -> String {
     let mut candidate = text.trim();
-    while let Some(tag) = ["system-reminder", "environment_context"]
-        .into_iter()
-        .find(|tag| candidate.starts_with(&format!("<{tag}>")))
+    while let Some(tag) = [
+        "system-reminder",
+        "recommended_plugins",
+        "environment_context",
+    ]
+    .into_iter()
+    .find(|tag| candidate.starts_with(&format!("<{tag}>")))
     {
         let close = format!("</{tag}>");
         let Some(index) = candidate.find(&close) else {
@@ -1967,6 +1971,7 @@ fn is_visible_user_text(text: &str) -> bool {
             "<local-command-caveat>",
             "<local-command-stdout>",
             "<system-reminder>",
+            "<recommended_plugins>",
             "<environment_context>",
             "# AGENTS.md instructions",
             "Caveat:",
@@ -2151,6 +2156,19 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use uuid::Uuid;
+
+    #[test]
+    fn visible_user_text_strips_codex_context_wrappers() {
+        let hidden = concat!(
+            "<recommended_plugins>\nplugins\n</recommended_plugins>\n",
+            "<environment_context>\ncontext\n</environment_context>\n"
+        );
+        assert_eq!(visible_user_text(hidden), "");
+        assert_eq!(
+            visible_user_text(&format!("{hidden}\nActual prompt")),
+            "Actual prompt"
+        );
+    }
 
     #[test]
     fn discovers_and_loads_all_supported_cli_histories() {

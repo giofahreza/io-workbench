@@ -494,6 +494,17 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_session_menu_copies_codex_resume_command() {
+        let source = asset_text("app.js");
+
+        assert!(source.contains("function codexResumeCommand(session, projectPath = \"\")"));
+        assert!(source.contains("Copy Codex Resume Command"));
+        assert!(source.contains("cd ${shellSingleQuote(path)} && ${resume}"));
+        assert!(source.contains("data-sidebar-session-card"));
+        assert!(source.contains("openSessionContextMenuFromRow(row"));
+    }
+
+    #[test]
     fn io_gateway_settings_match_the_mobile_configuration_contract() {
         let html = asset_text("index.html");
         let source = asset_text("app.js");

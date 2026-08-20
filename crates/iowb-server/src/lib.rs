@@ -19,7 +19,7 @@ use std::{
 
 use axum::{
     Extension, Json, Router,
-    body::{Bytes, to_bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{
         DefaultBodyLimit, Multipart, Path as AxumPath, Query, Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
@@ -62,7 +62,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
     net::TcpListener,
     process::Command,
     sync::mpsc,
@@ -398,6 +398,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/projects/{project_name}/files/content",
             get(read_project_file),
+        )
+        .route(
+            "/api/projects/{project_name}/files/raw",
+            get(stream_project_file),
         )
         .route(
             "/api/projects/{project_name}/files/create",
@@ -2147,6 +2151,63 @@ async fn read_project_file(
     ))
 }
 
+async fn stream_project_file(
+    State(state): State<AppState>,
+    AxumPath(project_name): AxumPath<String>,
+    Query(query): Query<FileQuery>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let project = state.projects.find_by_name(&project_name)?;
+    let file = state
+        .files
+        .resolve_file(project.path, query.requested_path())
+        .await?;
+    let range_header = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let requested_range = parse_file_range(range_header, file.size)?;
+    let (status, start, end) = match requested_range {
+        Some(range) => (StatusCode::PARTIAL_CONTENT, range.start, range.end),
+        None => (StatusCode::OK, 0, file.size.saturating_sub(1)),
+    };
+    let content_length = if file.size == 0 { 0 } else { end - start + 1 };
+    let mut disk_file = tokio::fs::File::open(&file.path)
+        .await
+        .map_err(FsError::Io)?;
+    if start > 0 {
+        disk_file
+            .seek(SeekFrom::Start(start))
+            .await
+            .map_err(FsError::Io)?;
+    }
+
+    let content_type = file
+        .mime_type
+        .as_deref()
+        .filter(|mime| !mime.trim().is_empty())
+        .unwrap_or("application/octet-stream");
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, content_length.to_string());
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", file.size),
+        );
+    }
+    builder
+        .body(file_response_body(disk_file, content_length))
+        .map_err(|error| {
+            ServerError::with_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build file response",
+                error.to_string(),
+            )
+        })
+}
+
 async fn write_project_file(
     State(state): State<AppState>,
     AxumPath(project_name): AxumPath<String>,
@@ -2166,6 +2227,106 @@ struct WriteFileRequestCompat {
     #[serde(alias = "path", rename = "filePath")]
     file_path: String,
     content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileByteRange {
+    start: u64,
+    end: u64,
+}
+
+fn parse_file_range(header_value: Option<&str>, file_size: u64) -> Result<Option<FileByteRange>> {
+    let Some(header_value) = header_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(range_value) = header_value.strip_prefix("bytes=") else {
+        return Err(ServerError::new(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "unsupported range unit",
+        ));
+    };
+    let range_spec = range_value.split(',').next().unwrap_or_default().trim();
+    let Some((start_raw, end_raw)) = range_spec.split_once('-') else {
+        return Err(ServerError::new(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "invalid range",
+        ));
+    };
+    if file_size == 0 {
+        return Err(ServerError::new(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "requested range is not satisfiable",
+        ));
+    }
+    if start_raw.trim().is_empty() {
+        let suffix_length = end_raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| ServerError::new(StatusCode::RANGE_NOT_SATISFIABLE, "invalid range"))?;
+        if suffix_length == 0 {
+            return Err(ServerError::new(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "requested range is not satisfiable",
+            ));
+        }
+        let start = file_size.saturating_sub(suffix_length);
+        return Ok(Some(FileByteRange {
+            start,
+            end: file_size - 1,
+        }));
+    }
+
+    let start = start_raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| ServerError::new(StatusCode::RANGE_NOT_SATISFIABLE, "invalid range"))?;
+    if start >= file_size {
+        return Err(ServerError::new(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "requested range is not satisfiable",
+        ));
+    }
+    let end = if end_raw.trim().is_empty() {
+        file_size - 1
+    } else {
+        end_raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| ServerError::new(StatusCode::RANGE_NOT_SATISFIABLE, "invalid range"))?
+            .min(file_size - 1)
+    };
+    if end < start {
+        return Err(ServerError::new(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "requested range is not satisfiable",
+        ));
+    }
+    Ok(Some(FileByteRange { start, end }))
+}
+
+fn file_response_body(file: tokio::fs::File, remaining: u64) -> Body {
+    const CHUNK_SIZE: u64 = 64 * 1024;
+    let stream =
+        futures_util::stream::try_unfold((file, remaining), |(mut file, remaining)| async move {
+            if remaining == 0 {
+                return Ok::<_, std::io::Error>(None);
+            }
+            let read_len = remaining.min(CHUNK_SIZE) as usize;
+            let mut buffer = vec![0; read_len];
+            let bytes_read = file.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                return Ok(None);
+            }
+            buffer.truncate(bytes_read);
+            Ok(Some((
+                Bytes::from(buffer),
+                (file, remaining.saturating_sub(bytes_read as u64)),
+            )))
+        });
+    Body::from_stream(stream)
 }
 
 async fn create_project_file(
@@ -4871,6 +5032,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
         mpsc::channel::<WsServerEvent>(iowb_protocol::WS_EVENT_CHANNEL_CAPACITY);
     let mut hub_rx = state.ws_hub.subscribe();
     let mut board_session_subscriptions = HashSet::<String>::new();
+    let mut chat_session_subscriptions: Option<HashSet<String>> = None;
 
     let reader_connection_id = connection_id.clone();
     tokio::spawn(async move {
@@ -4921,6 +5083,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
                     &user,
                     command,
                     &mut board_session_subscriptions,
+                    &mut chat_session_subscriptions,
                 ).await;
             }
             Some(event) = direct_rx.recv() => {
@@ -4928,6 +5091,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
                     &state,
                     &event,
                     &board_session_subscriptions,
+                    &chat_session_subscriptions,
                 ) && send_ws_event(&mut sender, event).await.is_err() {
                     break;
                 }
@@ -4939,6 +5103,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
                             &state,
                             &event,
                             &board_session_subscriptions,
+                            &chat_session_subscriptions,
                         ) && send_ws_event(&mut sender, event).await.is_err() {
                             break;
                         }
@@ -4969,6 +5134,7 @@ async fn handle_ws_command(
     user: &iowb_protocol::UserProfile,
     command: WsClientCommand,
     board_session_subscriptions: &mut HashSet<String>,
+    chat_session_subscriptions: &mut Option<HashSet<String>>,
 ) {
     match command {
         WsClientCommand::Ping { nonce } => {
@@ -4979,16 +5145,26 @@ async fn handle_ws_command(
                 })
                 .await;
         }
-        WsClientCommand::Subscribe { session_ids, .. } => {
+        WsClientCommand::Subscribe {
+            session_ids,
+            chat_session_ids,
+            ..
+        } => {
             *board_session_subscriptions =
                 validated_board_session_subscriptions(state, session_ids);
+            *chat_session_subscriptions = validated_chat_session_subscriptions(chat_session_ids);
             let _ = direct_tx
                 .send(WsServerEvent::ActiveSessions {
                     sessions: state.sessions.list_active().await,
                 })
                 .await;
             for event in state.replay_agent_events().await {
-                if ws_event_visible_to_connection(state, &event, board_session_subscriptions) {
+                if ws_event_visible_to_connection(
+                    state,
+                    &event,
+                    board_session_subscriptions,
+                    chat_session_subscriptions,
+                ) {
                     // This command is handled by the same task that drains
                     // `direct_tx`. Waiting on a full channel here would
                     // deadlock a reconnect with many active replays.
@@ -5143,6 +5319,18 @@ fn validated_board_session_subscriptions(
         .collect()
 }
 
+fn validated_chat_session_subscriptions(
+    session_ids: Option<Vec<String>>,
+) -> Option<HashSet<String>> {
+    session_ids.map(|session_ids| {
+        session_ids
+            .into_iter()
+            .map(|session_id| session_id.trim().to_string())
+            .filter(|session_id| !session_id.is_empty())
+            .collect()
+    })
+}
+
 fn ws_event_session_id(event: &WsServerEvent) -> Option<&str> {
     match event {
         WsServerEvent::Error {
@@ -5161,12 +5349,23 @@ fn ws_event_visible_to_connection(
     state: &AppState,
     event: &WsServerEvent,
     board_session_subscriptions: &HashSet<String>,
+    chat_session_subscriptions: &Option<HashSet<String>>,
 ) -> bool {
     let Some(session_id) = ws_event_session_id(event) else {
         return true;
     };
     let board_session = state.sessions.is_board_session_cached(session_id);
-    !board_session || board_session_subscriptions.contains(session_id)
+    if board_session {
+        return board_session_subscriptions.contains(session_id);
+    }
+    match event {
+        WsServerEvent::Output { .. } | WsServerEvent::ChatRecoveryRequired { .. } => {
+            chat_session_subscriptions
+                .as_ref()
+                .map_or(true, |session_ids| session_ids.contains(session_id))
+        }
+        _ => true,
+    }
 }
 
 fn resolve_session_chat_runtime(
@@ -8148,6 +8347,96 @@ fn compat_path_key(path: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parses_file_ranges_for_media_streaming() {
+        assert_eq!(
+            parse_file_range(Some("bytes=10-19"), 100).unwrap(),
+            Some(FileByteRange { start: 10, end: 19 })
+        );
+        assert_eq!(
+            parse_file_range(Some("bytes=90-"), 100).unwrap(),
+            Some(FileByteRange { start: 90, end: 99 })
+        );
+        assert_eq!(
+            parse_file_range(Some("bytes=-12"), 100).unwrap(),
+            Some(FileByteRange { start: 88, end: 99 })
+        );
+        assert_eq!(parse_file_range(None, 100).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_unsatisfiable_file_ranges() {
+        assert!(parse_file_range(Some("bytes=100-120"), 100).is_err());
+        assert!(parse_file_range(Some("bytes=20-10"), 100).is_err());
+        assert!(parse_file_range(Some("items=0-10"), 100).is_err());
+        assert!(parse_file_range(Some("bytes=-0"), 100).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn streams_project_file_with_byte_ranges() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-server-media-stream-{}", uuid::Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).expect("project directory");
+        std::fs::write(project.join("clip.mp3"), b"0123456789").expect("media file");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().expect("host"),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 4,
+        })
+        .await
+        .expect("state initializes");
+        state.projects.add_project(&project).expect("add project");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_state = state.clone();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, build_router(server_state)).await });
+        let response = reqwest::Client::new()
+            .get(format!(
+                "http://{address}/api/projects/project/files/raw?filePath=clip.mp3"
+            ))
+            .header(reqwest::header::RANGE, "bytes=2-5")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+            .expect("stream response");
+
+        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes 2-5/10")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes")
+        );
+        assert_eq!(
+            response.bytes().await.expect("body bytes").as_ref(),
+            b"2345"
+        );
+
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
     async fn board_scope_test_state() -> (PathBuf, AppState) {
         let root = std::env::temp_dir().join(format!(
             "iowb-server-board-ws-scope-{}",
@@ -8230,18 +8519,34 @@ mod tests {
             content: "ordinary output".to_string(),
             done: false,
         };
+        let ordinary_status = WsServerEvent::SessionStatus {
+            provider: Provider::Codex,
+            session_id: "ordinary-chat".to_string(),
+            status: iowb_protocol::SessionRuntimeStatus::Completed,
+            response_id: Some("response-ordinary".to_string()),
+            sequence: Some(2),
+            latest_user_prompt: None,
+        };
 
         let none = HashSet::new();
+        let legacy_chat_subscriptions = None;
         assert!(!ws_event_visible_to_connection(
             &state,
             &board_output,
-            &none
+            &none,
+            &legacy_chat_subscriptions,
         ));
-        assert!(!ws_event_visible_to_connection(&state, &board_error, &none));
+        assert!(!ws_event_visible_to_connection(
+            &state,
+            &board_error,
+            &none,
+            &legacy_chat_subscriptions,
+        ));
         assert!(ws_event_visible_to_connection(
             &state,
             &ordinary_output,
-            &none
+            &none,
+            &legacy_chat_subscriptions,
         ));
 
         let accepted = validated_board_session_subscriptions(
@@ -8256,12 +8561,46 @@ mod tests {
         assert!(ws_event_visible_to_connection(
             &state,
             &board_output,
-            &accepted
+            &accepted,
+            &legacy_chat_subscriptions,
         ));
         assert!(ws_event_visible_to_connection(
             &state,
             &board_error,
-            &accepted
+            &accepted,
+            &legacy_chat_subscriptions,
+        ));
+
+        let no_visible_chat = validated_chat_session_subscriptions(Some(Vec::new()));
+        assert!(!ws_event_visible_to_connection(
+            &state,
+            &ordinary_output,
+            &none,
+            &no_visible_chat,
+        ));
+        assert!(ws_event_visible_to_connection(
+            &state,
+            &ordinary_status,
+            &none,
+            &no_visible_chat,
+        ));
+        let selected_chat = validated_chat_session_subscriptions(Some(vec![
+            " ordinary-chat ".to_string(),
+            "ordinary-chat".to_string(),
+            "missing-chat".to_string(),
+        ]));
+        assert_eq!(
+            selected_chat,
+            Some(HashSet::from([
+                "ordinary-chat".to_string(),
+                "missing-chat".to_string(),
+            ])),
+        );
+        assert!(ws_event_visible_to_connection(
+            &state,
+            &ordinary_output,
+            &none,
+            &selected_chat,
         ));
 
         drop(state);
@@ -8349,6 +8688,7 @@ mod tests {
 
         let (direct_tx, mut direct_rx) = mpsc::channel(4);
         let mut board_session_subscriptions = HashSet::new();
+        let mut chat_session_subscriptions = None;
         handle_ws_command(
             &state,
             &direct_tx,
@@ -8370,6 +8710,7 @@ mod tests {
                 fast: None,
             },
             &mut board_session_subscriptions,
+            &mut chat_session_subscriptions,
         )
         .await;
 

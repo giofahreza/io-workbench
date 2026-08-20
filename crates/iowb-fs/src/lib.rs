@@ -24,6 +24,15 @@ pub enum FsError {
 pub type Result<T> = std::result::Result<T, FsError>;
 
 #[derive(Debug, Clone)]
+pub struct ResolvedFile {
+    pub path: PathBuf,
+    pub display_path: String,
+    pub size: u64,
+    pub mime_type: Option<String>,
+    pub modified: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkspacePathValidator {
     workspace_root: PathBuf,
 }
@@ -207,51 +216,65 @@ impl FileService {
         project_root: impl AsRef<Path>,
         file_path: impl AsRef<Path>,
     ) -> Result<FileContentResponse> {
-        let root = fs::canonicalize(project_root.as_ref()).await?;
-        let target = resolve_child_path(&root, file_path.as_ref()).await?;
-        let metadata = fs::metadata(&target).await?;
-        if !metadata.is_file() {
-            return Err(FsError::InvalidPath("path is not a file".to_string()));
-        }
-        if metadata.len() > self.max_file_read_bytes {
+        let file = self.resolve_file(project_root, file_path).await?;
+        if file.size > self.max_file_read_bytes {
             return Err(FsError::InvalidPath(format!(
                 "file exceeds read limit of {} bytes",
                 self.max_file_read_bytes
             )));
         }
 
-        let bytes = fs::read(&target).await?;
-        let mime_type = mime_guess::from_path(&target)
-            .first_raw()
-            .map(str::to_string);
-        let is_image = mime_type
+        let bytes = fs::read(&file.path).await?;
+        let mime_type = file.mime_type;
+        let inline_binary_preview_supported = mime_type
             .as_deref()
-            .is_some_and(|mime| mime.starts_with("image/"));
+            .is_some_and(supports_inline_binary_preview);
         let binary = bytes.contains(&0);
-        let (content, content_encoding, response_mime_type) = if binary || is_image {
-            if !is_image {
-                return Err(FsError::BinaryFile);
-            }
-            (
-                BASE64_STANDARD.encode(&bytes),
-                Some("base64".to_string()),
-                mime_type,
-            )
-        } else {
-            (
-                String::from_utf8(bytes).map_err(|_| FsError::BinaryFile)?,
-                None,
-                mime_type,
-            )
-        };
+        let (content, content_encoding, response_mime_type) =
+            if binary || inline_binary_preview_supported {
+                if !inline_binary_preview_supported {
+                    return Err(FsError::BinaryFile);
+                }
+                (
+                    BASE64_STANDARD.encode(&bytes),
+                    Some("base64".to_string()),
+                    mime_type,
+                )
+            } else {
+                (
+                    String::from_utf8(bytes).map_err(|_| FsError::BinaryFile)?,
+                    None,
+                    mime_type,
+                )
+            };
 
         Ok(FileContentResponse {
-            path: display_path(&root, &target),
+            path: file.display_path,
             content,
-            size: metadata.len(),
+            size: file.size,
             content_encoding,
             mime_type: response_mime_type,
+            modified: file.modified,
+        })
+    }
+
+    pub async fn resolve_file(
+        &self,
+        project_root: impl AsRef<Path>,
+        file_path: impl AsRef<Path>,
+    ) -> Result<ResolvedFile> {
+        let root = fs::canonicalize(project_root.as_ref()).await?;
+        let target = resolve_child_path(&root, file_path.as_ref()).await?;
+        let metadata = fs::metadata(&target).await?;
+        if !metadata.is_file() {
+            return Err(FsError::InvalidPath("path is not a file".to_string()));
+        }
+        Ok(ResolvedFile {
+            display_path: display_path(&root, &target),
+            mime_type: mime_type_for_path(&target),
+            size: metadata.len(),
             modified: metadata.modified().ok().map(DateTime::<Utc>::from),
+            path: target,
         })
     }
 
@@ -643,6 +666,14 @@ fn should_skip_name(name: &str) -> bool {
         || name.ends_with(".swp")
 }
 
+fn supports_inline_binary_preview(mime: &str) -> bool {
+    mime.starts_with("image/") || mime.starts_with("video/") || mime.starts_with("audio/")
+}
+
+fn mime_type_for_path(path: &Path) -> Option<String> {
+    mime_guess::from_path(path).first_raw().map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +725,37 @@ mod tests {
             .find(|entry| entry.name == "nested")
             .unwrap();
         assert!(nested.children.is_empty());
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_media_files_as_base64_for_preview() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-fs-media-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let audio_bytes = vec![0, 1, 2, 3, 4, 5];
+        let video_bytes = vec![0, 0, 0, 24, b'f', b't', b'y', b'p'];
+        tokio::fs::write(root.join("clip.mp3"), &audio_bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("clip.mp4"), &video_bytes)
+            .await
+            .unwrap();
+
+        let service = FileService::new(6, 1024 * 1024);
+        let audio = service.read_file(&root, "clip.mp3").await.unwrap();
+        let video = service.read_file(&root, "clip.mp4").await.unwrap();
+
+        assert_eq!(audio.content_encoding.as_deref(), Some("base64"));
+        assert_eq!(audio.mime_type.as_deref(), Some("audio/mpeg"));
+        assert_eq!(BASE64_STANDARD.decode(audio.content).unwrap(), audio_bytes);
+        assert_eq!(video.content_encoding.as_deref(), Some("base64"));
+        assert_eq!(video.mime_type.as_deref(), Some("video/mp4"));
+        assert_eq!(BASE64_STANDARD.decode(video.content).unwrap(), video_bytes);
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

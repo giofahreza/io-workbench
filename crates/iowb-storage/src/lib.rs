@@ -1849,6 +1849,40 @@ impl Storage {
         self.with_connection(|conn| insert_chat_run_attempt_conn(conn, attempt))
     }
 
+    pub fn update_chat_run_attempt_native_session_id(
+        &self,
+        attempt_id: &str,
+        native_session_id: &str,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                r#"
+                UPDATE chat_run_attempts
+                SET native_session_id = ?1, updated_at = ?2
+                WHERE id = ?3
+                  AND status IN ('starting', 'running', 'recovering', 'waiting_for_input')
+                  AND (native_session_id IS NULL OR native_session_id = ?1)
+                "#,
+                params![native_session_id, now, attempt_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    pub fn chat_run_attempt_native_session_id(&self, attempt_id: &str) -> Result<Option<String>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT native_session_id FROM chat_run_attempts WHERE id = ?1",
+                params![attempt_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(StorageError::from)
+        })
+    }
+
     pub fn finish_chat_run_attempt(
         &self,
         attempt_id: &str,
@@ -5113,6 +5147,9 @@ fn serialize_session_metadata(session: &SessionSummary) -> String {
     if let Some(native_session_id) = session.native_session_id.as_ref() {
         value.insert("nativeSessionId".into(), json!(native_session_id));
     }
+    if session.native_rollout_owned_by_provider {
+        value.insert("nativeRolloutOwnedByProvider".into(), json!(true));
+    }
     if let Some(title_source) = session.title_source {
         value.insert("titleSource".into(), json!(title_source));
     }
@@ -5181,6 +5218,12 @@ fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
     }
     if let Some(v) = value.get("nativeSessionId").and_then(Value::as_str) {
         session.native_session_id = Some(v.to_string());
+    }
+    if let Some(v) = value
+        .get("nativeRolloutOwnedByProvider")
+        .and_then(Value::as_bool)
+    {
+        session.native_rollout_owned_by_provider = v;
     }
     if let Some(v) = value.get("titleSource") {
         session.title_source = serde_json::from_value(v.clone()).ok();
@@ -7635,6 +7678,7 @@ mod tests {
             title: "Test".to_string(),
             last_activity: Utc::now(),
             native_session_id: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            native_rollout_owned_by_provider: true,
             title_source: Some(SessionTitleSource::Manual),
             runtime: Some(ChatRuntime::IoGateway),
             fast: Some(true),
@@ -7656,6 +7700,7 @@ mod tests {
             .expect("query")
             .expect("stored session");
         assert_eq!(restored.native_session_id, session.native_session_id);
+        assert!(restored.native_rollout_owned_by_provider);
         assert_eq!(restored.title_source, session.title_source);
         assert_eq!(restored.runtime, Some(ChatRuntime::IoGateway));
         assert_eq!(restored.fast, Some(true));
@@ -7667,6 +7712,7 @@ mod tests {
         let api_value = serde_json::to_value(&restored).expect("serialize session");
         assert_eq!(api_value["token_usage"]["used"], 4_321);
         assert_eq!(api_value["fast"], true);
+        assert!(api_value.get("nativeRolloutOwnedByProvider").is_none());
 
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");
