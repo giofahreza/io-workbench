@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260819-01";
+const APP_VERSION = "20260820-01";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -89,6 +89,9 @@ const state = {
   fileLoadingDirectoryPaths: new Set(),
   fileLoading: false,
   fileLoadRequestId: 0,
+  fileRefreshTimer: null,
+  filePendingRefreshProjectPath: "",
+  filePendingRefreshPaths: new Set(),
   fileContentRequestId: 0,
   fileProjectPath: "",
   fileRootPath: ".",
@@ -368,7 +371,7 @@ async function api(path, options = {}) {
     headers.Authorization = `Bearer ${state.token}`;
   }
 
-  const response = await fetch(path, { ...options, headers });
+  const response = await fetch(path, { cache: "no-store", ...options, headers });
   const text = await response.text();
   const body = text ? JSON.parse(text) : null;
   if (!response.ok) {
@@ -423,6 +426,16 @@ function activeProjectPath(selector = "#active-project") {
 function activeProjectName(selectId = "#active-project") {
   const path = qs(selectId)?.value || activeProjectPath(selectId);
   return state.projects.find((project) => project.path === path)?.name || "";
+}
+
+function activeProjectRecord(selectId = "#active-project") {
+  const path = activeProjectPath(selectId);
+  return state.projects.find((project) => project.path === path) || null;
+}
+
+function activeProjectKey(selectId = "#active-project") {
+  const project = activeProjectRecord(selectId);
+  return project?.id || project?.name || "";
 }
 
 function chatProvider() {
@@ -5368,7 +5381,7 @@ async function loadMetrics() {
 }
 
 async function loadFiles() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project) {
     state.fileLoadRequestId += 1;
     state.fileLoading = false;
@@ -5400,7 +5413,7 @@ async function loadFiles() {
   }
   renderFileEntries();
   try {
-    const body = await api(`/api/projects/${encodeURIComponent(project)}/files?path=${encodeURIComponent(path)}&maxDepth=1`);
+    const body = await api(`/api/projects/${encodeURIComponent(project)}/files?path=${encodeURIComponent(path)}&maxDepth=0`);
     if (
       requestId !== state.fileLoadRequestId
       || projectPath !== activeProjectPath()
@@ -5410,12 +5423,12 @@ async function loadFiles() {
     state.fileRootPath = path;
     state.fileEntries = Array.isArray(body) ? body : body.entries || [];
     state.fileLoadedDirectoryPaths = new Set([path]);
-    markLoadedFileDirectories(state.fileEntries);
+    state.fileLoadingDirectoryPaths.clear();
     state.fileExpandedPaths.clear();
     for (const expandedPath of expandedPaths) {
       if (!findFileEntryByPath(state.fileEntries, expandedPath)) continue;
       state.fileExpandedPaths.add(expandedPath);
-      await loadFileDirectory(expandedPath);
+      await loadFileDirectory(expandedPath, { force: true });
       if (requestId !== state.fileLoadRequestId || projectPath !== activeProjectPath()) return;
     }
     state.fileSelectedPaths = new Set(
@@ -5427,13 +5440,6 @@ async function loadFiles() {
       state.fileLoading = false;
       renderFileEntries();
     }
-  }
-}
-
-function markLoadedFileDirectories(entries) {
-  for (const entry of entries || []) {
-    if (entry.type !== "directory") continue;
-    state.fileLoadedDirectoryPaths.add(entry.path);
   }
 }
 
@@ -5455,25 +5461,29 @@ function replaceFileEntryChildren(entries, path, children) {
   return replaced ? nextEntries : entries;
 }
 
-async function loadFileDirectory(path) {
+async function loadFileDirectory(path, options = {}) {
   const normalizedPath = normalizeProjectPath(path);
+  const force = !!options.force;
   if (
-    state.fileLoadedDirectoryPaths.has(normalizedPath)
-    || state.fileLoadingDirectoryPaths.has(normalizedPath)
+    !force
+    && (
+      state.fileLoadedDirectoryPaths.has(normalizedPath)
+      || state.fileLoadingDirectoryPaths.has(normalizedPath)
+    )
   ) return;
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const projectPath = activeProjectPath();
   const requestId = state.fileLoadRequestId;
   if (!project || !findFileEntryByPath(state.fileEntries, normalizedPath)) return;
+  state.fileLoadedDirectoryPaths.delete(normalizedPath);
   state.fileLoadingDirectoryPaths.add(normalizedPath);
   renderFileEntries();
   try {
-    const body = await api(`/api/projects/${encodeURIComponent(project)}/files?path=${encodeURIComponent(normalizedPath)}&maxDepth=1`);
+    const body = await api(`/api/projects/${encodeURIComponent(project)}/files?path=${encodeURIComponent(normalizedPath)}&maxDepth=0`);
     if (requestId !== state.fileLoadRequestId || projectPath !== activeProjectPath()) return;
     const children = Array.isArray(body) ? body : body.entries || [];
     state.fileEntries = replaceFileEntryChildren(state.fileEntries, normalizedPath, children);
     state.fileLoadedDirectoryPaths.add(normalizedPath);
-    markLoadedFileDirectories(children);
   } catch (error) {
     state.fileExpandedPaths.delete(normalizedPath);
     throw error;
@@ -5599,6 +5609,28 @@ function parentProjectPath(path) {
   const parts = normalized.split("/").filter(Boolean);
   parts.pop();
   return parts.length ? parts.join("/") : ".";
+}
+
+function sameProjectRootPath(left, right) {
+  const normalize = (value) => String(value || "").replaceAll("\\", "/").replace(/\/+$/, "");
+  return normalize(left) === normalize(right);
+}
+
+function scheduleProjectFilesRefresh(payload) {
+  const projectPath = String(payload?.projectPath || "");
+  if (!projectPath || !sameProjectRootPath(projectPath, activeProjectPath())) return;
+  (payload.paths || []).forEach((path) => state.filePendingRefreshPaths.add(normalizeProjectPath(path)));
+  state.filePendingRefreshProjectPath = projectPath;
+  window.clearTimeout(state.fileRefreshTimer);
+  state.fileRefreshTimer = window.setTimeout(() => {
+    const refreshProjectPath = state.filePendingRefreshProjectPath;
+    state.fileRefreshTimer = null;
+    state.filePendingRefreshProjectPath = "";
+    state.filePendingRefreshPaths.clear();
+    if (activeView() !== "files") return;
+    if (!sameProjectRootPath(refreshProjectPath, activeProjectPath())) return;
+    loadFiles().catch(showError);
+  }, 250);
 }
 
 function parentFilesystemPath(path) {
@@ -5919,7 +5951,7 @@ async function commitFileCreate() {
 }
 
 async function createFileTreePath(directory, parentPath = ".", name = "") {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project) return;
   const base = normalizeProjectPath(parentPath || qs("#files-path")?.value || ".");
   const trimmed = normalizeProjectPath(name || "");
@@ -6238,7 +6270,7 @@ async function openFile(filePath) {
 }
 
 async function loadFileContent(filePath, options = {}) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const projectPath = activeProjectPath();
   if (!project) return;
   if (!options.skipDirtyCheck && !confirmDiscardDirtyFile()) return;
@@ -6291,7 +6323,7 @@ function closeFileEditor(options = {}) {
 async function saveFile(event) {
   event.preventDefault();
   requireCurrentFileProject();
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const filePath = qs("#file-editor-path").value.trim();
   if (!project || !filePath) return;
   await api(`/api/projects/${encodeURIComponent(project)}/file`, {
@@ -6309,7 +6341,7 @@ async function saveFile(event) {
 
 async function createPath(directory) {
   requireCurrentFileProject();
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const filePath = qs("#file-editor-path").value.trim();
   if (!project || !filePath) return;
   await api(`/api/projects/${encodeURIComponent(project)}/files/create`, {
@@ -6333,7 +6365,7 @@ async function deletePath() {
 }
 
 async function deleteFilePath(filePath) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project || !filePath) return;
   await api(`/api/projects/${encodeURIComponent(project)}/files`, {
     method: "DELETE",
@@ -6358,7 +6390,7 @@ async function renamePath() {
 }
 
 async function renameFilePath(oldPath, newPath) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project || !oldPath || !newPath) return;
   await api(`/api/projects/${encodeURIComponent(project)}/files/rename`, {
     method: "PUT",
@@ -6378,7 +6410,7 @@ async function renameFilePath(oldPath, newPath) {
 }
 
 async function uploadProjectFiles() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const files = [...qs("#file-upload-input").files];
   if (!project || !files.length) return;
   const formData = new FormData();
@@ -6392,7 +6424,7 @@ async function uploadProjectFiles() {
 }
 
 async function uploadProjectFolder() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const files = [...qs("#folder-upload-input").files];
   if (!project || !files.length) return;
   const relativePaths = files.map((file) => normalizeProjectPath(file.webkitRelativePath || file.name));
@@ -6420,7 +6452,7 @@ function downloadCurrentFile() {
 }
 
 async function downloadFilePath(filePath) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project || !filePath) return;
   const body = await api(`/api/projects/${encodeURIComponent(project)}/files/content?path=${encodeURIComponent(filePath)}`);
   const blob = new Blob([body.content || ""], { type: "text/plain;charset=utf-8" });
@@ -6625,7 +6657,7 @@ function findLastIndex(items, predicate) {
 }
 
 async function loadGitStatus() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project) return;
   qs("#git-files").innerHTML = '<p class="empty">Loading source control.</p>';
   qs("#git-output").innerHTML = "";
@@ -6952,7 +6984,7 @@ async function requestGitFileAction(file, status) {
 }
 
 async function gitFileOperation(path, file) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project || !file) return;
   const body = await api(path, {
     method: "POST",
@@ -7094,7 +7126,7 @@ function renderSessionMessages(body = null) {
 }
 
 async function uploadChatImages() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const files = [...qs("#chat-image-input").files];
   if (!project || !files.length) return;
   const formData = new FormData();
@@ -7482,7 +7514,7 @@ async function updateSessionModel() {
 }
 
 async function loadProjectSessions() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project) return;
   const body = await api(`/api/projects/${encodeURIComponent(project)}/sessions`);
   state.sessions = (Array.isArray(body) ? body : body.sessions || [])
@@ -7492,7 +7524,7 @@ async function loadProjectSessions() {
 }
 
 async function loadSessionTokenUsage() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const sessionId = selectedSessionId();
   if (!project || !sessionId) return;
   const provider = qs("#session-provider").value;
@@ -7515,7 +7547,7 @@ async function renameSelectedSession() {
 }
 
 async function generateGitMessage() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const files = selectedGitFiles();
   if (!project || !files.length) return;
   const body = await api("/api/git/generate-commit-message", {
@@ -7527,7 +7559,7 @@ async function generateGitMessage() {
 }
 
 async function commitGitSelection() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const files = selectedGitFiles();
   const message = qs("#git-message").value.trim();
   if (!project || !files.length || !message) return;
@@ -7540,7 +7572,7 @@ async function commitGitSelection() {
 }
 
 async function gitOperation(path) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project) return;
   const body = await api(path, {
     method: "POST",
@@ -7551,21 +7583,21 @@ async function gitOperation(path) {
 }
 
 async function gitRead(path, renderer = renderJson) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project) return;
   const body = await api(`${path}${path.includes("?") ? "&" : "?"}project=${encodeURIComponent(project)}`);
   renderer("#git-output", body);
 }
 
 async function gitDiffSelected() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const file = selectedGitFiles()[0];
   if (!project || !file) return;
   await gitDiffForFile(file);
 }
 
 async function gitDiffForFile(file) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project || !file) return;
   state.currentGitDiffFile = file;
   renderGitFiles();
@@ -7574,28 +7606,28 @@ async function gitDiffForFile(file) {
 }
 
 async function gitFileDiffSelected() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const file = selectedGitFiles()[0];
   if (!project || !file) return;
   await gitFileReviewForFile(file);
 }
 
 async function gitFileReviewForFile(file) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project || !file) return;
   const body = await api(`/api/git/file-with-diff?project=${encodeURIComponent(project)}&file=${encodeURIComponent(file)}`);
   renderGitFileReview(file, body);
 }
 
 async function loadGitConflicts() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project) return;
   const body = await api(`/api/git/conflicts?project=${encodeURIComponent(project)}`);
   renderGitConflicts(body);
 }
 
 async function loadGitConflictFile(file) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project || !file) return;
   const body = await api(`/api/git/conflict-file?project=${encodeURIComponent(project)}&file=${encodeURIComponent(file)}`);
   renderGitConflictFile(body);
@@ -7674,7 +7706,7 @@ function renderGitConflictFile(body) {
 }
 
 async function resolveGitConflict(file, resolution, content) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project || !file || !resolution) return;
   const payload = { project, file, resolution, stage: true };
   if (content !== undefined) payload.content = content;
@@ -7783,7 +7815,7 @@ function setGitHunkSelection(checked) {
 }
 
 async function applySelectedGitHunks(operation) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const file = state.currentGitDiffFile;
   const hunkIndexes = selectedGitHunks();
   if (!project || !file || !hunkIndexes.length) return;
@@ -7914,7 +7946,7 @@ function renderGitCommits(selector, body) {
 }
 
 async function gitCommitDiff(commit) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   if (!project || !commit) return;
   const body = await api(`/api/git/commit-diff?project=${encodeURIComponent(project)}&commit=${encodeURIComponent(commit)}`);
   renderGitDiff(commit, body);
@@ -7947,7 +7979,7 @@ async function publishCurrentBranch() {
 }
 
 async function gitBranchOperation(path) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const branch = qs("#git-branch").value.trim();
   if (!project || !branch) return;
   const body = await api(path, {
@@ -7959,7 +7991,7 @@ async function gitBranchOperation(path) {
 }
 
 async function setGitRemote() {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const url = qs("#git-remote-url").value.trim();
   if (!project || !url) return;
   const body = await api("/api/git/remote", {
@@ -7970,7 +8002,7 @@ async function setGitRemote() {
 }
 
 async function gitSelectedFileOperation(path) {
-  const project = activeProjectName();
+  const project = activeProjectKey();
   const files = selectedGitFiles();
   if (!project || !files.length) return;
   const results = [];
@@ -9866,6 +9898,9 @@ function connectWs() {
       hideBoardChatSessionsFromLists();
       syncProjectOrder();
       renderProjects();
+    }
+    if (payload.type === "project_files_changed") {
+      scheduleProjectFilesRefresh(payload);
     }
     if (payload.type === "active_sessions") {
       state.sessions = (payload.sessions || []).filter((session) => !isBoardChatSession(session));

@@ -1612,7 +1612,7 @@ async fn resolve_project_path(state: &AppState, project_ref: &str) -> Result<Pat
         ));
     }
 
-    if let Ok(project) = state.projects.find_by_name(project_ref) {
+    if let Ok(project) = state.projects.find_by_ref(project_ref) {
         return canonicalize_dir(PathBuf::from(project.path)).await;
     }
 

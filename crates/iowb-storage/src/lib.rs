@@ -1184,9 +1184,83 @@ impl Storage {
         })
     }
 
-    pub fn delete_project_by_name(&self, name: &str) -> Result<bool> {
+    pub fn find_project_by_id(&self, id: &str) -> Result<Option<ProjectSummary>> {
         self.with_connection(|conn| {
-            let changed = conn.execute("DELETE FROM projects WHERE name = ?1", params![name])?;
+            let row = conn
+                .query_row(
+                    r#"
+                    SELECT id, name, path, created_at, updated_at
+                    FROM projects
+                    WHERE id = ?1
+                    "#,
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            row.map(|(id, name, path, created_at, updated_at)| {
+                Ok(ProjectSummary {
+                    id,
+                    name,
+                    path,
+                    repo_name: None,
+                    created_at: parse_time(&created_at)?,
+                    updated_at: parse_time(&updated_at)?,
+                    sessions: Vec::new(),
+                })
+            })
+            .transpose()
+        })
+    }
+
+    pub fn find_project_by_path(&self, path: &str) -> Result<Option<ProjectSummary>> {
+        self.with_connection(|conn| {
+            let row = conn
+                .query_row(
+                    r#"
+                    SELECT id, name, path, created_at, updated_at
+                    FROM projects
+                    WHERE path = ?1
+                    "#,
+                    params![path],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            row.map(|(id, name, path, created_at, updated_at)| {
+                Ok(ProjectSummary {
+                    id,
+                    name,
+                    path,
+                    repo_name: None,
+                    created_at: parse_time(&created_at)?,
+                    updated_at: parse_time(&updated_at)?,
+                    sessions: Vec::new(),
+                })
+            })
+            .transpose()
+        })
+    }
+
+    pub fn delete_project_by_id(&self, id: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            let changed = conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
             Ok(changed > 0)
         })
     }

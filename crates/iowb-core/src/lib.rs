@@ -6084,8 +6084,19 @@ impl ProjectIndex {
             .ok_or_else(|| CoreError::ProjectNotFound(project_name.to_string()))
     }
 
-    pub fn delete_by_name(&self, project_name: &str) -> Result<bool> {
-        Ok(self.storage.delete_project_by_name(project_name)?)
+    pub fn find_by_ref(&self, project_ref: &str) -> Result<ProjectSummary> {
+        if let Some(project) = self.storage.find_project_by_id(project_ref)? {
+            return Ok(project);
+        }
+        if let Some(project) = self.storage.find_project_by_path(project_ref)? {
+            return Ok(project);
+        }
+        self.find_by_name(project_ref)
+    }
+
+    pub fn delete_by_ref(&self, project_ref: &str) -> Result<bool> {
+        let project = self.find_by_ref(project_ref)?;
+        Ok(self.storage.delete_project_by_id(&project.id)?)
     }
 }
 

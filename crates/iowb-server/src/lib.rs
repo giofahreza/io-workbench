@@ -24,7 +24,7 @@ use axum::{
         DefaultBodyLimit, Multipart, Path as AxumPath, Query, Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, Method, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     middleware,
     middleware::Next,
     response::{
@@ -584,9 +584,21 @@ pub fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(
             MAX_UPLOAD_FILE_BYTES * MAX_UPLOAD_FILES,
         ))
+        .layer(middleware::from_fn(no_store_api_cache_headers))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn no_store_api_cache_headers(request: Request, next: Next) -> Response {
+    let is_api = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    if is_api {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 #[derive(Debug)]
@@ -2038,7 +2050,7 @@ async fn project_sessions(
     State(state): State<AppState>,
     AxumPath(project_name): AxumPath<String>,
 ) -> Result<Json<Vec<SessionSummary>>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     Ok(Json(state.sessions.list_for_project(&project.path).await?))
 }
 
@@ -2046,7 +2058,7 @@ async fn delete_project(
     State(state): State<AppState>,
     AxumPath(project_name): AxumPath<String>,
 ) -> Result<Json<PlaceholderResponse>> {
-    let deleted = state.projects.delete_by_name(&project_name)?;
+    let deleted = state.projects.delete_by_ref(&project_name)?;
     if !deleted {
         return Err(ServerError::new(StatusCode::NOT_FOUND, "project not found"));
     }
@@ -2067,7 +2079,7 @@ async fn rename_project(
     AxumPath(project_name): AxumPath<String>,
     Json(request): Json<RenameProjectRequest>,
 ) -> Result<Json<ProjectSummary>> {
-    let mut project = state.projects.find_by_name(&project_name)?;
+    let mut project = state.projects.find_by_ref(&project_name)?;
     let name = request.name.trim();
     if name.is_empty() {
         return Err(ServerError::new(
@@ -2124,7 +2136,7 @@ async fn list_project_files(
     AxumPath(project_name): AxumPath<String>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<Vec<FileEntry>>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     Ok(Json(
         state
             .files
@@ -2142,7 +2154,7 @@ async fn read_project_file(
     AxumPath(project_name): AxumPath<String>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<FileContentResponse>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     Ok(Json(
         state
             .files
@@ -2157,7 +2169,7 @@ async fn stream_project_file(
     Query(query): Query<FileQuery>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     let file = state
         .files
         .resolve_file(project.path, query.requested_path())
@@ -2213,7 +2225,7 @@ async fn write_project_file(
     AxumPath(project_name): AxumPath<String>,
     Json(request): Json<WriteFileRequestCompat>,
 ) -> Result<Json<FileContentResponse>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     Ok(Json(
         state
             .files
@@ -2334,7 +2346,7 @@ async fn create_project_file(
     AxumPath(project_name): AxumPath<String>,
     Json(request): Json<CreateFileRequest>,
 ) -> Result<Json<FileEntry>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     Ok(Json(
         state
             .files
@@ -2353,7 +2365,7 @@ async fn rename_project_file(
     AxumPath(project_name): AxumPath<String>,
     Json(request): Json<RenameFileRequest>,
 ) -> Result<Json<FileEntry>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     Ok(Json(
         state
             .files
@@ -2367,7 +2379,7 @@ async fn rename_project_files_batch(
     AxumPath(project_name): AxumPath<String>,
     Json(request): Json<BatchRenameFileRequest>,
 ) -> Result<Json<Vec<FileEntry>>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     let mut renamed = Vec::with_capacity(request.entries.len());
     for entry in request.entries {
         renamed.push(
@@ -2385,7 +2397,7 @@ async fn copy_project_file(
     AxumPath(project_name): AxumPath<String>,
     Json(request): Json<CopyFileRequest>,
 ) -> Result<Json<FileEntry>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     Ok(Json(
         state
             .files
@@ -2399,7 +2411,7 @@ async fn copy_project_files_batch(
     AxumPath(project_name): AxumPath<String>,
     Json(request): Json<BatchCopyFileRequest>,
 ) -> Result<Json<Vec<FileEntry>>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     let mut copied = Vec::with_capacity(request.entries.len());
     for entry in request.entries {
         copied.push(
@@ -2417,7 +2429,7 @@ async fn delete_project_file(
     AxumPath(project_name): AxumPath<String>,
     Json(request): Json<DeleteFileRequest>,
 ) -> Result<Json<PlaceholderResponse>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     state
         .files
         .delete_path(project.path, request.file_path)
@@ -2433,7 +2445,7 @@ async fn delete_project_files_batch(
     AxumPath(project_name): AxumPath<String>,
     Json(request): Json<BatchDeleteFileRequest>,
 ) -> Result<Json<PlaceholderResponse>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     let count = request.paths.len();
     for path in request.paths {
         state.files.delete_path(project.path.clone(), path).await?;
@@ -2449,7 +2461,7 @@ async fn files_upload(
     AxumPath(project_name): AxumPath<String>,
     multipart: Multipart,
 ) -> Result<Json<Value>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     let (fields, files) =
         collect_multipart_files(multipart, MAX_UPLOAD_FILES, MAX_UPLOAD_FILE_BYTES).await?;
     if files.is_empty() {
@@ -2511,7 +2523,7 @@ async fn upload_images(
     AxumPath(project_name): AxumPath<String>,
     multipart: Multipart,
 ) -> Result<Json<Value>> {
-    let project = state.projects.find_by_name(&project_name)?;
+    let project = state.projects.find_by_ref(&project_name)?;
     let (_fields, files) =
         collect_multipart_files(multipart, MAX_UPLOAD_IMAGES, MAX_UPLOAD_IMAGE_BYTES).await?;
     if files.is_empty() {
