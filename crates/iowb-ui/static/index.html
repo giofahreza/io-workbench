@@ -7,7 +7,7 @@
     <meta name="theme-color" content="#0f766e" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20260820-01" />
+    <link rel="stylesheet" href="/styles.css?v=20260821-01" />
   </head>
   <body class="auth-pending">
     <aside class="sidebar">
@@ -344,6 +344,147 @@
                 <label>
                   <span>Model</span>
                   <input id="board-model" placeholder="Optional model" />
+                </label>
+                <label>
+                  <span>Profile</span>
+                  <select id="board-run-profile">
+                    <option value="minimal">Minimal</option>
+                    <option value="complete_app" selected>Complete App</option>
+                    <option value="product_ready">Product-Ready</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Strategy</span>
+                  <select id="board-model-strategy">
+                    <option value="manual">Manual</option>
+                    <option value="cheap">Cheap</option>
+                    <option value="hybrid">Hybrid</option>
+                    <option value="expensive">Expensive</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Session</span>
+                  <select id="board-session-policy">
+                    <option value="continuous" selected>Continuous</option>
+                    <option value="task-model">Per-task Model</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Git Policy</span>
+                  <select id="board-git-policy">
+                    <option value="read_only" selected>Read Only</option>
+                    <option value="managed">Managed</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Cheap Model</span>
+                  <input id="board-cheap-model" placeholder="Optional cheap model" />
+                </label>
+                <label>
+                  <span>Expensive Model</span>
+                  <input id="board-expensive-model" placeholder="Optional expensive model" />
+                </label>
+                <label>
+                  <span>TDD</span>
+                  <select id="board-tdd-enabled">
+                    <option value="true" selected>On</option>
+                    <option value="false">Off</option>
+                  </select>
+                </label>
+                <label>
+                  <span>TDD Baseline</span>
+                  <select id="board-tdd-baseline">
+                    <option value="true" selected>Require Failing</option>
+                    <option value="false">Allow Passing</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Allow No Tests</span>
+                  <select id="board-tdd-allow-no-tests">
+                    <option value="false" selected>No</option>
+                    <option value="true">Yes</option>
+                  </select>
+                </label>
+                <label>
+                  <span>TDD Fix Attempts</span>
+                  <input id="board-tdd-max-fixes" type="number" min="0" max="20" value="3" />
+                </label>
+                <label>
+                  <span>Validation</span>
+                  <select id="board-validation-enabled">
+                    <option value="true" selected>On</option>
+                    <option value="false">Off</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Validation Timeout</span>
+                  <input id="board-validation-timeout" type="number" min="5" max="3600" value="120" />
+                </label>
+                <label>
+                  <span>Feature Commands</span>
+                  <textarea id="board-validation-feature-commands" rows="2" placeholder="One command per line"></textarea>
+                </label>
+                <label>
+                  <span>Final Commands</span>
+                  <textarea id="board-validation-final-commands" rows="2" placeholder="One command per line"></textarea>
+                </label>
+                <label>
+                  <span>QA Commands</span>
+                  <textarea id="board-validation-qa-commands" rows="2" placeholder="One command per line"></textarea>
+                </label>
+                <label>
+                  <span>Feature Command Limit</span>
+                  <input id="board-validation-max-feature" type="number" min="0" max="20" value="2" />
+                </label>
+                <label>
+                  <span>Final Command Limit</span>
+                  <input id="board-validation-max-final" type="number" min="0" max="20" value="4" />
+                </label>
+                <label>
+                  <span>QA Command Limit</span>
+                  <input id="board-validation-max-qa" type="number" min="0" max="20" value="2" />
+                </label>
+                <label>
+                  <span>RAG</span>
+                  <select id="board-rag-enabled">
+                    <option value="true" selected>On</option>
+                    <option value="false">Off</option>
+                  </select>
+                </label>
+                <label>
+                  <span>RAG Context Chars</span>
+                  <input id="board-rag-context-chars" type="number" min="1000" max="80000" value="12000" />
+                </label>
+                <label>
+                  <span>QA Mode</span>
+                  <select id="board-qa-mode">
+                    <option value="high_risk" selected>High Risk</option>
+                    <option value="all">All Tasks</option>
+                    <option value="off">Off</option>
+                  </select>
+                </label>
+                <label>
+                  <span>QA Follow-ups</span>
+                  <input id="board-qa-followups" type="number" min="0" max="20" value="3" />
+                </label>
+                <label>
+                  <span>Task Attempts</span>
+                  <input id="board-qa-attempts" type="number" min="1" max="10" value="2" />
+                </label>
+                <label>
+                  <span>Auto Retry</span>
+                  <select id="board-auto-retry-enabled">
+                    <option value="false" selected>Off</option>
+                    <option value="true">On</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Retry Delay</span>
+                  <input id="board-auto-retry-delay" type="number" min="1" max="1440" value="10" />
+                </label>
+                <label>
+                  <span>Retry Attempts</span>
+                  <input id="board-auto-retry-attempts" type="number" min="1" max="100" value="3" />
                 </label>
                 <button class="primary-action" type="submit">Create Board</button>
               </div>
@@ -999,6 +1140,6 @@
     </nav>
     <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
-    <script src="/app.js?v=20260820-01" type="module"></script>
+    <script src="/app.js?v=20260821-01" type="module"></script>
   </body>
 </html>

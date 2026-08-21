@@ -92,6 +92,13 @@ pub(crate) fn router() -> Router<AppState> {
         )
         .route("/api/danger/runs/{id}/git-policy", patch(update_git_policy))
         .route("/api/danger/runs/{id}/tools", patch(update_tools_settings))
+        .route("/api/danger/runs/{id}/tdd", patch(update_tdd_settings))
+        .route(
+            "/api/danger/runs/{id}/validation",
+            patch(update_validation_config),
+        )
+        .route("/api/danger/runs/{id}/rag", patch(update_rag_settings))
+        .route("/api/danger/runs/{id}/qa-policy", patch(update_qa_policy))
         .route(
             "/api/danger/runs/{id}/task-models",
             patch(update_task_models),
@@ -341,6 +348,12 @@ struct CreateRunRequest {
     session_policy: Option<String>,
     git_policy: Option<String>,
     tools_settings: Option<Value>,
+    tdd_enabled: Option<bool>,
+    tdd_policy: Option<Value>,
+    validation_config: Option<Value>,
+    rag_settings: Option<Value>,
+    qa_policy: Option<Value>,
+    auto_retry: Option<Value>,
     force_new_run: Option<bool>,
     scheduled_start_at: Option<String>,
 }
@@ -440,6 +453,14 @@ struct BoardRun {
     git_policy: String,
     #[serde(default)]
     tools_settings: Option<Value>,
+    #[serde(default)]
+    quality_profile: Value,
+    #[serde(default = "default_validation_config")]
+    validation_config: Value,
+    #[serde(default = "default_rag_settings")]
+    rag_settings: Value,
+    #[serde(default = "default_qa_policy")]
+    qa_policy: Value,
     #[serde(default)]
     project_path: String,
     #[serde(default)]
@@ -699,7 +720,24 @@ impl BoardRun {
         let project_path = trim_string(request.project_path)
             .ok_or_else(|| bad_request("Project path is required"))?;
         let provider = normalize_provider(request.provider.as_deref())?;
-        let model = trim_string(request.model).unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let model_strategy = normalize_model_strategy(request.model_strategy);
+        let strategy_overrides = task_model_overrides_for_strategy(model_strategy.as_ref());
+        let request_overrides = normalize_task_model_overrides(
+            request.task_model_overrides.unwrap_or_else(|| json!({})),
+        );
+        let task_model_overrides =
+            merge_task_model_overrides(strategy_overrides, request_overrides);
+        let model = trim_string(request.model)
+            .or_else(|| primary_model_for_strategy(model_strategy.as_ref()))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let run_profile = normalize_run_profile_for_strategy(
+            request.run_profile.as_deref(),
+            model_strategy.as_ref(),
+        );
+        let validation_config = normalize_validation_config(request.validation_config.as_ref());
+        let rag_settings = normalize_rag_settings(request.rag_settings.as_ref());
+        let qa_policy = normalize_qa_policy(request.qa_policy.as_ref());
+        let auto_retry = normalize_auto_retry(request.auto_retry.as_ref().unwrap_or(&Value::Null));
         let now = Utc::now();
         let scheduled_start_at =
             parse_optional_scheduled_start(request.scheduled_start_at.as_deref())?;
@@ -715,12 +753,16 @@ impl BoardRun {
             next_provider: normalize_optional_provider(request.next_provider.as_deref())?,
             last_effective_model: None,
             model_history: Vec::new(),
-            model_strategy: request.model_strategy,
-            run_profile: normalize_run_profile(request.run_profile.as_deref()),
-            task_model_overrides: request.task_model_overrides.unwrap_or_else(|| json!({})),
+            model_strategy,
+            run_profile,
+            task_model_overrides,
             session_policy: normalize_session_policy(request.session_policy.as_deref()),
             git_policy: normalize_git_policy(request.git_policy.as_deref()),
             tools_settings: request.tools_settings,
+            quality_profile: json!({}),
+            validation_config,
+            rag_settings: rag_settings.clone(),
+            qa_policy,
             project_name: trim_string(request.project_name)
                 .unwrap_or_else(|| project_name_from_path(&project_path)),
             project_path,
@@ -760,16 +802,7 @@ impl BoardRun {
             provider_call_started_at: None,
             provider_call_label: None,
             final_matrix_qa_complete: false,
-            auto_retry: json!({
-                "enabled": false,
-                "delayMinutes": 10,
-                "maxAttempts": 3,
-                "attempts": 0,
-                "nextRetryAt": null,
-                "lastRetryAt": null,
-                "lastError": "",
-                "updatedAt": now,
-            }),
+            auto_retry,
             logs: vec!["Created agentic board".to_string()],
             next_task_sequence: 0,
             tasks: Vec::new(),
@@ -793,13 +826,13 @@ impl BoardRun {
             change_ledger: Vec::new(),
             git_ledger: Vec::new(),
             validation_runs: Vec::new(),
-            rag_enabled: RagClient::is_configured(),
+            rag_enabled: rag_enabled_from_settings(&rag_settings),
             rag_service_url: RagClient::configured_descriptor(),
             rag_queries: Vec::new(),
             rag_ingestions: Vec::new(),
             rag_trace_refs: Vec::new(),
-            tdd_enabled: default_tdd_enabled(),
-            tdd_policy: default_tdd_policy(),
+            tdd_enabled: request.tdd_enabled.unwrap_or_else(default_tdd_enabled),
+            tdd_policy: normalize_tdd_policy(request.tdd_policy.as_ref()),
             qa_artifacts: Vec::new(),
             promotion_candidates: Vec::new(),
             planning_round: 0,
@@ -810,6 +843,7 @@ impl BoardRun {
             v2_coverage_fallback_added: false,
             final_review: None,
         };
+        sync_session_policy_with_task_models(&mut run, "board creation");
         let task = BoardTask::manual(
             &mut run,
             TaskRequest {
@@ -866,6 +900,9 @@ impl BoardRun {
             "gitPolicy": self.git_policy,
             "modelHistory": self.model_history,
             "taskModelOverrides": self.task_model_overrides,
+            "validationConfig": self.validation_config,
+            "ragSettings": self.rag_settings,
+            "qaPolicy": self.qa_policy,
             "projectPath": self.project_path,
             "projectName": self.project_name,
             "sourcePrompt": self.source_prompt,
@@ -1697,19 +1734,37 @@ async fn update_model_strategy(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>> {
     mutate_run(&state, &user.0.id, &id, |run| {
-        run.model_strategy = body
+        let strategy_patch = body
             .get("modelStrategy")
             .cloned()
-            .or_else(|| Some(body.clone()));
+            .or_else(|| body_has_model_strategy_keys(&body).then(|| body.clone()));
+        let strategy_was_patched = strategy_patch.is_some();
+        if strategy_was_patched {
+            run.model_strategy = normalize_model_strategy(strategy_patch);
+        }
         if let Some(profile) = body.get("runProfile").and_then(Value::as_str) {
             run.run_profile = normalize_run_profile(Some(profile));
         }
+        let strategy_overrides = task_model_overrides_for_strategy(run.model_strategy.as_ref());
         if let Some(overrides) = body.get("taskModelOverrides").cloned() {
-            run.task_model_overrides = overrides;
+            run.task_model_overrides = merge_task_model_overrides(
+                strategy_overrides,
+                normalize_task_model_overrides(overrides),
+            );
+        } else if !json_object_is_empty(&strategy_overrides) {
+            run.task_model_overrides =
+                merge_task_model_overrides(strategy_overrides, run.task_model_overrides.clone());
+        }
+        if let Some(model) = primary_model_for_strategy(run.model_strategy.as_ref()) {
+            if run.primary_model.trim().is_empty() || strategy_was_patched {
+                run.primary_model = model.clone();
+                run.model = model;
+            }
         }
         if let Some(policy) = body.get("sessionPolicy").and_then(Value::as_str) {
             run.session_policy = normalize_session_policy(Some(policy));
         }
+        sync_session_policy_with_task_models(run, "model strategy update");
         if let Some(policy) = body.get("gitPolicy").and_then(Value::as_str) {
             run.git_policy = normalize_git_policy(Some(policy));
         }
@@ -1754,6 +1809,90 @@ async fn update_tools_settings(
     })
 }
 
+async fn update_tdd_settings(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    mutate_run(&state, &user.0.id, &id, |run| {
+        if let Some(enabled) = body
+            .get("tddEnabled")
+            .or_else(|| body.get("enabled"))
+            .and_then(Value::as_bool)
+        {
+            run.tdd_enabled = enabled;
+        }
+        let patch = body
+            .get("tddPolicy")
+            .or_else(|| body.get("policy"))
+            .cloned()
+            .unwrap_or_else(|| body.clone());
+        let merged = merge_json_objects(run.tdd_policy.clone(), patch);
+        run.tdd_policy = normalize_tdd_policy(Some(&merged));
+        run.append_log("Updated board TDD policy");
+        Ok(())
+    })
+}
+
+async fn update_validation_config(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    mutate_run(&state, &user.0.id, &id, |run| {
+        let patch = body
+            .get("validationConfig")
+            .or_else(|| body.get("config"))
+            .cloned()
+            .unwrap_or_else(|| body.clone());
+        let merged = merge_json_objects(run.validation_config.clone(), patch);
+        run.validation_config = normalize_validation_config(Some(&merged));
+        run.append_log("Updated board validation config");
+        Ok(())
+    })
+}
+
+async fn update_rag_settings(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    mutate_run(&state, &user.0.id, &id, |run| {
+        let patch = body
+            .get("ragSettings")
+            .or_else(|| body.get("settings"))
+            .cloned()
+            .unwrap_or_else(|| body.clone());
+        let merged = merge_json_objects(run.rag_settings.clone(), patch);
+        run.rag_settings = normalize_rag_settings(Some(&merged));
+        run.rag_enabled = rag_enabled_from_settings(&run.rag_settings);
+        run.append_log("Updated board RAG settings");
+        Ok(())
+    })
+}
+
+async fn update_qa_policy(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    mutate_run(&state, &user.0.id, &id, |run| {
+        let patch = body
+            .get("qaPolicy")
+            .or_else(|| body.get("policy"))
+            .cloned()
+            .unwrap_or_else(|| body.clone());
+        let merged = merge_json_objects(run.qa_policy.clone(), patch);
+        run.qa_policy = normalize_qa_policy(Some(&merged));
+        run.append_log("Updated board QA policy");
+        Ok(())
+    })
+}
+
 async fn update_task_models(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -1761,11 +1900,13 @@ async fn update_task_models(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>> {
     mutate_run(&state, &user.0.id, &id, |run| {
-        run.task_model_overrides = body
-            .get("taskModelOverrides")
-            .or_else(|| body.get("models"))
-            .cloned()
-            .unwrap_or(body);
+        run.task_model_overrides = normalize_task_model_overrides(
+            body.get("taskModelOverrides")
+                .or_else(|| body.get("models"))
+                .cloned()
+                .unwrap_or(body),
+        );
+        sync_session_policy_with_task_models(run, "task model update");
         run.append_log("Updated board task models");
         Ok(())
     })
@@ -2593,7 +2734,7 @@ async fn run_board_loop(state: AppState, user_id: String, run_id: String) -> Res
                         .run
                         .tasks
                         .get(task_position.unwrap_or(task_index))
-                        .map(|task| task.attempt_count < MAX_TASK_ATTEMPTS)
+                        .map(|task| task.attempt_count < max_task_attempts(&stored.run))
                         .unwrap_or(false)
                 {
                     let stale_tool_blocker = is_tool_environment_self_reported_blocker(&parsed)
@@ -2910,7 +3051,7 @@ async fn run_board_loop(state: AppState, user_id: String, run_id: String) -> Res
                         .as_ref()
                         .filter(|task| {
                             task.status == "completed"
-                                && task_needs_immediate_ai_qa(task, &parsed)
+                                && task_needs_immediate_ai_qa(&stored.run, task, &parsed)
                                 && !has_task_qa_for_source(&stored.run, &task.id)
                         })
                         .map(|task| {
@@ -3215,6 +3356,9 @@ async fn extract_requirements_for_run(
     run_id: &str,
 ) -> Result<Vec<Value>> {
     let stored = load_user_run(state, user_id, run_id)?;
+    if stored.run.source_chunks.is_empty() && prompt_has_explicit_source_locator(&stored.run) {
+        return Ok(build_unresolved_source_requirement_matrix(&stored.run));
+    }
     let prompt = build_requirement_extraction_prompt(&stored.run);
     let output =
         execute_internal_prompt(state, user_id, run_id, "requirement extraction", &prompt).await;
@@ -4295,9 +4439,20 @@ fn create_task_qa_task(run: &BoardRun, source_task: &BoardTask, reason: &str) ->
     }
 }
 
-fn task_needs_immediate_ai_qa(task: &BoardTask, parsed: &Value) -> bool {
+fn task_needs_immediate_ai_qa(run: &BoardRun, task: &BoardTask, parsed: &Value) -> bool {
     if is_qa_task(task) || task.agents_knowledge_task || task.id == AGENTS_KNOWLEDGE_TASK_ID {
         return false;
+    }
+    match run
+        .qa_policy
+        .get("taskQaMode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("high_risk")
+    {
+        "off" => return false,
+        "all" => return true,
+        _ => {}
     }
     if task.priority == "high" || task.qa_fix_task || task.followup_task {
         return true;
@@ -4765,11 +4920,12 @@ fn append_followup_task_if_needed(
         .iter()
         .filter(|task| task.followup_task && task.group_id.as_deref() == Some(&group_id))
         .count();
-    if existing_followups >= MAX_FOLLOWUP_TASKS_PER_GROUP {
+    let max_followups = max_followups_per_group(run);
+    if existing_followups >= max_followups {
         if let Some(task) = run.tasks.iter_mut().find(|task| task.id == source_task_id) {
             task.status = "blocked".to_string();
             task.error = Some(format!(
-                "Follow-up limit reached for {group_id} ({MAX_FOLLOWUP_TASKS_PER_GROUP})."
+                "Follow-up limit reached for {group_id} ({max_followups})."
             ));
         }
         run.append_log(format!(
@@ -5342,38 +5498,128 @@ fn build_codebase_bundle(project_path: &str) -> Bundle {
 
 fn resolve_source_references(project_path: &str, prompt: &str) -> Vec<Value> {
     let root = Path::new(project_path);
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut references = Vec::new();
     let mut seen = BTreeSet::<PathBuf>::new();
-    for token in prompt.split_whitespace() {
-        let cleaned = token
-            .trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    '"' | '\'' | '`' | ',' | ':' | ';' | ')' | '(' | '[' | ']'
-                )
-            })
-            .trim();
-        if cleaned.len() < 2 || cleaned.starts_with("http://") || cleaned.starts_with("https://") {
-            continue;
-        }
-        if !(cleaned.contains('/') || cleaned.contains('.') || cleaned == "AGENTS.md") {
-            continue;
-        }
-        let candidate = if Path::new(cleaned).is_absolute() {
-            PathBuf::from(cleaned)
+    for cleaned in prompt_source_locator_candidates(prompt) {
+        let candidate = if Path::new(&cleaned).is_absolute() {
+            PathBuf::from(&cleaned)
         } else {
-            root.join(cleaned)
+            root.join(&cleaned)
         };
-        if candidate.exists() && candidate.starts_with(root) && seen.insert(candidate.clone()) {
+        let resolved = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.clone());
+        if candidate.exists()
+            && resolved.starts_with(&canonical_root)
+            && seen.insert(resolved.clone())
+        {
             references.push(json!({
                 "matchedFrom": cleaned,
-                "path": relative_display(root, &candidate),
-                "absolutePath": candidate,
+                "path": relative_display(&canonical_root, &resolved),
+                "absolutePath": resolved,
                 "reason": "prompt-reference",
             }));
         }
     }
     references
+}
+
+fn prompt_has_explicit_source_locator(run: &BoardRun) -> bool {
+    !prompt_source_locator_candidates(&run.source_prompt).is_empty()
+}
+
+fn prompt_source_locator_candidates(prompt: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    prompt
+        .split_whitespace()
+        .filter_map(normalize_prompt_source_token)
+        .filter(|token| is_prompt_source_locator(token))
+        .filter(|token| seen.insert(token.clone()))
+        .collect()
+}
+
+fn normalize_prompt_source_token(token: &str) -> Option<String> {
+    let mut value = token
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | ',' | ':' | ';' | ')' | '(' | '[' | ']' | '<' | '>'
+            )
+        })
+        .trim()
+        .to_string();
+    if value.ends_with('.') && value.matches('.').count() > 1 {
+        value.pop();
+    }
+    if let Some((prefix, suffix)) = value.rsplit_once(':') {
+        if !prefix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            value = prefix.to_string();
+        }
+    }
+    if let Some((prefix, suffix)) = value.rsplit_once("#L") {
+        if !prefix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            value = prefix.to_string();
+        }
+    }
+    (!value.is_empty()).then_some(value)
+}
+
+fn is_prompt_source_locator(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return false;
+    }
+    if matches!(
+        lower.as_str(),
+        "agents.md" | "readme.md" | "package.json" | "cargo.toml" | "pyproject.toml"
+    ) {
+        return true;
+    }
+    if token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with('/')
+        || token.contains('/')
+        || token.contains('\\')
+    {
+        return true;
+    }
+    let Some(extension) = Path::new(token).extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "rs" | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "json"
+            | "md"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "html"
+            | "css"
+            | "scss"
+            | "kt"
+            | "kts"
+            | "java"
+            | "swift"
+            | "go"
+            | "py"
+            | "rb"
+            | "php"
+            | "cs"
+            | "cpp"
+            | "c"
+            | "h"
+            | "hpp"
+            | "sql"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "env"
+    )
 }
 
 fn collect_text_files(
@@ -5618,22 +5864,40 @@ async fn ensure_tdd_baseline_for_task(
             .or_else(|| parsed.get("qaTestCommands")),
     );
     let workspace_delta = record_task_workspace_changes(run, &task.id, before_workspace);
+    let allow_without_tests = tdd_allows_implementation_without_tests(run);
+    let require_failing_baseline = tdd_requires_failing_baseline(run);
+    let commands_empty = commands.is_empty();
     let baseline = if commands.is_empty() {
         json!({
             "stage": "qa_baseline",
             "taskId": task.id,
             "startedAt": now,
             "completedAt": Utc::now(),
-            "passed": false,
+            "passed": allow_without_tests,
             "commands": [],
-            "blocked": true,
-            "summary": "QA generation returned no test commands.",
+            "blocked": !allow_without_tests,
+            "skipped": allow_without_tests,
+            "summary": if allow_without_tests {
+                "QA generation returned no test commands; TDD policy allows implementation without generated tests."
+            } else {
+                "QA generation returned no test commands."
+            },
         })
     } else {
-        run_generated_test_commands(&run.project_path, &task.id, &commands, "qa_baseline").await
+        run_generated_test_commands(
+            &run.project_path,
+            &task.id,
+            &commands,
+            "qa_baseline",
+            validation_timeout(run),
+        )
+        .await
     };
     let qa_generation_done = parsed_status_done(Some(&parsed));
     let baseline_failed = qa_generation_done && validation_has_failure(&baseline);
+    let baseline_allowed_without_failure =
+        !require_failing_baseline && !commands_empty && qa_generation_done;
+    let implementation_allowed_without_tests = commands_empty && allow_without_tests;
     run.validation_runs.push(baseline.clone());
     run.qa_artifacts.push(json!({
         "taskId": task.id,
@@ -5661,19 +5925,31 @@ async fn ensure_tdd_baseline_for_task(
             "content": parsed,
         }));
         task.transcript_updated_at = Some(Utc::now());
-        if baseline_failed {
+        if baseline_failed
+            || baseline_allowed_without_failure
+            || implementation_allowed_without_tests
+        {
             task.status = "in_progress".to_string();
-            task.tdd_phase = "qa_failed_expected".to_string();
+            task.tdd_phase = if baseline_failed {
+                "qa_failed_expected".to_string()
+            } else if implementation_allowed_without_tests {
+                "qa_skipped_allowed".to_string()
+            } else {
+                "qa_baseline_not_required".to_string()
+            };
             task.error = None;
             true
         } else {
             task.status = "blocked".to_string();
             task.tdd_phase = "qa_needs_review".to_string();
             task.qa_passed = Some(false);
-            task.error = Some(
+            task.error = Some(if commands_empty {
+                "QA generation returned no test commands and TDD policy does not allow implementation without tests."
+                    .to_string()
+            } else {
                 "Generated QA tests did not fail before implementation; tests may be weak or feature already exists."
-                    .to_string(),
-            );
+                    .to_string()
+            });
             task.completed_at = Some(Utc::now());
             false
         }
@@ -5682,7 +5958,7 @@ async fn ensure_tdd_baseline_for_task(
     };
     if outcome {
         run.append_log(format!(
-            "TDD baseline failed as expected for {task_id_for_log}; implementation may start"
+            "TDD baseline accepted for {task_id_for_log}; implementation may start"
         ));
     } else {
         run.append_log(format!(
@@ -5727,7 +6003,50 @@ fn max_tdd_fix_attempts(run: &BoardRun) -> u32 {
         .unwrap_or(3)
 }
 
+fn tdd_requires_failing_baseline(run: &BoardRun) -> bool {
+    run.tdd_policy
+        .get("requireFailingTestBeforeDev")
+        .and_then(value_as_bool)
+        .unwrap_or(true)
+}
+
+fn tdd_allows_implementation_without_tests(run: &BoardRun) -> bool {
+    run.tdd_policy
+        .get("allowImplementationWithoutTests")
+        .and_then(value_as_bool)
+        .unwrap_or(false)
+}
+
+fn max_followups_per_group(run: &BoardRun) -> usize {
+    run.qa_policy
+        .get("maxFollowupsPerGroup")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(MAX_FOLLOWUP_TASKS_PER_GROUP)
+}
+
+fn max_task_attempts(run: &BoardRun) -> u32 {
+    run.qa_policy
+        .get("maxTaskAttempts")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(MAX_TASK_ATTEMPTS)
+}
+
 async fn index_project_for_rag(run: &mut BoardRun) {
+    if !rag_enabled_from_settings(&run.rag_settings) {
+        run.rag_enabled = false;
+        return;
+    }
+    if run
+        .rag_settings
+        .get("indexOnBootstrap")
+        .and_then(value_as_bool)
+        == Some(false)
+    {
+        run.rag_enabled = true;
+        return;
+    }
     let Some(client) = rag_client_for_run(run) else {
         return;
     };
@@ -5762,11 +6081,20 @@ async fn attach_rag_context_for_task(run: &mut BoardRun, task_index: usize) {
     let Some(task) = run.tasks.get(task_index).cloned() else {
         return;
     };
+    if !run
+        .rag_settings
+        .get("queryEnabled")
+        .and_then(value_as_bool)
+        .unwrap_or(true)
+    {
+        return;
+    }
     let Some(client) = rag_client_for_run(run) else {
         return;
     };
     let phase = rag_phase_for_task(&task);
     let project_id = rag_project_id(run);
+    let context_max_chars = rag_context_max_chars(run);
     record_rag_trace_ref(run, Some(&task.id), "query", &project_id);
     let request = RagQueryRequest {
         project_id,
@@ -5777,11 +6105,7 @@ async fn attach_rag_context_for_task(run: &mut BoardRun, task_index: usize) {
         requirements: task_requirement_values(run, &task),
         known_files: rag_known_files(&task),
         validation_error: task.deterministic_validation.clone(),
-        scopes: vec![
-            "global_standard".to_string(),
-            "project_specific".to_string(),
-            "validation_error".to_string(),
-        ],
+        scopes: rag_scopes(run),
     };
     match client.query(&request).await {
         Ok(response) => {
@@ -5799,7 +6123,7 @@ async fn attach_rag_context_for_task(run: &mut BoardRun, task_index: usize) {
                     .as_array()
                     .cloned()
                     .unwrap_or_default();
-                task.rag_prompt_context = limit_text(&response.prompt_context, 12_000);
+                task.rag_prompt_context = limit_text(&response.prompt_context, context_max_chars);
                 task.transcript.push(json!({
                     "timestamp": Utc::now(),
                     "kind": "rag_context",
@@ -5825,6 +6149,19 @@ async fn attach_rag_context_for_task(run: &mut BoardRun, task_index: usize) {
 }
 
 async fn ingest_rag_task_outcome(run: &mut BoardRun, task_id: &str, parsed: &Value) {
+    let ingest_task_results = run
+        .rag_settings
+        .get("ingestTaskResults")
+        .and_then(value_as_bool)
+        .unwrap_or(true);
+    let ingest_validation_errors = run
+        .rag_settings
+        .get("ingestValidationErrors")
+        .and_then(value_as_bool)
+        .unwrap_or(true);
+    if !ingest_task_results && !ingest_validation_errors {
+        return;
+    }
     let Some(client) = rag_client_for_run(run) else {
         return;
     };
@@ -5832,7 +6169,7 @@ async fn ingest_rag_task_outcome(run: &mut BoardRun, task_id: &str, parsed: &Val
         return;
     };
     let project_id = rag_project_id(run);
-    if parsed_status_done(Some(parsed)) {
+    if ingest_task_results && parsed_status_done(Some(parsed)) {
         record_rag_trace_ref(run, Some(&task.id), "task_result", &project_id);
         let request = TaskResultIngestRequest {
             project_id: project_id.clone(),
@@ -5882,37 +6219,39 @@ async fn ingest_rag_task_outcome(run: &mut BoardRun, task_id: &str, parsed: &Val
         }));
     }
 
-    if let Some(validation) = task.deterministic_validation.as_ref() {
-        if validation.get("passed").and_then(Value::as_bool) == Some(false) {
-            let (command, exit_code, output) = failed_validation_excerpt(validation);
-            record_rag_trace_ref(run, Some(&task.id), "validation_error", &project_id);
-            let request = ValidationErrorIngestRequest {
-                project_id: project_id.clone(),
-                run_id: run.id.clone(),
-                task_id: task.id.clone(),
-                phase: "fix".to_string(),
-                command,
-                exit_code,
-                output,
-                validation: validation.clone(),
-            };
-            let record = match client.ingest_validation_error(&request).await {
-                Ok(response) => json!({
-                    "taskId": task.id.clone(),
-                    "kind": "validation_error",
-                    "ingestedAt": Utc::now(),
-                    "ok": true,
-                    "response": response,
-                }),
-                Err(error) => json!({
-                    "taskId": task.id.clone(),
-                    "kind": "validation_error",
-                    "ingestedAt": Utc::now(),
-                    "ok": false,
-                    "error": error_record(error),
-                }),
-            };
-            run.rag_ingestions.push(record);
+    if ingest_validation_errors {
+        if let Some(validation) = task.deterministic_validation.as_ref() {
+            if validation.get("passed").and_then(Value::as_bool) == Some(false) {
+                let (command, exit_code, output) = failed_validation_excerpt(validation);
+                record_rag_trace_ref(run, Some(&task.id), "validation_error", &project_id);
+                let request = ValidationErrorIngestRequest {
+                    project_id: project_id.clone(),
+                    run_id: run.id.clone(),
+                    task_id: task.id.clone(),
+                    phase: "fix".to_string(),
+                    command,
+                    exit_code,
+                    output,
+                    validation: validation.clone(),
+                };
+                let record = match client.ingest_validation_error(&request).await {
+                    Ok(response) => json!({
+                        "taskId": task.id.clone(),
+                        "kind": "validation_error",
+                        "ingestedAt": Utc::now(),
+                        "ok": true,
+                        "response": response,
+                    }),
+                    Err(error) => json!({
+                        "taskId": task.id.clone(),
+                        "kind": "validation_error",
+                        "ingestedAt": Utc::now(),
+                        "ok": false,
+                        "error": error_record(error),
+                    }),
+                };
+                run.rag_ingestions.push(record);
+            }
         }
     }
     trim_rag_history(run);
@@ -6098,6 +6437,11 @@ fn mark_promotion_review_task(run: &mut BoardRun, task_id: &str, result: Value) 
 }
 
 fn rag_client_for_run(run: &mut BoardRun) -> Option<RagClient> {
+    if !rag_enabled_from_settings(&run.rag_settings) {
+        run.rag_enabled = false;
+        run.rag_service_url = RagClient::configured_descriptor();
+        return None;
+    }
     let Some(client_result) = RagClient::from_env() else {
         run.rag_enabled = false;
         run.rag_service_url = None;
@@ -6119,6 +6463,24 @@ fn rag_client_for_run(run: &mut BoardRun) -> Option<RagClient> {
     run.rag_enabled = true;
     run.rag_service_url = Some(client.descriptor());
     Some(client)
+}
+
+fn rag_scopes(run: &BoardRun) -> Vec<String> {
+    let scopes = normalize_string_list(run.rag_settings.get("scopes"));
+    if scopes.is_empty() {
+        normalize_string_list(default_rag_settings().get("scopes"))
+    } else {
+        scopes
+    }
+}
+
+fn rag_context_max_chars(run: &BoardRun) -> usize {
+    run.rag_settings
+        .get("contextMaxChars")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(12_000)
+        .clamp(1_000, 80_000)
 }
 
 fn rag_project_id(run: &BoardRun) -> String {
@@ -7509,6 +7871,10 @@ Prompt template: {prompt_mode}
 Project: {project_name}
 Project path: {project_path}
 Board run id: {run_id}
+{run_profile_block}
+
+{git_policy_block}
+
 Task {task_number}: {task_id}
 Title: {title}
 Priority: {priority}
@@ -7582,6 +7948,8 @@ Instructions:
         project_name = run.project_name,
         project_path = run.project_path,
         run_id = run.id,
+        run_profile_block = run_profile_block(run),
+        git_policy_block = git_policy_block(run),
         task_number = index + 1,
         task_id = task.id,
         title = task.title,
@@ -7629,6 +7997,10 @@ Goal: create failing tests before implementation. Do not implement the feature.
 Project: {project_name}
 Project path: {project_path}
 Board run id: {run_id}
+{run_profile_block}
+
+{git_policy_block}
+
 Task {task_number}: {task_id}
 Title: {title}
 
@@ -7666,6 +8038,8 @@ Schema:
         project_name = run.project_name,
         project_path = run.project_path,
         run_id = run.id,
+        run_profile_block = run_profile_block(run),
+        git_policy_block = git_policy_block(run),
         task_number = index + 1,
         task_id = task.id,
         title = task.title,
@@ -7761,6 +8135,10 @@ fn build_requirement_extraction_prompt(run: &BoardRun) -> String {
 User request:
 {prompt}
 
+{run_profile_block}
+
+{git_policy_block}
+
 Explicit source chunks:
 {source_chunks}
 
@@ -7794,6 +8172,8 @@ Rules:
 - If a referenced source is missing, create a blocked requirement explaining that source resolution must be fixed.
 - Keep each requirement independently verifiable."#,
         prompt = run.source_prompt,
+        run_profile_block = run_profile_block(run),
+        git_policy_block = git_policy_block(run),
         source_chunks = if source_chunks.is_empty() {
             "None"
         } else {
@@ -7808,6 +8188,10 @@ fn build_codebase_recon_prompt(run: &BoardRun, local_snapshot: &Value) -> String
 
 User request:
 {prompt}
+
+{run_profile_block}
+
+{git_policy_block}
 
 Extracted requirements:
 {requirements}
@@ -7834,6 +8218,8 @@ Rules:
 - Prefer concrete files, scripts, and conventions over generic advice.
 - Treat summaries as navigation hints; task executions still inspect files before editing."#,
         prompt = run.source_prompt,
+        run_profile_block = run_profile_block(run),
+        git_policy_block = git_policy_block(run),
         requirements = requirement_summary(run),
         snapshot = serde_json::to_string_pretty(local_snapshot).unwrap_or_default(),
     )
@@ -7846,8 +8232,9 @@ fn build_planning_prompt(run: &BoardRun) -> String {
 User request:
 {prompt}
 
-Run profile: {profile}
-Git policy: {git_policy}
+{run_profile_block}
+
+{git_policy_block}
 
 Requirement coverage:
 {requirements}
@@ -7880,8 +8267,8 @@ Rules:
 - Each task must be small enough to complete in one autonomous provider execution.
 - Include checks and QA in acceptance criteria for the feature task itself."#,
         prompt = run.source_prompt,
-        profile = run.run_profile,
-        git_policy = run.git_policy,
+        run_profile_block = run_profile_block(run),
+        git_policy_block = git_policy_block(run),
         requirements = requirement_summary(run),
         codebase = serde_json::to_string_pretty(&run.codebase_map).unwrap_or_default(),
     )
@@ -7893,6 +8280,10 @@ fn build_gap_review_prompt(run: &BoardRun) -> String {
 
 User request:
 {prompt}
+
+{run_profile_block}
+
+{git_policy_block}
 
 Requirements:
 {requirements}
@@ -7930,6 +8321,8 @@ Rules:
 - Do not create workspace UX tasks.
 - Do not claim coverage without evidence from task results or existing requirement evidence."#,
         prompt = run.source_prompt,
+        run_profile_block = run_profile_block(run),
+        git_policy_block = git_policy_block(run),
         requirements = requirement_summary(run),
         tasks = completed_task_summary(run),
     )
@@ -7941,6 +8334,10 @@ fn build_final_review_prompt(run: &BoardRun) -> String {
 
 User request:
 {prompt}
+
+{run_profile_block}
+
+{git_policy_block}
 
 Requirements:
 {requirements}
@@ -7971,6 +8368,8 @@ Rules:
 - Add concrete follow-up Kanban tasks if any required implementation remains.
 - Do not mention or implement workspace user experience."#,
         prompt = run.source_prompt,
+        run_profile_block = run_profile_block(run),
+        git_policy_block = git_policy_block(run),
         requirements = requirement_summary(run),
         tasks = task_result_summary(run),
         validation = serde_json::to_string_pretty(&run.validation_runs).unwrap_or_default(),
@@ -8122,6 +8521,39 @@ fn fallback_requirements(run: &BoardRun) -> Vec<Value> {
         "verifiedBy": [],
         "blockedReason": "",
         "notes": "Fallback requirement generated because provider extraction returned no usable JSON.",
+        "extractedAt": Utc::now(),
+        "updatedAt": Utc::now(),
+    })]
+}
+
+fn build_unresolved_source_requirement_matrix(run: &BoardRun) -> Vec<Value> {
+    let candidates = prompt_source_locator_candidates(&run.source_prompt);
+    vec![json!({
+        "id": "REQ-0001",
+        "sourceChunkId": "",
+        "sourcePath": "User prompt",
+        "heading": "Unresolved source reference",
+        "requirement": format!(
+            "Resolve and implement the explicitly referenced source files or folders from the prompt: {}",
+            limit_text(&run.source_prompt, 240)
+        ),
+        "acceptanceCriteria": [
+            "The referenced source files/folders are resolved and read before implementation coverage is claimed.",
+            "If the referenced source does not exist or is unreadable, the run remains blocked with clear evidence instead of reporting completion.",
+        ],
+        "priority": "high",
+        "dependencies": [],
+        "status": "blocked",
+        "evidence": ["The prompt explicitly referenced source files/folders, but no readable source chunks were resolved during bootstrap."],
+        "plannedBy": [],
+        "implementedBy": [],
+        "verifiedBy": [],
+        "blockedReason": "No readable files were resolved from the explicit source reference in the prompt.",
+        "notes": if candidates.is_empty() {
+            String::new()
+        } else {
+            format!("Unresolved source locator candidates: {}", candidates.join(", "))
+        },
         "extractedAt": Utc::now(),
         "updatedAt": Utc::now(),
     })]
@@ -9572,11 +10004,26 @@ fn refresh_codebase_context_after_task(run: &mut BoardRun, change_summary: &Valu
 
 async fn run_deterministic_validation(run: &BoardRun, task_id: &str, stage: &str) -> Value {
     let started_at = Utc::now();
-    let scripts = package_validation_scripts(&run.project_path, stage);
+    if run.validation_config.get("enabled").and_then(value_as_bool) == Some(false) {
+        return json!({
+            "stage": stage,
+            "taskId": task_id,
+            "startedAt": started_at,
+            "completedAt": Utc::now(),
+            "passed": true,
+            "skipped": true,
+            "commands": [],
+            "summary": "Deterministic validation disabled for this board.",
+        });
+    }
+    let scripts = package_validation_scripts(run, stage);
+    let validation_timeout = validation_timeout(run);
     let mut commands = Vec::new();
     for (script_name, command_text) in scripts {
         let command_started = Utc::now();
-        let result = run_shell_validation_command(&run.project_path, &command_text).await;
+        let result =
+            run_shell_validation_command(&run.project_path, &command_text, validation_timeout)
+                .await;
         let duration_ms = (Utc::now() - command_started).num_milliseconds().max(0);
         let exit_code = result.as_ref().map(|result| result.0).unwrap_or(124);
         let output = result
@@ -9610,9 +10057,14 @@ async fn run_tdd_validation(run: &BoardRun, task: &BoardTask, stage: &str) -> Va
     if is_qa_task(task) || task.qa_test_commands.is_empty() {
         return run_deterministic_validation(run, &task.id, stage).await;
     }
-    let generated =
-        run_generated_test_commands(&run.project_path, &task.id, &task.qa_test_commands, stage)
-            .await;
+    let generated = run_generated_test_commands(
+        &run.project_path,
+        &task.id,
+        &task.qa_test_commands,
+        stage,
+        validation_timeout(run),
+    )
+    .await;
     let deterministic = run_deterministic_validation(run, &task.id, stage).await;
     let mut commands = generated
         .get("commands")
@@ -9646,12 +10098,14 @@ async fn run_generated_test_commands(
     task_id: &str,
     commands_to_run: &[String],
     stage: &str,
+    validation_timeout: Duration,
 ) -> Value {
     let started_at = Utc::now();
     let mut commands = Vec::new();
     for command_text in commands_to_run {
         let command_started = Utc::now();
-        let result = run_shell_validation_command(project_path, command_text).await;
+        let result =
+            run_shell_validation_command(project_path, command_text, validation_timeout).await;
         let duration_ms = (Utc::now() - command_started).num_milliseconds().max(0);
         let exit_code = result.as_ref().map(|result| result.0).unwrap_or(124);
         let output = result
@@ -9684,6 +10138,7 @@ async fn run_generated_test_commands(
 async fn run_shell_validation_command(
     project_path: &str,
     command_text: &str,
+    validation_timeout: Duration,
 ) -> std::result::Result<(i32, String, String), String> {
     let mut command = Command::new("sh");
     command
@@ -9696,7 +10151,7 @@ async fn run_shell_validation_command(
     let child = command
         .spawn()
         .map_err(|error| format!("Failed to spawn validation command: {error}"))?;
-    match timeout(DETERMINISTIC_VALIDATION_TIMEOUT, child.wait_with_output()).await {
+    match timeout(validation_timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => Ok((
             output.status.code().unwrap_or(1),
             String::from_utf8_lossy(&output.stdout).to_string(),
@@ -9705,12 +10160,21 @@ async fn run_shell_validation_command(
         Ok(Err(error)) => Err(format!("Validation command failed: {error}")),
         Err(_) => Err(format!(
             "Validation command timed out after {} seconds",
-            DETERMINISTIC_VALIDATION_TIMEOUT.as_secs()
+            validation_timeout.as_secs()
         )),
     }
 }
 
-fn package_validation_scripts(project_path: &str, stage: &str) -> Vec<(String, String)> {
+fn package_validation_scripts(run: &BoardRun, stage: &str) -> Vec<(String, String)> {
+    let configured = validation_commands_for_stage(run, stage)
+        .into_iter()
+        .enumerate()
+        .map(|(index, command)| (format!("configured_{}", index + 1), command))
+        .collect::<Vec<_>>();
+    if !configured.is_empty() {
+        return configured;
+    }
+    let project_path = &run.project_path;
     let package_path = Path::new(project_path).join("package.json");
     let Some(package_json) = fs::read_to_string(package_path)
         .ok()
@@ -9730,9 +10194,41 @@ fn package_validation_scripts(project_path: &str, stage: &str) -> Vec<(String, S
     candidates
         .into_iter()
         .filter(|name| scripts.contains_key(*name))
-        .take(if stage == "final" { 4 } else { 2 })
+        .take(validation_max_commands_for_stage(run, stage))
         .map(|name| (name.to_string(), format!("{runner} run {name}")))
         .collect()
+}
+
+fn validation_commands_for_stage(run: &BoardRun, stage: &str) -> Vec<String> {
+    let key = match stage {
+        "final" => "finalCommands",
+        "qa" | "qa_baseline" => "qaCommands",
+        _ => "featureCommands",
+    };
+    normalize_string_list(run.validation_config.get(key))
+}
+
+fn validation_max_commands_for_stage(run: &BoardRun, stage: &str) -> usize {
+    let key = match stage {
+        "final" => "maxFinalCommands",
+        "qa" | "qa_baseline" => "maxQaCommands",
+        _ => "maxFeatureCommands",
+    };
+    run.validation_config
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(if stage == "final" { 4 } else { 2 })
+}
+
+fn validation_timeout(run: &BoardRun) -> Duration {
+    Duration::from_secs(
+        run.validation_config
+            .get("timeoutSeconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(DETERMINISTIC_VALIDATION_TIMEOUT.as_secs())
+            .clamp(5, 3600),
+    )
 }
 
 fn infer_package_runner(project_path: &str) -> &'static str {
@@ -9876,6 +10372,367 @@ fn normalize_priority(value: Option<&str>) -> &'static str {
     }
 }
 
+fn normalize_model_strategy(value: Option<Value>) -> Option<Value> {
+    let source = match value? {
+        Value::String(mode) => json!({ "mode": mode }),
+        Value::Object(map) => Value::Object(map),
+        _ => return None,
+    };
+    let Some(source) = source.as_object() else {
+        return None;
+    };
+    if source.is_empty() {
+        return None;
+    }
+
+    let raw_mode = source
+        .get("mode")
+        .or_else(|| source.get("strategy"))
+        .or_else(|| source.get("value"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    let cheap_model = normalize_model_value(
+        source
+            .get("cheapModel")
+            .or_else(|| source.get("cheap"))
+            .or_else(|| source.get("budgetModel"))
+            .or_else(|| source.get("budget")),
+    )
+    .or_else(default_cheap_model);
+    let expensive_model = normalize_model_value(
+        source
+            .get("expensiveModel")
+            .or_else(|| source.get("expensive"))
+            .or_else(|| source.get("qualityModel"))
+            .or_else(|| source.get("quality")),
+    )
+    .or_else(default_expensive_model);
+
+    let has_strategy_inputs = matches!(
+        raw_mode.as_str(),
+        "cheap" | "hybrid" | "expensive" | "manual"
+    ) || cheap_model.is_some()
+        || expensive_model.is_some();
+    let mode = match raw_mode.as_str() {
+        "cheap" | "hybrid" | "expensive" | "manual" => raw_mode,
+        _ if cheap_model.is_some() || expensive_model.is_some() => "hybrid".to_string(),
+        _ => String::new(),
+    };
+
+    let mut normalized = source.clone();
+    if !mode.is_empty() {
+        normalized.insert("mode".to_string(), json!(mode));
+    }
+    if has_strategy_inputs {
+        normalized.insert(
+            "cheapModel".to_string(),
+            json!(cheap_model.unwrap_or_default()),
+        );
+        normalized.insert(
+            "expensiveModel".to_string(),
+            json!(expensive_model.unwrap_or_default()),
+        );
+    }
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(Value::Object(normalized))
+    }
+}
+
+fn body_has_model_strategy_keys(value: &Value) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    [
+        "mode",
+        "strategy",
+        "cheapModel",
+        "cheap",
+        "budgetModel",
+        "expensiveModel",
+        "expensive",
+        "qualityModel",
+        "fallbackProvider",
+        "fallbackModel",
+        "reasoningEffort",
+        "reasoning_effort",
+        "effort",
+        "thinking",
+        "enableThinking",
+        "fast",
+        "fastMode",
+        "serviceTier",
+        "model",
+        "taskModel",
+    ]
+    .iter()
+    .any(|key| map.contains_key(*key))
+}
+
+fn normalize_model_value(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn default_cheap_model() -> Option<String> {
+    env::var("DANGER_CHEAP_MODEL")
+        .ok()
+        .or_else(|| env::var("IO_WORKBENCH_CHEAP_MODEL").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_expensive_model() -> Option<String> {
+    env::var("DANGER_EXPENSIVE_MODEL")
+        .ok()
+        .or_else(|| env::var("IO_WORKBENCH_EXPENSIVE_MODEL").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn model_strategy_mode(strategy: Option<&Value>) -> &str {
+    strategy
+        .and_then(|value| value.get("mode"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+}
+
+fn primary_model_for_strategy(strategy: Option<&Value>) -> Option<String> {
+    let strategy = strategy?;
+    let mode = model_strategy_mode(Some(strategy));
+    let candidate = match mode {
+        "cheap" => strategy.get("cheapModel"),
+        "hybrid" | "expensive" => strategy.get("expensiveModel"),
+        "manual" => None,
+        _ => strategy
+            .get("model")
+            .or_else(|| strategy.get("primaryModel"))
+            .or_else(|| strategy.get("taskModel")),
+    };
+    normalize_model_value(candidate)
+}
+
+fn task_model_overrides_for_strategy(strategy: Option<&Value>) -> Value {
+    let Some(strategy) = strategy else {
+        return json!({});
+    };
+    let mode = model_strategy_mode(Some(strategy));
+    let cheap = normalize_model_value(strategy.get("cheapModel"));
+    let expensive = normalize_model_value(strategy.get("expensiveModel"));
+    let mut map = serde_json::Map::new();
+    let mut insert = |key: &str, model: Option<&String>| {
+        if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
+            map.insert(key.to_string(), json!(model));
+        }
+    };
+    match mode {
+        "cheap" => {
+            for key in [
+                "breakdown",
+                "implementation",
+                "qa",
+                "qa_fix",
+                "agents",
+                "final_qa",
+            ] {
+                insert(key, cheap.as_ref());
+            }
+        }
+        "expensive" => {
+            for key in [
+                "breakdown",
+                "implementation",
+                "qa",
+                "qa_fix",
+                "agents",
+                "final_qa",
+            ] {
+                insert(key, expensive.as_ref());
+            }
+        }
+        "hybrid" => {
+            insert("breakdown", expensive.as_ref());
+            insert("implementation", cheap.as_ref());
+            insert("qa", expensive.as_ref());
+            insert("qa_fix", expensive.as_ref());
+            insert("agents", cheap.as_ref());
+            insert("final_qa", expensive.as_ref());
+        }
+        _ => {}
+    }
+    Value::Object(map)
+}
+
+fn normalize_task_model_overrides(value: Value) -> Value {
+    let Some(source) = value.as_object() else {
+        return json!({});
+    };
+    let mut map = serde_json::Map::new();
+    for (key, value) in source {
+        let Some(model) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        map.insert(canonical_task_model_key(key), json!(model));
+    }
+    Value::Object(map)
+}
+
+fn canonical_task_model_key(key: &str) -> String {
+    match key.trim().replace('-', "_").as_str() {
+        "qaFix" | "qa_fix" => "qa_fix".to_string(),
+        "finalQa" | "finalQA" | "final_qa" => "final_qa".to_string(),
+        "taskExecution" | "task_execution" => "task_execution".to_string(),
+        "requirementExtraction" | "requirement_extraction" => "requirement_extraction".to_string(),
+        value => value.to_string(),
+    }
+}
+
+fn merge_task_model_overrides(base: Value, overrides: Value) -> Value {
+    let mut map = base.as_object().cloned().unwrap_or_default();
+    if let Some(overrides) = overrides.as_object() {
+        for (key, value) in overrides {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(map)
+}
+
+fn merge_json_objects(base: Value, patch: Value) -> Value {
+    let mut map = base.as_object().cloned().unwrap_or_default();
+    if let Some(patch) = patch.as_object() {
+        for (key, value) in patch {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(map)
+}
+
+fn json_object_is_empty(value: &Value) -> bool {
+    value.as_object().map(|map| map.is_empty()).unwrap_or(true)
+}
+
+fn normalize_validation_config(value: Option<&Value>) -> Value {
+    let defaults = default_validation_config();
+    let source = value.and_then(Value::as_object);
+    json!({
+        "enabled": source.and_then(|map| map.get("enabled")).and_then(value_as_bool).unwrap_or(true),
+        "featureCommands": nonempty_string_list_or_default(source.and_then(|map| map.get("featureCommands")), defaults.get("featureCommands")),
+        "finalCommands": nonempty_string_list_or_default(source.and_then(|map| map.get("finalCommands")), defaults.get("finalCommands")),
+        "qaCommands": nonempty_string_list_or_default(source.and_then(|map| map.get("qaCommands")), defaults.get("qaCommands")),
+        "maxFeatureCommands": source.and_then(|map| map.get("maxFeatureCommands")).and_then(Value::as_u64).unwrap_or(2).clamp(0, 20),
+        "maxFinalCommands": source.and_then(|map| map.get("maxFinalCommands")).and_then(Value::as_u64).unwrap_or(4).clamp(0, 20),
+        "maxQaCommands": source.and_then(|map| map.get("maxQaCommands")).and_then(Value::as_u64).unwrap_or(2).clamp(0, 20),
+        "timeoutSeconds": source.and_then(|map| map.get("timeoutSeconds")).and_then(Value::as_u64).unwrap_or(120).clamp(5, 3600),
+    })
+}
+
+fn default_validation_config() -> Value {
+    json!({
+        "enabled": true,
+        "featureCommands": [],
+        "finalCommands": [],
+        "qaCommands": [],
+        "maxFeatureCommands": 2,
+        "maxFinalCommands": 4,
+        "maxQaCommands": 2,
+        "timeoutSeconds": 120,
+    })
+}
+
+fn normalize_rag_settings(value: Option<&Value>) -> Value {
+    let defaults = default_rag_settings();
+    let source = value.and_then(Value::as_object);
+    json!({
+        "enabled": source.and_then(|map| map.get("enabled")).and_then(value_as_bool).unwrap_or(true),
+        "indexOnBootstrap": source.and_then(|map| map.get("indexOnBootstrap")).and_then(value_as_bool).unwrap_or(true),
+        "queryEnabled": source.and_then(|map| map.get("queryEnabled")).and_then(value_as_bool).unwrap_or(true),
+        "ingestTaskResults": source.and_then(|map| map.get("ingestTaskResults")).and_then(value_as_bool).unwrap_or(true),
+        "ingestValidationErrors": source.and_then(|map| map.get("ingestValidationErrors")).and_then(value_as_bool).unwrap_or(true),
+        "scopes": nonempty_string_list_or_default(source.and_then(|map| map.get("scopes")), defaults.get("scopes")),
+        "contextMaxChars": source.and_then(|map| map.get("contextMaxChars")).and_then(Value::as_u64).unwrap_or(12_000).clamp(1_000, 80_000),
+    })
+}
+
+fn default_rag_settings() -> Value {
+    json!({
+        "enabled": true,
+        "indexOnBootstrap": true,
+        "queryEnabled": true,
+        "ingestTaskResults": true,
+        "ingestValidationErrors": true,
+        "scopes": ["global_standard", "project_specific", "validation_error"],
+        "contextMaxChars": 12_000,
+    })
+}
+
+fn rag_enabled_from_settings(settings: &Value) -> bool {
+    settings
+        .get("enabled")
+        .and_then(value_as_bool)
+        .unwrap_or(true)
+}
+
+fn normalize_qa_policy(value: Option<&Value>) -> Value {
+    let source = value.and_then(Value::as_object);
+    json!({
+        "maxFollowupsPerGroup": source.and_then(|map| map.get("maxFollowupsPerGroup")).and_then(Value::as_u64).unwrap_or(MAX_FOLLOWUP_TASKS_PER_GROUP as u64).clamp(0, 20),
+        "maxTaskAttempts": source.and_then(|map| map.get("maxTaskAttempts")).and_then(Value::as_u64).unwrap_or(MAX_TASK_ATTEMPTS as u64).clamp(1, 10),
+        "taskQaMode": normalize_task_qa_mode(source.and_then(|map| map.get("taskQaMode")).and_then(Value::as_str)),
+    })
+}
+
+fn default_qa_policy() -> Value {
+    normalize_qa_policy(None)
+}
+
+fn normalize_task_qa_mode(value: Option<&str>) -> String {
+    match value
+        .map(str::trim)
+        .unwrap_or("high_risk")
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "off" | "none" | "disabled" | "false" => "off".to_string(),
+        "all" | "always" | "every" => "all".to_string(),
+        _ => "high_risk".to_string(),
+    }
+}
+
+fn normalize_tdd_policy(value: Option<&Value>) -> Value {
+    let defaults = default_tdd_policy();
+    let source = value.and_then(Value::as_object);
+    json!({
+        "requireFailingTestBeforeDev": source.and_then(|map| map.get("requireFailingTestBeforeDev")).and_then(value_as_bool).unwrap_or(true),
+        "maxFixAttempts": source.and_then(|map| map.get("maxFixAttempts")).and_then(Value::as_u64).unwrap_or(3).clamp(0, 20),
+        "allowImplementationWithoutTests": source.and_then(|map| map.get("allowImplementationWithoutTests")).and_then(value_as_bool).unwrap_or(false),
+        "qaCommandStage": source.and_then(|map| map.get("qaCommandStage")).and_then(Value::as_str).unwrap_or_else(|| defaults.get("qaCommandStage").and_then(Value::as_str).unwrap_or("qa")),
+        "featureCommandStage": source.and_then(|map| map.get("featureCommandStage")).and_then(Value::as_str).unwrap_or_else(|| defaults.get("featureCommandStage").and_then(Value::as_str).unwrap_or("feature")),
+        "finalCommandStage": source.and_then(|map| map.get("finalCommandStage")).and_then(Value::as_str).unwrap_or_else(|| defaults.get("finalCommandStage").and_then(Value::as_str).unwrap_or("final")),
+    })
+}
+
+fn nonempty_string_list_or_default(value: Option<&Value>, default: Option<&Value>) -> Vec<String> {
+    let values = normalize_string_list(value);
+    if values.is_empty() {
+        normalize_string_list(default)
+    } else {
+        values
+    }
+}
+
 fn normalize_auto_retry(value: &Value) -> Value {
     let object = value.as_object();
     json!({
@@ -9909,7 +10766,7 @@ fn auto_retry_enabled(value: &Value) -> bool {
 
 fn is_resumable_run(run: &BoardRun) -> bool {
     match run.status.as_str() {
-        "scheduled" | "paused" | "pausing" => true,
+        "paused" | "pausing" => true,
         "blocked" | "failed" | "cancelled" => run.tasks.iter().any(|task| {
             matches!(
                 task.status.as_str(),
@@ -10390,6 +11247,53 @@ fn model_type_for_task(task: &BoardTask) -> &'static str {
     }
 }
 
+fn collect_task_models(run: &BoardRun, overrides: Option<&Value>) -> BTreeSet<String> {
+    let fallback = trim_string(Some(if run.primary_model.trim().is_empty() {
+        run.model.clone()
+    } else {
+        run.primary_model.clone()
+    }))
+    .unwrap_or_default();
+    let overrides = overrides.unwrap_or(&run.task_model_overrides);
+    [
+        "breakdown",
+        "implementation",
+        "qa",
+        "qa_fix",
+        "agents",
+        "final_qa",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        overrides
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+            .or_else(|| (!fallback.is_empty()).then(|| fallback.clone()))
+    })
+    .collect()
+}
+
+fn has_mixed_task_models(run: &BoardRun, overrides: Option<&Value>) -> bool {
+    collect_task_models(run, overrides).len() > 1
+}
+
+fn sync_session_policy_with_task_models(run: &mut BoardRun, source: &str) -> bool {
+    if normalize_session_policy(Some(&run.session_policy)) != "continuous" {
+        return false;
+    }
+    if !has_mixed_task_models(run, None) {
+        return false;
+    }
+    run.session_policy = "task-model".to_string();
+    run.append_log(format!(
+        "Session policy set to task-model from {source} because task routing uses multiple models"
+    ));
+    true
+}
+
 fn apply_task_model_routing(run: &mut BoardRun, task_index: usize) {
     let Some(task) = run.tasks.get(task_index) else {
         return;
@@ -10422,11 +11326,35 @@ fn apply_task_model_routing(run: &mut BoardRun, task_index: usize) {
 }
 
 fn normalize_session_policy(policy: Option<&str>) -> String {
-    match policy.map(str::trim).filter(|value| !value.is_empty()) {
-        Some("continuous") => "continuous".to_string(),
-        Some("task-model") | Some("task_model") | Some("per-task") => "task-model".to_string(),
+    let normalized = policy
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase().replace(' ', "_"));
+    match normalized.as_deref() {
+        Some("continuous") | Some("single") | Some("one-session") | Some("one_session") => {
+            "continuous".to_string()
+        }
+        Some("task-model")
+        | Some("task_model")
+        | Some("per-task")
+        | Some("per_task")
+        | Some("per-task-model")
+        | Some("per_task_model") => "task-model".to_string(),
+        _ if danger_continuous_session_default() => "continuous".to_string(),
         _ => "task-model".to_string(),
     }
+}
+
+fn danger_continuous_session_default() -> bool {
+    env::var("DANGER_CONTINUOUS_SESSION")
+        .or_else(|_| env::var("IO_WORKBENCH_DANGER_CONTINUOUS_SESSION"))
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "false" | "0" | "no"
+            )
+        })
+        .unwrap_or(true)
 }
 
 fn increment_provider_usage(
@@ -10681,13 +11609,26 @@ fn apply_run_options(run: &mut BoardRun, request: &CreateRunRequest) -> Result<(
         run.next_provider = normalize_optional_provider(request.next_provider.as_deref())?;
     }
     if request.model_strategy.is_some() {
-        run.model_strategy = request.model_strategy.clone();
+        run.model_strategy = normalize_model_strategy(request.model_strategy.clone());
+        let strategy_overrides = task_model_overrides_for_strategy(run.model_strategy.as_ref());
+        if !json_object_is_empty(&strategy_overrides) {
+            run.task_model_overrides =
+                merge_task_model_overrides(strategy_overrides, run.task_model_overrides.clone());
+        }
+        if let Some(model) = primary_model_for_strategy(run.model_strategy.as_ref()) {
+            run.primary_model = model.clone();
+            run.model = model;
+        }
     }
     if let Some(profile) = trim_string(request.run_profile.clone()) {
         run.run_profile = normalize_run_profile(Some(&profile));
     }
     if let Some(overrides) = request.task_model_overrides.clone() {
-        run.task_model_overrides = overrides;
+        let strategy_overrides = task_model_overrides_for_strategy(run.model_strategy.as_ref());
+        run.task_model_overrides = merge_task_model_overrides(
+            strategy_overrides,
+            normalize_task_model_overrides(overrides),
+        );
     }
     if let Some(policy) = request.session_policy.as_deref() {
         run.session_policy = normalize_session_policy(Some(policy));
@@ -10698,6 +11639,26 @@ fn apply_run_options(run: &mut BoardRun, request: &CreateRunRequest) -> Result<(
     if request.tools_settings.is_some() {
         run.tools_settings = request.tools_settings.clone();
     }
+    if let Some(enabled) = request.tdd_enabled {
+        run.tdd_enabled = enabled;
+    }
+    if request.tdd_policy.is_some() {
+        run.tdd_policy = normalize_tdd_policy(request.tdd_policy.as_ref());
+    }
+    if request.validation_config.is_some() {
+        run.validation_config = normalize_validation_config(request.validation_config.as_ref());
+    }
+    if request.rag_settings.is_some() {
+        run.rag_settings = normalize_rag_settings(request.rag_settings.as_ref());
+        run.rag_enabled = rag_enabled_from_settings(&run.rag_settings);
+    }
+    if request.qa_policy.is_some() {
+        run.qa_policy = normalize_qa_policy(request.qa_policy.as_ref());
+    }
+    if request.auto_retry.is_some() {
+        run.auto_retry = normalize_auto_retry(request.auto_retry.as_ref().unwrap_or(&Value::Null));
+    }
+    sync_session_policy_with_task_models(run, "run option update");
     Ok(())
 }
 
@@ -11039,8 +12000,9 @@ fn build_prompt_task_draft_prompt(run: &BoardRun, prompt: &str, profile: &str) -
 Prompt:
 {prompt}
 
-Run profile: {profile}
-Profile requirements: {profile_instructions}
+{run_profile_block}
+
+{git_policy_block}
 
 Known requirements:
 {requirements}
@@ -11071,8 +12033,8 @@ Rules:
 - Keep every card independently actionable and verifiable.
 - Prefer a small number of complete cards over many vague cards."#,
         prompt = prompt,
-        profile = profile,
-        profile_instructions = run_profile_instructions(profile),
+        run_profile_block = format_run_profile_block(profile),
+        git_policy_block = git_policy_block(run),
         requirements = requirement_summary(run),
         tasks = run
             .tasks
@@ -11089,17 +12051,88 @@ Rules:
     )
 }
 
-fn run_profile_instructions(profile: &str) -> &'static str {
+fn run_profile_block(run: &BoardRun) -> String {
+    format_run_profile_block(&run.run_profile)
+}
+
+fn format_run_profile_block(profile: &str) -> String {
     match normalize_run_profile(Some(profile)).as_str() {
-        "minimal" => {
-            "Implement explicit requirements with minimal expansion and the lowest useful context footprint."
-        }
-        "product_ready" => {
-            "Include complete workflow detail, useful summaries, structural responsive checks, and strict edge-case QA when relevant."
-        }
-        _ => {
-            "Include needed validation, persistence, empty and error states, and local verification for a complete feature."
-        }
+        "minimal" => [
+            "Run profile: Minimal",
+            "Implement explicit requirements with minimal expansion, low context, and concrete verification.",
+            "Requirement scope:",
+            "- Preserve every explicit requirement from the prompt or source documents.",
+            "- For broad app-generation prompts, infer only the core product data, CRUD/workflows, persistence, navigation, validation, and runnable local verification needed for the requested app to work.",
+            "- Do not add optional dashboards, analytics, roles, integrations, or visual polish unless the prompt or source docs require them.",
+            "Planning scope:",
+            "- Create the smallest task set that fully satisfies the explicit requirements and required local glue.",
+            "- Avoid optional enhancement tasks unless they are necessary for correctness or verification.",
+            "Execution scope:",
+            "- Prefer focused code changes and local verification over broad rewrites.",
+            "- Do not expand scope beyond the attached requirements except for necessary wiring, error handling, and tests/checks.",
+            "QA scope:",
+            "- Verify explicit requirements, necessary inferred glue, and functional happy/error paths.",
+            "- Do not fail completion for optional polish or non-required enhancements.",
+        ]
+        .join("\n"),
+        "product_ready" => [
+            "Run profile: Product-Ready",
+            "Deliver complete workflows with richer product detail, structural UX checks, and stricter edge-case validation.",
+            "Requirement scope:",
+            "- Preserve every explicit requirement from the prompt or source documents.",
+            "- For broad app-generation prompts, infer a product-ready local app: core data model, CRUD/workflows, persistence, navigation, validation, useful dashboard/summaries, search/filter where useful, empty/loading/error states, responsive structure, and runnable verification.",
+            "- Add richer workflow/detail requirements only when they directly support the requested product; do not invent unrelated integrations, payments, enterprise roles, or subjective redesign.",
+            "Planning scope:",
+            "- Plan requirements into complete user-facing workflows, not only isolated CRUD endpoints.",
+            "- Include validation, useful summaries/comparisons, responsive structural checks, and concrete local QA for important flows.",
+            "Execution scope:",
+            "- Implement complete functional screens, forms, persistence paths, validation feedback, and state handling for the attached product workflow.",
+            "- Keep subjective visual polish as backlog unless the task explicitly asks for it, but do not leave structurally broken or unusable UI.",
+            "QA scope:",
+            "- Verify core workflows plus validation failures, empty states, persisted state, and important responsive structure.",
+            "- Fail QA for missing required workflow detail or unusable UI structure, not for subjective aesthetic preferences.",
+        ]
+        .join("\n"),
+        _ => [
+            "Run profile: Complete App",
+            "Build a complete functional app with common app completeness and bounded token use.",
+            "Requirement scope:",
+            "- Preserve every explicit requirement from the prompt or source documents.",
+            "- For broad app-generation prompts, infer the common complete-app pieces: core product data model, CRUD/workflows, persistence, navigation, validation, practical empty/error states, basic summaries, responsive layout, and runnable verification.",
+            "- Do not invent unrelated integrations, payment flows, enterprise roles, or subjective UI polish unless required.",
+            "Planning scope:",
+            "- Plan enough tasks to make the requested app complete and locally verifiable without adding optional product expansion.",
+            "- Include validation, persistence, and functional UI sanity checks where relevant.",
+            "Execution scope:",
+            "- Implement complete end-to-end behavior for the attached workflow, including useful validation and state handling.",
+            "- Avoid broad redesigns or optional features that are not needed for a correct complete app.",
+            "QA scope:",
+            "- Verify main workflows, persistence, validation, and functional responsive usability.",
+            "- Do not block on subjective polish unless it prevents required workflow use.",
+        ]
+        .join("\n"),
+    }
+}
+
+fn git_policy_block(run: &BoardRun) -> String {
+    match normalize_git_policy(Some(&run.git_policy)).as_str() {
+        "managed" => [
+            "Git policy: Managed Git Workflow",
+            "The orchestrator handles git writes after each verified task group.",
+            "- Read-only git inspection commands are allowed.",
+            "- Do not run git write commands yourself. Do not create branches, add, commit, merge, rebase, reset, clean, stash, tag, or push from the provider.",
+            "- The orchestrator creates a task branch before implementation, then commits, merges to main, and pushes only after the task group is complete and verified.",
+            "- If git state prevents the managed workflow, report the blocker clearly instead of trying a manual workaround.",
+        ]
+        .join("\n"),
+        _ => [
+            "Git policy: Read-only Git",
+            "Provider tasks may inspect git state but must not change git state.",
+            "- Read-only git inspection commands are allowed, such as git status, git diff, git log, git show, git branch --show-current, and git remote -v.",
+            "- Do not run git write commands: no add, commit, checkout, switch, branch creation/deletion, merge, rebase, reset, restore, clean, stash, tag, or push.",
+            "- Do not plan git history tasks. Finish with code/test evidence only.",
+        ]
+        .join("\n"),
     }
 }
 
@@ -11596,6 +12629,20 @@ fn normalize_run_profile(profile: Option<&str>) -> String {
     }
 }
 
+fn normalize_run_profile_for_strategy(profile: Option<&str>, strategy: Option<&Value>) -> String {
+    if profile
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        return normalize_run_profile(profile);
+    }
+    match model_strategy_mode(strategy) {
+        "cheap" => "minimal".to_string(),
+        "expensive" => "product_ready".to_string(),
+        _ => normalize_run_profile(None),
+    }
+}
+
 fn project_name_from_path(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -11709,6 +12756,7 @@ mod tests {
     use iowb_core::AppConfig;
     use iowb_protocol::ChatMessage;
 
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
     static RAG_TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct TestEnvGuard {
@@ -12355,6 +13403,71 @@ pub const KANBAN_RAG_SENTINEL: &str = "SessionTokenStore validates refresh token
     }
 
     #[test]
+    fn default_session_policy_is_continuous_for_single_model_runs() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let _env = TestEnvGuard::set(vec![
+            ("DANGER_CONTINUOUS_SESSION", None),
+            ("IO_WORKBENCH_DANGER_CONTINUOUS_SESSION", None),
+        ]);
+        let run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project",
+            "model": "sonnet"
+        }));
+
+        assert_eq!(run.session_policy, "continuous");
+        assert!(!has_mixed_task_models(&run, None));
+    }
+
+    #[test]
+    fn hybrid_strategy_switches_continuous_session_to_task_model() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let _env = TestEnvGuard::set(vec![
+            ("DANGER_CONTINUOUS_SESSION", None),
+            ("IO_WORKBENCH_DANGER_CONTINUOUS_SESSION", None),
+        ]);
+        let run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project",
+            "modelStrategy": {
+                "mode": "hybrid",
+                "cheapModel": "gpt-5-mini",
+                "expensiveModel": "gpt-5.6-sol"
+            }
+        }));
+
+        assert_eq!(run.model, "gpt-5.6-sol");
+        assert_eq!(run.run_profile, "complete_app");
+        assert_eq!(run.session_policy, "task-model");
+        assert_eq!(run.task_model_overrides["implementation"], "gpt-5-mini");
+        assert_eq!(run.task_model_overrides["qa"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn manual_task_model_overrides_win_over_strategy_presets() {
+        let run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project",
+            "modelStrategy": {
+                "mode": "hybrid",
+                "cheapModel": "cheap-model",
+                "expensiveModel": "expensive-model"
+            },
+            "taskModelOverrides": {
+                "implementation": "manual-implementation",
+                "finalQa": "manual-final"
+            }
+        }));
+
+        assert_eq!(
+            run.task_model_overrides["implementation"],
+            "manual-implementation"
+        );
+        assert_eq!(run.task_model_overrides["final_qa"], "manual-final");
+        assert_eq!(run.task_model_overrides["qa"], "expensive-model");
+    }
+
+    #[test]
     fn prompt_generation_placeholder_preserves_retry_settings() {
         let mut run = board_run(json!({
             "command": "Implement feature",
@@ -12914,6 +14027,25 @@ pub const KANBAN_RAG_SENTINEL: &str = "SessionTokenStore validates refresh token
         assert_eq!(run.scheduled_start_at, None);
         assert!(!run.auto_run_enabled);
         assert_eq!(run.pause_reason.as_deref(), Some("schedule cleared"));
+    }
+
+    #[test]
+    fn future_scheduled_run_does_not_arm_auto_retry() {
+        let mut run = board_run(json!({
+            "command": "Implement feature",
+            "projectPath": "/tmp/project",
+            "scheduledStartAt": "2099-08-09T01:00:00Z",
+            "autoRetry": {
+                "enabled": true,
+                "delayMinutes": 10,
+                "maxAttempts": 3
+            }
+        }));
+
+        assert_eq!(run.status, "scheduled");
+        assert!(!is_resumable_run(&run));
+        assert!(!schedule_auto_retry_if_eligible(&mut run, "resumable status"));
+        assert_eq!(run.auto_retry["nextRetryAt"], Value::Null);
     }
 
     #[test]

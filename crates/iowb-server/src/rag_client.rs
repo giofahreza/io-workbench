@@ -54,10 +54,6 @@ impl RagClient {
         })
     }
 
-    pub(crate) fn is_configured() -> bool {
-        configured_descriptor_from_env().is_some()
-    }
-
     pub(crate) fn configured_descriptor() -> Option<String> {
         configured_descriptor_from_env()
     }

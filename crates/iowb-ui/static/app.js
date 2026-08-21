@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260820-01";
+const APP_VERSION = "20260821-01";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -7294,6 +7294,7 @@ function renderMarkdownLiteWithSections(value) {
   const sections = [];
   let buffer = [];
   let currentSection = null;
+  let fenced = false;
 
   const flushBuffer = () => {
     if (!buffer.length) return;
@@ -7301,21 +7302,37 @@ function renderMarkdownLiteWithSections(value) {
     buffer = [];
   };
 
-  const HEADER_RE = /^(exec|tool)\s*\/\s*(Parameters|Details)\s*$/i;
   const THINKING_HEADER_RE = /^thinking\s*$/i;
+
+  const toolSectionHeader = (line) => {
+    const normalized = normalizeChatToolHeading(line);
+    let match = normalized.match(/^(exec|tool)\s*\/\s*(Parameters|Details)\s*$/i);
+    if (match) {
+      return { kind: match[1].toLowerCase(), variant: match[2].toLowerCase() };
+    }
+    match = normalized.match(/^Tool use(?:\s*·\s*Command)?\s*·\s*(Parameters|Details)\s*$/i);
+    if (match) {
+      const kind = /\bCommand\b/i.test(normalized) ? "exec" : (currentSection?.kind || "tool");
+      return { kind, variant: match[1].toLowerCase() };
+    }
+    match = normalized.match(/^(?:Command\s*·\s*)?(Parameters|Details)\s*$/i);
+    if (match && (currentSection?.kind === "exec" || currentSection?.kind === "tool")) {
+      return { kind: currentSection.kind, variant: match[1].toLowerCase() };
+    }
+    return null;
+  };
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const header = line.match(HEADER_RE);
+    const fenceBoundary = line.trimStart().startsWith("```");
+    const header = fenced ? null : toolSectionHeader(line);
     if (header) {
       flushBuffer();
-      const kind = header[1].toLowerCase();
-      const variant = header[2].toLowerCase();
-      currentSection = { kind, variant, lines: [] };
+      currentSection = { kind: header.kind, variant: header.variant, lines: [] };
       sections.push(currentSection);
       continue;
     }
-    if (THINKING_HEADER_RE.test(line)) {
+    if (!fenced && THINKING_HEADER_RE.test(line)) {
       // `thinking` starts a reasoning block. Everything after the header
       // until the next blank line that precedes a non-thinking segment
       // (or the next structured header) belongs to the block.
@@ -7326,7 +7343,7 @@ function renderMarkdownLiteWithSections(value) {
     }
     if (currentSection && /^[a-zA-Z]/.test(line) && !line.startsWith("```") && !line.match(/^\s+/)) {
       const next = lines[i + 1];
-      if (next && (next.match(HEADER_RE) || THINKING_HEADER_RE.test(next))) {
+      if (next && (toolSectionHeader(next) || THINKING_HEADER_RE.test(next))) {
         flushBuffer();
         sections.push({ kind: "markdown", text: line });
         continue;
@@ -7336,6 +7353,9 @@ function renderMarkdownLiteWithSections(value) {
       currentSection.lines.push(line);
     } else {
       buffer.push(line);
+    }
+    if (fenceBoundary) {
+      fenced = !fenced;
     }
   }
   flushBuffer();
@@ -10635,6 +10655,11 @@ function renderBoardRunDetails(run) {
   const promotions = Array.isArray(run.promotionCandidates) ? run.promotionCandidates : [];
   const finalReview = run.finalReview || {};
   const tddPolicy = run.tddPolicy || {};
+  const modelStrategy = run.modelStrategy || {};
+  const validationConfig = run.validationConfig || {};
+  const ragSettings = run.ragSettings || {};
+  const qaPolicy = run.qaPolicy || {};
+  const autoRetry = run.autoRetry || {};
   const latestValidations = validations.slice(-4).reverse();
   const latestPromotions = promotions.slice(-4).reverse();
   const requirementCounts = requirements.reduce((counts, requirement) => {
@@ -10645,8 +10670,17 @@ function renderBoardRunDetails(run) {
   return `
     <section class="board-run-details-grid">
       <article>
+        <h3>Strategy</h3>
+        <p>${escapeHtml(statusLabel(run.runProfile || "complete_app"))} · ${escapeHtml(statusLabel(modelStrategy.mode || "manual"))}</p>
+        <p>${escapeHtml(statusLabel(run.sessionPolicy || "continuous"))} · ${escapeHtml(statusLabel(run.gitPolicy || "read_only"))}</p>
+        <p>Cheap: ${escapeHtml(modelStrategy.cheapModel || "provider default")}</p>
+        <p>Expensive: ${escapeHtml(modelStrategy.expensiveModel || "provider default")}</p>
+      </article>
+      <article>
         <h3>TDD Policy</h3>
+        <p>${run.tddEnabled === false ? "Disabled" : "Enabled"}</p>
         <p>Failing baseline: ${escapeHtml(String(tddPolicy.requireFailingTestBeforeDev !== false))}</p>
+        <p>Allow no tests: ${escapeHtml(String(tddPolicy.allowImplementationWithoutTests === true))}</p>
         <p>Max fixes: ${escapeHtml(tddPolicy.maxFixAttempts ?? 3)}</p>
       </article>
       <article>
@@ -10656,7 +10690,24 @@ function renderBoardRunDetails(run) {
       </article>
       <article>
         <h3>Validation</h3>
+        <p>${validationConfig.enabled === false ? "Disabled" : "Enabled"} · timeout ${escapeHtml(validationConfig.timeoutSeconds || 120)}s</p>
+        <p>Limits: feature ${escapeHtml(validationConfig.maxFeatureCommands ?? 2)} · final ${escapeHtml(validationConfig.maxFinalCommands ?? 4)} · QA ${escapeHtml(validationConfig.maxQaCommands ?? 2)}</p>
         ${latestValidations.length ? latestValidations.map((item) => `<p>${escapeHtml(item.stage || item.command || "validation")} · ${item.passed === false ? "fail" : "pass"}</p>`).join("") : "<p>No validation runs yet</p>"}
+      </article>
+      <article>
+        <h3>RAG</h3>
+        <p>${ragSettings.enabled === false ? "Disabled" : "Enabled"} · query ${ragSettings.queryEnabled === false ? "off" : "on"}</p>
+        <p>${escapeHtml(run.ragQueryCount || 0)} queries · ${escapeHtml(ragSettings.contextMaxChars || 12000)} chars</p>
+      </article>
+      <article>
+        <h3>QA Policy</h3>
+        <p>${escapeHtml(statusLabel(qaPolicy.taskQaMode || "high_risk"))}</p>
+        <p>Follow-ups: ${escapeHtml(qaPolicy.maxFollowupsPerGroup ?? 3)} · attempts: ${escapeHtml(qaPolicy.maxTaskAttempts ?? 2)}</p>
+      </article>
+      <article>
+        <h3>Auto Retry</h3>
+        <p>${autoRetry.enabled === true ? "Enabled" : "Disabled"} · ${escapeHtml(autoRetry.delayMinutes ?? 10)} min</p>
+        <p>Attempts: ${escapeHtml(autoRetry.attempts ?? 0)}/${escapeHtml(autoRetry.maxAttempts ?? 3)}</p>
       </article>
       <article>
         <h3>Promotion</h3>
@@ -10821,6 +10872,13 @@ function statusLabel(status) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function multilineInputLines(selector) {
+  return (qs(selector)?.value || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
 async function createBoard(event) {
   event.preventDefault();
   const projectPath = activeProjectPath();
@@ -10829,6 +10887,32 @@ async function createBoard(event) {
   if (!prompt) throw new Error("Enter a board prompt.");
   const provider = qs("#board-provider")?.value || "claude";
   const model = qs("#board-model")?.value.trim() || "";
+  const runProfile = qs("#board-run-profile")?.value || "complete_app";
+  const strategyMode = qs("#board-model-strategy")?.value || "manual";
+  const sessionPolicy = qs("#board-session-policy")?.value || "continuous";
+  const gitPolicy = qs("#board-git-policy")?.value || "read_only";
+  const cheapModel = qs("#board-cheap-model")?.value.trim() || "";
+  const expensiveModel = qs("#board-expensive-model")?.value.trim() || "";
+  const tddEnabled = qs("#board-tdd-enabled")?.value !== "false";
+  const tddBaseline = qs("#board-tdd-baseline")?.value !== "false";
+  const tddAllowNoTests = qs("#board-tdd-allow-no-tests")?.value === "true";
+  const tddMaxFixes = numericInputValue("#board-tdd-max-fixes", 3, 0, 20);
+  const validationEnabled = qs("#board-validation-enabled")?.value !== "false";
+  const validationTimeout = numericInputValue("#board-validation-timeout", 120, 5, 3600);
+  const validationFeatureCommands = multilineInputLines("#board-validation-feature-commands");
+  const validationFinalCommands = multilineInputLines("#board-validation-final-commands");
+  const validationQaCommands = multilineInputLines("#board-validation-qa-commands");
+  const validationMaxFeature = numericInputValue("#board-validation-max-feature", 2, 0, 20);
+  const validationMaxFinal = numericInputValue("#board-validation-max-final", 4, 0, 20);
+  const validationMaxQa = numericInputValue("#board-validation-max-qa", 2, 0, 20);
+  const ragEnabled = qs("#board-rag-enabled")?.value !== "false";
+  const ragContextChars = numericInputValue("#board-rag-context-chars", 12000, 1000, 80000);
+  const qaMode = qs("#board-qa-mode")?.value || "high_risk";
+  const qaFollowups = numericInputValue("#board-qa-followups", 3, 0, 20);
+  const qaAttempts = numericInputValue("#board-qa-attempts", 2, 1, 10);
+  const autoRetryEnabled = qs("#board-auto-retry-enabled")?.value === "true";
+  const autoRetryDelay = numericInputValue("#board-auto-retry-delay", 10, 1, 1440);
+  const autoRetryAttempts = numericInputValue("#board-auto-retry-attempts", 3, 1, 100);
   const body = await api("/api/danger/runs", {
     method: "POST",
     body: JSON.stringify({
@@ -10837,6 +10921,46 @@ async function createBoard(event) {
       projectName: activeProjectName() || selectedProjectLabel("#active-project"),
       provider,
       model,
+      runProfile,
+      sessionPolicy,
+      gitPolicy,
+      modelStrategy: {
+        mode: strategyMode,
+        cheapModel,
+        expensiveModel,
+      },
+      tddEnabled,
+      tddPolicy: {
+        requireFailingTestBeforeDev: tddBaseline,
+        allowImplementationWithoutTests: tddAllowNoTests,
+        maxFixAttempts: tddMaxFixes,
+      },
+      validationConfig: {
+        enabled: validationEnabled,
+        featureCommands: validationFeatureCommands,
+        finalCommands: validationFinalCommands,
+        qaCommands: validationQaCommands,
+        maxFeatureCommands: validationMaxFeature,
+        maxFinalCommands: validationMaxFinal,
+        maxQaCommands: validationMaxQa,
+        timeoutSeconds: validationTimeout,
+      },
+      ragSettings: {
+        enabled: ragEnabled,
+        queryEnabled: ragEnabled,
+        indexOnBootstrap: ragEnabled,
+        contextMaxChars: ragContextChars,
+      },
+      qaPolicy: {
+        taskQaMode: qaMode,
+        maxFollowupsPerGroup: qaFollowups,
+        maxTaskAttempts: qaAttempts,
+      },
+      autoRetry: {
+        enabled: autoRetryEnabled,
+        delayMinutes: autoRetryDelay,
+        maxAttempts: autoRetryAttempts,
+      },
       forceNewRun: true,
     }),
   });
