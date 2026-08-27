@@ -371,10 +371,10 @@ mod tests {
     }
 
     #[test]
-    fn board_task_chats_open_explicit_snapshots_without_joining_chat_history() {
+    fn board_task_transcripts_are_read_only_and_use_complete_snapshots() {
         let source = asset_text("app.js");
         let opener = source
-            .split_once("async function openBoardTaskChat(taskId) {")
+            .split_once("async function openBoardTaskTranscript(taskId) {")
             .map(|(_, rest)| rest)
             .expect("board task chat opener")
             .split_once("\n}\n\nfunction renderBoardCard")
@@ -390,9 +390,10 @@ mod tests {
 
         assert!(source.contains("task?.providerSessionId"));
         assert!(source.contains("task?.provider_session_id"));
-        assert!(source.contains("data-board-open-chat"));
-        assert!(opener.contains("boardSession: true"));
-        assert!(opener.contains("forceSnapshot: true"));
+        assert!(source.contains("data-board-view-transcript"));
+        assert!(source.contains("async function loadBoardSessionTranscript(sessionId)"));
+        assert!(opener.contains("loadBoardSessionTranscript(sessionId)"));
+        assert!(!source.contains("data-board-open-chat"));
         assert!(source.contains("provider !== \"cursor\""));
         assert!(
             snapshot_merge
@@ -426,11 +427,26 @@ mod tests {
     }
 
     #[test]
+    fn board_mobile_config_exposes_malformed_tool_call_repair_policy() {
+        let html = asset_text("index.html");
+        let source = asset_text("app.js");
+
+        for id in ["board-tool-repair-enabled", "board-tool-repair-retries"] {
+            assert!(html.contains(&format!(r#"id="{id}""#)), "missing {id}");
+        }
+        assert!(source.contains("const repairMalformedToolCalls ="));
+        assert!(source.contains("const toolRepairRetries ="));
+        assert!(source.contains("repairMalformedToolCalls,"));
+        assert!(source.contains("malformedToolCallRepairRetries: toolRepairRetries"));
+        assert!(source.contains("Tool repair:"));
+    }
+
+    #[test]
     fn openapi_documents_board_scope_and_direct_snapshot_access() {
         let source = asset_text("openapi.json");
 
         assert!(source.contains("\"boardSession\""));
-        assert!(source.contains("\"boardRunId\""));
+        assert!(source.contains("\"boardId\""));
         assert!(source.contains("\"boardTaskId\""));
         assert!(source.contains("\"/api/sessions/{session_id}/snapshot\""));
         assert!(source.contains("excluded from ordinary project/session discovery"));
@@ -491,6 +507,24 @@ mod tests {
             2
         );
         assert!(source.contains(r#"fast: chatFastValue(),"#));
+    }
+
+    #[test]
+    fn web_chat_turn_cards_match_mobile_session_actions() {
+        let source = asset_text("app.js");
+        let styles = asset_text("styles.css");
+
+        assert!(source.contains("function chatResponsePresentation(messages, options = {})"));
+        assert!(source.contains("showResponseHeader: true"));
+        assert!(source.contains("showResponseFooter: true"));
+        assert!(source.contains("function renderChatResponseHeader(node, meta = {})"));
+        assert!(source.contains("function attachUserChatActions(node, message, options = {})"));
+        assert!(source.contains("Copy prompt"));
+        assert!(source.contains("Copy response"));
+        assert!(source.contains("withoutChatToolTelemetrySections(content)"));
+        assert!(source.contains("replayChatMessages(replayMessages, {"));
+        assert!(styles.contains(".chat-response-header"));
+        assert!(styles.contains(".chat-line-assistant .chat-line-actions"));
     }
 
     #[test]

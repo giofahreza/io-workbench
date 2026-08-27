@@ -182,6 +182,29 @@ impl FileService {
         Ok(entries)
     }
 
+    pub async fn browse_entries(&self, path: impl AsRef<Path>) -> Result<Vec<FileEntry>> {
+        let root = absolutize(&expand_tilde(path.as_ref().to_path_buf()))?;
+        let mut entries = Vec::new();
+        let mut reader = fs::read_dir(&root).await?;
+
+        while let Some(entry) = reader.next_entry().await? {
+            let metadata = entry.metadata().await?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if should_skip_name(&name) {
+                continue;
+            }
+            entries.push(file_entry_from_metadata(
+                &root,
+                &entry.path(),
+                &metadata,
+                true,
+            ));
+        }
+
+        sort_file_entries(&mut entries);
+        Ok(entries)
+    }
+
     pub async fn list_tree(
         &self,
         project_root: impl AsRef<Path>,
@@ -507,6 +530,16 @@ fn file_entry_from_metadata(
     }
 }
 
+fn sort_file_entries(entries: &mut [FileEntry]) {
+    entries.sort_by(|a, b| {
+        let left_dir = a.kind == FileKind::Directory;
+        let right_dir = b.kind == FileKind::Directory;
+        right_dir
+            .cmp(&left_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
 fn display_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -725,6 +758,37 @@ mod tests {
             .find(|entry| entry.name == "nested")
             .unwrap();
         assert!(nested.children.is_empty());
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn browse_entries_includes_files_and_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-fs-browse-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        tokio::fs::create_dir_all(root.join("folder"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("notes.txt"), "hello")
+            .await
+            .unwrap();
+
+        let service = FileService::new(6, 1024 * 1024);
+        let entries = service.browse_entries(&root).await.unwrap();
+
+        assert!(
+            entries
+                .iter()
+                .any(|entry| { entry.name == "folder" && entry.kind == FileKind::Directory })
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| { entry.name == "notes.txt" && entry.kind == FileKind::File })
+        );
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

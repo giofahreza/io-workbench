@@ -135,8 +135,6 @@ pub struct RagQueryRequest {
     pub phase: String,
     pub query: String,
     #[serde(default)]
-    pub requirements: Vec<Value>,
-    #[serde(default)]
     pub known_files: Vec<String>,
     #[serde(default)]
     pub validation_error: Option<Value>,
@@ -196,8 +194,6 @@ pub struct TaskResultIngestRequest {
     pub project_id: String,
     pub run_id: String,
     pub task_id: String,
-    #[serde(default)]
-    pub requirements: Vec<Value>,
     #[serde(default)]
     pub changed_files: Vec<String>,
     #[serde(default)]

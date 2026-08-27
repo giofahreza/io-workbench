@@ -2537,7 +2537,7 @@ fn commit_message_prompt(files: &[String], diff_context: &str) -> String {
     let diff_context = diff_context.chars().take(6000).collect::<String>();
     format!(
         "Generate a conventional commit message for these changes.\n\n\
-REQUIREMENTS:\n\
+RULES:\n\
 - Format: type(scope): subject\n\
 - Include body explaining what changed and why\n\
 - Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore\n\

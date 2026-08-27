@@ -1547,7 +1547,7 @@ impl Storage {
         Ok(self
             .list_sessions_including_board()?
             .into_iter()
-            .filter(|session| !session.board_session)
+            .filter(|session| !session.is_board_session())
             .collect())
     }
 
@@ -1811,7 +1811,7 @@ impl Storage {
             let mut sessions = Vec::new();
             for row in rows {
                 let session = row?;
-                if !session.board_session {
+                if !session.is_board_session() {
                     sessions.push(session);
                 }
             }
@@ -3461,7 +3461,14 @@ impl Storage {
                 )
                   AND CASE
                       WHEN json_valid(s.metadata)
-                      THEN COALESCE(json_extract(s.metadata, '$.boardSession'), 0)
+                      THEN CASE
+                          WHEN COALESCE(json_extract(s.metadata, '$.boardSession'), 0) = 1
+                               OR json_extract(s.metadata, '$.boardId') IS NOT NULL
+                               OR json_extract(s.metadata, '$.boardTaskId') IS NOT NULL
+                               OR json_extract(s.metadata, '$.boardRunId') IS NOT NULL
+                          THEN 1
+                          ELSE 0
+                      END
                       ELSE 0
                   END = 0
                 ORDER BY m.timestamp DESC
@@ -3501,7 +3508,7 @@ impl Storage {
             let mut results = Vec::new();
             for row in rows {
                 let result = row?;
-                if !result.0.board_session {
+                if !result.0.is_board_session() {
                     results.push(result);
                 }
             }
@@ -5209,11 +5216,11 @@ fn serialize_session_metadata(session: &SessionSummary) -> String {
     if session.external {
         value.insert("external".into(), json!(true));
     }
-    if session.board_session {
+    if session.is_board_session() {
         value.insert("boardSession".into(), json!(true));
     }
-    if let Some(board_run_id) = session.board_run_id.as_ref() {
-        value.insert("boardRunId".into(), json!(board_run_id));
+    if let Some(board_id) = session.board_id.as_ref() {
+        value.insert("boardId".into(), json!(board_id));
     }
     if let Some(board_task_id) = session.board_task_id.as_ref() {
         value.insert("boardTaskId".into(), json!(board_task_id));
@@ -5284,11 +5291,18 @@ fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
     if let Some(v) = value.get("boardSession").and_then(Value::as_bool) {
         session.board_session = v;
     }
-    if let Some(v) = value.get("boardRunId").and_then(Value::as_str) {
-        session.board_run_id = Some(v.to_string());
+    if let Some(v) = value
+        .get("boardId")
+        .or_else(|| value.get("boardRunId"))
+        .and_then(Value::as_str)
+    {
+        session.board_id = Some(v.to_string());
     }
     if let Some(v) = value.get("boardTaskId").and_then(Value::as_str) {
         session.board_task_id = Some(v.to_string());
+    }
+    if session.is_board_session() {
+        session.board_session = true;
     }
     if let Some(v) = value.get("nativeSessionId").and_then(Value::as_str) {
         session.native_session_id = Some(v.to_string());
@@ -7800,7 +7814,7 @@ mod tests {
         let mut board = test_session("board-session", true);
         board.title = "board searchable conversation".to_string();
         board.board_session = true;
-        board.board_run_id = Some("run-1".to_string());
+        board.board_id = Some("board-1".to_string());
         board.board_task_id = Some("task-1".to_string());
         for session in [&ordinary, &board] {
             storage.upsert_session(session).expect("upsert session");
@@ -7822,7 +7836,7 @@ mod tests {
             .expect("board query")
             .expect("board session");
         assert!(restored.board_session);
-        assert_eq!(restored.board_run_id.as_deref(), Some("run-1"));
+        assert_eq!(restored.board_id.as_deref(), Some("board-1"));
         assert_eq!(restored.board_task_id.as_deref(), Some("task-1"));
         assert_eq!(
             storage
@@ -7866,6 +7880,63 @@ mod tests {
             .expect("limited conversation search");
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].0.id, "ordinary-session");
+
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn legacy_board_run_scope_is_hidden_from_discovery_and_search() {
+        let (storage, root) = temporary_storage("legacy-board-run-scope");
+        let mut legacy = test_session("legacy-board-session", true);
+        legacy.title = "legacy board searchable conversation".to_string();
+        storage.upsert_session(&legacy).expect("upsert session");
+        storage
+            .append_message(
+                &legacy.id,
+                &test_message(
+                    "legacy-board-message",
+                    MessageRole::User,
+                    "legacy board searchable",
+                    0,
+                ),
+            )
+            .expect("append message");
+
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE sessions SET metadata = ?1 WHERE id = ?2",
+                    params![r#"{"boardRunId":"board-legacy"}"#, legacy.id],
+                )?;
+                Ok(())
+            })
+            .expect("write legacy metadata");
+
+        let restored = storage
+            .get_session(&legacy.id)
+            .expect("legacy session query")
+            .expect("legacy session");
+        assert!(restored.is_board_session());
+        assert_eq!(restored.board_id.as_deref(), Some("board-legacy"));
+        assert!(
+            storage
+                .list_sessions()
+                .expect("visible sessions")
+                .is_empty()
+        );
+        assert!(
+            storage
+                .list_sessions_for_project("/tmp/project")
+                .expect("project sessions")
+                .is_empty()
+        );
+        assert!(
+            storage
+                .search_messages("searchable", 10)
+                .expect("session search")
+                .is_empty()
+        );
 
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");
@@ -8113,7 +8184,7 @@ mod tests {
     fn durable_chat_run_round_trips_and_updates_native_session_id() {
         let (storage, root) = temporary_storage("durable-round-trip");
         let mut run = StoredDurableChatRun::new(
-            "run-1",
+            "board-1",
             Some("user-1".to_string()),
             "ui-session-1",
             "codex",

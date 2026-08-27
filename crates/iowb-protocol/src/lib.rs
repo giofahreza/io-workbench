@@ -425,9 +425,10 @@ pub struct SessionSummary {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        rename = "boardRunId"
+        rename = "boardId",
+        alias = "boardRunId"
     )]
-    pub board_run_id: Option<String>,
+    pub board_id: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -506,6 +507,24 @@ pub struct SessionSummary {
         rename = "spentTokenUsage"
     )]
     pub spent_token_usage: Option<SessionSpentTokenUsage>,
+}
+
+impl SessionSummary {
+    /// Board ownership was added after some session rows already existed.
+    /// Treat either explicit ownership id as authoritative even when the
+    /// older `boardSession` boolean was not persisted, or older versions
+    /// called the board id `boardRunId`.
+    pub fn is_board_session(&self) -> bool {
+        self.board_session
+            || self
+                .board_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            || self
+                .board_task_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -1962,16 +1981,41 @@ mod tests {
     fn board_session_summary_uses_camel_case_scope_fields() {
         let summary = SessionSummary {
             board_session: true,
-            board_run_id: Some("run-1".to_string()),
+            board_id: Some("board-1".to_string()),
             board_task_id: Some("task-1".to_string()),
             native_session_id: Some("native-1".to_string()),
             ..Default::default()
         };
         let value = serde_json::to_value(summary).expect("serialize board session");
         assert_eq!(value["boardSession"], true);
-        assert_eq!(value["boardRunId"], "run-1");
+        assert_eq!(value["boardId"], "board-1");
         assert_eq!(value["boardTaskId"], "task-1");
         assert_eq!(value["nativeSessionId"], "native-1");
+    }
+
+    #[test]
+    fn board_session_summary_recognizes_legacy_and_partial_scope_metadata() {
+        let legacy: SessionSummary = serde_json::from_value(serde_json::json!({
+            "id": "legacy-board-session",
+            "boardRunId": "board-legacy"
+        }))
+        .expect("deserialize legacy board scope");
+        assert_eq!(legacy.board_id.as_deref(), Some("board-legacy"));
+        assert!(legacy.is_board_session());
+
+        let board_id_only = SessionSummary {
+            board_id: Some("board-1".to_string()),
+            ..Default::default()
+        };
+        let task_id_only = SessionSummary {
+            board_task_id: Some("task-1".to_string()),
+            ..Default::default()
+        };
+        let ordinary = SessionSummary::default();
+
+        assert!(board_id_only.is_board_session());
+        assert!(task_id_only.is_board_session());
+        assert!(!ordinary.is_board_session());
     }
 
     #[test]

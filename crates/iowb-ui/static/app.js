@@ -1,7 +1,7 @@
 const TOKEN_STORAGE_KEY = "iowb.token";
 window.localStorage.removeItem(TOKEN_STORAGE_KEY);
 
-const APP_VERSION = "20260821-01";
+const APP_VERSION = "20260821-03";
 const SIDEBAR_STATE_SETTING_KEY = "iowb.web.sidebar";
 const SIDEBAR_STATE_UPDATED_KEY = "iowb.sidebarStateUpdatedAt";
 const PINNED_CHAT_SESSIONS_KEY = "iowb.pinnedChatSessions";
@@ -225,9 +225,7 @@ const state = {
     showHidden: false,
     loading: false,
   },
-  boardRuns: [],
-  boardRun: null,
-  boardSelectedRunId: window.localStorage.getItem("iowb.boardSelectedRunId") || "",
+  board: null,
   boardChatSessionIds: new Set(),
   boardWsSessionId: "",
   boardLoading: false,
@@ -353,7 +351,7 @@ const VIEW_NAMES = {
 };
 
 const VIEW_SUBTITLES = {
-  board: "Track agentic runs and task boards.",
+  board: "Track agentic boards and task progress.",
   files: "Browse, edit, upload, and organize project files.",
   chat: "Start or resume agent sessions in the selected project.",
   shell: "Run a PTY-backed terminal in the selected project.",
@@ -1434,6 +1432,8 @@ function isBoardChatSession(session, sessionId = session?.id) {
   return Boolean(
     session?.boardSession
     || session?.board_session
+    || session?.boardId
+    || session?.board_id
     || session?.boardRunId
     || session?.board_run_id
     || session?.boardTaskId
@@ -3188,6 +3188,234 @@ function buildChatLineNode(role) {
   return { node, text, footer };
 }
 
+function chatFooterTimestamp(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? String(value) : formatReceivedDateTime(value);
+}
+
+function normalizedChatMessageMeta(raw = {}) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const meta = {
+    ...source,
+    cli: firstDefined(source.cli, source.provider, source.chatCli),
+    model: firstDefined(source.model, source.chatModel),
+    effort: firstDefined(source.effort, source.chatEffort),
+    mode: firstDefined(source.mode, source.chatMode),
+    thinking: source.thinking ?? source.chatThinking,
+    fast: source.fast ?? source.chatFast,
+    sentAt: firstDefined(source.sentAt, source.sent_at),
+    receivedAt: firstDefined(source.receivedAt, source.received_at),
+    tokenUsage: firstDefined(source.tokenUsage, source.token_usage),
+    elapsedMs: firstDefined(source.elapsedMs, source.elapsed_ms),
+  };
+  if (meta.sentAt) meta.sentAt = chatFooterTimestamp(meta.sentAt);
+  if (meta.receivedAt) meta.receivedAt = chatFooterTimestamp(meta.receivedAt);
+  return normalizeMessageMeta(meta);
+}
+
+function applyChatControlFallback(meta, fallback = {}) {
+  const next = { ...meta };
+  ["cli", "model", "effort", "mode", "thinking", "fast"].forEach((field) => {
+    if (next[field] === undefined || next[field] === null || next[field] === "") {
+      const value = fallback[field];
+      if (value !== undefined && value !== null && value !== "") next[field] = value;
+    }
+  });
+  return next;
+}
+
+function chatSessionControls(sessionId = state.chatSessionId, session = null, overrides = null) {
+  const persisted = overrides || getSessionOverridesFor(sessionId) || {};
+  return normalizedChatMessageMeta({
+    cli: firstDefined(session?.provider, session?.cli, persisted.cli, persisted.provider, state.preferences.chatCli, state.preferences.chatProvider, "codex"),
+    model: firstDefined(session?.model, persisted.model, state.preferences.chatModel, ""),
+    effort: firstDefined(session?.effort, persisted.effort, state.preferences.chatEffort, "medium"),
+    mode: firstDefined(session?.mode, persisted.mode, state.preferences.chatMode, "default"),
+    thinking: session?.thinking ?? persisted.thinking ?? state.preferences.chatThinking ?? false,
+    fast: session?.fast ?? persisted.fast ?? state.preferences.chatFast ?? false,
+  });
+}
+
+function chatMessageFooterMeta(message, role, controls = {}, previousPrompt = null) {
+  let meta = normalizedChatMessageMeta(persistedChatMessageMeta(message));
+  meta = applyChatControlFallback(meta, controls);
+  const timestamp = chatFooterTimestamp(message?.timestamp || message?.receivedAt || "");
+  if (role === "user") {
+    if (!meta.sentAt && timestamp) meta.sentAt = timestamp;
+  } else {
+    if (!meta.receivedAt && timestamp) meta.receivedAt = timestamp;
+    if (previousPrompt?.timestamp && message?.timestamp) {
+      meta.elapsed = formatElapsed(previousPrompt.timestamp, message.timestamp);
+    }
+  }
+  return meta;
+}
+
+function chatResponseCopyText(messages, indices, previousPrompt, session) {
+  return indices
+    .map((index) => {
+      const message = messages[index];
+      const content = assistantResponseContent(
+        String(message?.content || ""),
+        chatMessageProvider(message, persistedChatMessageMeta(message), session),
+        previousPrompt?.content || "",
+      );
+      return withoutChatToolTelemetrySections(content);
+    })
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+function chatResponsePresentation(messages, options = {}) {
+  const presentation = new Map();
+  const session = options.session || findChatSession(options.sessionId || state.chatSessionId) || null;
+  const sessionId = options.sessionId || session?.id || state.chatSessionId || "";
+  const controls = chatSessionControls(sessionId, session, options.overrides);
+  let previousPrompt = null;
+  let index = 0;
+
+  while (index < messages.length) {
+    const message = messages[index];
+    const role = String(message?.role || "").toLowerCase();
+    if (role === "user") {
+      previousPrompt = message;
+      index += 1;
+      continue;
+    }
+
+    const groupStart = index;
+    while (
+      index + 1 < messages.length &&
+      String(messages[index + 1]?.role || "").toLowerCase() !== "user"
+    ) {
+      index += 1;
+    }
+    const assistantIndices = [];
+    for (let cursor = groupStart; cursor <= index; cursor += 1) {
+      const candidate = messages[cursor];
+      if (
+        String(candidate?.role || "").toLowerCase() === "assistant" &&
+        !isTerminalStatusMessageMeta(persistedChatMessageMeta(candidate)) &&
+        assistantResponseContent(
+          String(candidate?.content || ""),
+          chatMessageProvider(candidate, persistedChatMessageMeta(candidate), session),
+          previousPrompt?.content || "",
+        )
+      ) {
+        assistantIndices.push(cursor);
+      }
+    }
+    if (assistantIndices.length) {
+      const firstIndex = assistantIndices[0];
+      const lastIndex = assistantIndices[assistantIndices.length - 1];
+      const first = presentation.get(firstIndex) || {};
+      presentation.set(firstIndex, {
+        ...first,
+        showResponseHeader: true,
+        headerMeta: chatMessageFooterMeta(messages[firstIndex], "assistant", controls, previousPrompt),
+      });
+      const last = presentation.get(lastIndex) || {};
+      presentation.set(lastIndex, {
+        ...last,
+        showResponseFooter: true,
+        footerMeta: chatMessageFooterMeta(messages[lastIndex], "assistant", controls, previousPrompt),
+        copyText: chatResponseCopyText(messages, assistantIndices, previousPrompt, session),
+      });
+    }
+    index += 1;
+  }
+  return { controls, presentation };
+}
+
+function renderChatResponseHeader(node, meta = {}) {
+  if (!node) return;
+  const normalized = normalizedChatMessageMeta(meta);
+  const provider = String(firstDefined(normalized.cli, normalized.provider, "codex")).toLowerCase();
+  const model = String(normalized.model || "").trim();
+  let header = node.querySelector(":scope > .chat-response-header");
+  if (!header) {
+    header = document.createElement("div");
+    header.className = "chat-response-header";
+    const text = node.querySelector(":scope > .chat-line-text");
+    node.insertBefore(header, text || null);
+  }
+  const signature = `${provider}\u0000${model}`;
+  if (header.dataset.signature === signature) return;
+  header.dataset.signature = signature;
+  const icon = document.createElement("img");
+  icon.src = sidebarProviderIcon(provider);
+  icon.alt = "";
+  icon.setAttribute("aria-hidden", "true");
+  const label = document.createElement("span");
+  label.textContent = [sidebarProviderLabel(provider), model].filter(Boolean).join(" · ");
+  header.replaceChildren(icon, label);
+}
+
+function chatLineActions(node, kind) {
+  let actions = node?.querySelector(":scope > .chat-line-actions");
+  if (actions) return actions;
+  actions = document.createElement("div");
+  actions.className = `chat-line-actions chat-line-actions-${kind}`;
+  const footer = node?.querySelector(":scope > .chat-line-footer");
+  if (footer) node.insertBefore(actions, footer);
+  else node?.appendChild(actions);
+  return actions;
+}
+
+function attachChatCopyAction(node, content, kind, label) {
+  if (!node || !String(content || "").trim()) return;
+  const actions = chatLineActions(node, kind);
+  const selector = `[data-chat-copy-kind="${kind}"]`;
+  let button = actions.querySelector(selector);
+  if (!button) {
+    button = document.createElement("button");
+    button.type = "button";
+    button.className = "chat-message-copy icon-button";
+    button.dataset.symbol = "copy";
+    button.dataset.chatCopyKind = kind;
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      await copyText(button._iowbCopyText || "");
+      showToast("Copied", "ok");
+    });
+    actions.appendChild(button);
+  }
+  button._iowbCopyText = content;
+}
+
+function attachUserChatActions(node, message, options = {}) {
+  const actions = chatLineActions(node, "user");
+  const messageId = persistedChatMessageId(message);
+  if (messageId && options.allowEdit !== false && !actions.querySelector("[data-chat-edit-from-here]")) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "chat-message-edit icon-button";
+    button.dataset.symbol = "pencil";
+    button.dataset.chatEditFromHere = messageId;
+    button.setAttribute("aria-label", "Edit from here");
+    button.title = "Edit from here";
+    const session = findChatSession(state.chatSessionId);
+    if (session?.active || selectedRunningChatSession()) {
+      button.disabled = true;
+      button.title = "Stop the current response before editing from here";
+    }
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      editChatFromHere(messageId, button).catch(showError);
+    });
+    actions.appendChild(button);
+  }
+  attachChatCopyAction(node, String(message?.content || ""), "user", "Copy prompt");
+}
+
+function attachAssistantChatActions(node, content) {
+  attachChatCopyAction(node, content, "assistant", "Copy response");
+}
+
 function chatRecoveryRequestId() {
   if (window.crypto?.randomUUID) return `compact-${window.crypto.randomUUID()}`;
   return `compact-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
@@ -3725,11 +3953,10 @@ function renderChatLineFooter(footer, meta) {
   if (meta.effort !== undefined && meta.effort !== null && meta.effort !== "") {
     items.push(`<span>Effort: <strong>${escapeHtml(meta.effort)}</strong></span>`);
   }
+  if (meta.status) items.push(`<span>Status: <strong>${escapeHtml(meta.status)}</strong></span>`);
   if (meta.thinking) items.push(`<span>Thinking on</span>`);
   if (meta.fast) items.push(`<span>Fast priority requested</span>`);
-  // Token usage is intentionally hidden from the per-turn footer; the mobile
-  // app and web UI both keep the chat transcript focused on the actual
-  // response, not on internal accounting metrics.
+  if (meta.tokenUsage) items.push(`<span>Tokens: <strong>${escapeHtml(meta.tokenUsage)}</strong></span>`);
   if (meta.receivedAt) items.push(`<span>Received: <strong>${escapeHtml(meta.receivedAt)}</strong></span>`);
   if (meta.elapsed) items.push(`<span>Elapsed: <strong>${escapeHtml(meta.elapsed)}</strong></span>`);
   if (meta.sentAt) items.push(`<span>Sent: <strong>${escapeHtml(meta.sentAt)}</strong></span>`);
@@ -3747,59 +3974,23 @@ function renderChatLineFooter(footer, meta) {
     : "";
 }
 
-function clearChatLineMetadata() {
-  chatOutputRoot()?.querySelectorAll(".chat-line-footer").forEach((footer) => {
-    footer.innerHTML = "";
-  });
-  renderChatFooter(null);
-}
-
 function persistedChatMessageId(message) {
   const id = String(message?.id || "").trim();
   if (!id || id.startsWith("local-") || id.startsWith("local:")) return "";
   return id;
 }
 
-function attachEditFromHereAction(node, message) {
-  const messageId = persistedChatMessageId(message);
-  if (!messageId) return;
-  const actions = document.createElement("div");
-  actions.className = "chat-line-actions";
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "chat-message-edit icon-button";
-  button.dataset.symbol = "pencil";
-  button.setAttribute("aria-label", "Edit from here");
-  button.title = "Edit from here";
-  const session = findChatSession(state.chatSessionId);
-  if (session?.active || selectedRunningChatSession()) {
-    button.disabled = true;
-    button.title = "Stop the current response before editing from here";
-  }
-  button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    editChatFromHere(messageId, button).catch(showError);
-  });
-  actions.appendChild(button);
-  const footer = node.querySelector(":scope > .chat-line-footer");
-  if (footer) {
-    node.insertBefore(actions, footer);
-  } else {
-    node.appendChild(actions);
-  }
-}
-
-function replayUserPromptLine(message) {
+function replayUserPromptLine(message, meta = null) {
   const output = chatOutputRoot();
   if (!output) return;
   const { node, text, footer } = buildChatLineNode("user");
   text.textContent = String(message?.content || "");
-  attachEditFromHereAction(node, message);
-  renderChatLineFooter(footer, null);
+  attachUserChatActions(node, message);
+  renderChatLineFooter(footer, meta);
   output.appendChild(node);
 }
 
-function replayAssistantLine(content, meta) {
+function replayAssistantLine(content, meta = null, options = {}) {
   const output = chatOutputRoot();
   if (!output) return;
   const { node, text, footer } = buildChatLineNode("assistant");
@@ -3809,7 +4000,11 @@ function replayAssistantLine(content, meta) {
   // of block tags, so this stays safe while exec / Parameters /
   // exec / Details become collapsible blocks.
   text.innerHTML = renderChatBubbleHtml(String(content));
+  if (options.showResponseHeader) {
+    renderChatResponseHeader(node, options.headerMeta || meta || {});
+  }
   renderChatLineFooter(footer, meta);
+  if (options.copyText) attachAssistantChatActions(node, options.copyText);
   output.appendChild(node);
 }
 
@@ -3846,6 +4041,25 @@ function isChatAssistantBoundary(value) {
 function isChatToolTelemetryHeading(value) {
   return /^(?:exec(?:\s*\/\s*(?:parameters|details))?|bash(?:\s*\/\s*(?:parameters|details))?|shell(?:\s+command)?(?:\s*\/\s*(?:parameters|details))?|command_execution|function_call(?:_output)?|custom_tool_call(?:_output)?|tool(?:\s*\/\s*(?:parameters|details))?|(?:edit|create|delete|move)\s*\/\s*.+|file_change(?:\s*\/\s*.+)?|apply[_\s]+patch(?:\s*\/\s*(?:parameters|details))?|patch\s*:.*|diff\s+--git\b.*)$/i
     .test(normalizeChatToolHeading(value));
+}
+
+function withoutChatToolTelemetrySections(value) {
+  const visible = [];
+  let suppressingToolSection = false;
+  let fenced = false;
+  for (const line of String(value || "").split("\n")) {
+    const fenceBoundary = line.trimStart().startsWith("```");
+    if (!suppressingToolSection && !fenced && isChatToolTelemetryHeading(line)) {
+      suppressingToolSection = true;
+    } else if (suppressingToolSection && !fenced && isChatAssistantBoundary(line)) {
+      suppressingToolSection = false;
+      visible.push(line);
+    } else if (!suppressingToolSection) {
+      visible.push(line);
+    }
+    if (fenceBoundary) fenced = !fenced;
+  }
+  return visible.join("\n").trim();
 }
 
 function withoutChatTokenUsageSections(value) {
@@ -3946,44 +4160,47 @@ function isTerminalStatusMessageMeta(meta) {
   return String(meta?.kind || "").toLowerCase() === "terminal_status";
 }
 
-function latestRenderableAssistantIndex(messages) {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const raw = messages[index];
-    if (String(raw?.role || "").toLowerCase() !== "assistant") continue;
-    if (isTerminalStatusMessageMeta(persistedChatMessageMeta(raw))) continue;
-    return index;
-  }
-  return -1;
-}
-
-function replayChatMessages(messages) {
-  syncChatPromptHistoryFromMessages(messages);
-  const latestAssistantIndex = latestRenderableAssistantIndex(messages);
-  let previousPrompt = "";
+function replayChatMessages(messages, options = {}) {
+  const session = options.session || findChatSession(options.sessionId || state.chatSessionId) || null;
+  const sessionId = options.sessionId || session?.id || state.chatSessionId || "";
+  syncChatPromptHistoryFromMessages(messages, sessionId);
+  const { controls, presentation } = chatResponsePresentation(messages, {
+    session,
+    sessionId,
+    overrides: options.overrides,
+  });
+  let previousPrompt = null;
   messages.forEach((raw, index) => {
     if (!raw) return;
     const role = String(raw.role || "").toLowerCase();
     const content = raw.content == null ? "" : String(raw.content);
-    // Per-turn metadata (cli / model / sentAt / receivedAt / tokenUsage /
-    // elapsed) is stored on each message row in storage. Fall back to the
-    // legacy `meta` alias in case older sessions used it.
     const persistedMeta = persistedChatMessageMeta(raw);
-    const meta = role === "assistant" && index === latestAssistantIndex
-      ? normalizeMessageMeta(persistedMeta)
-      : null;
     if (role === "user") {
-      previousPrompt = content;
-      replayUserPromptLine(raw);
+      replayUserPromptLine(raw, chatMessageFooterMeta(raw, role, controls));
+      previousPrompt = raw;
     } else if (role === "assistant") {
       if (isTerminalStatusMessageMeta(persistedMeta)) return;
       const displayContent = assistantResponseContent(
         content,
-        chatMessageProvider(raw, persistedMeta),
-        previousPrompt,
+        chatMessageProvider(raw, persistedMeta, session),
+        previousPrompt?.content || "",
       );
-      if (displayContent) replayAssistantLine(displayContent, meta);
-    } else if (role === "tool") replayToolLine(content);
-    else if (role === "system") {
+      if (!displayContent) return;
+      const turn = presentation.get(index) || {};
+      replayAssistantLine(
+        displayContent,
+        turn.showResponseFooter
+          ? (turn.footerMeta || chatMessageFooterMeta(raw, role, controls, previousPrompt))
+          : null,
+        {
+          showResponseHeader: turn.showResponseHeader === true,
+          headerMeta: turn.headerMeta,
+          copyText: turn.showResponseFooter ? turn.copyText : "",
+        },
+      );
+    } else if (role === "tool") {
+      replayToolLine(content);
+    } else if (role === "system") {
       const output = chatOutputRoot();
       if (!output) return;
       const node = document.createElement("div");
@@ -4182,66 +4399,16 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       buffer: split.streamingBuffer || state.chatOutputBuffersBySession[sessionId] || "",
       provider: sessionProvider(snapshotSession),
     };
-    const latestAssistantIndex = latestRenderableAssistantIndex(replayMessages);
     const offset = loadingOlder
       ? requestedOffset
       : Math.max(0, totalCount - page.length);
     chatHistoryWindow = { sessionId, offset, totalCount, messages: replayMessages };
-    syncChatPromptHistoryFromMessages(replayMessages, sessionId);
     resetChatOutputDom();
     const persisted = getSessionOverridesFor(sessionId) || {};
-    const replayMeta = (msg, role) => {
-      // Prefer the per-message metadata persisted on the message row by the
-      // server. Fall back to the legacy per-session override so older turns
-      // still render something useful in the footer.
-      const stored = persistedChatMessageMeta(msg);
-      if (stored) {
-        const normalized = normalizeMessageMeta(stored);
-        if (Object.keys(normalized).length) return normalized;
-      }
-      if (role === "user") {
-        return {};
-      }
-      return {
-        cli: persisted.cli || persisted.provider,
-        model: persisted.model,
-        mode: persisted.mode,
-        effort: persisted.effort,
-        tokenUsage: persisted.tokenUsage || "",
-        receivedAt: persisted.receivedAt || "",
-        elapsed: persisted.elapsed || "",
-      };
-    };
-    let previousPrompt = "";
-    replayMessages.forEach((raw, index) => {
-      if (!raw) return;
-      const role = String(raw.role || "").toLowerCase();
-      const content = raw.content == null ? "" : String(raw.content);
-      const meta = role === "assistant" && index === latestAssistantIndex
-        ? replayMeta(raw, role)
-        : null;
-      if (role === "user") {
-        previousPrompt = content;
-        replayUserPromptLine(raw);
-      } else if (role === "assistant") {
-        const persistedMeta = persistedChatMessageMeta(raw);
-        if (isTerminalStatusMessageMeta(persistedMeta)) return;
-        const displayContent = assistantResponseContent(
-          content,
-          chatMessageProvider(raw, persistedMeta, snapshotSession),
-          previousPrompt,
-        );
-        if (displayContent) replayAssistantLine(displayContent, meta);
-      }
-      else if (role === "tool") replayToolLine(content);
-      else if (role === "system") {
-        const output = chatOutputRoot();
-        if (!output) return;
-        const node = document.createElement("div");
-        node.className = "chat-line-system";
-        node.textContent = content;
-        output.appendChild(node);
-      }
+    replayChatMessages(replayMessages, {
+      session: snapshotSession,
+      sessionId,
+      overrides: persisted,
     });
     renderChatRecoveryCard(sessionId);
     renderChatManualCompactionCard(sessionId);
@@ -4263,8 +4430,8 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       scrollChatToBottom();
     }
     maybeLoadOlderChatMessages();
-    // Restore per-session overrides without showing the legacy global
-    // metadata slot; only the latest assistant response owns metadata.
+    // Restore the current session controls after replaying the persisted
+    // per-turn metadata in the transcript.
     loadSessionOverridesIntoState(sessionId, snapshotSession);
     renderChatFooter(null);
     rememberCurrentChatSession({
@@ -7294,7 +7461,7 @@ function renderMarkdownLiteWithSections(value) {
   const sections = [];
   let buffer = [];
   let currentSection = null;
-  let fenced = false;
+  let fenceTicks = null;
 
   const flushBuffer = () => {
     if (!buffer.length) return;
@@ -7302,63 +7469,228 @@ function renderMarkdownLiteWithSections(value) {
     buffer = [];
   };
 
-  const THINKING_HEADER_RE = /^thinking\s*$/i;
+  const phaseLabel = (variant) => variant === "parameters" ? "Parameters" : "Details";
+
+  const markdownFenceMarker = (line) => {
+    const trimmedStart = String(line || "").trimStart();
+    if (!trimmedStart.startsWith("```")) return null;
+    const tickMatch = trimmedStart.match(/^`{3,}/);
+    if (!tickMatch) return null;
+    return {
+      tickCount: tickMatch[0].length,
+      info: trimmedStart.slice(tickMatch[0].length).trim(),
+    };
+  };
+
+  const nextFenceTicks = (activeTicks, line) => {
+    const marker = markdownFenceMarker(line);
+    if (!marker) return activeTicks;
+    if (activeTicks == null) return marker.tickCount;
+    if (!marker.info && marker.tickCount >= activeTicks) return null;
+    return activeTicks;
+  };
+
+  const thinkingHeader = (line) => {
+    const normalized = normalizeChatToolHeading(line);
+    if (/^thinking$/i.test(normalized)) return "Thinking";
+    if (/^reasoning$/i.test(normalized)) return "Reasoning";
+    if (/^analysis$/i.test(normalized)) return "Analysis";
+    return "";
+  };
+
+  const toolNameFromMarkdown = (text) => {
+    for (const line of String(text || "").split("\n")) {
+      const match = line.trim().match(/^\*\*Tool:\*\*\s*`([^`]+)`\s*$/i);
+      if (match?.[1]?.trim()) return match[1].trim();
+    }
+    return "";
+  };
+
+  const toolNameFromTitle = (title) => {
+    const match = String(title || "").trim().match(/^(.+?)\s*·\s*(?:Parameters|Details)$/i);
+    const name = match?.[1]?.trim() || "";
+    if (!name || /^Tool use(?:\s*·\s*Command)?$/i.test(name)) return "";
+    return name;
+  };
+
+  const titleWithPhase = (title, variant) => {
+    const phase = phaseLabel(variant);
+    if (title && /\b(?:Parameters|Details)$/i.test(title)) {
+      return title.replace(/\b(?:Parameters|Details)$/i, phase);
+    }
+    return `Tool use · ${phase}`;
+  };
+
+  const codeEditTitle = (action, path) => {
+    const cleanPath = String(path || "").trim();
+    if (/^create$/i.test(action)) return cleanPath ? `Code created · \`${cleanPath}\`` : "Code created";
+    if (/^delete$/i.test(action)) return cleanPath ? `Code deleted · \`${cleanPath}\`` : "Code deleted";
+    if (/^move$/i.test(action)) return cleanPath ? `Code moved · \`${cleanPath}\`` : "Code moved";
+    return cleanPath ? `Code edited · \`${cleanPath}\`` : "Code edit";
+  };
 
   const toolSectionHeader = (line) => {
     const normalized = normalizeChatToolHeading(line);
-    let match = normalized.match(/^(exec|tool)\s*\/\s*(Parameters|Details)\s*$/i);
+    let match = normalized.match(/^(exec|bash|shell(?:\s+command)?|command_execution|function_call(?:_output)?|custom_tool_call(?:_output)?)(?:\s*\/\s*(Parameters|Details))?\s*$/i);
     if (match) {
-      return { kind: match[1].toLowerCase(), variant: match[2].toLowerCase() };
+      const variant = (match[2] || "Parameters").toLowerCase();
+      return {
+        kind: "exec",
+        variant,
+        title: `Tool use · Command · ${phaseLabel(variant)}`,
+        toolish: true,
+      };
+    }
+    match = normalized.match(/^(tool|diff)\s*\/\s*(Parameters|Details)\s*$/i);
+    if (match) {
+      const variant = match[2].toLowerCase();
+      return {
+        kind: "tool",
+        variant,
+        title: `Tool use · ${phaseLabel(variant)}`,
+        toolish: true,
+      };
     }
     match = normalized.match(/^Tool use(?:\s*·\s*Command)?\s*·\s*(Parameters|Details)\s*$/i);
     if (match) {
+      const variant = match[1].toLowerCase();
       const kind = /\bCommand\b/i.test(normalized) ? "exec" : (currentSection?.kind || "tool");
-      return { kind, variant: match[1].toLowerCase() };
+      return {
+        kind,
+        variant,
+        title: /\bCommand\b/i.test(normalized)
+          ? `Tool use · Command · ${phaseLabel(variant)}`
+          : `Tool use · ${phaseLabel(variant)}`,
+        toolish: true,
+      };
+    }
+    match = normalized.match(/^(.+?)\s*·\s*(Parameters|Details)\s*$/i);
+    if (match) {
+      const variant = match[2].toLowerCase();
+      return {
+        kind: "tool",
+        variant,
+        title: `${match[1].trim()} · ${phaseLabel(variant)}`,
+        toolish: true,
+      };
     }
     match = normalized.match(/^(?:Command\s*·\s*)?(Parameters|Details)\s*$/i);
-    if (match && (currentSection?.kind === "exec" || currentSection?.kind === "tool")) {
-      return { kind: currentSection.kind, variant: match[1].toLowerCase() };
+    if (match && currentSection?.toolish) {
+      const variant = match[1].toLowerCase();
+      return {
+        kind: currentSection.kind,
+        variant,
+        title: titleWithPhase(currentSection.title, variant),
+        toolish: true,
+      };
+    }
+    match = normalized.match(/^(edit|create|delete|move)\s*\/\s*(.+)$/i);
+    if (match) {
+      return {
+        kind: "code",
+        variant: "details",
+        title: codeEditTitle(match[1], match[2]),
+        toolish: false,
+      };
+    }
+    match = normalized.match(/^(add file|update file|delete file|move to)\s*:\s*(.+)$/i);
+    if (match) {
+      const action = match[1].toLowerCase().startsWith("add")
+        ? "create"
+        : match[1].toLowerCase().startsWith("delete")
+          ? "delete"
+          : match[1].toLowerCase().startsWith("move")
+            ? "move"
+            : "edit";
+      return {
+        kind: "code",
+        variant: "details",
+        title: codeEditTitle(action, match[2]),
+        toolish: false,
+      };
+    }
+    match = normalized.match(/^(apply[_\s]+patch|patch\s*:.*|file_change(?:\s*\/\s*.+)?)(?:\s*\/\s*(Parameters|Details))?$/i);
+    if (match) {
+      return {
+        kind: "code",
+        variant: (match[2] || "Details").toLowerCase(),
+        title: "Code edit",
+        toolish: false,
+      };
     }
     return null;
   };
 
+  const formatSectionBody = (section) => {
+    const sourceLines = section.lines.slice();
+    if (!section.toolish || section.variant !== "parameters") {
+      return sourceLines.join("\n").trim();
+    }
+    let activeFenceTicks = null;
+    return sourceLines.map((line) => {
+      const commandHeading = activeFenceTicks == null &&
+        normalizeChatToolHeading(line).match(/^Command$/i) &&
+        line.trimStart().startsWith("#");
+      const output = commandHeading ? "**Command:**" : line;
+      activeFenceTicks = nextFenceTicks(activeFenceTicks, line);
+      return output;
+    }).join("\n").trim();
+  };
+
+  const canonicalizeToolTitles = () => {
+    let activeToolName = "";
+    for (const section of sections) {
+      if (!section || section.kind === "markdown" || section.kind === "thinking") continue;
+      if (!section.toolish) {
+        section.displayTitle = section.title || "Activity";
+        continue;
+      }
+      const body = section.lines.join("\n");
+      const toolName = toolNameFromMarkdown(body) || toolNameFromTitle(section.title) || activeToolName;
+      if (toolName) activeToolName = toolName;
+      const phase = phaseLabel(section.variant);
+      if (toolName) {
+        section.displayTitle = `${toolName} · ${phase}`;
+      } else if (/^Tool use\s*·\s*Command\s*·/i.test(section.title || "")) {
+        section.displayTitle = `Tool use · ${phase}`;
+      } else {
+        section.displayTitle = section.title || `Tool use · ${phase}`;
+      }
+    }
+  };
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const fenceBoundary = line.trimStart().startsWith("```");
-    const header = fenced ? null : toolSectionHeader(line);
+    const header = fenceTicks == null ? toolSectionHeader(line) : null;
     if (header) {
       flushBuffer();
-      currentSection = { kind: header.kind, variant: header.variant, lines: [] };
+      currentSection = { ...header, lines: [] };
       sections.push(currentSection);
       continue;
     }
-    if (!fenced && THINKING_HEADER_RE.test(line)) {
+    const thinkingTitle = fenceTicks == null ? thinkingHeader(line) : "";
+    if (thinkingTitle) {
       // `thinking` starts a reasoning block. Everything after the header
       // until the next blank line that precedes a non-thinking segment
       // (or the next structured header) belongs to the block.
       flushBuffer();
-      currentSection = { kind: "thinking", variant: "block", lines: [] };
+      currentSection = { kind: "thinking", variant: "block", title: thinkingTitle, lines: [] };
       sections.push(currentSection);
       continue;
     }
-    if (currentSection && /^[a-zA-Z]/.test(line) && !line.startsWith("```") && !line.match(/^\s+/)) {
-      const next = lines[i + 1];
-      if (next && (toolSectionHeader(next) || THINKING_HEADER_RE.test(next))) {
-        flushBuffer();
-        sections.push({ kind: "markdown", text: line });
-        continue;
-      }
+    if (currentSection && fenceTicks == null && isChatAssistantBoundary(line)) {
+      currentSection = null;
+      continue;
     }
     if (currentSection) {
       currentSection.lines.push(line);
     } else {
       buffer.push(line);
     }
-    if (fenceBoundary) {
-      fenced = !fenced;
-    }
+    fenceTicks = nextFenceTicks(fenceTicks, line);
   }
   flushBuffer();
+  canonicalizeToolTitles();
 
   const html = [];
   for (const section of sections) {
@@ -7368,7 +7700,7 @@ function renderMarkdownLiteWithSections(value) {
       const body = section.lines.join("\n").trim();
       html.push(
         `<details class="thinking-section"${chatDisplaySettings().expandThinking ? " open" : ""}>` +
-          `<summary><span class="thinking-title">Thinking</span></summary>` +
+          `<summary><span class="thinking-title">${escapeHtml(section.title || "Thinking")}</span></summary>` +
           `<div class="thinking-body">${renderMarkdownSegment(
             body || "*No reasoning captured.*"
           )}</div>` +
@@ -7376,10 +7708,8 @@ function renderMarkdownLiteWithSections(value) {
       );
     } else {
       const variant = section.variant === "parameters" ? "parameters" : "details";
-      const kindCap = section.kind.charAt(0).toUpperCase() + section.kind.slice(1);
-      const variantCap = section.variant.charAt(0).toUpperCase() + section.variant.slice(1);
-      const label = `${kindCap} / ${variantCap}`;
-      const body = section.lines.join("\n").trim();
+      const label = section.displayTitle || `${section.kind} / ${phaseLabel(variant)}`;
+      const body = formatSectionBody(section);
       const open = variant === "parameters" && chatDisplaySettings().expandParameters;
       html.push(
         `<details class="exec-section exec-${variant}"${open ? " open" : ""}>` +
@@ -8892,7 +9222,7 @@ async function runTool(event) {
     commands: "/api/commands/run",
     plugins: "/api/plugins/run",
     taskmaster: "/api/taskmaster/run",
-    danger: "/api/danger/run",
+    danger: "/api/danger/boards",
     notifications: "/api/notifications/push",
   }[kind];
   const payload = parseJsonField("#tool-payload", {});
@@ -10113,7 +10443,16 @@ function connectWs() {
         };
         const finalizeBubble = (entry) => {
           if (chatStream.node && chatStream.role === "assistant") {
+            renderChatResponseHeader(chatStream.node, entry);
             renderChatLineFooter(chatStream.node.querySelector(".chat-line-footer"), entry);
+            const copyContent = withoutChatToolTelemetrySections(
+              assistantResponseContent(
+                state.chatBuffer,
+                entry.cli || payload.provider || chatCliValue(),
+                lastChatUserPromptContent(),
+              ),
+            );
+            attachAssistantChatActions(chatStream.node, copyContent);
           }
         };
         if (sid) {
@@ -10261,7 +10600,16 @@ function connectWs() {
         }
         if (state.chatSessionId === sid || state.pendingChatSessionId === sid) {
           if (chatStream.node && chatStream.role === "assistant") {
+            renderChatResponseHeader(chatStream.node, entry);
             renderChatLineFooter(chatStream.node.querySelector(".chat-line-footer"), entry);
+            const copyContent = withoutChatToolTelemetrySections(
+              assistantResponseContent(
+                state.chatBuffer,
+                entry.cli || payload.provider || chatCliValue(),
+                lastChatUserPromptContent(),
+              ),
+            );
+            attachAssistantChatActions(chatStream.node, copyContent);
           }
         }
       }
@@ -10540,50 +10888,30 @@ async function refreshCurrentView() {
 
 const BOARD_COLUMNS = [
   { id: "backlog", title: "Backlog", description: "Needs human approval" },
-  { id: "todo", title: "Todo", description: "Ready to run" },
+  { id: "todo", title: "Todo", description: "Ready to start" },
   { id: "active", title: "In Progress", description: "Currently executing" },
-  { id: "review", title: "QA", description: "Validation and fixes" },
   { id: "blocked", title: "Blocked", description: "Waiting on other tasks" },
   { id: "done", title: "Done", description: "Completed groups" },
 ];
-
-function boardSelectedStorageKey(projectPath = activeProjectPath()) {
-  return `iowb.boardSelectedRunId.${projectPath || "default"}`;
-}
-
-function boardSelectedRunId(projectPath = activeProjectPath()) {
-  return window.localStorage.getItem(boardSelectedStorageKey(projectPath)) || state.boardSelectedRunId || "";
-}
-
-function setBoardSelectedRunId(runId, projectPath = activeProjectPath()) {
-  state.boardSelectedRunId = runId || "";
-  window.localStorage.setItem("iowb.boardSelectedRunId", state.boardSelectedRunId);
-  if (projectPath) window.localStorage.setItem(boardSelectedStorageKey(projectPath), state.boardSelectedRunId);
-}
 
 async function loadBoard() {
   const projectPath = activeProjectPath();
   const label = qs("#board-project-label");
   if (label) label.textContent = projectPath ? selectedProjectLabel("#active-project") : "No project selected";
   if (!projectPath) {
-    state.boardRuns = [];
-    state.boardRun = null;
+    state.board = null;
     renderBoard();
     return;
   }
   state.boardLoading = true;
   renderBoard();
   try {
-    const query = new URLSearchParams({ projectPath, includeHistory: "true" });
-    const body = await api(`/api/danger/runs?${query.toString()}`);
-    state.boardRuns = Array.isArray(body.runs) ? body.runs : [];
-    let runId = boardSelectedRunId(projectPath);
-    if (!state.boardRuns.some((run) => run.id === runId)) {
-      runId = state.boardRuns[0]?.id || "";
-      setBoardSelectedRunId(runId, projectPath);
-    }
-    state.boardRun = runId ? await loadBoardRunDetail(runId) : null;
-    rememberBoardChatSessionIds(state.boardRun);
+    const query = new URLSearchParams({ projectPath });
+    const body = await api(`/api/danger/boards?${query.toString()}`);
+    const boards = Array.isArray(body.boards) ? body.boards : [];
+    const boardId = boards[0]?.id || "";
+    state.board = boardId ? await loadBoardDetail(boardId) : null;
+    rememberBoardChatSessionIds(state.board);
     hideBoardChatSessionsFromLists();
   } finally {
     state.boardLoading = false;
@@ -10591,9 +10919,9 @@ async function loadBoard() {
   }
 }
 
-async function loadBoardRunDetail(runId) {
-  const body = await api(`/api/danger/runs/${encodeURIComponent(runId)}`);
-  return body.run || null;
+async function loadBoardDetail(boardId) {
+  const body = await api(`/api/danger/boards/${encodeURIComponent(boardId)}`);
+  return body.board || null;
 }
 
 function rememberBoardChatSessionIds(run) {
@@ -10604,11 +10932,10 @@ function rememberBoardChatSessionIds(run) {
 }
 
 function renderBoard() {
-  renderBoardRunSelect();
-  renderBoardRunControls();
+  renderBoardControls();
   const status = qs("#board-status");
   const columns = qs("#board-columns");
-  const details = qs("#board-run-details");
+  const details = qs("#board-details");
   if (!columns) return;
   const projectPath = activeProjectPath();
   if (!projectPath) {
@@ -10623,14 +10950,16 @@ function renderBoard() {
     columns.innerHTML = "";
     return;
   }
-  if (!state.boardRun) {
+  if (!state.board) {
     if (status) status.textContent = "No board for this project yet.";
     if (details) details.innerHTML = "";
     columns.innerHTML = BOARD_COLUMNS.map((column) => renderBoardColumn(column, [])).join("");
     return;
   }
-  const run = state.boardRun;
-  const tasks = Array.isArray(run.tasks) ? run.tasks : [];
+  const run = state.board;
+  const tasks = (Array.isArray(run.tasks) ? run.tasks : []).filter((task) => {
+    return boardColumnForTask(task) !== "backlog" || boardTaskIsPlanningLevel(task);
+  });
   if (status) {
     status.innerHTML = `
       <strong>${escapeHtml(run.projectName || "Project board")}</strong>
@@ -10641,16 +10970,25 @@ function renderBoard() {
       <span>RAG ${run.ragEnabled ? "on" : "off"} · ${escapeHtml(run.ragQueryCount || 0)} queries</span>
     `;
   }
-  if (details) details.innerHTML = renderBoardRunDetails(run);
+  if (details) details.innerHTML = renderBoardDetails(run);
   const byColumn = new Map(BOARD_COLUMNS.map((column) => [column.id, []]));
-  tasks.forEach((task) => {
+  tasks.filter((task) => boardColumnForTask(task) === "backlog").forEach((task) => {
     byColumn.get(boardColumnForTask(task))?.push(task);
   });
-  columns.innerHTML = BOARD_COLUMNS.map((column) => renderBoardColumn(column, byColumn.get(column.id) || [])).join("");
+  const groupedColumns = new Map(BOARD_COLUMNS.map((column) => [column.id, []]));
+  boardTaskGroupsForDisplay(run, tasks).forEach((group) => {
+    const column = boardColumnForGroup(group);
+    if (column !== "backlog") groupedColumns.get(column)?.push(group);
+  });
+  columns.innerHTML = BOARD_COLUMNS.map((column) => {
+    const items = column.id === "backlog"
+      ? byColumn.get(column.id) || []
+      : groupedColumns.get(column.id) || [];
+    return renderBoardColumn(column, items, column.id === "backlog" ? renderBoardCard : renderBoardGroupCard);
+  }).join("");
 }
 
-function renderBoardRunDetails(run) {
-  const requirements = Array.isArray(run.requirementMatrix) ? run.requirementMatrix : [];
+function renderBoardDetails(run) {
   const validations = Array.isArray(run.validationRuns) ? run.validationRuns : [];
   const promotions = Array.isArray(run.promotionCandidates) ? run.promotionCandidates : [];
   const finalReview = run.finalReview || {};
@@ -10662,16 +11000,14 @@ function renderBoardRunDetails(run) {
   const autoRetry = run.autoRetry || {};
   const latestValidations = validations.slice(-4).reverse();
   const latestPromotions = promotions.slice(-4).reverse();
-  const requirementCounts = requirements.reduce((counts, requirement) => {
-    const status = requirement.status || "unknown";
-    counts[status] = (counts[status] || 0) + 1;
-    return counts;
-  }, {});
+  const breakdownTranscript = Array.isArray(run.backlogBreakdown?.transcript)
+    ? run.backlogBreakdown.transcript
+    : [];
   return `
-    <section class="board-run-details-grid">
+    <section class="board-details-grid">
       <article>
         <h3>Strategy</h3>
-        <p>${escapeHtml(statusLabel(run.runProfile || "complete_app"))} · ${escapeHtml(statusLabel(modelStrategy.mode || "manual"))}</p>
+        <p>${escapeHtml(statusLabel(run.boardProfile || "complete_app"))} · ${escapeHtml(statusLabel(modelStrategy.mode || "manual"))}</p>
         <p>${escapeHtml(statusLabel(run.sessionPolicy || "continuous"))} · ${escapeHtml(statusLabel(run.gitPolicy || "read_only"))}</p>
         <p>Cheap: ${escapeHtml(modelStrategy.cheapModel || "provider default")}</p>
         <p>Expensive: ${escapeHtml(modelStrategy.expensiveModel || "provider default")}</p>
@@ -10684,15 +11020,10 @@ function renderBoardRunDetails(run) {
         <p>Max fixes: ${escapeHtml(tddPolicy.maxFixAttempts ?? 3)}</p>
       </article>
       <article>
-        <h3>Requirements</h3>
-        <p>${escapeHtml(requirements.length)} total</p>
-        <p>${Object.entries(requirementCounts).map(([key, value]) => `${escapeHtml(key)} ${escapeHtml(value)}`).join(" · ") || "No matrix yet"}</p>
-      </article>
-      <article>
         <h3>Validation</h3>
         <p>${validationConfig.enabled === false ? "Disabled" : "Enabled"} · timeout ${escapeHtml(validationConfig.timeoutSeconds || 120)}s</p>
         <p>Limits: feature ${escapeHtml(validationConfig.maxFeatureCommands ?? 2)} · final ${escapeHtml(validationConfig.maxFinalCommands ?? 4)} · QA ${escapeHtml(validationConfig.maxQaCommands ?? 2)}</p>
-        ${latestValidations.length ? latestValidations.map((item) => `<p>${escapeHtml(item.stage || item.command || "validation")} · ${item.passed === false ? "fail" : "pass"}</p>`).join("") : "<p>No validation runs yet</p>"}
+        ${latestValidations.length ? latestValidations.map((item) => `<p>${escapeHtml(item.stage || item.command || "validation")} · ${item.passed === false ? "fail" : "pass"}</p>`).join("") : "<p>No validation yet</p>"}
       </article>
       <article>
         <h3>RAG</h3>
@@ -10703,6 +11034,7 @@ function renderBoardRunDetails(run) {
         <h3>QA Policy</h3>
         <p>${escapeHtml(statusLabel(qaPolicy.taskQaMode || "high_risk"))}</p>
         <p>Follow-ups: ${escapeHtml(qaPolicy.maxFollowupsPerGroup ?? 3)} · attempts: ${escapeHtml(qaPolicy.maxTaskAttempts ?? 2)}</p>
+        <p>Tool repair: ${qaPolicy.repairMalformedToolCalls === false ? "off" : "on"} · retries ${escapeHtml(qaPolicy.malformedToolCallRepairRetries ?? 1)}</p>
       </article>
       <article>
         <h3>Auto Retry</h3>
@@ -10723,42 +11055,27 @@ function renderBoardRunDetails(run) {
         <p>${finalReview.complete === true ? "Complete" : finalReview.complete === false ? "Incomplete" : "Pending"}</p>
         ${finalReview.summary ? `<p>${escapeHtml(finalReview.summary)}</p>` : ""}
       </article>
+      ${breakdownTranscript.length ? `<article><h3>Board discussion</h3><button type="button" data-board-view-transcript="breakdown">View transcript</button></article>` : ""}
     </section>
   `;
 }
 
-function renderBoardRunSelect() {
-  const select = qs("#board-run-select");
-  if (!select) return;
-  if (!state.boardRuns.length) {
-    select.innerHTML = `<option value="">No boards</option>`;
-    select.disabled = true;
-    return;
-  }
-  select.disabled = false;
-  const selected = state.boardRun?.id || boardSelectedRunId();
-  select.innerHTML = state.boardRuns.map((run) => {
-    const title = `${run.projectName || "Board"} · ${formatShortDate(run.updatedAt || run.createdAt)}`;
-    return `<option value="${escapeHtml(run.id)}"${run.id === selected ? " selected" : ""}>${escapeHtml(title)}</option>`;
-  }).join("");
-}
-
-function renderBoardRunControls() {
-  const run = state.boardRun;
+function renderBoardControls() {
+  const run = state.board;
   const status = String(run?.status || "").toLowerCase();
   const hasRun = Boolean(run?.id);
   const running = hasRun && ["running", "planning", "in_progress"].includes(status);
   const terminal = hasRun && ["completed", "cancelled", "failed"].includes(status);
-  const hasTodo = Array.isArray(run?.tasks) && run.tasks.some((task) => ["pending", "planned"].includes(String(task.status || "").toLowerCase()));
-  const resume = qs("#board-run-resume");
-  const pause = qs("#board-run-pause");
-  const abort = qs("#board-run-abort");
+  const hasTodo = Array.isArray(run?.tasks) && run.tasks.some((task) => ["todo", "pending", "planned"].includes(String(task.status || "").toLowerCase()));
+  const resume = qs("#board-resume");
+  const pause = qs("#board-pause");
+  const abort = qs("#board-abort");
   if (resume) resume.disabled = !hasRun || running || (terminal && !hasTodo);
   if (pause) pause.disabled = !hasRun || !running;
   if (abort) abort.disabled = !hasRun || terminal;
 }
 
-function renderBoardColumn(column, tasks) {
+function renderBoardColumn(column, items, renderer = renderBoardCard) {
   return `
     <section class="board-column" data-board-column="${escapeHtml(column.id)}">
       <header>
@@ -10766,12 +11083,92 @@ function renderBoardColumn(column, tasks) {
           <h3>${escapeHtml(column.title)}</h3>
           <span>${escapeHtml(column.description)}</span>
         </div>
-        <strong>${tasks.length}</strong>
+        <strong>${items.length}</strong>
       </header>
       <div class="board-card-list">
-        ${tasks.length ? tasks.map(renderBoardCard).join("") : `<div class="board-empty-column">No cards</div>`}
+        ${items.length ? items.map(renderer).join("") : `<div class="board-empty-column">No cards</div>`}
       </div>
     </section>
+  `;
+}
+
+function boardTaskGroupId(task) {
+  return String(task?.groupId || task?.group_id || task?.id || "").trim();
+}
+
+function boardTaskGroupsForDisplay(run, tasks) {
+  const sourceTasks = (Array.isArray(run?.tasks) ? run.tasks : tasks).filter((task) => {
+    return !task?.backlogGenerationTask
+      && !(Number(run?.orchestrationVersion || 0) >= 2 && task?.internalValidation);
+  });
+  const byId = new Map(sourceTasks.map((task) => [String(task?.id || ""), task]));
+  const apiGroups = Array.isArray(run?.taskGroups) ? run.taskGroups : [];
+  const groups = apiGroups.map((group) => {
+    const groupTasks = Array.isArray(group?.subtasks)
+      ? group.subtasks.map((task) => byId.get(String(task?.id || "")) || task).filter(Boolean)
+      : Array.isArray(group?.taskIds)
+        ? group.taskIds.map((id) => byId.get(String(id || ""))).filter(Boolean)
+        : [];
+    if (!groupTasks.length) return null;
+    return { ...group, subtasks: groupTasks };
+  }).filter(Boolean);
+  if (groups.length) return groups;
+
+  const grouped = new Map();
+  sourceTasks.forEach((task) => {
+    const id = boardTaskGroupId(task);
+    if (!id) return;
+    if (!grouped.has(id)) grouped.set(id, []);
+    grouped.get(id).push(task);
+  });
+  return [...grouped.entries()].map(([id, subtasks]) => ({ id, subtasks }));
+}
+
+function boardGroupPrimaryTask(group) {
+  const subtasks = Array.isArray(group?.subtasks) ? group.subtasks : [];
+  const primaryId = String(group?.primaryTaskId || "").trim();
+  return subtasks.find((task) => String(task?.id || "") === primaryId)
+    || subtasks.find((task) => !boardTaskParentId(task))
+    || subtasks.find((task) => boardTaskIsPlanningLevel(task))
+    || subtasks[0]
+    || null;
+}
+
+function boardColumnForGroup(group) {
+  const status = String(group?.status || "").trim().toLowerCase();
+  if (["running", "in_progress", "pausing", "cancelling"].includes(status)) return "active";
+  if (["blocked", "failed", "cancelled"].includes(status)) return "blocked";
+  if (["done", "completed"].includes(status)) return "done";
+  if (status === "backlog") return "backlog";
+  if (status === "todo" || status === "pending" || status === "planned") return "todo";
+  const subtasks = Array.isArray(group?.subtasks) ? group.subtasks : [];
+  if (subtasks.some((task) => boardColumnForTask(task) === "active")) return "active";
+  if (subtasks.some((task) => boardColumnForTask(task) === "blocked")) return "blocked";
+  if (subtasks.some((task) => boardColumnForTask(task) === "todo")) return "todo";
+  if (subtasks.length && subtasks.every((task) => boardColumnForTask(task) === "done")) return "done";
+  return "backlog";
+}
+
+function renderBoardGroupCard(group) {
+  const subtasks = Array.isArray(group?.subtasks) ? group.subtasks : [];
+  const primary = boardGroupPrimaryTask(group);
+  if (!primary) return "";
+  const children = subtasks.filter((task) => String(task?.id || "") !== String(primary?.id || ""));
+  const completed = children.filter((task) => boardColumnForTask(task) === "done").length;
+  const total = children.length;
+  return `
+    <article class="board-feature-card" data-board-group-id="${escapeHtml(group.id || boardTaskGroupId(primary))}">
+      <header class="board-feature-header">
+        <div>
+          <span class="badge board-ticket-type">${escapeHtml(statusLabel(boardTaskLevel(primary)))}</span>
+          <span class="badge">Feature group</span>
+          <strong>${escapeHtml(group.title || primary.title || primary.id || "Work item")}</strong>
+        </div>
+        <span class="board-feature-progress">${escapeHtml(total ? `${completed}/${total} nested work complete` : "No nested work")}</span>
+      </header>
+      <div class="board-feature-primary">${renderBoardCard(primary, { nested: true })}</div>
+      ${children.length ? `<div class="board-feature-children"><h5>Nested work</h5>${children.map((task) => renderBoardCard(task, { nested: true })).join("")}</div>` : ""}
+    </article>
   `;
 }
 
@@ -10786,12 +11183,55 @@ function boardTaskSessionId(task) {
 }
 
 function boardTaskChatAvailable(task) {
-  const provider = String(task?.provider || state.boardRun?.provider || "").trim().toLowerCase();
+  const provider = String(task?.provider || state.board?.provider || "").trim().toLowerCase();
   return Boolean(boardTaskSessionId(task)) && provider !== "cursor";
 }
 
-async function openBoardTaskChat(taskId) {
-  const task = (state.boardRun?.tasks || []).find((item) => item.id === taskId);
+async function loadBoardSessionTranscript(sessionId) {
+  const id = String(sessionId || "").trim();
+  if (!id) return [];
+  const body = await api(`/api/sessions/${encodeURIComponent(id)}/snapshot?limit=${CHAT_HISTORY_PAGE_SIZE}`);
+  const firstPage = Array.isArray(body) ? body : (body?.messages || []);
+  const totalCount = Number(body?.total_count ?? body?.totalCount ?? firstPage.length) || firstPage.length;
+  let messages = firstPage;
+  let offset = Math.max(0, totalCount - firstPage.length);
+  while (offset > 0) {
+    const nextOffset = Math.max(0, offset - CHAT_HISTORY_PAGE_SIZE);
+    const page = await api(
+      `/api/sessions/${encodeURIComponent(id)}/messages?limit=${offset - nextOffset}&offset=${nextOffset}`,
+    );
+    const older = Array.isArray(page) ? page : (page?.messages || []);
+    if (!older.length) break;
+    messages = older.concat(messages);
+    if (older.length >= offset) break;
+    offset = nextOffset;
+  }
+  return messages;
+}
+
+async function openBoardTaskTranscript(taskId) {
+  const task = (state.board?.tasks || []).find((item) => String(item?.id || "") === String(taskId || ""));
+  if (!task) throw new Error("This board task is no longer available. Refresh the board and try again.");
+  const embeddedTranscript = Array.isArray(task.transcript) ? task.transcript : [];
+  if (embeddedTranscript.length) {
+    openBoardTranscriptModal(`${task.title || task.id} transcript`, embeddedTranscript);
+    return;
+  }
+  const sessionId = boardTaskSessionId(task);
+  if (!boardTaskChatAvailable(task)) {
+    throw new Error(sessionId
+      ? "Cursor task chats are not available in the Workbench chat viewer yet."
+      : "This task does not have a chat session yet.");
+  }
+  state.boardChatSessionIds.add(sessionId);
+  hideBoardChatSessionsFromLists();
+  const transcript = await loadBoardSessionTranscript(sessionId);
+  openBoardTranscriptModal(`${task.title || task.id} transcript`, transcript);
+  hideBoardChatSessionsFromLists();
+}
+
+async function openBoardTaskChatSession(taskId) {
+  const task = (state.board?.tasks || []).find((item) => String(item?.id || "") === String(taskId || ""));
   if (!task) throw new Error("This board task is no longer available. Refresh the board and try again.");
   const sessionId = boardTaskSessionId(task);
   if (!boardTaskChatAvailable(task)) {
@@ -10801,58 +11241,71 @@ async function openBoardTaskChat(taskId) {
   }
   state.boardChatSessionIds.add(sessionId);
   hideBoardChatSessionsFromLists();
-  await pickChatSession(sessionId, state.boardRun?.projectPath || activeProjectPath(), {
-    boardSession: true,
-    forceSnapshot: true,
-  });
-  hideBoardChatSessionsFromLists();
-  renderProjects();
+  await pickChatSession(
+    sessionId,
+    state.board?.projectPath || activeProjectPath(),
+    { boardSession: true, forceSnapshot: true },
+  );
 }
 
-function renderBoardCard(task) {
+function renderBoardCard(task, options = {}) {
+  const nested = options.nested === true;
   const status = String(task.status || "backlog");
   const details = task.details || task.description || task.prompt || "";
   const references = Array.isArray(task.references) ? task.references : [];
   const acceptance = Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria : [];
-  const ragRefs = Array.isArray(task.ragContextRefs) ? task.ragContextRefs : [];
-  const qaTests = Array.isArray(task.qaTestPaths) ? task.qaTestPaths : [];
-  const qaCommands = Array.isArray(task.qaTestCommands) ? task.qaTestCommands : [];
-  const baselinePassed = task.qaBaselineValidation?.passed;
-  const tddPhase = task.tddPhase || "";
+  const sideEffects = boardTaskSideEffects(task);
+  const sideEffectsPending = sideEffects.length > 0 && task.sideEffectsApproved !== true;
+  const researchPending = boardTaskKind(task) === "research"
+    && boardTaskColumnStatus(task) === "done"
+    && task.researchAccepted !== true;
   const taskSessionId = boardTaskSessionId(task);
+  const transcriptAvailable = Array.isArray(task.transcript) && task.transcript.length > 0;
+  const chatSessionAvailable = Boolean(taskSessionId && boardTaskChatAvailable(task));
+  const level = boardTaskLevel(task);
+  const kind = boardTaskKind(task);
+  const breadcrumb = boardTaskBreadcrumb(task, state.board?.tasks || []);
+  const blockers = boardTaskBlockers(task);
+  const affectedDescendants = boardTaskScopeEffectDescendants(task);
   return `
-    <article class="board-card" data-board-task-id="${escapeHtml(task.id)}">
+    <article class="board-card${nested ? " board-card-nested" : ""}" data-board-task-id="${escapeHtml(task.id)}">
       <div class="board-card-topline">
-        <span class="badge">${escapeHtml(statusLabel(status))}</span>
+        <span class="badge">${escapeHtml(statusLabel(level))}</span>
+        <span class="badge">${escapeHtml(statusLabel(kind))}</span>
         <span>${escapeHtml(task.priority || "medium")}</span>
       </div>
-      <div class="board-card-signals">
-        ${tddPhase ? `<span class="badge ${tddPhase === "done" ? "ok" : tddPhase.includes("blocked") || tddPhase.includes("review") ? "danger" : "warn"}">TDD ${escapeHtml(statusLabel(tddPhase))}</span>` : ""}
-        ${qaTests.length || qaCommands.length ? `<span class="badge">Tests ${escapeHtml(qaTests.length || qaCommands.length)}</span>` : ""}
-        ${baselinePassed === false ? `<span class="badge danger">Baseline failed</span>` : baselinePassed === true ? `<span class="badge ok">Baseline passed</span>` : ""}
-        ${ragRefs.length ? `<span class="badge">RAG ${escapeHtml(ragRefs.length)}</span>` : ""}
-        ${task.fixAttempts ? `<span class="badge warn">Fix ${escapeHtml(task.fixAttempts)}</span>` : ""}
-      </div>
       <h4>${escapeHtml(task.title || task.id || "Task")}</h4>
+      ${breadcrumb ? `<p class="board-card-breadcrumb">${escapeHtml(breadcrumb)}</p>` : ""}
       ${details ? `<p>${escapeHtml(details)}</p>` : ""}
+      ${blockers.length ? `<p class="board-card-blockers">Blocked by: ${escapeHtml(blockers.join(", "))}</p>` : ""}
       ${acceptance.length ? `<ul>${acceptance.slice(0, 3).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}
       ${references.length ? `<div class="board-card-meta">${references.slice(0, 3).map((item) => `<code>${escapeHtml(item)}</code>`).join("")}</div>` : ""}
+      ${sideEffectsPending ? `<p class="board-card-blockers">External side-effect approval required</p>` : ""}
+      ${researchPending ? `<p class="board-card-blockers">Research output awaits acceptance</p>` : ""}
+      ${affectedDescendants.length && boardTaskColumnStatus(task) !== "done" ? `<p class="board-card-blockers">${affectedDescendants.length} generated descendant${affectedDescendants.length === 1 ? "" : "s"} recorded effects; resolve before changing scope</p>` : ""}
       <div class="board-card-actions">
-        ${taskSessionId && boardTaskChatAvailable(task) ? `<button type="button" data-board-open-chat="${escapeHtml(task.id)}">Open chat</button>` : ""}
+        <button type="button" data-board-open-details="${escapeHtml(task.id)}">View details</button>
+        <button type="button" data-board-discuss-task="${escapeHtml(task.id)}">Discuss</button>
+        ${boardTaskCanBreakdown(task) ? `<button type="button" data-board-breakdown-task="${escapeHtml(task.id)}">Breakdown</button>` : ""}
+        ${chatSessionAvailable ? `<button type="button" data-board-open-chat-session="${escapeHtml(task.id)}">View chat session</button>` : ""}
+        ${transcriptAvailable ? `<button type="button" data-board-view-transcript="${escapeHtml(task.id)}">View transcript</button>` : ""}
         ${boardMoveButton(task, "backlog", "Backlog")}
         ${boardMoveButton(task, "pending", "Todo")}
-        ${boardMoveButton(task, "in_progress", "Progress")}
-        ${boardMoveButton(task, "qa", "QA")}
-        ${boardMoveButton(task, "blocked", "Block")}
-        ${boardMoveButton(task, "completed", "Done")}
-        <button type="button" class="danger" data-board-delete-task="${escapeHtml(task.id)}">Delete</button>
       </div>
     </article>
   `;
 }
 
 function boardMoveButton(task, status, label) {
-  if (String(task.status || "") === status) return "";
+  const current = String(task?.status || "backlog").trim().toLowerCase();
+  const normalizedCurrent = ["pending", "planned"].includes(current) ? "todo" : current;
+  const normalizedTarget = status === "pending" ? "todo" : status;
+  if (normalizedCurrent === normalizedTarget) return "";
+  if (normalizedTarget === "todo" && ["blocked", "failed"].includes(normalizedCurrent)) {
+    return `<button type="button" data-board-retry-task="${escapeHtml(task.id)}">Retry transient failure</button>`;
+  }
+  if (normalizedTarget === "todo" && normalizedCurrent !== "backlog") return "";
+  if (normalizedTarget === "backlog" && normalizedCurrent !== "todo") return "";
   return `<button type="button" data-board-task-status="${escapeHtml(status)}" data-board-task-id="${escapeHtml(task.id)}">${escapeHtml(label)}</button>`;
 }
 
@@ -10862,8 +11315,581 @@ function boardColumnForTask(task) {
   if (status === "completed" || status === "done") return "done";
   if (status === "blocked" || status === "failed" || status === "cancelled") return "blocked";
   if (status === "running" || status === "in_progress" || status === "pausing" || status === "cancelling") return "active";
-  if (status === "qa" || status === "review" || String(task.tddPhase || "").startsWith("qa") || task.qaTask || task.finalQaTask || task.qaFixTask || task.taskLevelQa) return "review";
   return "todo";
+}
+
+function boardTaskLevel(task) {
+  const explicit = String(task?.level || task?.hierarchyLevel || task?.hierarchy_level || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("-", "_")
+    .replaceAll(" ", "_");
+  if (["initiative", "epic", "story", "task", "subtask"].includes(explicit)) return explicit;
+  return task?.executable || task?.parentId || task?.parent_id ? "subtask" : "story";
+}
+
+function boardTaskIsPlanningLevel(task) {
+  return ["initiative", "epic", "story"].includes(boardTaskLevel(task));
+}
+
+function boardTaskCanBreakdown(task) {
+  const level = boardTaskLevel(task);
+  const status = String(task?.status || "backlog").trim().toLowerCase();
+  const failure = String(firstDefined(task?.error, task?.summary, "") || "").trim()
+    .replace(/^Planning error:\s*/i, "");
+  const retryablePlanningFailure = ["blocked", "failed"].includes(status)
+    && failure.toLowerCase().startsWith("hierarchy breakdown ");
+  return ["initiative", "epic", "story", "task"].includes(level)
+    && (["backlog", "todo", "pending", "planned"].includes(status) || retryablePlanningFailure);
+}
+
+function boardTaskKind(task) {
+  const explicit = String(task?.kind || task?.taskType || task?.task_type || "implementation").trim().toLowerCase();
+  if (task?.qaFixTask || task?.sourceQaTaskId || explicit === "qa_fix") return "fix";
+  if (task?.followupTask || explicit === "followup") return "followup";
+  if (task?.qaTask || task?.finalQaTask || task?.taskLevelQa || ["qa", "final_qa"].includes(explicit)) return "qa";
+  return explicit.replaceAll("-", "_").replaceAll(" ", "_") || "implementation";
+}
+
+function boardTaskColumnStatus(task) {
+  return boardColumnForTask(task) === "done" ? "done" : String(task?.status || "backlog").toLowerCase();
+}
+
+function boardTaskSideEffects(task) {
+  const value = Array.isArray(task?.sideEffects) ? task.sideEffects : [];
+  return [...new Set(value.map((item) => {
+    if (typeof item === "string") return item.trim();
+    return String(item?.name || item?.title || item?.path || item?.description || "").trim();
+  }).filter(Boolean))];
+}
+
+function boardTaskSideEffectEvidence(task) {
+  const value = Array.isArray(task?.sideEffectEvidence) ? task.sideEffectEvidence : [];
+  return value.map((item) => typeof item === "string"
+    ? item.trim()
+    : String(item?.description || item?.summary || item?.name || "").trim()).filter(Boolean);
+}
+
+function boardTaskHasRecordedEffects(task) {
+  return [
+    task?.changedFiles,
+    task?.sideEffectEvidence,
+  ].some((value) => Array.isArray(value) && value.length > 0);
+}
+
+function boardTaskScopeEffectDescendants(task) {
+  const rootId = String(task?.id || "").trim();
+  if (!rootId) return [];
+  const tasks = Array.isArray(state.board?.tasks) ? state.board.tasks : [];
+  const descendants = [];
+  let frontier = new Set([rootId]);
+  const seen = new Set([rootId]);
+  while (frontier.size) {
+    const children = tasks.filter((candidate) => {
+      const candidateId = String(candidate?.id || "").trim();
+      return candidateId && !seen.has(candidateId) && frontier.has(boardTaskParentId(candidate));
+    });
+    if (!children.length) break;
+    descendants.push(...children);
+    children.forEach((candidate) => seen.add(String(candidate.id)));
+    frontier = new Set(children.map((candidate) => String(candidate.id)));
+  }
+  return descendants.filter(boardTaskHasRecordedEffects);
+}
+
+function boardApprovedFixTaskId(task) {
+  const failedId = String(task?.id || "").trim();
+  if (!failedId) return "";
+  const tasks = Array.isArray(state.board?.tasks) ? state.board.tasks : [];
+  const fix = tasks.find((candidate) => {
+    const sourceId = String(candidate?.sourceTaskId || candidate?.source_task_id || candidate?.sourceQaTaskId || candidate?.source_qa_task_id || "").trim();
+    const status = boardTaskColumnStatus(candidate);
+    return String(candidate?.id || "").trim()
+      && String(candidate.id).trim() !== failedId
+      && boardTaskKind(candidate) === "fix"
+      && sourceId === failedId
+      && ["todo", "active", "done"].includes(status);
+  });
+  return String(fix?.id || "").trim();
+}
+
+function boardTaskIsUserCreatedChild(task) {
+  return (task?.manualTask === true || String(task?.taskOrigin || "") === "user_manual")
+    && Boolean(boardTaskParentId(task))
+    && boardTaskColumnStatus(task) === "backlog";
+}
+
+function boardTaskParentId(task) {
+  return String(task?.parentId || task?.parent_id || "").trim();
+}
+
+function boardTaskBreadcrumbParentId(task) {
+  const explicitParentId = boardTaskParentId(task);
+  if (explicitParentId) return explicitParentId;
+  const sourceId = String(task?.sourceTaskId || task?.source_task_id || "").trim();
+  if (!sourceId) return "";
+  const kind = boardTaskKind(task);
+  return ["qa", "fix", "followup", "review"].includes(kind) ? sourceId : "";
+}
+
+function boardTaskBreadcrumb(task, tasks) {
+  const byId = new Map((tasks || []).map((item) => [String(item.id || ""), item]));
+  const labels = [];
+  const seen = new Set();
+  let current = task;
+  while (current) {
+    const id = String(current.id || "");
+    if (id && seen.has(id)) break;
+    if (id) seen.add(id);
+    const title = String(current.title || current.details || current.description || "").trim();
+    if (title) labels.unshift(title);
+    const parentId = boardTaskBreadcrumbParentId(current);
+    current = parentId ? byId.get(parentId) : null;
+  }
+  return labels.join(" > ");
+}
+
+function boardTaskDescendants(task, tasks) {
+  const rootId = String(task?.id || "").trim();
+  if (!rootId) return [];
+  const childrenByParent = new Map();
+  (tasks || []).forEach((candidate) => {
+    const candidateId = String(candidate?.id || "").trim();
+    const parentId = boardTaskParentId(candidate);
+    if (!candidateId || !parentId) return;
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push(candidate);
+  });
+  const descendants = [];
+  const seen = new Set([rootId]);
+  const visit = (parentId, depth) => {
+    (childrenByParent.get(parentId) || []).forEach((child) => {
+      const childId = String(child?.id || "").trim();
+      if (!childId || seen.has(childId)) return;
+      seen.add(childId);
+      descendants.push({ task: child, depth });
+      visit(childId, depth + 1);
+    });
+  };
+  visit(rootId, 0);
+  return descendants;
+}
+
+function boardTaskBlockers(task) {
+  const values = Array.isArray(task?.blockedBy)
+    ? task.blockedBy
+    : Array.isArray(task?.dependsOn)
+      ? task.dependsOn
+      : [];
+  return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
+}
+
+function renderBoardNestedWork(task) {
+  const descendants = boardTaskDescendants(task, state.board?.tasks || []);
+  if (!descendants.length) return "";
+  return `
+    <section class="board-nested-work">
+      <h3>Nested work</h3>
+      <p class="board-nested-work-note">Tasks and subtasks stay inside this parent detail and do not appear as top-level Backlog cards.</p>
+      <div class="board-nested-work-list">
+        ${descendants.map(({ task: child, depth }) => {
+          const childDetails = child.details || child.description || child.prompt || "";
+          const childBlockers = boardTaskBlockers(child);
+          const childStatus = boardTaskColumnStatus(child);
+          return `
+            <article class="board-nested-work-item" style="--board-nested-depth: ${depth};">
+              <div class="board-nested-work-heading">
+                <div class="board-detail-badges"><span class="badge">${escapeHtml(statusLabel(boardTaskLevel(child)))}</span><span class="badge">${escapeHtml(statusLabel(boardTaskKind(child)))}</span><span class="badge">${escapeHtml(statusLabel(childStatus))}</span></div>
+                <strong>${escapeHtml(child.title || child.id || "Nested work")}</strong>
+              </div>
+              ${childDetails ? `<p>${escapeHtml(childDetails)}</p>` : ""}
+              ${childBlockers.length ? `<p class="board-card-blockers">Blocked by: ${escapeHtml(childBlockers.join(", "))}</p>` : ""}
+              <button type="button" data-board-open-details="${escapeHtml(child.id)}">View details</button>
+              ${boardTaskChatAvailable(child) ? `<button type="button" data-board-open-chat-session="${escapeHtml(child.id)}">View chat session</button>` : ""}
+            </article>
+          `;
+        }).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function boardTaskDiscussion(task) {
+  return Array.isArray(task?.discussion)
+    ? task.discussion
+    : Array.isArray(task?.hierarchy?.discussion)
+      ? task.hierarchy.discussion
+      : [];
+}
+
+function boardProposalDiffText(proposal) {
+  const changes = Array.isArray(proposal?.diff?.changes) ? proposal.diff.changes : [];
+  if (!changes.length) return proposal?.diff?.changed === false ? "No scope fields change." : "No structured field changes reported.";
+  return changes.map((change) => {
+    const before = JSON.stringify(change?.before ?? null);
+    const after = JSON.stringify(change?.after ?? null);
+    return `${change?.path || "$"}: ${before} -> ${after}`;
+  }).join("\n");
+}
+
+function boardProposalMarkup(task) {
+  const proposals = boardTaskDiscussion(task)
+    .filter((proposal) => proposal?.kind === "proposal" || proposal?.proposalId)
+    .slice()
+    .reverse();
+  if (!proposals.length) return "";
+  return `
+    <section class="board-proposals">
+      <h3>Discussion proposals</h3>
+      ${proposals.map((proposal) => {
+        const status = String(proposal.status || "pending");
+        const warnings = Array.isArray(proposal.warnings) ? proposal.warnings : [];
+        const canDecide = status === "pending" && proposal.proposalId;
+        return `<article class="board-proposal board-proposal-${escapeHtml(status)}">
+          <div class="board-proposal-header"><strong>${escapeHtml(statusLabel(proposal.action || "message"))}</strong><span class="badge">${escapeHtml(statusLabel(status))}</span></div>
+          ${proposal.summary ? `<p>${escapeHtml(proposal.summary)}</p>` : ""}
+          <pre class="board-proposal-diff">${escapeHtml(boardProposalDiffText(proposal))}</pre>
+          ${warnings.length ? `<ul class="board-proposal-warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+          ${proposal.error ? `<p class="danger-text">${escapeHtml(proposal.error)}</p>` : ""}
+          ${canDecide ? `<div class="board-modal-actions"><button type="button" class="primary-action" data-board-proposal-apply="${escapeHtml(proposal.proposalId)}" data-board-proposal-task="${escapeHtml(task.id)}">Apply</button><button type="button" data-board-proposal-reject="${escapeHtml(proposal.proposalId)}" data-board-proposal-task="${escapeHtml(task.id)}">Reject</button></div>` : ""}
+        </article>`;
+      }).join("")}
+    </section>
+  `;
+}
+
+function closeBoardModal() {
+  qs("#board-modal")?.remove();
+}
+
+function boardTranscriptEntryContent(entry) {
+  return String(entry?.content || entry?.summary || entry?.text || entry?.toolResult || entry?.toolInput || "").trim()
+    || [entry?.kind, entry?.status, entry?.toolName].filter(Boolean).join(" · ");
+}
+
+function boardTranscriptEntryRole(entry) {
+  const role = String(entry?.role || entry?.kind || "system").toLowerCase();
+  if (role === "user" || role === "prompt") return "user";
+  if (role === "assistant" || role === "message") return "assistant";
+  if (role === "tool" || role.includes("tool")) return "tool";
+  return "system";
+}
+
+function openBoardTranscriptModal(title, entries) {
+  closeBoardModal();
+  const safeEntries = Array.isArray(entries) ? entries : [];
+  document.body.insertAdjacentHTML("beforeend", `
+    <div id="board-modal" class="board-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
+      <section class="board-modal-dialog board-transcript-dialog">
+        <header class="board-modal-header"><h2>${escapeHtml(title)}</h2></header>
+        <div class="board-transcript-messages">
+          ${safeEntries.length ? safeEntries.map((entry) => `
+            <article class="board-transcript-message board-transcript-${escapeHtml(boardTranscriptEntryRole(entry))}">
+              <header><strong>${escapeHtml(statusLabel(boardTranscriptEntryRole(entry)))}</strong><time>${escapeHtml(entry?.timestamp || "")}</time></header>
+              <pre>${escapeHtml(boardTranscriptEntryContent(entry))}</pre>
+            </article>
+          `).join("") : `<p class="empty">No transcript captured yet.</p>`}
+        </div>
+        <footer class="board-modal-footer"><button type="button" data-board-modal-close>Back</button></footer>
+      </section>
+    </div>
+  `);
+  qs("#board-modal")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget || event.target.closest("[data-board-modal-close]")) closeBoardModal();
+  });
+}
+
+function openBoardAttemptModal(title, attempt) {
+  closeBoardModal();
+  const snapshot = attempt && typeof attempt === "object" ? attempt : {};
+  document.body.insertAdjacentHTML("beforeend", `
+    <div id="board-modal" class="board-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
+      <section class="board-modal-dialog board-transcript-dialog">
+        <header class="board-modal-header"><h2>${escapeHtml(title)}</h2><button type="button" data-board-modal-close aria-label="Close">Close</button></header>
+        <div class="board-modal-body"><pre>${escapeHtml(JSON.stringify(snapshot, null, 2))}</pre></div>
+      </section>
+    </div>
+  `);
+  qs("#board-modal")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget || event.target.closest("[data-board-modal-close]")) closeBoardModal();
+  });
+}
+
+function openBoardTaskDetails(taskId) {
+  const task = (state.board?.tasks || []).find((item) => String(item.id) === String(taskId));
+  if (!task) return;
+  closeBoardModal();
+  const blockers = boardTaskBlockers(task);
+  const breadcrumb = boardTaskBreadcrumb(task, state.board?.tasks || []);
+  const criteria = Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria : [];
+  const changedFiles = Array.isArray(task.changedFiles) ? task.changedFiles : [];
+  const evidence = Array.isArray(task.evidence) ? task.evidence : [];
+  const transcript = Array.isArray(task.transcript) ? task.transcript : [];
+  const chatSessionAvailable = Boolean(boardTaskSessionId(task) && boardTaskChatAvailable(task));
+  const transcriptAvailable = transcript.length > 0;
+  const attempts = Array.isArray(task.attempts) ? task.attempts : [];
+  const sideEffects = boardTaskSideEffects(task);
+  const sideEffectEvidence = boardTaskSideEffectEvidence(task);
+  const sideEffectsApproved = task.sideEffectsApproved === true;
+  const requiresSideEffectDeclaration = task.requiresSideEffectDeclaration === true;
+  const sideEffectApproval = task.sideEffectApproval || null;
+  const supersededBy = String(task.supersededBy || "").trim();
+  const researchPending = boardTaskKind(task) === "research"
+    && boardTaskColumnStatus(task) === "done"
+    && task.researchAccepted !== true;
+  const researchItems = Array.isArray(task.result?.proposedPlanningItems) ? task.result.proposedPlanningItems : [];
+  const manualEnvironment = task.manualTestEnvironment && typeof task.manualTestEnvironment === "object"
+    ? task.manualTestEnvironment
+    : null;
+  const manualResultObject = task.result && typeof task.result === "object" ? task.result : {};
+  const manualSteps = Array.isArray(manualResultObject.manualTestSteps)
+    ? manualResultObject.manualTestSteps.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  const manualResult = String(manualResultObject.manualTestResult || "").trim();
+  const affectedDescendants = boardTaskScopeEffectDescendants(task);
+  const attentionTask = ["blocked", "failed"].includes(boardTaskColumnStatus(task));
+  const approvedFixTaskId = attentionTask ? boardApprovedFixTaskId(task) : "";
+  const canApproveSideEffects = sideEffects.length > 0
+    && !sideEffectsApproved
+    && ["backlog", "todo", "blocked", "failed"].includes(boardTaskColumnStatus(task));
+  const canRevokeSideEffectApproval = sideEffects.length > 0
+    && sideEffectsApproved
+    && ["backlog", "todo", "blocked", "failed"].includes(boardTaskColumnStatus(task));
+  const canDeclareSideEffects = requiresSideEffectDeclaration
+    && !sideEffects.length
+    && task.executable === true
+    && boardTaskColumnStatus(task) === "backlog";
+  const canDetach = boardTaskIsUserCreatedChild(task);
+  document.body.insertAdjacentHTML("beforeend", `
+    <div id="board-modal" class="board-modal" role="dialog" aria-modal="true" aria-label="Task details">
+      <section class="board-modal-dialog">
+        <header class="board-modal-header"><h2>${escapeHtml(task.title || task.id || "Task")}</h2><button type="button" data-board-modal-close aria-label="Close">Close</button></header>
+        <div class="board-modal-body">
+          <div class="board-detail-badges"><span class="badge">${escapeHtml(statusLabel(boardTaskLevel(task)))}</span><span class="badge">${escapeHtml(statusLabel(boardTaskKind(task)))}</span><span class="badge">${escapeHtml(statusLabel(task.status || "backlog"))}</span><span class="badge">${escapeHtml(task.priority || "medium")}</span></div>
+          ${breadcrumb ? `<p class="board-card-breadcrumb">${escapeHtml(breadcrumb)}</p>` : ""}
+          <h3>Description</h3><p>${escapeHtml(task.details || task.description || task.prompt || "No description captured.")}</p>
+          ${supersededBy ? `<h3>Superseded by</h3><p><code>${escapeHtml(supersededBy)}</code></p>` : ""}
+          ${criteria.length ? `<h3>Acceptance criteria</h3><ul>${criteria.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}
+          ${blockers.length ? `<h3>Blocked by</h3><p><code>${escapeHtml(blockers.join(", "))}</code></p>` : ""}
+          ${task.error ? `<h3>Error</h3><p class="danger-text">${escapeHtml(task.error)}</p>` : ""}
+          ${changedFiles.length ? `<h3>Changed files</h3><p><code>${escapeHtml(changedFiles.join("\n"))}</code></p>` : ""}
+          ${evidence.length ? `<h3>Evidence</h3><ul>${evidence.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}
+          ${sideEffects.length ? `<h3>External side effects</h3><ul>${sideEffects.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul><p>Approval: ${sideEffectsApproved ? "approved" : "pending"}</p>` : requiresSideEffectDeclaration ? `<h3>External side effects</h3><p class="danger-text">Declaration required before this subtask can run.</p>` : ""}
+          ${sideEffectEvidence.length ? `<h3>External side-effect evidence</h3><ul>${sideEffectEvidence.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : ""}
+          ${manualEnvironment ? `<h3>Manual-test environment</h3><pre>${escapeHtml(JSON.stringify(manualEnvironment, null, 2))}</pre>` : ""}
+          ${manualSteps.length ? `<h3>Manual-test steps</h3><ol>${manualSteps.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol>` : ""}
+          ${manualResult ? `<h3>Manual-test result</h3><p>${escapeHtml(manualResult)}</p>` : ""}
+          ${affectedDescendants.length ? `<h3>Affected generated descendants</h3><ul>${affectedDescendants.map((item) => `<li>${escapeHtml(item.title || item.id)} <code>${escapeHtml(item.id || "")}</code></li>`).join("")}</ul>` : ""}
+          ${sideEffectApproval ? `<h3>Side-effect approval audit</h3><pre>${escapeHtml(JSON.stringify(sideEffectApproval, null, 2))}</pre>` : ""}
+          ${task.researchAccepted === true ? `<h3>Research acceptance</h3><pre>${escapeHtml(JSON.stringify(task.researchAcceptance || {}, null, 2))}</pre>` : ""}
+          ${researchItems.length ? `<h3>Proposed planning items</h3><ul>${researchItems.map((item) => `<li>${escapeHtml(item?.title || item?.details || "Planning item")}</li>`).join("")}</ul>` : ""}
+          ${renderBoardNestedWork(task)}
+          ${boardProposalMarkup(task)}
+          ${attempts.length ? `<h3>Attempts</h3><ol>${attempts.map((attempt, index) => `<li>${escapeHtml(`Attempt ${index + 1} · ${statusLabel(attempt?.status || "unknown")}`)} <button type="button" data-board-view-attempt="${escapeHtml(task.id)}" data-board-attempt-index="${index}">View attempt</button></li>`).join("")}</ol>` : ""}
+          <div class="board-modal-actions">
+            <button type="button" data-board-discuss-task="${escapeHtml(task.id)}">Discuss</button>
+            ${boardTaskCanBreakdown(task) ? `<button type="button" data-board-breakdown-task="${escapeHtml(task.id)}">Breakdown</button>` : ""}
+            ${chatSessionAvailable ? `<button type="button" data-board-open-chat-session="${escapeHtml(task.id)}">View chat session</button>` : ""}
+            ${canDeclareSideEffects ? `<button type="button" class="primary-action" data-board-side-effects-declare="${escapeHtml(task.id)}">Declare external side effects</button>` : ""}
+            ${canApproveSideEffects ? `<button type="button" class="primary-action" data-board-side-effects-approve="${escapeHtml(task.id)}">Approve external side effects</button>` : ""}
+            ${canRevokeSideEffectApproval ? `<button type="button" data-board-side-effects-revoke="${escapeHtml(task.id)}">Revoke side-effect approval</button>` : ""}
+            ${researchPending ? `<button type="button" class="primary-action" data-board-research-accept="${escapeHtml(task.id)}">Accept research output</button>` : ""}
+            ${canDetach ? `<button type="button" data-board-detach-task="${escapeHtml(task.id)}">Detach as Backlog story</button>` : ""}
+            ${attentionTask ? `<button type="button" data-board-retry-task="${escapeHtml(task.id)}">Retry transient failure</button>` : ""}
+            ${approvedFixTaskId ? `<button type="button" class="primary-action" data-board-retry-fix-task="${escapeHtml(task.id)}" data-board-retry-fix-id="${escapeHtml(approvedFixTaskId)}">Retry with approved fix</button>` : ""}
+            ${affectedDescendants.length && boardTaskColumnStatus(task) !== "done" ? `<button type="button" data-board-scope-effects="keep" data-board-scope-effects-task="${escapeHtml(task.id)}">Keep recorded changes</button><button type="button" data-board-scope-effects="revert" data-board-scope-effects-task="${escapeHtml(task.id)}">Create revert work</button><button type="button" data-board-scope-effects="cleanup" data-board-scope-effects-task="${escapeHtml(task.id)}">Create cleanup work</button>` : ""}
+            ${transcriptAvailable ? `<button type="button" data-board-view-transcript="${escapeHtml(task.id)}">View transcript</button>` : ""}
+          </div>
+        </div>
+      </section>
+    </div>
+  `);
+  qs("#board-modal")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget || event.target.closest("[data-board-modal-close]")) closeBoardModal();
+    const nestedDetailsButton = event.target.closest("[data-board-open-details]");
+    if (nestedDetailsButton) {
+      openBoardTaskDetails(nestedDetailsButton.dataset.boardOpenDetails);
+      return;
+    }
+    const applyButton = event.target.closest("[data-board-proposal-apply]");
+    if (applyButton) {
+      withButtonLoading(applyButton, () => resolveBoardDiscussionProposal(
+        applyButton.dataset.boardProposalTask,
+        applyButton.dataset.boardProposalApply,
+        "apply",
+      )).catch(showError);
+      return;
+    }
+    const rejectButton = event.target.closest("[data-board-proposal-reject]");
+    if (rejectButton) {
+      withButtonLoading(rejectButton, () => resolveBoardDiscussionProposal(
+        rejectButton.dataset.boardProposalTask,
+        rejectButton.dataset.boardProposalReject,
+        "reject",
+      )).catch(showError);
+      return;
+    }
+    const transcriptButton = event.target.closest("[data-board-view-transcript]");
+    if (transcriptButton) {
+      openBoardTaskTranscript(transcriptButton.dataset.boardViewTranscript).catch(showError);
+      return;
+    }
+    const chatSessionButton = event.target.closest("[data-board-open-chat-session]");
+    if (chatSessionButton) {
+      openBoardTaskChatSession(chatSessionButton.dataset.boardOpenChatSession).catch(showError);
+      return;
+    }
+    const attemptButton = event.target.closest("[data-board-view-attempt]");
+    if (attemptButton) {
+      const index = Number.parseInt(attemptButton.dataset.boardAttemptIndex || "-1", 10);
+      const attempt = Number.isInteger(index) && index >= 0 ? attempts[index] : null;
+      if (attempt) openBoardAttemptModal(`${task.title || task.id} · attempt ${index + 1}`, attempt);
+      return;
+    }
+    const discussButton = event.target.closest("[data-board-discuss-task]");
+    if (discussButton) openBoardDiscussionModal(task.id);
+    const breakdownButton = event.target.closest("[data-board-breakdown-task]");
+    if (breakdownButton) {
+      withButtonLoading(breakdownButton, () => breakdownBoardTask(task.id)).catch(showError);
+      return;
+    }
+    const approveButton = event.target.closest("[data-board-side-effects-approve]");
+    if (approveButton) {
+      if (!window.confirm("Approve the declared external side effects for this subtask?")) return;
+      withButtonLoading(approveButton, () => approveBoardTaskSideEffects(task.id, true)).catch(showError);
+      return;
+    }
+    const declareButton = event.target.closest("[data-board-side-effects-declare]");
+    if (declareButton) {
+      const raw = window.prompt("List one possible external side effect per line", "");
+      if (raw === null) return;
+      const values = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+      if (!values.length) {
+        showToast("Declare at least one possible external side effect", "error");
+        return;
+      }
+      withButtonLoading(
+        declareButton,
+        () => declareBoardTaskSideEffects(task.id, values),
+      ).catch(showError);
+      return;
+    }
+    const revokeButton = event.target.closest("[data-board-side-effects-revoke]");
+    if (revokeButton) {
+      if (!window.confirm("Revoke external side-effect approval?")) return;
+      withButtonLoading(revokeButton, () => approveBoardTaskSideEffects(task.id, false)).catch(showError);
+      return;
+    }
+    const researchButton = event.target.closest("[data-board-research-accept]");
+    if (researchButton) {
+      const note = window.prompt("Optional research acceptance note", "") ?? "";
+      withButtonLoading(researchButton, () => acceptBoardTaskResearch(task.id, note)).catch(showError);
+      return;
+    }
+    const detachButton = event.target.closest("[data-board-detach-task]");
+    if (detachButton) {
+      if (!window.confirm("Detach this user-created child and preserve it as a Backlog story?")) return;
+      withButtonLoading(detachButton, () => detachBoardTask(task.id)).catch(showError);
+      return;
+    }
+    const retryButton = event.target.closest("[data-board-retry-task]");
+    if (retryButton) {
+      if (!window.confirm("Retry this task as a transient/environment failure?")) return;
+      withButtonLoading(
+        retryButton,
+        () => retryBoardTask(retryButton.dataset.boardRetryTask || task.id),
+      ).catch(showError);
+      return;
+    }
+    const retryFixButton = event.target.closest("[data-board-retry-fix-task]");
+    if (retryFixButton) {
+      if (!window.confirm("Retry this task after applying the approved linked fix?")) return;
+      withButtonLoading(
+        retryFixButton,
+        () => retryBoardTask(
+          retryFixButton.dataset.boardRetryFixTask || task.id,
+          "fix",
+          retryFixButton.dataset.boardRetryFixId || "",
+        ),
+      ).catch(showError);
+      return;
+    }
+    const scopeEffectsButton = event.target.closest("[data-board-scope-effects]");
+    if (scopeEffectsButton) {
+      const decision = scopeEffectsButton.dataset.boardScopeEffects;
+      const label = decision === "keep"
+        ? "Keep the recorded changes"
+        : decision === "revert"
+          ? "Create explicit revert work"
+          : "Create explicit cleanup work";
+      if (!window.confirm(`${label} for the recorded effects of this scope?`)) return;
+      withButtonLoading(
+        scopeEffectsButton,
+        () => resolveBoardTaskScopeEffects(
+          scopeEffectsButton.dataset.boardScopeEffectsTask || task.id,
+          decision,
+        ),
+      ).catch(showError);
+    }
+  });
+}
+
+function openBoardDiscussionModal(taskId) {
+  const task = (state.board?.tasks || []).find((item) => String(item.id) === String(taskId));
+  if (!task) return;
+  closeBoardModal();
+  document.body.insertAdjacentHTML("beforeend", `
+    <div id="board-modal" class="board-modal" role="dialog" aria-modal="true" aria-label="Discuss task">
+      <section class="board-modal-dialog">
+        <header class="board-modal-header"><h2>Discuss · ${escapeHtml(task.title || task.id)}</h2><button type="button" data-board-modal-close aria-label="Close">Close</button></header>
+        <form id="board-discussion-form" class="board-modal-body">
+          <label><span>Action</span><select name="action">
+            <option value="">Discuss</option><option value="edit">Edit scope</option><option value="replace">Replace scope</option><option value="reprioritize">Reprioritize</option><option value="delete">Delete</option><option value="split">Split</option><option value="merge">Merge</option><option value="regenerate_children">Regenerate children</option><option value="re_research">Re-research</option><option value="revision">Create revision</option><option value="fix">Create fix</option><option value="replacement">Create replacement</option>
+          </select></label>
+          <label><span>Message or action data</span><textarea name="message" rows="7" placeholder="Explain the change or provide action data"></textarea></label>
+          <p class="board-discussion-note">The AI will prepare a proposal for review. Nothing changes until you apply it.</p>
+          <div class="board-modal-actions"><button type="submit" class="primary-action">Prepare proposal</button><button type="button" data-board-modal-close>Cancel</button></div>
+        </form>
+      </section>
+    </div>
+  `);
+  const modal = qs("#board-modal");
+  modal?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget || event.target.closest("[data-board-modal-close]")) closeBoardModal();
+  });
+  qs("#board-discussion-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const action = form.elements.action.value;
+    const message = form.elements.message.value.trim();
+    if (!message && !action) throw new Error("Write a discussion message.");
+    let payload = {};
+    if (["edit", "replace"].includes(action)) payload = { details: message };
+    if (action === "reprioritize") payload = { priority: message };
+    if (action === "merge") payload = { targetId: message };
+    if (action === "split") payload = { items: message.split(/\r?\n/).map((title) => title.trim()).filter(Boolean).map((title) => ({ title, details: title })) };
+    if (action === "re_research") payload = { title: "Research revised direction", details: message };
+    if (["revision", "fix", "replacement"].includes(action)) payload = { title: `${statusLabel(action)} for completed item`, details: message, kind: action, ...(action === "replacement" ? { supersedeSource: true } : {}) };
+    const response = await api(`/api/danger/boards/${encodeURIComponent(state.board.id)}/tasks/${encodeURIComponent(taskId)}/discussion`, {
+      method: "POST",
+      body: JSON.stringify({ message, action, payload }),
+    });
+    closeBoardModal();
+    await loadBoard();
+    openBoardTaskDetails(taskId);
+    if (response?.success === false) showToast("Discussion proposal could not be prepared", "error");
+  });
+}
+
+async function resolveBoardDiscussionProposal(taskId, proposalId, decision) {
+  const run = state.board;
+  if (!run?.id || !taskId || !proposalId) return;
+  await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/discussion/${encodeURIComponent(proposalId)}/${decision}`, {
+    method: "POST",
+  });
+  closeBoardModal();
+  await loadBoard();
+  openBoardTaskDetails(taskId);
 }
 
 function statusLabel(status) {
@@ -10887,7 +11913,7 @@ async function createBoard(event) {
   if (!prompt) throw new Error("Enter a board prompt.");
   const provider = qs("#board-provider")?.value || "claude";
   const model = qs("#board-model")?.value.trim() || "";
-  const runProfile = qs("#board-run-profile")?.value || "complete_app";
+  const boardProfile = qs("#board-profile")?.value || "complete_app";
   const strategyMode = qs("#board-model-strategy")?.value || "manual";
   const sessionPolicy = qs("#board-session-policy")?.value || "continuous";
   const gitPolicy = qs("#board-git-policy")?.value || "read_only";
@@ -10910,10 +11936,12 @@ async function createBoard(event) {
   const qaMode = qs("#board-qa-mode")?.value || "high_risk";
   const qaFollowups = numericInputValue("#board-qa-followups", 3, 0, 20);
   const qaAttempts = numericInputValue("#board-qa-attempts", 2, 1, 10);
+  const repairMalformedToolCalls = qs("#board-tool-repair-enabled")?.value !== "false";
+  const toolRepairRetries = numericInputValue("#board-tool-repair-retries", 1, 0, 3);
   const autoRetryEnabled = qs("#board-auto-retry-enabled")?.value === "true";
   const autoRetryDelay = numericInputValue("#board-auto-retry-delay", 10, 1, 1440);
   const autoRetryAttempts = numericInputValue("#board-auto-retry-attempts", 3, 1, 100);
-  const body = await api("/api/danger/runs", {
+  await api("/api/danger/boards", {
     method: "POST",
     body: JSON.stringify({
       command: prompt,
@@ -10921,7 +11949,7 @@ async function createBoard(event) {
       projectName: activeProjectName() || selectedProjectLabel("#active-project"),
       provider,
       model,
-      runProfile,
+      boardProfile,
       sessionPolicy,
       gitPolicy,
       modelStrategy: {
@@ -10955,36 +11983,35 @@ async function createBoard(event) {
         taskQaMode: qaMode,
         maxFollowupsPerGroup: qaFollowups,
         maxTaskAttempts: qaAttempts,
+        repairMalformedToolCalls,
+        malformedToolCallRepairRetries: toolRepairRetries,
       },
       autoRetry: {
         enabled: autoRetryEnabled,
         delayMinutes: autoRetryDelay,
         maxAttempts: autoRetryAttempts,
       },
-      forceNewRun: true,
     }),
   });
-  const run = body.run || null;
-  if (run?.id) setBoardSelectedRunId(run.id, projectPath);
   qs("#board-start-prompt").value = "";
   await loadBoard();
-  showToast("Board created", "ok");
+  showToast("Board updated", "ok");
 }
 
 async function addBoardTask(event) {
   event.preventDefault();
-  const run = state.boardRun;
-  if (!run?.id) throw new Error("Create or select a board first.");
+  const run = state.board;
+  if (!run?.id) throw new Error("Create a board first.");
   const prompt = qs("#board-task-prompt")?.value.trim() || "";
   if (!prompt) throw new Error("Enter a task prompt.");
   const lines = prompt.split(/\n+/).map((line) => line.trim()).filter(Boolean);
   if (lines.length > 1) {
-    await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks/backlog-from-prompt`, {
+    await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/backlog-from-prompt`, {
       method: "POST",
       body: JSON.stringify({ prompt }),
     });
   } else {
-    await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks`, {
+    await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks`, {
       method: "POST",
       body: JSON.stringify({ prompt, status: "backlog" }),
     });
@@ -10995,14 +12022,14 @@ async function addBoardTask(event) {
 }
 
 async function moveBoardTask(taskId, status) {
-  const run = state.boardRun;
+  const run = state.board;
   if (!run?.id || !taskId) return;
   if (status === "pending") {
-    await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/promote`, { method: "POST" });
+    await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/promote`, { method: "POST" });
   } else if (status === "backlog") {
-    await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/demote`, { method: "POST" });
+    await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/demote`, { method: "POST" });
   } else {
-    await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}`, {
+    await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}`, {
       method: "PATCH",
       body: JSON.stringify({ status }),
     });
@@ -11010,28 +12037,125 @@ async function moveBoardTask(taskId, status) {
   await loadBoard();
 }
 
-async function deleteBoardTask(taskId) {
-  const run = state.boardRun;
+async function retryBoardTask(taskId, mode = "transient", fixTaskId = "") {
+  const run = state.board;
   if (!run?.id || !taskId) return;
-  await api(`/api/danger/runs/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" });
+  const body = {
+    taskIds: [taskId],
+    mode,
+    ...(fixTaskId ? { fixTaskId } : {}),
+    reason: mode === "fix"
+      ? "User approved the linked fix subtask"
+      : "User requested a transient failure retry",
+  };
+  await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/retry-attention`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  closeBoardModal();
+  await loadBoard();
+  openBoardTaskDetails(taskId);
+}
+
+async function breakdownBoardTask(taskId) {
+  const run = state.board;
+  if (!run?.id || !taskId) return;
+  await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/breakdown`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  closeBoardModal();
+  await loadBoard();
+  showToast("Breakdown added to the board", "ok");
+}
+
+async function approveBoardTaskSideEffects(taskId, approved = true, note = "") {
+  const run = state.board;
+  if (!run?.id || !taskId) return;
+  await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/side-effects/approve`, {
+    method: "POST",
+    body: JSON.stringify({ approved, ...(note.trim() ? { note: note.trim() } : {}) }),
+  });
+  closeBoardModal();
+  await loadBoard();
+  openBoardTaskDetails(taskId);
+  showToast(approved ? "External side effects approved" : "External side-effect approval revoked", "ok");
+}
+
+async function declareBoardTaskSideEffects(taskId, sideEffects) {
+  const run = state.board;
+  if (!run?.id || !taskId || !Array.isArray(sideEffects) || !sideEffects.length) return;
+  await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ sideEffects }),
+  });
+  closeBoardModal();
+  await loadBoard();
+  openBoardTaskDetails(taskId);
+  showToast("External side-effect declaration saved", "ok");
+}
+
+async function acceptBoardTaskResearch(taskId, note = "") {
+  const run = state.board;
+  if (!run?.id || !taskId) return;
+  await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/research/accept`, {
+    method: "POST",
+    body: JSON.stringify(note.trim() ? { note: note.trim() } : {}),
+  });
+  closeBoardModal();
+  await loadBoard();
+  openBoardTaskDetails(taskId);
+  showToast("Research output accepted; planning remains in Backlog", "ok");
+}
+
+async function detachBoardTask(taskId) {
+  const run = state.board;
+  if (!run?.id || !taskId) return;
+  await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/detach`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  closeBoardModal();
+  await loadBoard();
+  openBoardTaskDetails(taskId);
+  showToast("User-created child detached as a Backlog story", "ok");
+}
+
+async function resolveBoardTaskScopeEffects(taskId, decision, note = "") {
+  const run = state.board;
+  if (!run?.id || !taskId) return;
+  await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}/scope-effects/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ decision, ...(note.trim() ? { note: note.trim() } : {}) }),
+  });
+  closeBoardModal();
+  await loadBoard();
+  openBoardTaskDetails(taskId);
+  showToast("Recorded child effects resolved", "ok");
+}
+
+async function deleteBoardTask(taskId) {
+  const run = state.board;
+  if (!run?.id || !taskId) return;
+  await api(`/api/danger/boards/${encodeURIComponent(run.id)}/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" });
   await loadBoard();
   showToast("Task deleted", "ok");
 }
 
-async function boardRunAction(action) {
-  const run = state.boardRun;
-  if (!run?.id) throw new Error("Create or select a board first.");
+async function boardAction(action) {
+  const run = state.board;
+  if (!run?.id) throw new Error("Create a board first.");
   const body = action === "pause"
     ? { reason: "user request" }
     : action === "abort"
       ? { reason: "user request" }
       : {};
-  await api(`/api/danger/runs/${encodeURIComponent(run.id)}/${action}`, {
+  await api(`/api/danger/boards/${encodeURIComponent(run.id)}/${action}`, {
     method: "POST",
     body: JSON.stringify(body),
   });
   await loadBoard();
-  showToast(action === "resume" ? "Board running" : action === "pause" ? "Board paused" : "Board aborted", "ok");
+  showToast(action === "resume" ? "Board started" : action === "pause" ? "Board paused" : "Board aborted", "ok");
 }
 
 function commandPaletteCommands() {
@@ -11668,29 +12792,59 @@ function bindForms() {
   qs("#refresh-metrics").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadMetrics).catch(showError));
   qs("#refresh-settings").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadSettings).catch(showError));
   qs("#board-refresh")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadBoard).catch(showError));
-  qs("#board-run-resume")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardRunAction("resume")).catch(showError));
-  qs("#board-run-pause")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardRunAction("pause")).catch(showError));
-  qs("#board-run-abort")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardRunAction("abort")).catch(showError));
-  qs("#board-run-select")?.addEventListener("change", async (event) => {
-    setBoardSelectedRunId(event.currentTarget.value, activeProjectPath());
-    await loadBoard().catch(showError);
-  });
+  qs("#board-resume")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardAction("resume")).catch(showError));
+  qs("#board-pause")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardAction("pause")).catch(showError));
+  qs("#board-abort")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardAction("abort")).catch(showError));
   qs("#board-start-form")?.addEventListener("submit", (event) => withButtonLoading(event.submitter, () => createBoard(event)).catch(showError));
   qs("#board-task-form")?.addEventListener("submit", (event) => withButtonLoading(event.submitter, () => addBoardTask(event)).catch(showError));
+  qs("#board-details")?.addEventListener("click", (event) => {
+    const transcriptButton = event.target.closest("[data-board-view-transcript]");
+    if (transcriptButton && transcriptButton.dataset.boardViewTranscript === "breakdown") {
+      openBoardTranscriptModal(
+        "Backlog breakdown transcript",
+        state.board?.backlogBreakdown?.transcript || [],
+      );
+    }
+  });
   qs("#board-columns")?.addEventListener("click", (event) => {
-    const openChatButton = event.target.closest("[data-board-open-chat]");
-    if (openChatButton) {
-      withButtonLoading(openChatButton, () => openBoardTaskChat(openChatButton.dataset.boardOpenChat)).catch(showError);
+    const detailsButton = event.target.closest("[data-board-open-details]");
+    if (detailsButton) {
+      openBoardTaskDetails(detailsButton.dataset.boardOpenDetails);
+      return;
+    }
+    const discussionButton = event.target.closest("[data-board-discuss-task]");
+    if (discussionButton) {
+      openBoardDiscussionModal(discussionButton.dataset.boardDiscussTask);
+      return;
+    }
+    const breakdownButton = event.target.closest("[data-board-breakdown-task]");
+    if (breakdownButton) {
+      withButtonLoading(breakdownButton, () => breakdownBoardTask(breakdownButton.dataset.boardBreakdownTask)).catch(showError);
+      return;
+    }
+    const transcriptButton = event.target.closest("[data-board-view-transcript]");
+    if (transcriptButton) {
+      openBoardTaskTranscript(transcriptButton.dataset.boardViewTranscript).catch(showError);
+      return;
+    }
+    const chatSessionButton = event.target.closest("[data-board-open-chat-session]");
+    if (chatSessionButton) {
+      openBoardTaskChatSession(chatSessionButton.dataset.boardOpenChatSession).catch(showError);
+      return;
+    }
+    const retryButton = event.target.closest("[data-board-retry-task]");
+    if (retryButton) {
+      if (!window.confirm("Retry this task as a transient/environment failure?")) return;
+      withButtonLoading(
+        retryButton,
+        () => retryBoardTask(retryButton.dataset.boardRetryTask),
+      ).catch(showError);
       return;
     }
     const moveButton = event.target.closest("[data-board-task-status]");
     if (moveButton) {
       withButtonLoading(moveButton, () => moveBoardTask(moveButton.dataset.boardTaskId, moveButton.dataset.boardTaskStatus)).catch(showError);
       return;
-    }
-    const deleteButton = event.target.closest("[data-board-delete-task]");
-    if (deleteButton) {
-      withButtonLoading(deleteButton, () => deleteBoardTask(deleteButton.dataset.boardDeleteTask)).catch(showError);
     }
   });
   document.querySelectorAll("[data-chat-provider-option]").forEach((button) => {
@@ -12333,7 +13487,6 @@ function appendUserPromptToChat(prompt, meta) {
     renderChatFooter(null);
     return;
   }
-  clearChatLineMetadata();
   clearChatProcessing();
   // Finalize any pending assistant stream so the user prompt doesn't get
   // stacked behind an in-progress stream node.
@@ -12345,6 +13498,7 @@ function appendUserPromptToChat(prompt, meta) {
   }
   const { node, text, footer } = buildChatLineNode("user");
   text.textContent = prompt;
+  attachUserChatActions(node, { content: prompt });
   renderChatLineFooter(footer, meta);
   output.appendChild(node);
   scrollChatToBottom(true);
@@ -12408,6 +13562,12 @@ function appendChat(value, opts = {}) {
       output.appendChild(chatStream.node);
     }
   }
+  const liveControls = chatSessionControls(
+    sessionId,
+    findChatSession(sessionId) || state.currentSession,
+  );
+  liveControls.cli = opts.provider || liveControls.cli;
+  renderChatResponseHeader(chatStream.node, liveControls);
   // Render as Markdown so exec / Parameters and exec / Details sections
   // become collapsible blocks while the rest stays in plain Markdown form.
   // renderChatBubbleHtml keeps `textContent` safe by escaping every line.

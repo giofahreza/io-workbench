@@ -373,7 +373,7 @@ async fn synthesize_legacy_durable_runs(state: &AppState) -> anyhow::Result<()> 
 }
 
 pub fn build_router(state: AppState) -> Router {
-    agentic_board::recover_active_runs(&state);
+    agentic_board::recover_active_boards(&state);
 
     let protected_routes = Router::new()
         .route("/api/auth/logout", post(auth_logout))
@@ -568,8 +568,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/gemini/{*path}", any(provider_compat))
         .route("/api/plugins", any(plugins_compat))
         .route("/api/plugins/{*path}", any(plugins_compat))
-        .route("/api/danger", any(danger_compat))
-        .route("/api/danger/{*path}", any(danger_compat))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     Router::new()
@@ -2709,7 +2707,7 @@ async fn browse_filesystem(
         .as_deref()
         .filter(|path| !path.is_empty())
         .unwrap_or_else(|| state.config.workspace_root.to_str().unwrap_or("~"));
-    let entries = state.files.browse_directories(path).await?;
+    let entries = state.files.browse_entries(path).await?;
     Ok(Json(BrowseFilesystemResponse {
         path: path.to_string(),
         entries,
@@ -3237,7 +3235,7 @@ fn filter_sidebar_active_sessions(state: &AppState, value: Value) -> Result<Valu
         if state
             .storage
             .get_session_summary(&session_id)?
-            .is_some_and(|session| session.board_session)
+            .is_some_and(|session| session.is_board_session())
         {
             continue;
         }
@@ -5702,7 +5700,7 @@ async fn send_fcm_chat_completed(
 }
 
 fn chat_completion_push_allowed(session: Option<&SessionSummary>) -> bool {
-    !session.is_some_and(|session| session.board_session)
+    !session.is_some_and(SessionSummary::is_board_session)
 }
 
 fn truncate_notification_text(value: &str, max_chars: usize) -> String {
@@ -6224,10 +6222,10 @@ fn default_notification_preferences() -> Value {
             "actionRequired": true,
             "stop": true,
             "error": true,
-            "agenticRunStarted": true,
+            "agenticBoardStarted": true,
             "agenticTaskUpdated": false,
-            "agenticRunCompleted": true,
-            "agenticRunNeedsAttention": true
+            "agenticBoardCompleted": true,
+            "agenticBoardNeedsAttention": true
         }
     })
 }
@@ -8260,21 +8258,6 @@ async fn plugins_compat(
     .await
 }
 
-async fn danger_compat(
-    State(state): State<AppState>,
-    Extension(user): Extension<AuthenticatedUser>,
-    request: Request,
-) -> Result<Json<Value>> {
-    persisted_compat_endpoint(
-        state,
-        user,
-        request,
-        "danger",
-        serde_json::json!({ "runs": [] }),
-    )
-    .await
-}
-
 async fn persisted_compat_endpoint(
     state: AppState,
     user: AuthenticatedUser,
@@ -8486,7 +8469,7 @@ mod tests {
                 title: "Board chat".to_string(),
                 last_activity: now,
                 board_session: true,
-                board_run_id: Some("run-1".to_string()),
+                board_id: Some("board-1".to_string()),
                 board_task_id: Some("task-1".to_string()),
                 ..Default::default()
             },
@@ -8874,7 +8857,7 @@ mod tests {
         let board = SessionSummary {
             id: "board-chat".to_string(),
             board_session: true,
-            board_run_id: Some("run-1".to_string()),
+            board_id: Some("board-1".to_string()),
             ..Default::default()
         };
 
@@ -8960,7 +8943,7 @@ mod tests {
             title: "Board chat".to_string(),
             last_activity: Utc::now(),
             board_session: true,
-            board_run_id: Some("run-1".to_string()),
+            board_id: Some("board-1".to_string()),
             ..Default::default()
         };
         state

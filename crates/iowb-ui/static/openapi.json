@@ -544,11 +544,31 @@
     "/api/plugins/run": {
       "post": { "tags": ["Tools"], "summary": "Run plugin command integration" }
     },
-    "/api/danger/run": {
-      "post": { "tags": ["Tools"], "summary": "Run danger command integration" }
+    "/api/danger/boards": {
+      "get": { "tags": ["Tools"], "summary": "List project agentic boards" },
+      "post": { "tags": ["Tools"], "summary": "Create or update a project agentic board" }
     },
-    "/api/danger/runs": {
-      "get": { "tags": ["Tools"], "summary": "List danger command runs" }
+    "/api/danger/boards/{id}/tasks/{task_id}/breakdown": {
+      "post": { "tags": ["Tools"], "summary": "Break down one approved planning item into its next hierarchy level" }
+    },
+    "/api/danger/boards/{id}/tasks/retry-attention": {
+      "post": { "tags": ["Tools"], "summary": "Retry failed or blocked executable subtasks as transient work or with an approved fix" }
+    },
+    "/api/danger/boards/{id}/tasks/{task_id}/side-effects/approve": {
+      "post": { "tags": ["Tools"], "summary": "Approve or revoke declared external side effects for an executable subtask" }
+    },
+    "/api/danger/boards/{id}/tasks/{task_id}/research/accept": {
+      "post": { "tags": ["Tools"], "summary": "Accept completed research output and create Backlog planning items" }
+    },
+    "/api/danger/boards/{id}/tasks/{task_id}/detach": {
+      "post": { "tags": ["Tools"], "summary": "Detach a user-created child and preserve it as a Backlog story" }
+    },
+    "/api/danger/boards/{id}/tasks/{task_id}/scope-effects/resolve": {
+      "post": { "tags": ["Tools"], "summary": "Resolve recorded effects from generated descendants before changing scope" }
+    },
+    "/api/danger/boards/{id}/tasks/{task_id}": {
+      "patch": { "tags": ["Tools"], "summary": "Update an editable Backlog task scope or declare external side effects" },
+      "delete": { "tags": ["Tools"], "summary": "Delete a Backlog task and its descendants" }
     },
     "/api/notifications/push": {
       "post": { "tags": ["Tools"], "summary": "Run push notification command integration" }
@@ -697,7 +717,7 @@
             "default": false,
             "description": "True for a Kanban-owned chat. Board chats are directly addressable by session snapshot/message endpoints but are excluded from ordinary project/session discovery."
           },
-          "boardRunId": { "type": ["string", "null"] },
+          "boardId": { "type": ["string", "null"] },
           "boardTaskId": { "type": ["string", "null"] },
           "nativeSessionId": {
             "type": ["string", "null"],

@@ -356,7 +356,7 @@ impl AppState {
         .await
     }
 
-    /// Start a session owned by an agentic-board run. The scope is persisted
+    /// Start a session owned by an agentic board. The scope is persisted
     /// before the provider starts and before any active-session broadcast, so
     /// the board chat can never briefly leak into ordinary chat discovery.
     #[allow(clippy::too_many_arguments)]
@@ -374,7 +374,7 @@ impl AppState {
         runtime: ChatRuntime,
         direct_ai_config: Option<DirectAiRuntimeConfig>,
         user_id: Option<String>,
-        board_run_id: impl Into<String>,
+        board_id: impl Into<String>,
         board_task_id: Option<String>,
     ) -> Result<SessionSummary> {
         self.start_agent_session_scoped(
@@ -390,7 +390,7 @@ impl AppState {
             runtime,
             direct_ai_config,
             user_id,
-            Some((board_run_id.into(), board_task_id)),
+            Some((board_id.into(), board_task_id)),
         )
         .await
     }
@@ -509,7 +509,7 @@ impl AppState {
                 None
             };
 
-        let mut session = if let Some((board_run_id, board_task_id)) = board_scope {
+        let mut session = if let Some((board_id, board_task_id)) = board_scope {
             self.sessions
                 .create_or_update_board(
                     provider,
@@ -522,7 +522,7 @@ impl AppState {
                     mode.clone(),
                     thinking,
                     fast,
-                    board_run_id,
+                    board_id,
                     board_task_id,
                 )
                 .await?
@@ -843,8 +843,8 @@ impl AppState {
             id: destination_id,
             provider: source.provider,
             external: false,
-            board_session: source.board_session,
-            board_run_id: source.board_run_id.clone(),
+            board_session: source.is_board_session(),
+            board_id: source.board_id.clone(),
             board_task_id: source.board_task_id.clone(),
             native_session_id: native_forked_thread_id.clone(),
             native_rollout_owned_by_provider: source.native_rollout_owned_by_provider,
@@ -1166,6 +1166,8 @@ impl AppState {
             }
         }
 
+        validate_recovered_agent_runtime_config(provider, runtime, direct_ai_config.as_ref())?;
+
         let session = self.sessions.set_active(&run.session_id, true).await?;
         let recovery_prompt = durable_chat_recovery_prompt(&run.prompt);
         let direct_ai_messages =
@@ -1390,6 +1392,12 @@ impl AppState {
         compact_run.thinking = recovery_source.recovery_run.thinking.or(session.thinking);
         compact_run.fast = recovery_source.recovery_run.fast.or(session.fast);
         compact_run.native_session_id = None;
+        let runtime = session.runtime.unwrap_or(ChatRuntime::NativeCli);
+        validate_recovered_agent_runtime_config(
+            Provider::Codex,
+            runtime,
+            direct_ai_config.as_ref(),
+        )?;
 
         self.storage
             .replace_session_messages(session_id, &visible_messages)?;
@@ -1423,7 +1431,6 @@ impl AppState {
             });
         }
         self.sessions.set_active(session_id, true).await?;
-        let runtime = session.runtime.unwrap_or(ChatRuntime::NativeCli);
         let attempt_id = new_id("attempt");
         self.storage
             .create_chat_run_attempt(&StoredChatRunAttempt::new(
@@ -2193,7 +2200,7 @@ impl SessionManager {
         let persisted_sessions = storage.list_sessions_including_board()?;
         let board_session_ids = persisted_sessions
             .iter()
-            .filter(|session| session.board_session)
+            .filter(|session| session.is_board_session())
             .map(|session| session.id.clone())
             .collect();
         let sessions = persisted_sessions
@@ -2305,7 +2312,7 @@ impl SessionManager {
         mode: Option<String>,
         thinking: Option<bool>,
         fast: Option<bool>,
-        board_run_id: String,
+        board_id: String,
         board_task_id: Option<String>,
     ) -> Result<SessionSummary> {
         self.create_or_update_scoped(
@@ -2319,7 +2326,7 @@ impl SessionManager {
             mode,
             thinking,
             fast,
-            Some((board_run_id, board_task_id)),
+            Some((board_id, board_task_id)),
         )
         .await
     }
@@ -2357,7 +2364,7 @@ impl SessionManager {
                 provider,
                 external,
                 board_session: false,
-                board_run_id: None,
+                board_id: None,
                 board_task_id: None,
                 project_path: project_path.into(),
                 title: "New Session".to_string(),
@@ -2405,19 +2412,19 @@ impl SessionManager {
         session.last_activity = now;
         session.active = true;
         session.token_usage = None;
-        if let Some((board_run_id, board_task_id)) = board_scope {
-            if board_run_id.trim().is_empty() {
+        if let Some((board_id, board_task_id)) = board_scope {
+            if board_id.trim().is_empty() {
                 return Err(CoreError::InvalidInput(
-                    "board run id must not be empty".to_string(),
+                    "board id must not be empty".to_string(),
                 ));
             }
             session.board_session = true;
-            session.board_run_id = Some(board_run_id);
+            session.board_id = Some(board_id);
             session.board_task_id = board_task_id.filter(|value| !value.trim().is_empty());
         }
 
         self.storage.upsert_session(session)?;
-        if session.board_session {
+        if session.is_board_session() {
             self.board_session_ids
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2431,13 +2438,13 @@ impl SessionManager {
     pub async fn mark_board_session(
         &self,
         session_id: &str,
-        board_run_id: impl Into<String>,
+        board_id: impl Into<String>,
         board_task_id: Option<String>,
     ) -> Result<SessionSummary> {
-        let board_run_id = board_run_id.into();
-        if board_run_id.trim().is_empty() {
+        let board_id = board_id.into();
+        if board_id.trim().is_empty() {
             return Err(CoreError::InvalidInput(
-                "board run id must not be empty".to_string(),
+                "board id must not be empty".to_string(),
             ));
         }
         let mut sessions = self.sessions.write().await;
@@ -2450,7 +2457,7 @@ impl SessionManager {
             .get_mut(session_id)
             .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
         session.board_session = true;
-        session.board_run_id = Some(board_run_id);
+        session.board_id = Some(board_id);
         session.board_task_id = board_task_id.filter(|value| !value.trim().is_empty());
         self.storage.upsert_session(session)?;
         self.board_session_ids
@@ -2738,7 +2745,7 @@ impl SessionManager {
                 .read()
                 .await
                 .values()
-                .filter(|session| session.active && !session.board_session)
+                .filter(|session| session.active && !session.is_board_session())
                 .cloned()
                 .collect()
         };
@@ -2767,6 +2774,9 @@ impl SessionManager {
 
         for record in self.external_records().await {
             if !same_project_path(&record.summary.project_path, project_path) {
+                continue;
+            }
+            if record.summary.is_board_session() {
                 continue;
             }
             let mut external_summary = record.summary.clone();
@@ -3087,7 +3097,7 @@ impl SessionManager {
     }
 
     pub async fn remember_persisted_session(&self, session: SessionSummary) -> Result<()> {
-        if session.board_session {
+        if session.is_board_session() {
             self.board_session_ids
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -7477,6 +7487,22 @@ fn runtime_label(runtime: ChatRuntime) -> &'static str {
     }
 }
 
+fn validate_recovered_agent_runtime_config(
+    provider: Provider,
+    runtime: ChatRuntime,
+    direct_ai_config: Option<&DirectAiRuntimeConfig>,
+) -> Result<()> {
+    if provider == Provider::Codex
+        && runtime == ChatRuntime::IoGateway
+        && direct_ai_config.is_none()
+    {
+        return Err(CoreError::InvalidInput(
+            "IO Gateway is not configured for this session".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn runtime_status_label(status: iowb_protocol::SessionRuntimeStatus) -> &'static str {
     match status {
         iowb_protocol::SessionRuntimeStatus::Starting => "starting",
@@ -9991,13 +10017,11 @@ impl ClaudeLiveOutputNormalizer {
                         };
                         self.streamed_text_started = true;
                         self.emitted_content = true;
-                        if self.final_assistant_message.is_none() {
-                            self.final_assistant_message = Some(bound_agent_text(
-                                self.streamed_text.trim(),
-                                AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                                "assistant response",
-                            ));
-                        }
+                        self.final_assistant_message = Some(bound_agent_text(
+                            self.streamed_text.trim(),
+                            AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
+                            "assistant response",
+                        ));
                         format!("{prefix}{text}")
                     }
                     "input_json_delta" => {
@@ -10095,18 +10119,16 @@ impl ClaudeLiveOutputNormalizer {
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                 {
+                    self.final_assistant_message = Some(bound_agent_text(
+                        text.trim(),
+                        AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
+                        "assistant response",
+                    ));
                     let remaining = text.strip_prefix(&self.streamed_text).unwrap_or(text);
                     let trimmed = remaining.trim();
                     if !trimmed.is_empty()
                         && (self.streamed_text.is_empty() || !remaining.is_empty())
                     {
-                        if self.final_assistant_message.is_none() {
-                            self.final_assistant_message = Some(bound_agent_text(
-                                trimmed,
-                                AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                                "assistant response",
-                            ));
-                        }
                         parts.push(format!("claude\n{trimmed}"));
                     }
                 }
@@ -11112,7 +11134,7 @@ mod tests {
             .expect("source session");
         let source = state
             .sessions
-            .mark_board_session(&source.id, "run-1", Some("task-1".to_string()))
+            .mark_board_session(&source.id, "board-1", Some("task-1".to_string()))
             .await
             .expect("mark board session");
         let target = state
@@ -11146,7 +11168,7 @@ mod tests {
             .await
             .expect("continue board session");
         assert!(continued.board_session);
-        assert_eq!(continued.board_run_id.as_deref(), Some("run-1"));
+        assert_eq!(continued.board_id.as_deref(), Some("board-1"));
         assert_eq!(continued.board_task_id.as_deref(), Some("task-1"));
         assert!(reloaded.list_active().await.is_empty());
 
@@ -11166,7 +11188,7 @@ mod tests {
             .await
             .expect("fork board session");
         assert!(fork.session.board_session);
-        assert_eq!(fork.session.board_run_id.as_deref(), Some("run-1"));
+        assert_eq!(fork.session.board_id.as_deref(), Some("board-1"));
         assert_eq!(fork.session.board_task_id.as_deref(), Some("task-1"));
         assert!(!fork.source_hidden);
         assert!(
@@ -12766,6 +12788,10 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(claude.finish(), "");
+        assert_eq!(
+            claude.take_final_assistant_message().as_deref(),
+            Some("Hello mobile")
+        );
     }
 
     #[test]
@@ -14396,7 +14422,7 @@ mod tests {
             provider: Provider::Codex,
             external: false,
             board_session: false,
-            board_run_id: None,
+            board_id: None,
             board_task_id: None,
             project_path: root.display().to_string(),
             title: "Interrupted chat".to_string(),

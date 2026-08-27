@@ -22,7 +22,7 @@ The current implementation establishes the Rust foundation and several core work
 - Database workspace APIs for saved connections, SQLite/PostgreSQL/MySQL/MariaDB connection tests, explorer nodes, object details, SQL query execution, paginated table data, cross-database table transfer, and JSON import/export jobs.
 - User Git identity settings, onboarding state, provider CLI status checks, and Claude/Codex token usage parsing.
 - MCP server process start/stop/list endpoints plus command-backed MCP tool execution.
-- Command-backed slash command, plugin install/remove/run, Taskmaster run, Danger run, push notification, and MCP utility endpoints with persisted run history.
+- Command-backed slash command, plugin install/remove/run, Taskmaster run, agentic board, push notification, and MCP utility endpoints with persisted command history.
 - Settings-backed compatibility endpoints for provider config, external agent REST config, and legacy state paths.
 - Optional command-backed audio transcription through `IO_WORKBENCH_TRANSCRIBE_COMMAND`.
 - Runtime metrics endpoint for memory, active process, project, session, and configured limit snapshots.
