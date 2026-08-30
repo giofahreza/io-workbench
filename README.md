@@ -17,7 +17,7 @@ The current implementation establishes the Rust foundation and several core work
 - Supervised process start/list/abort with bounded stdout/stderr streaming and bounded stdin writes over REST or WebSocket.
 - PTY-backed shell sessions with input, resize, output streaming, and abort support.
 - Session message persistence, active-session tracking, session rename/model metadata, and persisted conversation search.
-- Agent provider orchestration for Claude, Codex, Cursor, and Gemini through supervised CLI processes, WebSocket start/abort commands, reconnect replay, and persisted assistant output.
+- Agent provider orchestration for Claude, Codex, and Gemini through supervised CLI processes, WebSocket start/abort commands, reconnect replay, and persisted assistant output.
 - Git workspace tools for init/status/diff/file diff/commit history/branches/remotes/fetch/pull/push/publish/discard/delete-untracked, GitHub clone workspace creation, and optional Direct AI commit-message generation.
 - Database workspace APIs for saved connections, SQLite/PostgreSQL/MySQL/MariaDB connection tests, explorer nodes, object details, SQL query execution, paginated table data, cross-database table transfer, and JSON import/export jobs.
 - User Git identity settings, onboarding state, provider CLI status checks, and Claude/Codex token usage parsing.
@@ -113,7 +113,6 @@ Agent commands default to the installed provider CLIs:
 
 - Claude: `claude --print {prompt}`
 - Codex: `codex exec {prompt}`
-- Cursor: `cursor-agent -p {prompt}`
 - Gemini: `gemini --prompt {prompt}`
 
 Use `IO_WORKBENCH_AGENT_COMMAND` and `IO_WORKBENCH_AGENT_ARGS_JSON` to override all providers, or provider-specific variants such as `IO_WORKBENCH_CODEX_COMMAND` and `IO_WORKBENCH_CODEX_ARGS_JSON`. Argument templates support `{prompt}`, `{session_id}`, and `{model}`. Set `IO_WORKBENCH_AGENT_STDIN=true` or a provider-specific `IO_WORKBENCH_CODEX_STDIN=true` when the prompt should be written to stdin instead of passed as an argument.

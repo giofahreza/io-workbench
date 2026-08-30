@@ -50,14 +50,6 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "image/svg+xml; charset=utf-8",
             bytes: include_bytes!("../static/icons/gemini-ai-icon.svg"),
         }),
-        "icons/cursor.svg" => Some(UiAsset {
-            content_type: "image/svg+xml; charset=utf-8",
-            bytes: include_bytes!("../static/icons/cursor.svg"),
-        }),
-        "icons/cursor-white.svg" => Some(UiAsset {
-            content_type: "image/svg+xml; charset=utf-8",
-            bytes: include_bytes!("../static/icons/cursor-white.svg"),
-        }),
         "sw.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/sw.js"),
@@ -69,6 +61,158 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
         "app.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app.js"),
+        }),
+        "app/core.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/core.js"),
+        }),
+        "app/sidebar.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/sidebar.js"),
+        }),
+        "app/chat/prompt-history.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/chat/prompt-history.js"),
+        }),
+        "app/chat/drafts.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/chat/drafts.js"),
+        }),
+        "app/chat/history.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/chat/history.js"),
+        }),
+        "app/chat/recovery.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/chat/recovery.js"),
+        }),
+        "app/chat/stream.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/chat/stream.js"),
+        }),
+        "app/chat/settings.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/chat/settings.js"),
+        }),
+        "app/workspace/files.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/files.js"),
+        }),
+        "app/workspace/git.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/git.js"),
+        }),
+        "app/workspace/git/status.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/git/status.js"),
+        }),
+        "app/workspace/git/commit.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/git/commit.js"),
+        }),
+        "app/workspace/git/chat_composer.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/git/chat_composer.js"),
+        }),
+        "app/workspace/git/markdown.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/git/markdown.js"),
+        }),
+        "app/workspace/git/session_actions.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/git/session_actions.js"),
+        }),
+        "app/workspace/git/conflicts.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/git/conflicts.js"),
+        }),
+        "app/workspace/git/diff.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/git/diff.js"),
+        }),
+        "app/workspace/git/history.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/git/history.js"),
+        }),
+        "app/workspace/database.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/database.js"),
+        }),
+        "app/workspace/shell.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/shell.js"),
+        }),
+        "app/workspace/settings.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/settings.js"),
+        }),
+        "app/workspace/websocket.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/websocket.js"),
+        }),
+        "app/navigation.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/navigation.js"),
+        }),
+        "app/board.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/board.js"),
+        }),
+        "app/commands.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/commands.js"),
+        }),
+        "app/forms.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/forms.js"),
+        }),
+        "app/startup.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/startup.js"),
+        }),
+        "styles/base.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/base.css"),
+        }),
+        "styles/sidebar.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/sidebar.css"),
+        }),
+        "styles/layout.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/layout.css"),
+        }),
+        "styles/workspace.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/workspace.css"),
+        }),
+        "styles/chat.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/chat.css"),
+        }),
+        "styles/shell-and-git.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/shell-and-git.css"),
+        }),
+        "styles/output.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/output.css"),
+        }),
+        "styles/board.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/board.css"),
+        }),
+        "styles/responsive/large.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/responsive/large.css"),
+        }),
+        "styles/responsive/mobile.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/responsive/mobile.css"),
+        }),
+        "styles/responsive/touch-and-small.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/responsive/touch-and-small.css"),
         }),
         "vendor/codemirror/codemirror.css" => Some(UiAsset {
             content_type: "text/css; charset=utf-8",
@@ -208,9 +352,69 @@ mod tests {
             .expect("APP_VERSION value")
     }
 
+    fn app_source() -> String {
+        [
+            "app.js",
+            "app/core.js",
+            "app/sidebar.js",
+            "app/chat/prompt-history.js",
+            "app/chat/drafts.js",
+            "app/chat/history.js",
+            "app/chat/recovery.js",
+            "app/chat/stream.js",
+            "app/chat/settings.js",
+            "app/workspace/files.js",
+            "app/workspace/git.js",
+            "app/workspace/git/status.js",
+            "app/workspace/git/commit.js",
+            "app/workspace/git/chat_composer.js",
+            "app/workspace/git/markdown.js",
+            "app/workspace/git/session_actions.js",
+            "app/workspace/git/conflicts.js",
+            "app/workspace/git/diff.js",
+            "app/workspace/git/history.js",
+            "app/workspace/database.js",
+            "app/workspace/shell.js",
+            "app/workspace/settings.js",
+            "app/workspace/websocket.js",
+            "app/navigation.js",
+            "app/board.js",
+            "app/commands.js",
+            "app/forms.js",
+            "app/startup.js",
+        ]
+        .into_iter()
+        .fold(String::new(), |mut source, path| {
+            source.push_str(asset_text(path));
+            source
+        })
+    }
+
+    fn styles_source() -> String {
+        [
+            "styles.css",
+            "styles/base.css",
+            "styles/sidebar.css",
+            "styles/layout.css",
+            "styles/workspace.css",
+            "styles/chat.css",
+            "styles/shell-and-git.css",
+            "styles/output.css",
+            "styles/board.css",
+            "styles/responsive/large.css",
+            "styles/responsive/mobile.css",
+            "styles/responsive/touch-and-small.css",
+        ]
+        .into_iter()
+        .fold(String::new(), |mut source, path| {
+            source.push_str(asset_text(path));
+            source
+        })
+    }
+
     #[test]
     fn chat_history_treats_agent_content_as_sanitized_markdown_and_uses_snapshot() {
-        let source = asset_text("app.js");
+        let source = app_source();
         assert!(source.contains("text.innerHTML = renderChatBubbleHtml(String(content));"));
         assert!(source.contains("text.textContent = String(message?.content || \"\")"));
         assert!(!source.contains("text.innerHTML = content"));
@@ -225,7 +429,7 @@ mod tests {
 
     #[test]
     fn chat_context_recovery_blocks_normal_send_and_retries_with_a_fresh_request() {
-        let source = asset_text("app.js");
+        let source = app_source();
         let remember_recovery = source
             .split_once("function rememberChatRecovery(sessionId, recovery) {")
             .map(|(_, rest)| rest)
@@ -303,7 +507,7 @@ mod tests {
 
     #[test]
     fn edit_from_here_stages_locally_and_replaces_only_on_submit() {
-        let source = asset_text("app.js");
+        let source = app_source();
 
         assert!(source.contains("state.chatEditFromHere.staged = staged;"));
         assert!(source.contains("renderStagedChatEdit(staged);"));
@@ -316,7 +520,7 @@ mod tests {
 
     #[test]
     fn active_chat_stream_is_cached_and_restored_across_session_switches() {
-        let source = asset_text("app.js");
+        let source = app_source();
         let snapshot_loader = source
             .split_once("async function loadChatHistoryForSession(sessionId, opts = {}) {")
             .map(|(_, rest)| rest)
@@ -353,7 +557,7 @@ mod tests {
 
     #[test]
     fn web_chat_sidebar_regressions_stay_fixed() {
-        let source = asset_text("app.js");
+        let source = app_source();
         let project_sessions = source
             .split_once("function sidebarProjectSessions(project) {")
             .map(|(_, rest)| rest)
@@ -372,7 +576,7 @@ mod tests {
 
     #[test]
     fn board_task_transcripts_are_read_only_and_use_complete_snapshots() {
-        let source = asset_text("app.js");
+        let source = app_source();
         let opener = source
             .split_once("async function openBoardTaskTranscript(taskId) {")
             .map(|(_, rest)| rest)
@@ -393,8 +597,8 @@ mod tests {
         assert!(source.contains("data-board-view-transcript"));
         assert!(source.contains("async function loadBoardSessionTranscript(sessionId)"));
         assert!(opener.contains("loadBoardSessionTranscript(sessionId)"));
-        assert!(!source.contains("data-board-open-chat"));
-        assert!(source.contains("provider !== \"cursor\""));
+        assert!(!source.contains("data-board-open-chat=\""));
+        assert!(source.contains("return Boolean(boardTaskSessionId(task));"));
         assert!(
             snapshot_merge
                 .contains("const boardSession = isBoardChatSession(snapshotSession, sessionId);")
@@ -429,7 +633,7 @@ mod tests {
     #[test]
     fn board_mobile_config_exposes_malformed_tool_call_repair_policy() {
         let html = asset_text("index.html");
-        let source = asset_text("app.js");
+        let source = app_source();
 
         for id in ["board-tool-repair-enabled", "board-tool-repair-retries"] {
             assert!(html.contains(&format!(r#"id="{id}""#)), "missing {id}");
@@ -454,7 +658,7 @@ mod tests {
 
     #[test]
     fn pinned_chat_sync_accepts_authoritative_empty_and_refreshes_live() {
-        let source = asset_text("app.js");
+        let source = app_source();
 
         assert!(source.contains("response?.initialized === true"));
         assert!(source.contains("response?.initialized == null && remotePinned.length > 0"));
@@ -468,7 +672,7 @@ mod tests {
 
     #[test]
     fn mobile_chat_composer_cannot_expand_past_viewport() {
-        let styles = asset_text("styles.css");
+        let styles = styles_source();
 
         assert!(styles.contains("grid-template-columns: minmax(0, 1fr);"));
         assert!(styles.contains(".chat-composer {"));
@@ -494,7 +698,7 @@ mod tests {
     #[test]
     fn chat_fast_controls_share_the_session_aware_setter() {
         let html = asset_text("index.html");
-        let source = asset_text("app.js");
+        let source = app_source();
 
         assert!(html.contains(r#"id="chat-fast-toggle""#));
         assert!(source.contains(r#"data-chat-fast-setting"#));
@@ -511,8 +715,8 @@ mod tests {
 
     #[test]
     fn web_chat_turn_cards_match_mobile_session_actions() {
-        let source = asset_text("app.js");
-        let styles = asset_text("styles.css");
+        let source = app_source();
+        let styles = styles_source();
 
         assert!(source.contains("function chatResponsePresentation(messages, options = {})"));
         assert!(source.contains("showResponseHeader: true"));
@@ -529,7 +733,7 @@ mod tests {
 
     #[test]
     fn sidebar_session_menu_copies_codex_resume_command() {
-        let source = asset_text("app.js");
+        let source = app_source();
 
         assert!(source.contains("function codexResumeCommand(session, projectPath = \"\")"));
         assert!(source.contains("Copy Codex Resume Command"));
@@ -541,7 +745,7 @@ mod tests {
     #[test]
     fn io_gateway_settings_match_the_mobile_configuration_contract() {
         let html = asset_text("index.html");
-        let source = asset_text("app.js");
+        let source = app_source();
 
         for id in [
             "io-gateway-enabled",
@@ -564,7 +768,7 @@ mod tests {
 
     #[test]
     fn chat_model_loader_preserves_empty_cli_default_value() {
-        let source = asset_text("app.js");
+        let source = app_source();
         let object_branch_start = source
             .find(r#"if (typeof entry === "object")"#)
             .expect("chat model object normalization branch");
@@ -582,10 +786,10 @@ mod tests {
 
     #[test]
     fn web_shell_asset_versions_stay_in_sync() {
-        let app = asset_text("app.js");
+        let app = app_source();
         let html = asset_text("index.html");
         let service_worker = asset_text("sw.js");
-        let version = app_version(app);
+        let version = app_version(&app);
 
         assert_eq!(app_version(service_worker), version);
         assert!(html.contains(&format!(r#"/styles.css?v={version}"#)));

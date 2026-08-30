@@ -591,9 +591,6 @@
     "/api/codex/{path}": {
       "x-any": { "tags": ["Compatibility"], "summary": "Provider compatibility endpoint" }
     },
-    "/api/cursor/{path}": {
-      "x-any": { "tags": ["Compatibility"], "summary": "Provider compatibility endpoint" }
-    },
     "/api/gemini/{path}": {
       "x-any": { "tags": ["Compatibility"], "summary": "Provider compatibility endpoint" }
     },

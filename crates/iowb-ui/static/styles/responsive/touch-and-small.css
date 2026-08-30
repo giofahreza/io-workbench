@@ -1,0 +1,833 @@
+@keyframes chat-processing-dots {
+  0% { content: ""; }
+  25% { content: "."; }
+  50% { content: ".."; }
+  75%,
+  100% { content: "..."; }
+}
+
+#chat-output .chat-line-assistant .chat-line-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 7px;
+  font-size: 10.5px;
+  color: var(--muted);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+#chat-output .chat-line-assistant .chat-line-footer span {
+  white-space: nowrap;
+}
+
+#chat-output .chat-line-assistant .chat-line-footer strong {
+  color: var(--text, inherit);
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* The footer is wrapped in a <details> so the chat transcript stays compact
+ * when re-opening a session. Click "details" to inspect cli/model/timestamps
+ * for any individual turn. */
+#chat-output .chat-line-footer-details {
+  display: inline;
+  font-size: inherit;
+  color: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  font-weight: inherit;
+}
+
+#chat-output .chat-line-footer-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  font-size: 10px;
+  color: var(--muted);
+  opacity: 0.65;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--panel-soft) 68%, transparent);
+  transition: opacity 0.15s ease, background 0.15s ease;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+#chat-output .chat-line-footer-summary::-webkit-details-marker {
+  display: none;
+}
+
+#chat-output .chat-line-footer-summary::before {
+  content: "▾";
+  font-size: 9px;
+  transition: transform 0.15s ease;
+}
+
+#chat-output .chat-line-footer-details[open] .chat-line-footer-summary::before {
+  transform: rotate(0deg);
+}
+
+#chat-output .chat-line-footer-summary:hover {
+  opacity: 1;
+  background: color-mix(in srgb, var(--panel-soft) 92%, transparent);
+}
+
+#chat-output .chat-line-footer-details[open] .chat-line-footer-summary {
+  opacity: 1;
+  margin-bottom: 2px;
+}
+
+#chat-output .chat-line-footer-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 7px;
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--muted);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+#chat-output .chat-line-footer-items span {
+  white-space: nowrap;
+}
+
+#chat-output .chat-line-footer-items strong {
+  color: var(--text, inherit);
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+#chat-output .chat-line-assistant:empty {
+  display: none;
+}
+
+#chat-output .chat-line-system {
+  display: block;
+  width: 100%;
+  padding: 2px 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+  white-space: pre-wrap;
+}
+
+#chat-output .chat-context-recovery,
+#chat-output .chat-manual-compaction {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+  color: var(--text);
+  font-size: 12px;
+  font-style: normal;
+  white-space: normal;
+}
+
+#chat-output .chat-context-recovery-copy,
+#chat-output .chat-manual-compaction-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+#chat-output .chat-context-recovery-copy span,
+#chat-output .chat-manual-compaction-copy span {
+  color: var(--muted);
+}
+
+#chat-output .chat-context-recovery button,
+#chat-output .chat-manual-compaction button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+#chat-output .chat-manual-compaction-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+@media (max-width: 640px) {
+  #chat-output .chat-context-recovery,
+  #chat-output .chat-manual-compaction {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  #chat-output .chat-manual-compaction-actions {
+    justify-content: flex-end;
+  }
+}
+
+#chat-output .chat-line-tool {
+  align-self: stretch;
+  width: 100%;
+  padding: 3px 6px;
+  border: 0;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 48%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-soft) 72%, transparent);
+  color: var(--muted);
+}
+
+#chat-output .chat-line-tool summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+  user-select: none;
+}
+
+#chat-output .chat-line-tool .chat-line-text {
+  max-height: 320px;
+  margin: 3px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font: inherit;
+}
+
+/* Collapsible exec sections embedded in assistant bubbles.
+   exec / Parameters stays expanded by default so the user can see the
+   command being executed; exec / Details is collapsed because it usually
+   contains the verbose command output. */
+#chat-output .exec-section {
+  display: block;
+  margin: 8px 0;
+  border: 0;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 42%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-soft) 74%, transparent);
+  font-size: 13px;
+  overflow: hidden;
+}
+
+#chat-output .exec-section > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 4px 9px;
+  font-weight: 600;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  letter-spacing: 0;
+}
+
+#chat-output .exec-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+#chat-output .exec-section > summary::before {
+  content: "▸";
+  font-size: 11px;
+  transition: transform 0.15s ease;
+  color: var(--muted);
+}
+
+#chat-output .exec-section[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+#chat-output .exec-section.exec-parameters > summary {
+  color: #2f6fed;
+  background: rgba(47, 111, 237, 0.06);
+  border-bottom: 0;
+}
+
+#chat-output .exec-section.exec-details > summary {
+  color: #7c5cff;
+  background: rgba(124, 92, 255, 0.06);
+  border-bottom: 0;
+}
+
+#chat-output .exec-section .exec-title {
+  font-size: 11.5px;
+  text-transform: none;
+}
+
+#chat-output .exec-section .exec-body {
+  padding: 5px 9px 6px;
+  background: color-mix(in srgb, var(--panel) 68%, transparent);
+}
+
+#chat-output .exec-section .exec-body > *:first-child {
+  margin-top: 0;
+}
+
+#chat-output .exec-section .exec-body > *:last-child {
+  margin-bottom: 0;
+}
+
+#chat-output .exec-section .exec-body pre.markdown-code {
+  margin: 2px 0;
+}
+
+#chat-output .exec-section .exec-body p {
+  margin: 2px 0;
+}
+
+#chat-output .exec-section .exec-body code {
+  background: rgba(127, 127, 127, 0.15);
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+/* The chain-of-thought / reasoning block is wrapped in a <details> so the
+ * chat transcript stays compact. Click "Thinking" to inspect what the model
+ * was reasoning about before producing the visible reply. */
+#chat-output .thinking-section {
+  display: block;
+  margin: 8px 0;
+  padding: 3px 7px;
+  border: 0;
+  border-left: 2px solid color-mix(in srgb, #7c5cff 42%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-soft) 72%, transparent);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+#chat-output .thinking-section > summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+#chat-output .thinking-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+#chat-output .thinking-section > summary::before {
+  content: "▾";
+  font-size: 10px;
+  transition: transform 0.15s ease;
+}
+
+#chat-output .thinking-section[open] > summary::before {
+  transform: rotate(0deg);
+}
+
+#chat-output .thinking-section .thinking-title {
+  font-size: 11px;
+}
+
+#chat-output .thinking-section[open] > summary {
+  margin-bottom: 2px;
+  padding-bottom: 2px;
+  border-bottom: 0;
+}
+
+#chat-output .thinking-section .thinking-body {
+  color: var(--text, inherit);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+#chat-output .thinking-section .thinking-body p {
+  margin: 2px 0;
+}
+
+#chat-output .thinking-section .thinking-body pre.markdown-code {
+  margin: 2px 0;
+  font-size: 12px;
+}
+
+#chat-output .thinking-section .thinking-body code {
+  background: rgba(127, 127, 127, 0.15);
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+#chat-output .exec-section .exec-body ul,
+#chat-output .exec-section .exec-body ol {
+  margin: 3px 0 3px 18px;
+  padding: 0;
+}
+
+#chat-output .exec-section .exec-body h1,
+#chat-output .exec-section .exec-body h2,
+#chat-output .exec-section .exec-body h3,
+#chat-output .exec-section .exec-body h4 {
+  margin: 5px 0 2px;
+  font-size: 13px;
+}
+
+/* Thinking block — model chain-of-thought, collapsed by default to keep
+ * the chat transcript focused on the visible response. The summary uses a
+ * purple "Thinking" label with a dashed border so it visually pairs with
+ * the tool / Details styling without competing with the response body. */
+#chat-output .thinking-section {
+  display: block;
+  margin: 8px 0;
+  border: 0;
+  border-left: 2px solid color-mix(in srgb, #7c5cff 42%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, rgba(124, 92, 255, 0.08) 74%, var(--panel-soft));
+  font-size: 12.5px;
+  overflow: hidden;
+}
+
+#chat-output .thinking-section > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 4px 8px;
+  font-weight: 600;
+  color: #7c5cff;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+}
+
+#chat-output .thinking-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+#chat-output .thinking-section > summary::before {
+  content: "▸";
+  display: inline-block;
+  font-size: 10px;
+  transition: transform 0.15s ease;
+}
+
+#chat-output .thinking-section[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+#chat-output .thinking-section .thinking-title {
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+#chat-output .thinking-section .thinking-body {
+  padding: 3px 8px 5px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  line-height: 1.5;
+  border-top: 0;
+}
+
+#chat-output .thinking-section .thinking-body > *:first-child {
+  margin-top: 0;
+}
+
+#chat-output .thinking-section .thinking-body > *:last-child {
+  margin-bottom: 0;
+}
+
+#chat-output .thinking-section .thinking-body p {
+  margin: 2px 0;
+}
+
+#chat-output .thinking-section .thinking-body pre.markdown-code {
+  margin: 2px 0;
+}
+
+#chat-output .thinking-section .thinking-body code {
+  background: rgba(127, 127, 127, 0.15);
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+#chat-output .chat-history-loading {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+#chat-output .chat-history-loading::before {
+  content: "";
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid color-mix(in srgb, var(--accent) 24%, transparent);
+  border-top-color: var(--accent);
+  animation: sidebar-session-spin 0.8s linear infinite;
+}
+
+/* ----------------------------------------------------------------------
+ * Sidebar chat session cards shown inside expanded projects.
+ * ---------------------------------------------------------------------- */
+.sidebar-history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 26px 26px;
+  gap: 4px 4px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.sidebar-history-item:hover,
+.sidebar-history-item:focus-within {
+  background: var(--panel-soft);
+  border-color: var(--line);
+  outline: none;
+}
+
+.sidebar-history-item.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.sidebar-history-item.pinned {
+  border-color: color-mix(in srgb, var(--warn) 35%, var(--line));
+}
+
+.sidebar-history-item.pinned-reorderable {
+  grid-template-columns: minmax(0, 1fr) 14px 26px;
+  touch-action: pan-y;
+  user-select: none;
+}
+
+.sidebar-history-item.pinned-reorderable.dragging {
+  opacity: 0.55;
+  cursor: grabbing;
+}
+
+.sidebar-history-item.pinned-reorderable.drag-over {
+  border-color: var(--accent);
+}
+
+.sidebar-history-item.pinned-reorderable.drag-over-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.sidebar-history-item.pinned-reorderable.drag-over-after {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.sidebar-history-main {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font: inherit;
+}
+
+.sidebar-history-main:hover,
+.sidebar-history-main:focus-visible {
+  background: transparent;
+  outline: none;
+}
+
+.sidebar-history-item .session-title {
+  font-weight: 600;
+  color: var(--text, inherit);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  grid-column: 1 / 2;
+}
+
+.sidebar-history-item .session-project {
+  grid-column: 1 / 2;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-history-item .session-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  grid-column: 1 / 2;
+  min-width: 0;
+}
+
+.sidebar-history-item .session-status-icon {
+  position: relative;
+  flex: 0 0 12px;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+}
+
+.sidebar-history-item.is-running .session-status-icon {
+  border: 2px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-top-color: var(--accent);
+  animation: sidebar-session-spin 0.8s linear infinite;
+}
+
+.sidebar-history-item.is-completed .session-status-icon {
+  background: var(--ok);
+}
+
+.sidebar-history-item.is-completed .session-status-icon::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 2px;
+  width: 5px;
+  height: 7px;
+  border: solid white;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.sidebar-history-item.is-failed .session-status-icon {
+  background: var(--danger);
+}
+
+.sidebar-history-item.is-failed .session-status-icon::before,
+.sidebar-history-item.is-failed .session-status-icon::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  left: 3px;
+  width: 6px;
+  height: 2px;
+  border-radius: 999px;
+  background: white;
+}
+
+.sidebar-history-item.is-failed .session-status-icon::before {
+  transform: rotate(45deg);
+}
+
+.sidebar-history-item.is-failed .session-status-icon::after {
+  transform: rotate(-45deg);
+}
+
+@keyframes sidebar-session-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.sidebar-history-item .session-bottom {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10.5px;
+  color: var(--muted);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.sidebar-history-item .session-pin,
+.sidebar-history-item .session-delete {
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  min-height: 26px;
+  align-self: center;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  opacity: 0.72;
+}
+
+.sidebar-history-item .session-pin {
+  color: var(--muted);
+}
+
+.sidebar-history-item .session-pin.active {
+  border-color: color-mix(in srgb, var(--warn) 38%, var(--line));
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  color: var(--warn);
+}
+
+.sidebar-history-item .session-pin.active::before {
+  background: currentColor;
+}
+
+.sidebar-history-item .session-pin::before,
+.sidebar-history-item .session-delete::before {
+  width: 14px;
+  height: 14px;
+}
+
+.sidebar-history-item .session-pin:hover,
+.sidebar-history-item .session-pin:focus-visible {
+  border-color: color-mix(in srgb, var(--warn) 35%, var(--line));
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn);
+  opacity: 1;
+}
+
+.sidebar-history-item .session-delete:hover,
+.sidebar-history-item .session-delete:focus-visible {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--line));
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  opacity: 1;
+}
+
+.sidebar-history-item .session-bottom .cli-badge {
+  display: inline-grid;
+  width: 22px;
+  height: 20px;
+  place-items: center;
+  padding: 0;
+  border-radius: 999px;
+  background: #111827;
+  border: 1px solid color-mix(in srgb, #ffffff 14%, transparent);
+  font-size: 0;
+  font-weight: 600;
+  color: #ffffff;
+}
+
+.sidebar-history-item .session-bottom .cli-badge img {
+  display: block;
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+  filter: brightness(0) invert(1);
+}
+
+.sidebar-history-item .session-bottom .cli-badge.codex {
+  color: #ffffff;
+}
+.sidebar-history-item .session-bottom .cli-badge.claude {
+  color: #ffffff;
+}
+.sidebar-history-item .session-bottom .cli-badge.gemini {
+  color: #ffffff;
+}
+.sidebar-history-item .session-bottom .meta-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sidebar-history-item .session-bottom .meta-time {
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+.sidebar-history-item .session-bottom .meta-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10.5px;
+  color: var(--muted);
+}
+
+/* The legacy standalone chat-footer is kept as a hidden slot so JS doesn't
+   blow up if it still tries to render into it. */
+.chat-footer {
+  display: none !important;
+}
+
+@media (max-width: 760px) {
+  .settings-shell {
+    border-width: 0;
+  }
+
+  .settings-header {
+    min-height: 48px;
+    padding: 8px 12px;
+  }
+
+  .settings-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .settings-nav {
+    order: 2;
+    flex-direction: row;
+    gap: 6px;
+    overflow-x: auto;
+    border-top: 1px solid var(--line);
+    border-right: 0;
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+    scrollbar-width: none;
+  }
+
+  .settings-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .settings-nav button {
+    flex: 0 0 auto;
+    min-height: 32px;
+    border-radius: 999px;
+    padding: 7px 10px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .settings-nav button::before {
+    width: 14px;
+    height: 14px;
+    flex-basis: 14px;
+  }
+
+  .settings-main {
+    order: 1;
+    padding: 10px;
+  }
+
+  .settings-card {
+    padding: 12px;
+  }
+
+  .settings-action-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .io-gateway-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .io-gateway-actions {
+    display: grid;
+    grid-template-columns: 38px minmax(0, 1fr) minmax(0, 1.25fr);
+  }
+}
