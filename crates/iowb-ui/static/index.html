@@ -552,6 +552,10 @@
       </section>
 
       <section id="git-view" class="panel view workbench-panel git-panel">
+        <div class="git-workspace-picker">
+          <label for="git-repository"><span>Repository</span><select id="git-repository"><option value="">Loading Git workspace…</option></select></label>
+          <p id="git-workspace-message" class="meta">Git operations are scoped to one selected worktree.</p>
+        </div>
         <div class="git-action-header">
           <label>
             <span>Branch</span>

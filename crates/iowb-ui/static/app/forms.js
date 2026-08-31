@@ -111,6 +111,11 @@ function bindForms() {
   qs("#refresh-files").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadFiles).catch(showError));
   qs("#refresh-sessions")?.addEventListener("click", renderSessions);
   qs("#refresh-git").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadGitStatus).catch(showError));
+  qs("#git-repository")?.addEventListener("change", (event) => {
+    state.gitSelectedRepositoryId = event.currentTarget.value;
+    state.gitStatus = null;
+    loadGitStatus().catch(showError);
+  });
   qs("#refresh-db").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadDbConnections).catch(showError));
   qs("#refresh-tool-runs").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadToolRuns).catch(showError));
   qs("#refresh-metrics").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadMetrics).catch(showError));
@@ -290,8 +295,8 @@ function bindForms() {
   qs("#update-session-model")?.addEventListener("click", () => updateSessionModel().catch(showError));
   qs("#load-session-token-usage")?.addEventListener("click", () => loadSessionTokenUsage().catch(showError));
   qs("#rename-session-action")?.addEventListener("click", () => renameSelectedSession().catch(showError));
-  qs("#git-init").addEventListener("click", () => gitOperation("/api/git/init").catch(showError));
-  qs("#git-initial-commit").addEventListener("click", () => gitOperation("/api/git/initial-commit").catch(showError));
+  qs("#git-init").addEventListener("click", () => initializeGitRepository().catch(showError));
+  qs("#git-initial-commit").addEventListener("click", () => createGitInitialCommit().catch(showError));
   qs("#git-generate-message").addEventListener("click", () => generateGitMessage().catch(showError));
   qs("#git-commit").addEventListener("click", () => commitGitSelection().catch(showError));
   qs("#git-diff").addEventListener("click", () => gitDiffSelected().catch(showError));

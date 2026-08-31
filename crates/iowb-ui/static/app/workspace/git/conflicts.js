@@ -1,14 +1,14 @@
 async function loadGitConflicts() {
   const project = activeProjectKey();
   if (!project) return;
-  const body = await api(`/api/git/conflicts?project=${encodeURIComponent(project)}`);
+  const body = await api(gitQuery("/api/git/conflicts"));
   renderGitConflicts(body);
 }
 
 async function loadGitConflictFile(file) {
   const project = activeProjectKey();
   if (!project || !file) return;
-  const body = await api(`/api/git/conflict-file?project=${encodeURIComponent(project)}&file=${encodeURIComponent(file)}`);
+  const body = await api(gitQuery("/api/git/conflict-file", { file }));
   renderGitConflictFile(body);
 }
 
@@ -20,18 +20,24 @@ function renderGitConflicts(body) {
     target.innerHTML = '<p class="empty">No unresolved Git conflicts.</p>';
     return;
   }
-  target.innerHTML = files.map((file) => `<article class="result-row conflict-row">
+  target.innerHTML = files.map((file) => {
+    const status = gitFilesFromStatus(state.gitStatus).find((item) => item.path === file.path);
+    const canResolve = !status || !isGitSubmoduleFile(status);
+    return `<article class="result-row conflict-row">
     <header class="row-title">
       <strong>${escapeHtml(file.path)}</strong>
       <span class="badge danger">${escapeHtml(file.status)}</span>
     </header>
     <span class="meta">${escapeHtml(file.conflictCount)} conflict region(s)</span>
     <div class="row-actions">
-      <button type="button" data-git-conflict-open="${escapeHtml(file.path)}">Open</button>
-      <button type="button" data-git-conflict-quick="${escapeHtml(file.path)}" data-resolution="ours">Use Ours</button>
-      <button type="button" data-git-conflict-quick="${escapeHtml(file.path)}" data-resolution="theirs">Use Theirs</button>
+      ${canResolve
+        ? `<button type="button" data-git-conflict-open="${escapeHtml(file.path)}">Open</button>
+          <button type="button" data-git-conflict-quick="${escapeHtml(file.path)}" data-resolution="ours">Use Ours</button>
+          <button type="button" data-git-conflict-quick="${escapeHtml(file.path)}" data-resolution="theirs">Use Theirs</button>`
+        : "<span class=\"meta\">Resolve the submodule pointer in Git, then stage it.</span>"}
     </div>
-  </article>`).join("");
+  </article>`;
+  }).join("");
   target.querySelectorAll("[data-git-conflict-open]").forEach((button) => {
     button.addEventListener("click", () => loadGitConflictFile(button.dataset.gitConflictOpen).catch(showError));
   });
@@ -87,7 +93,7 @@ function renderGitConflictFile(body) {
 async function resolveGitConflict(file, resolution, content) {
   const project = activeProjectKey();
   if (!project || !file || !resolution) return;
-  const payload = { project, file, resolution, stage: true };
+  const payload = gitBody({ file, resolution, stage: true });
   if (content !== undefined) payload.content = content;
   const body = await api("/api/git/resolve-conflict", {
     method: "POST",

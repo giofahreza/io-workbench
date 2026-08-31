@@ -2,32 +2,39 @@ async fn branches(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> Result<Json<GitBranchesResponse>> {
-    let project_path = resolve_project_path(&state, query.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, query.project_ref()?, query.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
-    let output = git(&project_path, ["branch", "-a"]).await?.stdout;
+    let output = git(
+        &project_path,
+        [
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname)%x1f%(symref)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .await?
+    .stdout;
     let mut local_branches = Vec::new();
     let mut remote_branches = Vec::new();
 
-    for line in output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        if line.contains("->") {
+    for line in output.lines().filter(|line| !line.is_empty()) {
+        let Some((reference, symbolic_target)) = line.split_once('\u{1f}') else {
+            continue;
+        };
+        // `for-each-ref` exposes remote HEAD aliases as symbolic refs. They
+        // are navigation metadata, not checkout targets, so keep them out of
+        // the branch picker.
+        if !symbolic_target.is_empty() {
             continue;
         }
-        let clean = line.strip_prefix("* ").unwrap_or(line).trim();
-        if clean.starts_with("remotes/") {
-            if let Some((_, branch)) = clean
-                .strip_prefix("remotes/")
-                .and_then(|value| value.split_once('/'))
-            {
-                if !local_branches.iter().any(|local| local == branch) {
-                    push_unique(&mut remote_branches, branch.to_string());
-                }
-            }
-        } else {
-            push_unique(&mut local_branches, clean.to_string());
+        if let Some(branch) = reference.strip_prefix("refs/heads/") {
+            push_unique(&mut local_branches, branch.to_string());
+        } else if let Some(remote_branch) = reference.strip_prefix("refs/remotes/")
+            && let Some((_, branch)) = remote_branch.split_once('/')
+        {
+            push_unique(&mut remote_branches, branch.to_string());
         }
     }
 
@@ -47,7 +54,7 @@ async fn checkout(
     State(state): State<AppState>,
     Json(body): Json<BranchBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_branch_name(&body.branch)?;
     let output = git(&project_path, ["checkout", body.branch.trim()]).await?;
     Ok(Json(GitOperationResponse::success(join_output(&output))))
@@ -57,7 +64,7 @@ async fn create_branch(
     State(state): State<AppState>,
     Json(body): Json<BranchBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_branch_name(&body.branch)?;
     let output = git(&project_path, ["checkout", "-b", body.branch.trim()]).await?;
     Ok(Json(GitOperationResponse::success(join_output(&output))))
@@ -67,7 +74,7 @@ async fn delete_branch(
     State(state): State<AppState>,
     Json(body): Json<BranchBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     validate_branch_name(&body.branch)?;
     let current = current_branch(&project_path).await?;
@@ -86,7 +93,7 @@ async fn commits(
     State(state): State<AppState>,
     Query(query): Query<CommitsQuery>,
 ) -> Result<Json<GitCommitsResponse>> {
-    let project_path = resolve_project_path(&state, query.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, query.project_ref()?, query.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     if !repository_has_commits(&project_path).await? {
         return Ok(Json(GitCommitsResponse {
@@ -146,9 +153,9 @@ async fn commit_diff(
     State(state): State<AppState>,
     Query(query): Query<CommitDiffQuery>,
 ) -> Result<Json<GitDiffResponse>> {
-    let project_path = resolve_project_path(&state, query.project_ref()?).await?;
-    validate_commit_ref(&query.commit)?;
-    let output = git(&project_path, ["show", query.commit.trim()])
+    let project_path = resolve_git_repository_path(&state, query.project_ref()?, query.repository_id.as_deref()).await?;
+    let commit = resolve_commit_reference(&project_path, &query.commit).await?;
+    let output = git(&project_path, ["show", "--submodule=log", commit.as_str()])
         .await?
         .stdout;
     let is_truncated = output.len() > COMMIT_DIFF_CHARACTER_LIMIT;
@@ -171,7 +178,7 @@ async fn stashes(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> Result<Json<GitStashesResponse>> {
-    let project_path = resolve_project_path(&state, query.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, query.project_ref()?, query.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let output = git(
         &project_path,
@@ -190,7 +197,7 @@ async fn create_stash(
     State(state): State<AppState>,
     Json(body): Json<StashBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let message = validate_optional_git_message(body.message.as_deref())?;
     let output = if let Some(message) = message {
@@ -208,7 +215,7 @@ async fn apply_stash(
     State(state): State<AppState>,
     Json(body): Json<StashRefBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let reference = validate_stash_ref(&body.reference)?;
     let output = git(&project_path, ["stash", "apply", &reference]).await?;
@@ -222,7 +229,7 @@ async fn pop_stash(
     State(state): State<AppState>,
     Json(body): Json<StashRefBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let reference = validate_stash_ref(&body.reference)?;
     let output = git(&project_path, ["stash", "pop", &reference]).await?;
@@ -236,7 +243,7 @@ async fn drop_stash(
     State(state): State<AppState>,
     Json(body): Json<StashRefBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let reference = validate_stash_ref(&body.reference)?;
     let output = git(&project_path, ["stash", "drop", &reference]).await?;
@@ -250,7 +257,7 @@ async fn tags(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> Result<Json<GitTagsResponse>> {
-    let project_path = resolve_project_path(&state, query.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, query.project_ref()?, query.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let output = git(
         &project_path,
@@ -274,7 +281,7 @@ async fn create_tag(
     State(state): State<AppState>,
     Json(body): Json<TagBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let tag = validate_tag_name(&body.tag)?;
     let message = validate_optional_git_message(body.message.as_deref())?;
@@ -293,7 +300,7 @@ async fn delete_tag(
     State(state): State<AppState>,
     Json(body): Json<TagBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let tag = validate_tag_name(&body.tag)?;
     let output = git(&project_path, ["tag", "-d", &tag]).await?;
@@ -307,7 +314,7 @@ async fn push_tag(
     State(state): State<AppState>,
     Json(body): Json<TagBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let tag = validate_tag_name(&body.tag)?;
     let remote_name = first_remote(&project_path).await?.ok_or_else(|| {

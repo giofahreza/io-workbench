@@ -9,7 +9,7 @@ async fn generate_commit_message(
             "Project name and files are required",
         ));
     }
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let repository_root = repository_root(&project_path).await?;
     let diff_context = commit_message_diff_context(&project_path, &repository_root, &body.files)
@@ -30,7 +30,7 @@ async fn remote_status(
     State(state): State<AppState>,
     Query(query): Query<ProjectQuery>,
 ) -> Result<Json<GitRemoteStatusResponse>> {
-    let project_path = resolve_project_path(&state, query.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, query.project_ref()?, query.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let branch = current_branch(&project_path)
         .await
@@ -69,7 +69,8 @@ async fn remote_status(
         [
             "rev-parse",
             "--abbrev-ref",
-            &format!("{branch}@{{upstream}}"),
+            "--symbolic-full-name",
+            "@{upstream}",
         ],
     )
     .await
@@ -128,7 +129,7 @@ async fn set_remote(
     State(state): State<AppState>,
     Json(body): Json<RemoteBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let remote_name = validate_remote_name(body.name.as_deref().unwrap_or("origin"))?;
     let remote_url = validate_remote_url(&body.url)?;
@@ -137,11 +138,15 @@ async fn set_remote(
     let output = if remote_exists {
         git(
             &project_path,
-            ["remote", "set-url", &remote_name, &remote_url],
+            ["remote", "set-url", "--", &remote_name, &remote_url],
         )
         .await?
     } else {
-        git(&project_path, ["remote", "add", &remote_name, &remote_url]).await?
+        git(
+            &project_path,
+            ["remote", "add", "--", &remote_name, &remote_url],
+        )
+        .await?
     };
 
     let mut response = GitOperationResponse::success(join_output(&output));
@@ -154,7 +159,7 @@ async fn fetch(
     State(state): State<AppState>,
     Json(body): Json<ProjectBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let remote_name = upstream_remote_or_origin(&project_path).await?;
     validate_remote_name(&remote_name)?;
@@ -169,7 +174,7 @@ async fn pull(
     State(state): State<AppState>,
     Json(body): Json<ProjectBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let branch = current_branch(&project_path).await?;
     let (remote_name, remote_branch) = upstream_remote_branch_or(&project_path, &branch).await?;
@@ -187,7 +192,7 @@ async fn push(
     State(state): State<AppState>,
     Json(body): Json<ProjectBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let branch = current_branch(&project_path).await?;
     let (remote_name, remote_branch) = upstream_remote_branch_or(&project_path, &branch).await?;
@@ -205,7 +210,7 @@ async fn publish(
     State(state): State<AppState>,
     Json(body): Json<BranchBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let branch = validate_branch_name(&body.branch)?;
     let current = current_branch(&project_path).await?;
@@ -238,9 +243,14 @@ async fn stage(
     State(state): State<AppState>,
     Json(body): Json<FileBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
-    let resolved = resolve_repository_file_path(&project_path, &body.file).await?;
+    let resolved = resolve_git_file_target(
+        &project_path,
+        &body.file,
+        GitFileTargetPolicy::Stage,
+    )
+    .await?;
     git(
         &resolved.repository_root,
         ["add", "--", &resolved.repository_relative_file],
@@ -256,9 +266,14 @@ async fn unstage(
     State(state): State<AppState>,
     Json(body): Json<FileBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
-    let resolved = resolve_repository_file_path(&project_path, &body.file).await?;
+    let resolved = resolve_git_file_target(
+        &project_path,
+        &body.file,
+        GitFileTargetPolicy::Unstage,
+    )
+    .await?;
 
     if repository_has_commits(&resolved.repository_root).await? {
         git(
@@ -303,9 +318,14 @@ async fn apply_hunks(
         ));
     }
 
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
-    let resolved = resolve_repository_file_path(&project_path, &body.file).await?;
+    let resolved = resolve_git_file_target(
+        &project_path,
+        &body.file,
+        GitFileTargetPolicy::Hunks,
+    )
+    .await?;
     let operation = validate_hunk_operation(&body.operation)?;
 
     let diff_args = if operation == "unstage" {
@@ -349,9 +369,14 @@ async fn resolve_conflict(
     State(state): State<AppState>,
     Json(body): Json<ResolveConflictBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
-    let resolved = resolve_repository_file_path(&project_path, &body.file).await?;
+    let resolved = resolve_git_file_target(
+        &project_path,
+        &body.file,
+        GitFileTargetPolicy::Inspect,
+    )
+    .await?;
     let status = repository_file_status(
         &resolved.repository_root,
         &resolved.repository_relative_file,
@@ -429,9 +454,14 @@ async fn discard(
     State(state): State<AppState>,
     Json(body): Json<FileBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
-    let resolved = resolve_repository_file_path(&project_path, &body.file).await?;
+    let resolved = resolve_git_file_target(
+        &project_path,
+        &body.file,
+        GitFileTargetPolicy::Discard,
+    )
+    .await?;
     let discarded = discard_repository_path(
         &resolved.repository_root,
         &resolved.repository_relative_file,
@@ -453,9 +483,14 @@ async fn delete_untracked(
     State(state): State<AppState>,
     Json(body): Json<FileBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_project_path(&state, body.project_ref()?).await?;
+    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
-    let resolved = resolve_repository_file_path(&project_path, &body.file).await?;
+    let resolved = resolve_git_file_target(
+        &project_path,
+        &body.file,
+        GitFileTargetPolicy::Discard,
+    )
+    .await?;
     let status = git(
         &resolved.repository_root,
         [

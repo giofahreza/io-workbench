@@ -51,7 +51,13 @@ async fn validate_git_repository(project_path: &Path) -> Result<()> {
     let inside = git(project_path, ["rev-parse", "--is-inside-work-tree"]).await;
     match inside {
         Ok(output) if output.stdout.trim() == "true" => {
-            repository_root(project_path).await?;
+            let root = repository_root(project_path).await?;
+            if normalize_path(&root) != normalize_path(project_path) {
+                return Err(ServerError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Project path is inside another Git repository. Select the repository root or initialize this workspace explicitly.",
+                ));
+            }
             Ok(())
         }
         _ => Err(ServerError::new(
@@ -70,7 +76,7 @@ async fn repository_root(project_path: &Path) -> Result<PathBuf> {
             "Could not resolve git repository root",
         ));
     }
-    Ok(PathBuf::from(root))
+    fs::canonicalize(root).await.map_err(io_server_error)
 }
 
 async fn current_branch(project_path: &Path) -> Result<String> {
@@ -100,6 +106,41 @@ async fn repository_has_commits(project_path: &Path) -> Result<bool> {
     }
 }
 
+async fn resolve_commit_reference(repository_path: &Path, value: &str) -> Result<String> {
+    let reference = validate_commit_ref(value)?;
+    let output = git(
+        repository_path,
+        [
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            reference.as_str(),
+        ],
+    )
+    .await?;
+    let hash = output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| {
+            ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "Commit reference did not resolve to an object",
+            )
+        })?;
+    let object_type = git(repository_path, ["cat-file", "-t", hash])
+        .await?
+        .stdout;
+    if object_type.trim() != "commit" {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Commit reference must resolve to a commit",
+        ));
+    }
+    Ok(hash.to_string())
+}
+
 async fn resolve_repository_file_path(
     project_path: &Path,
     file_path: &str,
@@ -109,10 +150,10 @@ async fn resolve_repository_file_path(
     let candidates = file_path_candidates(project_path, &repository_root, file_path);
 
     for candidate in &candidates {
-        let status = git(&repository_root, ["status", "--porcelain", "--", candidate])
+        if repository_file_status(&repository_root, candidate)
             .await?
-            .stdout;
-        if !status.trim().is_empty() {
+            .is_some()
+        {
             return Ok(ResolvedRepositoryFile {
                 repository_root,
                 repository_relative_file: candidate.clone(),
@@ -145,21 +186,23 @@ async fn discard_repository_path(
         repository_root,
         [
             "status",
-            "--porcelain",
+            "--porcelain=v2",
+            "-z",
             "--untracked-files=all",
+            "--ignore-submodules=none",
             "--",
             repository_relative_file,
         ],
     )
     .await?
-    .stdout;
+    ;
 
-    if status_output.trim().is_empty() {
+    let entries = parse_status_entries_detailed_bytes(&status_output.stdout_bytes);
+    if entries.is_empty() {
         return Ok(false);
     }
 
-    let entries = parse_status_entries(&status_output);
-    let has_tracked = entries.iter().any(|(status, _)| status != "??");
+    let has_tracked = entries.iter().any(|(status, _, _)| status != "??");
     let has_commits = repository_has_commits(repository_root).await?;
     let absolute_target = safe_repo_child(repository_root, repository_relative_file)?;
 
@@ -224,7 +267,8 @@ async fn upstream_remote_branch_or(project_path: &Path, branch: &str) -> Result<
         [
             "rev-parse",
             "--abbrev-ref",
-            &format!("{branch}@{{upstream}}"),
+            "--symbolic-full-name",
+            "@{upstream}",
         ],
     )
     .await
@@ -257,81 +301,390 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    run_git(cwd, args, true).await
+}
+
+// The initial-commit path uses Git's exclude pathspec magic to keep
+// independent nested repositories out of the parent tree.  All request data
+// still goes through `git`, which enables literal pathspecs; this helper is
+// reserved for the server-owned exclusion pathspecs.
+async fn git_with_pathspec_magic<I, S>(cwd: &Path, args: I) -> Result<GitOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    run_git(cwd, args, false).await
+}
+
+async fn run_git<I, S>(cwd: &Path, args: I, literal_pathspecs: bool) -> Result<GitOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let args = args
         .into_iter()
         .map(|arg| arg.as_ref().to_string())
         .collect::<Vec<_>>();
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(&args)
         .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|error| {
-            ServerError::with_details(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "git failed",
-                error.to_string(),
-            )
-        })?;
+        // Server requests must fail promptly when a remote needs credentials;
+        // there is no interactive terminal available to answer a prompt.
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if literal_pathspecs {
+        command.env("GIT_LITERAL_PATHSPECS", "1");
+    } else {
+        command.env_remove("GIT_LITERAL_PATHSPECS");
+    }
+    let output = command.output().await.map_err(|error| {
+        ServerError::with_details(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "git failed",
+            error.to_string(),
+        )
+    })?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stdout_bytes = output.stdout;
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if output.status.success() {
-        return Ok(GitOutput { stdout, stderr });
+        return Ok(GitOutput {
+            stdout,
+            stdout_bytes,
+            stderr,
+        });
     }
 
     Err(ServerError::with_details(
         StatusCode::BAD_REQUEST,
         "Git operation failed",
-        format!(
+        redact_git_diagnostic(&format!(
             "Command failed: git {}\n{}{}",
             args.join(" "),
             stdout,
             stderr
-        ),
+        )),
     ))
 }
 
+fn redact_git_diagnostic(value: &str) -> String {
+    let mut redacted = String::with_capacity(value.len());
+    let mut cursor = 0;
+
+    while let Some(scheme_offset) = value[cursor..].find("://") {
+        let authority_start = cursor + scheme_offset + 3;
+        let authority_tail = &value[authority_start..];
+        let authority_length = authority_tail
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '/' | '?' | '#' | '\'' | '"' | ')' | ']' | '}' | ',')
+            })
+            .unwrap_or(authority_tail.len());
+        let authority = &authority_tail[..authority_length];
+
+        let Some(user_info_end) = authority.rfind('@') else {
+            let next = authority_start + authority_length;
+            redacted.push_str(&value[cursor..next]);
+            cursor = next;
+            continue;
+        };
+
+        redacted.push_str(&value[cursor..authority_start]);
+        redacted.push_str("<redacted>@");
+        cursor = authority_start + user_info_end + 1;
+    }
+
+    redacted.push_str(&value[cursor..]);
+    redacted
+}
+
+#[cfg(test)]
 fn parse_status_entries(output: &str) -> Vec<(String, String)> {
-    output
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| {
-            if line.len() < 3 {
-                return None;
-            }
-            let status = line[0..2].to_string();
-            let raw_path = line[3..].to_string();
-            let path = raw_path
-                .split(" -> ")
-                .last()
-                .map(normalize_repo_relative_path)
-                .unwrap_or_default();
-            (!path.is_empty()).then_some((status, path))
-        })
+    parse_status_entries_detailed_bytes(output.as_bytes())
+        .into_iter()
+        .map(|(status, path, _)| (status, path))
         .collect()
+}
+
+fn parse_status_entries_detailed_bytes(output: &[u8]) -> Vec<(String, String, Option<String>)> {
+    if !output.contains(&0) {
+        return String::from_utf8_lossy(output)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| {
+                if line.len() < 3 {
+                    return None;
+                }
+                let status = line[0..2].to_string();
+                let raw_path = line[3..].to_string();
+                let path = raw_path
+                    .split(" -> ")
+                    .last()
+                    .map(normalize_repo_relative_path)
+                    .unwrap_or_default();
+                (!path.is_empty()).then_some((status, path, None))
+            })
+            .collect();
+    }
+
+    let records = output.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        index += 1;
+        if record.is_empty() || record.starts_with(b"!") {
+            continue;
+        }
+        let Some(kind) = record.split(|byte| *byte == b' ').next() else {
+            continue;
+        };
+        let parsed = match kind {
+            b"1" => parse_v2_detailed_record_bytes(record, 9),
+            b"2" => {
+                let parsed = parse_v2_detailed_record_bytes(record, 10);
+                // Rename/copy records carry the original path as a second NUL
+                // record. The first path is the worktree-visible destination.
+                index += 1;
+                parsed
+            }
+            b"u" => parse_v2_detailed_record_bytes(record, 11),
+            b"?" => Some((
+                "??".to_string(),
+                String::from_utf8_lossy(record.get(2..).unwrap_or_default()).to_string(),
+                None,
+            )),
+            _ => None,
+        };
+        let Some((status, path, submodule_state)) = parsed else {
+            continue;
+        };
+        let path = normalize_repo_relative_path(&path);
+        if !path.is_empty() {
+            entries.push((status, path, submodule_state));
+        }
+    }
+    entries
+}
+
+fn parse_v2_detailed_record_bytes(
+    record: &[u8],
+    field_count: usize,
+) -> Option<(String, String, Option<String>)> {
+    let fields = record
+        .splitn(field_count, |byte| *byte == b' ')
+        .collect::<Vec<_>>();
+    if fields.len() != field_count {
+        return None;
+    }
+    let submodule_state = (!matches!(fields[2], b"N..." | b""))
+        .then(|| String::from_utf8_lossy(fields[2]).to_string());
+    Some((
+        String::from_utf8_lossy(fields[1]).to_string(),
+        String::from_utf8_lossy(fields[field_count - 1]).to_string(),
+        submodule_state,
+    ))
+}
+
+#[derive(Debug, Copy, Clone)]
+enum GitFileTargetPolicy {
+    Inspect,
+    Stage,
+    Unstage,
+    Commit,
+    Discard,
+    Hunks,
+}
+
+// A repository boundary is a navigation boundary.  The parent repository may
+// expose a submodule gitlink, but it must never treat files belonging to an
+// independent child repository as its own files.
+async fn resolve_git_file_target(
+    project_path: &Path,
+    file_path: &str,
+    policy: GitFileTargetPolicy,
+) -> Result<ResolvedRepositoryFile> {
+    let resolved = resolve_repository_file_path(project_path, file_path).await?;
+    let target = safe_repo_child(
+        &resolved.repository_root,
+        &resolved.repository_relative_file,
+    )?;
+    let canonical_target = fs::canonicalize(&target).await.unwrap_or(target.clone());
+    let repository_root = normalize_path(&resolved.repository_root);
+    let catalog = discover_git_workspace(&repository_root).await?;
+    let child = catalog.repositories.into_iter().find(|repository| {
+        if repository.path == repository_root {
+            return false;
+        }
+        // Treat repository boundaries as overlapping paths in either
+        // direction.  Checking only "target is inside child" would let a
+        // request for a parent directory traverse into a nested repository
+        // and accidentally stage, discard, or delete its contents.
+        is_within(&canonical_target, &repository.path)
+            || is_within(&target, &repository.path)
+            || is_within(&repository.path, &canonical_target)
+            || is_within(&repository.path, &target)
+    });
+
+    if let Some(child) = child {
+        let exact_boundary = target == child.path || canonical_target == child.path;
+        let allow_submodule_pointer = exact_boundary
+            && match child.kind {
+                iowb_protocol::GitRepositoryKind::Submodule => matches!(
+                    policy,
+                    GitFileTargetPolicy::Inspect
+                        | GitFileTargetPolicy::Stage
+                        | GitFileTargetPolicy::Unstage
+                        | GitFileTargetPolicy::Commit
+                ),
+                // An uninitialized submodule can be inspected as a parent
+                // gitlink, but it is not a worktree and therefore cannot be
+                // staged, committed, discarded, or hunk-edited yet.
+                iowb_protocol::GitRepositoryKind::Uninitialized =>
+                    matches!(policy, GitFileTargetPolicy::Inspect),
+                _ => false,
+            };
+        if !allow_submodule_pointer {
+            let action = match policy {
+                GitFileTargetPolicy::Inspect => "inspect",
+                GitFileTargetPolicy::Stage => "stage",
+                GitFileTargetPolicy::Unstage => "unstage",
+                GitFileTargetPolicy::Commit => "commit",
+                GitFileTargetPolicy::Discard => "discard",
+                GitFileTargetPolicy::Hunks => "apply hunks to",
+            };
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Cannot {action} {file_path} from the parent repository. Select the {} repository at {} first.",
+                    repository_kind_label(&child.kind), child.relative_path
+                ),
+            ));
+        }
+    }
+
+    Ok(resolved)
+}
+
+async fn submodule_at_boundary(
+    repository_root: &Path,
+    repository_relative_file: &str,
+) -> Result<Option<GitRepositoryRecord>> {
+    let target = safe_repo_child(repository_root, repository_relative_file)?;
+    let canonical_target = fs::canonicalize(&target).await.unwrap_or(target.clone());
+    let repository_root = normalize_path(repository_root);
+    let catalog = discover_git_workspace(&repository_root).await?;
+    Ok(catalog.repositories.into_iter().find(|repository| {
+        matches!(
+            repository.kind,
+            iowb_protocol::GitRepositoryKind::Submodule
+                | iowb_protocol::GitRepositoryKind::Uninitialized
+        )
+            && (repository.path == canonical_target || repository.path == target)
+    }))
+}
+
+async fn submodule_diff(
+    repository_root: &Path,
+    repository_relative_file: &str,
+    staged: Option<bool>,
+) -> Result<String> {
+    if staged == Some(true) {
+        return Ok(git(
+            repository_root,
+            [
+                "diff",
+                "--cached",
+                "--submodule=log",
+                "--",
+                repository_relative_file,
+            ],
+        )
+        .await?
+        .stdout);
+    }
+    if staged == Some(false) {
+        return Ok(git(
+            repository_root,
+            [
+                "diff",
+                "--submodule=log",
+                "--",
+                repository_relative_file,
+            ],
+        )
+        .await?
+        .stdout);
+    }
+
+    let unstaged = git(
+        repository_root,
+        [
+            "diff",
+            "--submodule=log",
+            "--",
+            repository_relative_file,
+        ],
+    )
+    .await?
+    .stdout;
+    if !unstaged.trim().is_empty() {
+        return Ok(unstaged);
+    }
+    Ok(git(
+        repository_root,
+        [
+            "diff",
+            "--cached",
+            "--submodule=log",
+            "--",
+            repository_relative_file,
+        ],
+    )
+    .await?
+    .stdout)
+}
+
+fn repository_kind_label(kind: &iowb_protocol::GitRepositoryKind) -> &'static str {
+    match kind {
+        iowb_protocol::GitRepositoryKind::Root => "root",
+        iowb_protocol::GitRepositoryKind::Submodule => "submodule",
+        iowb_protocol::GitRepositoryKind::Nested => "nested",
+        iowb_protocol::GitRepositoryKind::Worktree => "worktree",
+        iowb_protocol::GitRepositoryKind::Uninitialized => "uninitialized submodule",
+    }
 }
 
 fn strip_diff_headers(diff: &str) -> String {
     let mut filtered = Vec::new();
     let mut include = false;
     for line in diff.lines() {
-        if line.starts_with("diff --git")
-            || line.starts_with("index ")
-            || line.starts_with("new file mode")
-            || line.starts_with("deleted file mode")
-            || line.starts_with("---")
-            || line.starts_with("+++")
-        {
-            continue;
-        }
-        if line.starts_with("@@") || include {
+        // Only discard the file-level preamble.  Once a hunk starts, lines
+        // beginning with `---` or `+++` are valid user content and must stay
+        // in the preview.
+        if !include && line.starts_with("@@") {
             include = true;
+        }
+        if include {
             filtered.push(line);
         }
     }
     filtered.join("\n")
+}
+
+async fn enclosing_git_repository(project_path: &Path) -> Option<PathBuf> {
+    let output = git(project_path, ["rev-parse", "--show-toplevel"])
+        .await
+        .ok()?;
+    let root = output.stdout.trim();
+    if root.is_empty() {
+        return None;
+    }
+    let root = std::fs::canonicalize(root).ok()?;
+    let project_path = normalize_path(project_path);
+    let root = normalize_path(&root);
+    (root != project_path && is_within(&project_path, &root)).then_some(root)
 }
 
 fn selected_hunk_patch(diff: &str, selected_indexes: &[usize]) -> Result<String> {
@@ -447,11 +800,11 @@ async fn apply_patch_to_index(repository_root: &Path, patch: &str, reverse: bool
     Err(ServerError::with_details(
         StatusCode::BAD_REQUEST,
         "Git hunk operation failed",
-        format!(
+        redact_git_diagnostic(&format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        ),
+        )),
     ))
 }
 
@@ -459,16 +812,32 @@ async fn repository_file_status(
     repository_root: &Path,
     repository_relative_file: &str,
 ) -> Result<Option<String>> {
+    Ok(repository_file_status_details(repository_root, repository_relative_file)
+        .await?
+        .map(|(status, _)| status))
+}
+
+async fn repository_file_status_details(
+    repository_root: &Path,
+    repository_relative_file: &str,
+) -> Result<Option<(String, Option<String>)>> {
     let output = git(
         repository_root,
-        ["status", "--porcelain", "--", repository_relative_file],
+        [
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--",
+            repository_relative_file,
+        ],
     )
-    .await?
-    .stdout;
-    Ok(parse_status_entries(&output)
+    .await?;
+    Ok(parse_status_entries_detailed_bytes(&output.stdout_bytes)
         .into_iter()
-        .find(|(_, path)| path == repository_relative_file)
-        .map(|(status, _)| status))
+        .find(|(_, path, _)| path == repository_relative_file)
+        .map(|(status, _, submodule_state)| (status, submodule_state)))
 }
 
 async fn read_repository_file_lossy(
@@ -500,6 +869,18 @@ async fn stage_resolved_path(repository_root: &Path, repository_relative_file: &
 fn is_conflict_status(status: &str) -> bool {
     matches!(status, "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU")
         || status.chars().take(2).any(|character| character == 'U')
+}
+
+fn status_contains(status: &str, expected: char) -> bool {
+    status.chars().take(2).any(|character| character == expected)
+}
+
+fn status_is_untracked(status: &str) -> bool {
+    status == "??"
+}
+
+fn status_is_deleted(status: &str) -> bool {
+    status_contains(status, 'D')
 }
 
 fn extract_conflict_regions(content: &str) -> Vec<GitConflictRegion> {
@@ -565,7 +946,6 @@ fn normalize_repo_relative_path(path: &str) -> String {
     path.replace('\\', "/")
         .trim_start_matches("./")
         .trim_start_matches('/')
-        .trim()
         .to_string()
 }
 
@@ -595,24 +975,60 @@ fn file_path_candidates(
 }
 
 fn safe_repo_child(repository_root: &Path, relative_path: &str) -> Result<PathBuf> {
+    // Validate before normalizing.  Normalization intentionally removes a
+    // leading `./`, but must never turn an absolute or backslash-rooted input
+    // into an apparently relative path.
+    validate_file_path(relative_path)?;
     let normalized = normalize_repo_relative_path(relative_path);
     validate_file_path(&normalized)?;
-    let candidate = repository_root.join(normalized);
-    let normalized_candidate = normalize_path(&candidate);
     let normalized_root = normalize_path(repository_root);
-    if normalized_candidate == normalized_root
-        || !normalized_candidate.starts_with(&normalized_root)
-    {
+    let normalized_candidate = normalize_path(&normalized_root.join(normalized));
+    if normalized_candidate == normalized_root || !is_within(&normalized_candidate, &normalized_root) {
         return Err(ServerError::new(
             StatusCode::BAD_REQUEST,
             "Invalid file path: path traversal detected",
         ));
     }
+
+    // Lexical checks do not protect against `link/file` when `link` points
+    // outside the repository.  Canonicalize the deepest existing component so
+    // both existing symlinks and symlinked parent directories are checked.
+    let canonical_root = std::fs::canonicalize(&normalized_root).map_err(io_server_error)?;
+    let mut existing = normalized_candidate.clone();
+    loop {
+        match std::fs::symlink_metadata(&existing) {
+            Ok(_) => {
+                let canonical_existing = std::fs::canonicalize(&existing).map_err(io_server_error)?;
+                if !is_within(&canonical_existing, &canonical_root) {
+                    return Err(ServerError::new(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid file path: symlink escapes repository scope",
+                    ));
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !existing.pop() {
+                    return Err(ServerError::new(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid file path",
+                    ));
+                }
+            }
+            Err(error) => return Err(io_server_error(error)),
+        }
+    }
     Ok(normalized_candidate)
 }
 
 fn validate_file_path(file: &str) -> Result<()> {
-    if file.trim().is_empty() || file.contains('\0') || file.contains("..") {
+    let normalized = file.replace('\\', "/");
+    if file.trim().is_empty()
+        || file.contains('\0')
+        || Path::new(file).is_absolute()
+        || file.starts_with('\\')
+        || normalized.split('/').any(|component| component == "..")
+    {
         return Err(ServerError::new(
             StatusCode::BAD_REQUEST,
             "Invalid file path",
@@ -632,15 +1048,41 @@ fn validate_commit_ref(commit: &str) -> Result<String> {
 }
 
 fn validate_branch_name(branch: &str) -> Result<String> {
-    validate_pattern(branch, "Invalid branch name", |character| {
-        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '/' | '-')
-    })
+    validate_git_ref_name(branch, "Invalid branch name")
 }
 
 fn validate_tag_name(tag: &str) -> Result<String> {
-    validate_pattern(tag, "Invalid tag name", |character| {
-        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '/' | '-')
-    })
+    validate_git_ref_name(tag, "Invalid tag name")
+}
+
+fn validate_git_ref_name(value: &str, message: &'static str) -> Result<String> {
+    let trimmed = value.trim();
+    let components = trimmed.split('/').collect::<Vec<_>>();
+    let invalid = trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.len() > 1024
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.starts_with('/')
+        || trimmed.ends_with('/')
+        || trimmed.contains("//")
+        || trimmed.contains("..")
+        || trimmed.contains("@{")
+        || trimmed.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        || components.iter().any(|component| {
+            component.is_empty()
+                || component.starts_with('.')
+                || component.ends_with('.')
+                || component.ends_with(".lock")
+        });
+    if invalid {
+        return Err(ServerError::new(StatusCode::BAD_REQUEST, message));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn validate_stash_ref(reference: &str) -> Result<String> {
@@ -661,14 +1103,30 @@ fn validate_stash_ref(reference: &str) -> Result<String> {
 }
 
 fn validate_remote_name(remote: &str) -> Result<String> {
-    validate_pattern(remote, "Invalid remote name", |character| {
+    let remote = validate_pattern(remote, "Invalid remote name", |character| {
         character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
-    })
+    })?;
+    if remote == "."
+        || remote == ".."
+        || remote.starts_with('.')
+        || remote.ends_with('.')
+        || remote.contains("..")
+    {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid remote name",
+        ));
+    }
+    Ok(remote)
 }
 
 fn validate_remote_url(url: &str) -> Result<String> {
     let trimmed = url.trim();
-    if trimmed.is_empty() || trimmed.contains('\0') {
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.len() > 4096
+        || trimmed.chars().any(|character| character.is_control())
+    {
         return Err(ServerError::new(
             StatusCode::BAD_REQUEST,
             "Invalid remote URL",

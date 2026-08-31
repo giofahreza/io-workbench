@@ -99,10 +99,59 @@ pub struct BrowseFilesystemResponse {
 pub struct GitStatusRequest {
     #[serde(rename = "projectPath")]
     pub project_path: String,
+    #[serde(
+        rename = "repositoryId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repository_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitRepositoryKind {
+    Root,
+    Submodule,
+    Nested,
+    Worktree,
+    Uninitialized,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitRepositorySummary {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    #[serde(rename = "relativePath")]
+    pub relative_path: String,
+    pub kind: GitRepositoryKind,
+    pub initialized: bool,
+    #[serde(rename = "isDefault")]
+    pub is_default: bool,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitWorkspaceResponse {
+    #[serde(rename = "projectPath")]
+    pub project_path: String,
+    #[serde(rename = "hasRootRepository")]
+    pub has_root_repository: bool,
+    #[serde(rename = "defaultRepositoryId")]
+    pub default_repository_id: Option<String>,
+    pub repositories: Vec<GitRepositorySummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitStatusResponse {
+    #[serde(rename = "repositoryId", skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
+    #[serde(rename = "repositoryPath", skip_serializing_if = "Option::is_none")]
+    pub repository_path: Option<String>,
+    #[serde(rename = "repositoryName", skip_serializing_if = "Option::is_none")]
+    pub repository_name: Option<String>,
+    #[serde(rename = "repositoryKind", skip_serializing_if = "Option::is_none")]
+    pub repository_kind: Option<GitRepositoryKind>,
     pub branch: Option<String>,
     #[serde(rename = "hasCommits")]
     pub has_commits: bool,
@@ -125,6 +174,8 @@ pub struct GitStatusResponse {
 pub struct GitFileStatus {
     pub path: String,
     pub status: String,
+    #[serde(rename = "submoduleState", default, skip_serializing_if = "Option::is_none")]
+    pub submodule_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +279,10 @@ pub struct GitFileWithDiffResponse {
     pub is_deleted: bool,
     #[serde(rename = "isUntracked")]
     pub is_untracked: bool,
+    #[serde(rename = "submoduleState", skip_serializing_if = "Option::is_none")]
+    pub submodule_state: Option<String>,
+    #[serde(rename = "submoduleDiff", skip_serializing_if = "Option::is_none")]
+    pub submodule_diff: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

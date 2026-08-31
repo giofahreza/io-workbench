@@ -58,7 +58,7 @@ function renderGitCommits(selector, body) {
 async function gitCommitDiff(commit) {
   const project = activeProjectKey();
   if (!project || !commit) return;
-  const body = await api(`/api/git/commit-diff?project=${encodeURIComponent(project)}&commit=${encodeURIComponent(commit)}`);
+  const body = await api(gitQuery("/api/git/commit-diff", { commit }));
   renderGitDiff(commit, body);
 }
 
@@ -94,7 +94,7 @@ async function gitBranchOperation(path) {
   if (!project || !branch) return;
   const body = await api(path, {
     method: "POST",
-    body: JSON.stringify({ project, branch }),
+    body: JSON.stringify(gitBody({ branch })),
   });
   renderGitOperation(body);
   await loadGitStatus().catch(() => {});
@@ -106,7 +106,7 @@ async function setGitRemote() {
   if (!project || !url) return;
   const body = await api("/api/git/remote", {
     method: "POST",
-    body: JSON.stringify({ project, name: "origin", url }),
+    body: JSON.stringify(gitBody({ name: "origin", url })),
   });
   renderGitOperation(body);
 }

@@ -1,11 +1,104 @@
-async function loadGitStatus() {
+async function loadGitWorkspace(options = {}) {
+  const project = activeProjectKey();
+  if (!project) return null;
+  if (!options.force && state.gitWorkspace && state.gitWorkspaceProject === project) {
+    renderGitRepositorySelector(state.gitWorkspace);
+    return state.gitWorkspace;
+  }
+  try {
+    const body = await api(`/api/git/workspace?project=${encodeURIComponent(project)}`);
+    state.gitWorkspace = body;
+    state.gitWorkspaceProject = project;
+  } catch (error) {
+    // Older servers predate the workspace catalog. Keep their single-root
+    // behavior working while still using repository IDs with new servers.
+    if (error.status !== 404) throw error;
+    state.gitWorkspace = {
+      projectPath: project,
+      hasRootRepository: true,
+      defaultRepositoryId: "root",
+      repositories: [{
+        id: "root",
+        name: project.split(/[\\/]/).filter(Boolean).at(-1) || "Repository",
+        path: project,
+        relativePath: ".",
+        kind: "root",
+        initialized: true,
+        isDefault: true,
+        branch: null,
+      }],
+    };
+    state.gitWorkspaceProject = project;
+  }
+  const workspace = state.gitWorkspace;
+  const current = state.gitSelectedRepositoryId;
+  const available = workspace.repositories || [];
+  const preferred = available.some((repository) => repository.id === current)
+    ? current
+    : workspace.defaultRepositoryId || (available.length === 1 ? available[0].id : "");
+  state.gitSelectedRepositoryId = preferred;
+  renderGitRepositorySelector(workspace);
+  return workspace;
+}
+
+function renderGitRepositorySelector(workspace = state.gitWorkspace) {
+  const selector = qs("#git-repository");
+  const message = qs("#git-workspace-message");
+  if (!selector) return;
+  const repositories = workspace?.repositories || [];
+  selector.innerHTML = repositories.length
+    ? repositories.map((repository) => {
+      const label = [repository.relativePath || repository.name, repository.kind ? `[${repository.kind}]` : "", repository.branch || ""]
+        .filter(Boolean).join(" · ");
+      return `<option value="${escapeHtml(repository.id)}" ${repository.id === selectedGitRepositoryId() ? "selected" : ""}>${escapeHtml(label)}${repository.initialized ? "" : " (uninitialized · initialize)"}</option>`;
+    }).join("")
+    : '<option value="">No Git repositories found</option>';
+  selector.disabled = !repositories.length;
+  if (message) {
+    if (!repositories.length) {
+      message.textContent = "This project is a workspace with no Git repositories. Use Init only after confirming a new root repository.";
+    } else if (!workspace.hasRootRepository && repositories.filter((repository) => repository.initialized).length > 1) {
+      message.textContent = "Git workspace · no main repository · choose a repository before running Git operations.";
+    } else if (!selectedGitRepositoryId()) {
+      message.textContent = "Choose an initialized Git repository to continue.";
+    } else {
+      const selected = repositories.find((repository) => repository.id === selectedGitRepositoryId());
+      message.textContent = selected
+        ? `${selected.name} · ${selected.kind || "repository"} · all Git operations stay inside this worktree`
+        : "Git operations are scoped to the selected worktree.";
+    }
+  }
+}
+
+async function loadGitStatus(options = {}) {
   const project = activeProjectKey();
   if (!project) return;
+  try {
+    await loadGitWorkspace(options);
+  } catch (error) {
+    state.gitStatus = null;
+    state.gitSelectedFiles = new Set();
+    renderGitRepositorySelector(null);
+    renderGitSummary(null);
+    qs("#git-files").innerHTML = "";
+    setOutput("#git-output", error.message || String(error), "error-output");
+    return;
+  }
+  if (!selectedGitRepositoryId() || selectedGitRepository()?.initialized === false) {
+    state.gitStatus = null;
+    state.gitSelectedFiles = new Set();
+    renderGitSummary(null);
+    qs("#git-files").innerHTML = selectedGitRepository()?.initialized === false
+      ? '<p class="empty">This repository is an uninitialized submodule. Use Init to check it out before viewing status.</p>'
+      : '<p class="empty">Select an initialized repository to view its status.</p>';
+    qs("#git-output").innerHTML = "";
+    return;
+  }
   qs("#git-files").innerHTML = '<p class="empty">Loading source control.</p>';
   qs("#git-output").innerHTML = "";
   let body;
   try {
-    body = await api(`/api/git/status?project=${encodeURIComponent(project)}`);
+    body = await api(gitQuery("/api/git/status"));
   } catch (error) {
     state.gitStatus = null;
     state.gitSelectedFiles = new Set();
@@ -83,19 +176,44 @@ function gitFilesFromStatus(status = state.gitStatus) {
 
 function gitStatusLabel(status) {
   if (isGitConflictStatus(status)) return "Conflicted";
-  if (status === "M") return "Modified";
-  if (status === "A") return "Added";
-  if (status === "D") return "Deleted";
+  if (String(status).includes("M")) return "Modified";
+  if (String(status).includes("A")) return "Added";
+  if (String(status).includes("D")) return "Deleted";
   if (status === "U" || status === "??") return "Untracked";
   return status || "Changed";
 }
 
 function gitStatusClass(status) {
   if (isGitConflictStatus(status)) return "status-conflict";
-  if (status === "A") return "status-a";
-  if (status === "D") return "status-d";
+  if (String(status).includes("A")) return "status-a";
+  if (String(status).includes("D")) return "status-d";
   if (status === "U" || status === "??") return "status-u";
   return "status-m";
+}
+
+function normalizedGitRelativePath(path) {
+  return String(path || "").replaceAll("\\", "/").replace(/^\.\//, "").replace(/^\//, "");
+}
+
+function gitSubmoduleForFile(file) {
+  const path = normalizedGitRelativePath(file?.path);
+  return (state.gitWorkspace?.repositories || []).find((repository) => {
+    const kind = String(repository.kind || "").toLowerCase();
+    return (kind === "submodule" || kind === "uninitialized")
+      && normalizedGitRelativePath(repository.relativePath) === path;
+  }) || null;
+}
+
+function isGitSubmoduleFile(file) {
+  return Boolean(file?.submoduleState || gitSubmoduleForFile(file));
+}
+
+function canStageGitFile(file) {
+  return gitSubmoduleForFile(file)?.initialized !== false;
+}
+
+function canDiscardGitFile(file) {
+  return !isGitSubmoduleFile(file);
 }
 
 function createGitFolderNode(name = "", path = "") {
@@ -184,8 +302,10 @@ function gitFileRowHtml(file, depth) {
   const statusClass = gitStatusClass(file.status);
   const checked = state.gitSelectedFiles.has(file.path) ? " checked" : "";
   const isUntracked = file.status === "U" || file.status === "??";
+  const isSubmodule = isGitSubmoduleFile(file);
+  const canStage = canStageGitFile(file);
   return `<article class="git-file-row${active}${isGitConflictStatus(file.status) ? " conflicted" : ""}" data-git-file-row="${escapeHtml(file.path)}" style="padding-left:${12 + depth * 16}px">
-    <input type="checkbox" data-git-file="${escapeHtml(file.path)}" aria-label="Stage ${escapeHtml(file.path)}"${checked} />
+    <input type="checkbox" data-git-file="${escapeHtml(file.path)}" aria-label="Stage ${escapeHtml(file.path)}"${checked}${canStage ? "" : " disabled"} />
     <button type="button" class="git-file-main" data-git-file-preview="${escapeHtml(file.path)}" title="${escapeHtml(file.path)}">
       <span class="git-file-icon" aria-hidden="true"></span>
       <strong>${escapeHtml(file.name || file.path)}</strong>
@@ -193,8 +313,8 @@ function gitFileRowHtml(file, depth) {
     <span class="git-row-actions">
       <button type="button" class="icon-button" data-git-open-file="${escapeHtml(file.path)}" aria-label="Open file" title="Open file" data-symbol="open"></button>
       <button type="button" class="icon-button" data-git-file-diff="${escapeHtml(file.path)}" aria-label="Show diff" title="Show diff" data-symbol="diff"></button>
-      ${isGitConflictStatus(file.status) ? `<button type="button" class="icon-button" data-git-conflict-file="${escapeHtml(file.path)}" aria-label="Resolve conflict" title="Resolve conflict" data-symbol="alert"></button>` : ""}
-      ${["M", "D", "U", "??"].includes(file.status) || isGitConflictStatus(file.status)
+      ${isGitConflictStatus(file.status) && !isSubmodule ? `<button type="button" class="icon-button" data-git-conflict-file="${escapeHtml(file.path)}" aria-label="Resolve conflict" title="Resolve conflict" data-symbol="alert"></button>` : ""}
+      ${canDiscard && (/[MDU]/.test(file.status) || isGitConflictStatus(file.status))
     ? `<button type="button" class="icon-button" data-git-file-action="${escapeHtml(file.path)}" data-git-file-status="${escapeHtml(file.status)}" aria-label="${isUntracked ? "Delete untracked file" : "Discard changes"}" title="${isUntracked ? "Delete untracked file" : "Discard changes"}" data-symbol="trash"></button>`
     : ""}
       <span class="git-status-badge ${statusClass}" title="${escapeHtml(statusLabel)}">${escapeHtml(file.status)}</span>
@@ -206,7 +326,9 @@ function bindGitFileTree(root) {
   root.querySelector("[data-git-open-commit]")?.addEventListener("click", openGitCommitModal);
   root.querySelectorAll("[data-git-section-action]").forEach((button) => {
     button.addEventListener("click", () => {
-      const files = gitFilesFromStatus(state.gitStatus).map((file) => file.path);
+      const files = gitFilesFromStatus(state.gitStatus)
+        .filter(canStageGitFile)
+        .map((file) => file.path);
       if (button.dataset.gitSectionAction === "changes") {
         state.gitSelectedFiles = new Set(files);
       } else {
@@ -225,7 +347,8 @@ function bindGitFileTree(root) {
   });
   root.querySelectorAll("[data-git-file]").forEach((input) => {
     input.addEventListener("change", () => {
-      if (input.checked) state.gitSelectedFiles.add(input.dataset.gitFile);
+      const file = gitFilesFromStatus(state.gitStatus).find((item) => item.path === input.dataset.gitFile);
+      if (input.checked && file && canStageGitFile(file)) state.gitSelectedFiles.add(input.dataset.gitFile);
       else state.gitSelectedFiles.delete(input.dataset.gitFile);
       renderGitFiles();
     });
@@ -301,7 +424,9 @@ function selectedGitFiles() {
 
 function setGitFileSelection(checked) {
   const files = gitFilesFromStatus(state.gitStatus);
-  state.gitSelectedFiles = checked ? new Set(files.map((file) => file.path)) : new Set();
+  state.gitSelectedFiles = checked
+    ? new Set(files.filter(canStageGitFile).map((file) => file.path))
+    : new Set();
   document.querySelectorAll("[data-git-file]").forEach((input) => {
     input.checked = checked;
   });
@@ -317,6 +442,10 @@ async function openGitChangedFile(file) {
 
 async function requestGitFileAction(file, status) {
   if (!file) return;
+  const fileStatus = gitFilesFromStatus(state.gitStatus).find((item) => item.path === file);
+  if (fileStatus && !canDiscardGitFile(fileStatus)) {
+    throw new Error("Discard is unavailable for submodule pointers; select the child repository instead.");
+  }
   const untracked = status === "U" || status === "??";
   const message = untracked
     ? `Delete untracked file "${file}"?`
@@ -330,7 +459,7 @@ async function gitFileOperation(path, file) {
   if (!project || !file) return;
   const body = await api(path, {
     method: "POST",
-    body: JSON.stringify({ project, file }),
+    body: JSON.stringify(gitBody({ file })),
   });
   renderGitOperation(body);
   await loadGitStatus().catch(() => {});

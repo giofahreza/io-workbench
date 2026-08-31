@@ -27,7 +27,14 @@ fn validate_pattern(
     allowed: impl Fn(char) -> bool,
 ) -> Result<String> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || !trimmed.chars().all(allowed) {
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.len() > 1024
+        || trimmed
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || !trimmed.chars().all(allowed)
+    {
         return Err(ServerError::new(StatusCode::BAD_REQUEST, message));
     }
     Ok(trimmed.to_string())
@@ -57,7 +64,7 @@ async fn commit_message_diff_context(
 ) -> Result<String> {
     let mut context = String::new();
     for file in files {
-        let resolved = match resolve_repository_file_path(project_path, file).await {
+        let resolved = match resolve_git_file_target(project_path, file, GitFileTargetPolicy::Inspect).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 warn_git_context(&mut context, file, &error.body.error);
@@ -67,7 +74,13 @@ async fn commit_message_diff_context(
 
         if let Ok(output) = git(
             repository_root,
-            ["diff", "HEAD", "--", &resolved.repository_relative_file],
+            [
+                "diff",
+                "HEAD",
+                "--submodule=log",
+                "--",
+                &resolved.repository_relative_file,
+            ],
         )
         .await
         {

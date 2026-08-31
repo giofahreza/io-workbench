@@ -77,10 +77,43 @@ async function generateGitMessage() {
   if (!project || !files.length) return;
   const body = await api("/api/git/generate-commit-message", {
     method: "POST",
-    body: JSON.stringify({ project, files }),
+    body: JSON.stringify(gitBody({ files })),
   });
   qs("#git-message").value = body.message || "";
   renderGeneratedGitMessage(body.message || "");
+}
+
+async function initializeGitRepository() {
+  const project = activeProjectKey();
+  if (!project) return;
+  const selected = selectedGitRepository();
+  const hasExistingRepositories = (state.gitWorkspace?.repositories || []).length > 0;
+  const initializingWorkspace = !selected;
+  const question = initializingWorkspace
+    ? "Create a new root Git repository for this workspace? Existing child repositories will remain independent."
+    : selected.initialized
+      ? "This repository is already initialized. Continue?"
+      : `Initialize the ${selected.name || selected.relativePath} repository?`;
+  if (!window.confirm(question)) return;
+  const body = await api("/api/git/init", {
+    method: "POST",
+    body: JSON.stringify(gitBody({ allowWorkspaceInit: initializingWorkspace && hasExistingRepositories })),
+  });
+  renderGitOperation(body);
+  await loadGitStatus({ force: true }).catch(() => {});
+}
+
+async function createGitInitialCommit() {
+  const project = activeProjectKey();
+  const selected = selectedGitRepository();
+  if (!project || !selected?.initialized) return;
+  if (!window.confirm(`Create the initial commit in ${selected.name || selected.relativePath}?`)) return;
+  const body = await api("/api/git/initial-commit", {
+    method: "POST",
+    body: JSON.stringify(gitBody()),
+  });
+  renderGitOperation(body);
+  await loadGitStatus({ force: true }).catch(() => {});
 }
 
 async function commitGitSelection() {
@@ -90,7 +123,7 @@ async function commitGitSelection() {
   if (!project || !files.length || !message) return;
   const body = await api("/api/git/commit", {
     method: "POST",
-    body: JSON.stringify({ project, files, message }),
+    body: JSON.stringify(gitBody({ files, message })),
   });
   renderGitOperation(body);
   await loadGitStatus();
@@ -101,7 +134,7 @@ async function gitOperation(path) {
   if (!project) return;
   const body = await api(path, {
     method: "POST",
-    body: JSON.stringify({ project }),
+    body: JSON.stringify(gitBody()),
   });
   renderGitOperation(body);
   await loadGitStatus().catch(() => {});
@@ -110,7 +143,7 @@ async function gitOperation(path) {
 async function gitRead(path, renderer = renderJson) {
   const project = activeProjectKey();
   if (!project) return;
-  const body = await api(`${path}${path.includes("?") ? "&" : "?"}project=${encodeURIComponent(project)}`);
+  const body = await api(gitQuery(path));
   renderer("#git-output", body);
 }
 
@@ -126,7 +159,7 @@ async function gitDiffForFile(file) {
   if (!project || !file) return;
   state.currentGitDiffFile = file;
   renderGitFiles();
-  const body = await api(`/api/git/diff?project=${encodeURIComponent(project)}&file=${encodeURIComponent(file)}`);
+  const body = await api(gitQuery("/api/git/diff", { file }));
   renderGitDiff(file, body);
 }
 
@@ -140,6 +173,6 @@ async function gitFileDiffSelected() {
 async function gitFileReviewForFile(file) {
   const project = activeProjectKey();
   if (!project || !file) return;
-  const body = await api(`/api/git/file-with-diff?project=${encodeURIComponent(project)}&file=${encodeURIComponent(file)}`);
+  const body = await api(gitQuery("/api/git/file-with-diff", { file }));
   renderGitFileReview(file, body);
 }

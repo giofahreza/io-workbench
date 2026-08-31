@@ -275,6 +275,9 @@
     "/api/search/conversations": {
       "get": { "tags": ["Sessions"], "summary": "Search stored conversations" }
     },
+    "/api/git/workspace": {
+      "get": { "tags": ["Git"], "summary": "List Git repositories in a project workspace" }
+    },
     "/api/git/status": {
       "get": { "tags": ["Git"], "summary": "Read Git working-tree status" }
     },

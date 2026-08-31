@@ -24,7 +24,8 @@ function renderGitDiff(file, body) {
   }
   const parsed = parseDiffHunks(diff);
   const truncated = body.isTruncated ? '<span class="badge warn">truncated</span>' : "";
-  const controls = parsed.hunks.length
+  const fileStatus = gitFilesFromStatus(state.gitStatus).find((item) => item.path === file);
+  const controls = parsed.hunks.length && (!fileStatus || !isGitSubmoduleFile(fileStatus))
     ? `<div class="diff-toolbar">
         <span>${parsed.hunks.length} hunk(s) ${truncated}</span>
         <button type="button" data-git-hunks-select="all">Select All</button>
@@ -100,7 +101,7 @@ async function applySelectedGitHunks(operation) {
   if (!project || !file || !hunkIndexes.length) return;
   const body = await api("/api/git/apply-hunks", {
     method: "POST",
-    body: JSON.stringify({ project, file, operation, hunkIndexes }),
+    body: JSON.stringify(gitBody({ file, operation, hunkIndexes })),
   });
   renderGitOperation(body);
   await loadGitStatus().catch(() => {});

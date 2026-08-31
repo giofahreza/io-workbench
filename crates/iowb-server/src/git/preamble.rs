@@ -17,7 +17,7 @@ use iowb_protocol::{
     GitConflictRegion, GitConflictSummary, GitConflictsResponse, GitDiffResponse, GitFileStatus,
     GitFileWithDiffResponse, GitGenerateMessageResponse, GitOperationResponse,
     GitRemoteStatusResponse, GitStashSummary, GitStashesResponse, GitStatusResponse, GitTagSummary,
-    GitTagsResponse,
+    GitTagsResponse, GitRepositoryKind,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,6 +29,7 @@ const COMMIT_DIFF_CHARACTER_LIMIT: usize = 500_000;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/git/workspace", get(git_workspace))
         .route("/api/git/status", get(status))
         .route("/api/git/conflicts", get(conflicts))
         .route("/api/git/conflict-file", get(conflict_file))
@@ -76,6 +77,8 @@ struct ProjectQuery {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
 }
 
 impl ProjectQuery {
@@ -93,6 +96,10 @@ struct DiffQuery {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
+    #[serde(rename = "staged")]
+    staged: Option<bool>,
     file: Option<String>,
 }
 
@@ -118,6 +125,8 @@ struct CommitDiffQuery {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     commit: String,
 }
 
@@ -136,6 +145,8 @@ struct CommitsQuery {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     limit: Option<usize>,
 }
 
@@ -154,6 +165,10 @@ struct ProjectBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
+    #[serde(rename = "allowWorkspaceInit", default)]
+    allow_workspace_init: bool,
 }
 
 impl ProjectBody {
@@ -171,6 +186,8 @@ struct BranchBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     branch: String,
 }
 
@@ -189,6 +206,8 @@ struct RemoteBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     name: Option<String>,
     url: String,
 }
@@ -208,6 +227,8 @@ struct StashBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     message: Option<String>,
 }
 
@@ -226,6 +247,8 @@ struct StashRefBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     reference: String,
 }
 
@@ -244,6 +267,8 @@ struct TagBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     tag: String,
     message: Option<String>,
 }
@@ -263,6 +288,8 @@ struct CommitBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     message: String,
     files: Vec<String>,
 }
@@ -282,6 +309,8 @@ struct FileBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     file: String,
 }
 
@@ -300,6 +329,8 @@ struct HunkBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     file: String,
     operation: String,
     #[serde(rename = "hunkIndexes")]
@@ -321,6 +352,8 @@ struct ResolveConflictBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     file: String,
     resolution: String,
     content: Option<String>,
@@ -347,6 +380,8 @@ struct GenerateCommitMessageBody {
     project: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<String>,
+    #[serde(rename = "repositoryId")]
+    repository_id: Option<String>,
     files: Vec<String>,
 }
 
@@ -363,5 +398,9 @@ impl GenerateCommitMessageBody {
 #[derive(Debug)]
 struct GitOutput {
     stdout: String,
+    // Keep the original bytes for porcelain output. Git paths are allowed to
+    // contain arbitrary bytes, so status parsing must not depend on lossy
+    // UTF-8 conversion.
+    stdout_bytes: Vec<u8>,
     stderr: String,
 }

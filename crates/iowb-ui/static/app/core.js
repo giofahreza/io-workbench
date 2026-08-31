@@ -72,6 +72,9 @@ const state = {
   ioGatewayLoadPromise: null,
   ioGatewayLoadGeneration: 0,
   gitStatus: null,
+  gitWorkspace: null,
+  gitWorkspaceProject: "",
+  gitSelectedRepositoryId: "",
   gitBranches: null,
   gitCommits: null,
   currentGitDiffFile: null,
@@ -430,6 +433,39 @@ function activeProjectRecord(selectId = "#active-project") {
 function activeProjectKey(selectId = "#active-project") {
   const project = activeProjectRecord(selectId);
   return project?.id || project?.name || "";
+}
+
+function selectedGitRepositoryId() {
+  const workspace = state.gitWorkspace;
+  if (!workspace || state.gitWorkspaceProject !== activeProjectKey()) return "";
+  const selected = state.gitSelectedRepositoryId || workspace.defaultRepositoryId || "";
+  return workspace.repositories?.some((repository) => repository.id === selected)
+    ? selected
+    : "";
+}
+
+function selectedGitRepository() {
+  const id = selectedGitRepositoryId();
+  return state.gitWorkspace?.repositories?.find((repository) => repository.id === id) || null;
+}
+
+function gitQuery(path, extra = {}) {
+  const url = new URL(path, window.location.origin);
+  const project = activeProjectKey();
+  if (project) url.searchParams.set("project", project);
+  const repositoryId = selectedGitRepositoryId();
+  if (repositoryId) url.searchParams.set("repositoryId", repositoryId);
+  Object.entries(extra).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, value);
+  });
+  return `${url.pathname}${url.search}`;
+}
+
+function gitBody(extra = {}) {
+  const body = { project: activeProjectKey(), ...extra };
+  const repositoryId = selectedGitRepositoryId();
+  if (repositoryId) body.repositoryId = repositoryId;
+  return body;
 }
 
 function chatProvider() {

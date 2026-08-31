@@ -1,5 +1,6 @@
 // Git handlers are organized by endpoint family and shared repository
 // helpers. The private namespace keeps the public router contract unchanged.
+include!("git/catalog.rs");
 include!("git/preamble.rs");
 include!("git/endpoints/status_and_history.rs");
 include!("git/endpoints/branches_and_tags.rs");
