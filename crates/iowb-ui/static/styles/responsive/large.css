@@ -790,6 +790,7 @@ th {
 
   .editor-topbar,
   .file-ops-strip {
+    flex-wrap: wrap;
     align-items: stretch;
   }
 

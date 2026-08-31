@@ -7,7 +7,7 @@
     <meta name="theme-color" content="#0f766e" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20260829-01" />
+    <link rel="stylesheet" href="/styles.css?v=20260830-01" />
   </head>
   <body class="auth-pending">
     <aside class="sidebar">
@@ -145,12 +145,17 @@
                 <input id="file-editor-path" name="filePath" />
               </label>
               <div class="editor-primary-actions">
+                <div id="file-editor-mode-toggle" class="editor-view-toggle" role="group" aria-label="File view mode">
+                  <button id="file-edit-mode" type="button" class="editor-view-option active" data-file-editor-mode="edit" aria-pressed="true">Edit</button>
+                  <button id="file-preview-mode" type="button" class="editor-view-option" data-file-editor-mode="preview" aria-pressed="false">Preview</button>
+                </div>
                 <button id="editor-create-file" class="icon-button" type="button" aria-label="New File (Cmd+N)" title="New File (Cmd+N)" data-symbol="file-plus"></button>
                 <button id="editor-create-directory" class="icon-button" type="button" aria-label="New Folder (Cmd+Shift+N)" title="New Folder (Cmd+Shift+N)" data-symbol="folder-plus"></button>
                 <span class="ops-separator" aria-hidden="true"></span>
                 <button type="submit" class="primary-action icon-button" aria-label="Save file" title="Save file" data-symbol="save"></button>
                 <button id="reload-file" class="icon-button" type="button" aria-label="Reload file" title="Reload file" data-symbol="refresh"></button>
                 <button id="copy-file-path" class="icon-button" type="button" aria-label="Copy file path" title="Copy file path" data-symbol="copy"></button>
+                <button id="editor-full-view" class="icon-button" type="button" aria-label="Full view" title="Full view" data-symbol="maximize"></button>
               </div>
             </div>
             <div class="editor-toolbar">
@@ -181,9 +186,10 @@
                 <button id="editor-go-line" class="icon-button" type="button" aria-label="Go to line" title="Go to line" data-symbol="corner-down-right"></button>
               </div>
             </div>
-            <div class="editor-shell">
+            <div id="file-editor-shell" class="editor-shell">
               <pre id="file-editor-lines" aria-hidden="true">1</pre>
               <textarea id="file-editor-content" rows="18" spellcheck="false" aria-label="File contents"></textarea>
+              <article id="file-editor-preview" class="markdown-file-preview hidden" aria-label="Formatted Markdown preview" aria-hidden="true"></article>
             </div>
             <div class="file-ops-strip">
               <button id="delete-file" class="icon-button" type="button" aria-label="Delete path" title="Delete path" data-symbol="trash"></button>
@@ -1154,6 +1160,6 @@
     </nav>
     <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
-    <script src="/app.js?v=20260829-01" defer></script>
+    <script src="/app.js?v=20260830-01" defer></script>
   </body>
 </html>

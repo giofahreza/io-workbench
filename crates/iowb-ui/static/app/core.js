@@ -199,6 +199,9 @@ const state = {
   currentFileProjectPath: "",
   fileEditorLineCount: 0,
   suppressEditorChange: false,
+  fileEditorMode: "edit",
+  fileEditorFullView: false,
+  fileEditorFullViewFocus: null,
   shellTerm: null,
   sidebarSearch: "",
   openProjectMenuPath: "",
@@ -312,8 +315,19 @@ function detachAuthProtectedShell() {
     "code-editor-active",
     "xterm-active",
     "files-editor-open",
+    "file-editor-full-view",
     "sidebar-project-dragging",
   );
+  state.fileEditorMode = "edit";
+  state.fileEditorFullView = false;
+  state.fileEditorFullViewFocus = null;
+  const fileEditorForm = qs("#file-editor-form");
+  fileEditorForm?.classList.remove("file-editor-full-view", "file-editor-preview-mode");
+  fileEditorForm?.removeAttribute("role");
+  fileEditorForm?.removeAttribute("aria-modal");
+  fileEditorForm?.removeAttribute("aria-label");
+  qs("#file-editor-shell")?.classList.remove("file-editor-preview-mode");
+  qs("#file-editor-preview")?.classList.add("hidden");
   closeCommandPalette();
   closeFolderBrowser();
   authProtectedSlots.forEach(({ node, marker }) => {

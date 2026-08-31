@@ -137,6 +137,7 @@ async function switchView(view) {
   }
   if (view !== "chat") closeChatEditFromHerePicker();
   if (view !== "chat" && state.boardWsSessionId) setBoardChatWsSubscription("");
+  if (view !== "files" && state.fileEditorFullView) setFileEditorFullView(false, { restoreFocus: false });
   document.querySelectorAll("button[data-view]").forEach((item) => item.classList.remove("active"));
   document.querySelectorAll(".view").forEach((item) => {
     item.classList.remove("active");

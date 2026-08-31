@@ -785,15 +785,69 @@ mod tests {
     }
 
     #[test]
+    fn file_editor_supports_markdown_preview_and_full_view() {
+        let html = asset_text("index.html");
+        let source = app_source();
+        let styles = styles_source();
+
+        for id in [
+            "file-editor-mode-toggle",
+            "file-edit-mode",
+            "file-preview-mode",
+            "editor-full-view",
+            "file-editor-shell",
+            "file-editor-preview",
+        ] {
+            assert!(html.contains(&format!(r#"id="{id}""#)), "missing {id}");
+        }
+        assert!(html.contains(r#"data-file-editor-mode="edit""#));
+        assert!(html.contains(r#"data-file-editor-mode="preview""#));
+        assert!(html.contains(r#"aria-label="Formatted Markdown preview""#));
+
+        for helper in [
+            "function isMarkdownFile(filePath = \"\")",
+            "function renderFileMarkdownPreview()",
+            "function syncFileEditorModeUi()",
+            "function setFileEditorMode(mode)",
+            "function setFileEditorFullView(enabled",
+            "function toggleFileEditorFullView()",
+        ] {
+            assert!(source.contains(helper), "missing {helper}");
+        }
+        assert!(source.contains("typeof renderMarkdownSegment === \"function\""));
+        assert!(source.contains("renderer(content)"));
+        assert!(source.contains("state.fileEditorMode = \"edit\""));
+        assert!(source.contains("state.fileEditorFullView = false"));
+        assert!(source.contains("setFileEditorFullView(false);"));
+        assert!(source.contains(
+            "qs(\"#editor-full-view\")?.addEventListener(\"click\", toggleFileEditorFullView);"
+        ));
+        assert!(source.contains("if (state.fileEditorFullView)"));
+
+        for selector in [
+            ".file-editor-pane.file-editor-preview-mode",
+            ".editor-shell.file-editor-preview-mode",
+            ".markdown-file-preview",
+            ".markdown-file-content",
+            ".file-editor-pane.file-editor-full-view",
+            "body.file-editor-full-view",
+        ] {
+            assert!(styles.contains(selector), "missing {selector}");
+        }
+    }
+
+    #[test]
     fn web_shell_asset_versions_stay_in_sync() {
         let app = app_source();
         let html = asset_text("index.html");
         let service_worker = asset_text("sw.js");
+        let styles = styles_source();
         let version = app_version(&app);
 
         assert_eq!(app_version(service_worker), version);
         assert!(html.contains(&format!(r#"/styles.css?v={version}"#)));
         assert!(html.contains(&format!(r#"/app.js?v={version}"#)));
+        assert!(styles.contains(&format!("?v={version}")));
         assert!(service_worker.contains("const CACHE_NAME = `io-workbench-web-${APP_VERSION}`;"));
         assert!(service_worker.contains("`/styles.css?v=${APP_VERSION}`"));
         assert!(service_worker.contains("`/app.js?v=${APP_VERSION}`"));

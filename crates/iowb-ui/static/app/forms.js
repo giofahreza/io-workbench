@@ -6,6 +6,7 @@ function bindForms() {
   });
   window.addEventListener("resize", () => {
     scheduleShellFit(true, 320);
+    if (state.fileEditorFullView) state.codeEditor?.refresh();
   });
   const chatBody = qs(".chat-body");
   chatBody?.addEventListener("touchstart", handleChatTouchStart, { passive: true });
@@ -92,7 +93,22 @@ function bindForms() {
     closeSidebar();
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeFileContextMenu();
+    if (event.key !== "Escape") return;
+    if (state.commandPalette.open || state.folderBrowser.open || document.body.classList.contains("sidebar-open")) return;
+    if (state.fileContextMenu) {
+      closeFileContextMenu();
+      return;
+    }
+    if (state.fileEditorFullView) {
+      event.preventDefault();
+      setFileEditorFullView(false);
+      return;
+    }
+    if (state.fileEditorMode === "preview") {
+      event.preventDefault();
+      setFileEditorMode("edit");
+      return;
+    }
   });
   qs("#bottom-more")?.addEventListener("click", openMoreSheet);
   qs("#more-close")?.addEventListener("click", closeMoreSheet);
@@ -252,6 +268,7 @@ function bindForms() {
   qs("#file-editor-content").addEventListener("scroll", () => {
     qs("#file-editor-lines").scrollTop = qs("#file-editor-content").scrollTop;
   });
+  qs("#file-editor-path").addEventListener("input", updateEditorChrome);
   qs("#editor-search").addEventListener("input", () => {
     resetEditorSearch();
     refreshEditorSearchMatches();
@@ -273,6 +290,10 @@ function bindForms() {
   });
   qs("#file-editor-form").addEventListener("submit", (event) => saveFile(event).catch(showError));
   qs("#editor-close")?.addEventListener("click", () => closeFileEditor());
+  document.querySelectorAll("[data-file-editor-mode]").forEach((button) => {
+    button.addEventListener("click", () => setFileEditorMode(button.dataset.fileEditorMode));
+  });
+  qs("#editor-full-view")?.addEventListener("click", toggleFileEditorFullView);
   qs("#create-file").addEventListener("click", () => startCreateFileTreePath(false, qs("#files-path")?.value || "."));
   qs("#create-directory").addEventListener("click", () => startCreateFileTreePath(true, qs("#files-path")?.value || "."));
   qs("#editor-create-file")?.addEventListener("click", () => startCreateFileTreePath(false, qs("#files-path")?.value || "."));

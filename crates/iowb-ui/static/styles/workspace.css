@@ -770,6 +770,41 @@ body:not(.files-editor-open) .file-editor-pane {
 
 .editor-primary-actions {
   flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+.editor-view-toggle {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px;
+  background: var(--panel-soft);
+}
+
+.editor-view-option {
+  min-height: 30px;
+  border-color: transparent;
+  border-radius: 4px;
+  padding: 4px 9px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.editor-view-option:hover,
+.editor-view-option.active {
+  border-color: var(--accent);
+  background: var(--panel);
+  color: var(--accent-strong);
+}
+
+.editor-view-option:disabled {
+  border-color: transparent;
+  background: transparent;
 }
 
 .file-editor-pane .editor-shell {
@@ -783,6 +818,148 @@ body:not(.files-editor-open) .file-editor-pane {
 
 .file-editor-pane .editor-shell .CodeMirror {
   height: 100%;
+  min-height: 0;
+}
+
+.file-editor-pane.file-editor-preview-mode .editor-command-grid,
+.file-editor-pane.file-editor-preview-mode .editor-command-row {
+  display: none;
+}
+
+.editor-shell.file-editor-preview-mode {
+  display: block;
+}
+
+.editor-shell.file-editor-preview-mode #file-editor-lines,
+.editor-shell.file-editor-preview-mode #file-editor-content,
+.editor-shell.file-editor-preview-mode .CodeMirror {
+  display: none !important;
+}
+
+.markdown-file-preview {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg) 70%, var(--panel));
+  text-align: left;
+}
+
+.markdown-file-content {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 20px 24px 32px;
+}
+
+.markdown-file-content > :first-child {
+  margin-top: 0;
+}
+
+.markdown-file-content > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-file-content h3,
+.markdown-file-content h4 {
+  margin: 20px 0 8px;
+  color: var(--text);
+  line-height: 1.25;
+}
+
+.markdown-file-content h3 {
+  font-size: 1.35rem;
+}
+
+.markdown-file-content h4 {
+  font-size: 1.1rem;
+}
+
+.markdown-file-content p {
+  margin: 0 0 10px;
+  line-height: 1.65;
+}
+
+.markdown-file-content ul,
+.markdown-file-content ol {
+  margin: 0 0 12px;
+  padding-left: 24px;
+}
+
+.markdown-file-content li {
+  margin: 4px 0;
+}
+
+.markdown-file-content blockquote {
+  margin: 0 0 12px;
+  border-left: 3px solid var(--accent);
+  padding: 2px 14px;
+  color: var(--muted);
+}
+
+.markdown-file-content code {
+  border-radius: 4px;
+  padding: 1px 4px;
+  background: color-mix(in srgb, var(--bg) 72%, var(--panel));
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+.markdown-file-content pre.markdown-code {
+  max-width: 100%;
+  margin: 0 0 14px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px;
+  background: color-mix(in srgb, var(--bg) 78%, var(--panel));
+  text-align: left;
+  white-space: pre;
+}
+
+.markdown-file-content pre.markdown-code code {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font-size: 13px;
+}
+
+.markdown-file-content a {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-file-empty {
+  margin: 0;
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+body.file-editor-full-view {
+  overflow: hidden;
+}
+
+.file-editor-pane.file-editor-full-view {
+  position: fixed;
+  z-index: 1200;
+  inset: 0;
+  width: 100vw;
+  height: var(--app-viewport-height);
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  background: var(--panel);
+  box-shadow: 0 18px 60px rgb(0 0 0 / 35%);
+}
+
+.file-editor-pane.file-editor-full-view .editor-topbar {
+  flex-wrap: wrap;
+}
+
+.file-editor-pane.file-editor-full-view .editor-shell {
   min-height: 0;
 }
 

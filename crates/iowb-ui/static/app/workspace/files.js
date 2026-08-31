@@ -826,6 +826,103 @@ function setEditorText(value) {
   }
 }
 
+function isMarkdownFile(filePath = "") {
+  const cleanPath = String(filePath).split(/[?#]/, 1)[0];
+  return /\.(?:md|markdown)$/i.test(cleanPath);
+}
+
+function renderFileMarkdownPreview() {
+  const preview = qs("#file-editor-preview");
+  if (!preview) return;
+  const content = editorText();
+  if (!content.trim()) {
+    preview.innerHTML = '<p class="markdown-file-empty">This Markdown file is empty.</p>';
+    return;
+  }
+  const renderer = typeof renderMarkdownSegment === "function"
+    ? renderMarkdownSegment
+    : (value) => `<pre>${escapeHtml(value)}</pre>`;
+  preview.innerHTML = `<div class="markdown-file-content">${renderer(content)}</div>`;
+}
+
+function syncFileEditorModeUi() {
+  const filePath = qs("#file-editor-path")?.value.trim() || "";
+  const hasFile = Boolean(filePath);
+  const markdown = isMarkdownFile(filePath);
+  if (!markdown && state.fileEditorMode === "preview") state.fileEditorMode = "edit";
+  const previewVisible = hasFile && markdown && state.fileEditorMode === "preview";
+  const shell = qs("#file-editor-shell");
+  const form = qs("#file-editor-form");
+  const preview = qs("#file-editor-preview");
+  const modeToggle = qs("#file-editor-mode-toggle");
+  const editButton = qs("#file-edit-mode");
+  const previewButton = qs("#file-preview-mode");
+  modeToggle?.classList.toggle("hidden", !hasFile || !markdown);
+  shell?.classList.toggle("file-editor-preview-mode", previewVisible);
+  form?.classList.toggle("file-editor-preview-mode", previewVisible);
+  if (preview) {
+    preview.classList.toggle("hidden", !previewVisible);
+    preview.setAttribute("aria-hidden", previewVisible ? "false" : "true");
+    if (previewVisible) renderFileMarkdownPreview();
+  }
+  if (editButton) {
+    editButton.classList.toggle("active", !previewVisible);
+    editButton.setAttribute("aria-pressed", previewVisible ? "false" : "true");
+    editButton.disabled = !hasFile;
+  }
+  if (previewButton) {
+    previewButton.classList.toggle("hidden", !markdown);
+    previewButton.classList.toggle("active", previewVisible);
+    previewButton.setAttribute("aria-pressed", previewVisible ? "true" : "false");
+    previewButton.disabled = !hasFile || !markdown;
+  }
+}
+
+function setFileEditorMode(mode) {
+  const filePath = qs("#file-editor-path")?.value.trim() || "";
+  state.fileEditorMode = mode === "preview" && isMarkdownFile(filePath) ? "preview" : "edit";
+  syncFileEditorModeUi();
+  updateEditorChrome();
+  if (state.fileEditorMode === "edit") {
+    window.requestAnimationFrame(() => refreshEditorWidget(filePath));
+  }
+}
+
+function setFileEditorFullView(enabled, options = {}) {
+  const form = qs("#file-editor-form");
+  const filePath = qs("#file-editor-path")?.value.trim() || "";
+  const next = Boolean(enabled && filePath);
+  if (!form || next === state.fileEditorFullView) return;
+  if (next) {
+    state.fileEditorFullViewFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    closeFileContextMenu();
+  }
+  state.fileEditorFullView = next;
+  form.classList.toggle("file-editor-full-view", next);
+  document.body.classList.toggle("file-editor-full-view", next);
+  if (next) {
+    form.setAttribute("role", "dialog");
+    form.setAttribute("aria-modal", "true");
+    form.setAttribute("aria-label", `File editor: ${filePath}`);
+  } else {
+    form.removeAttribute("role");
+    form.removeAttribute("aria-modal");
+    form.removeAttribute("aria-label");
+  }
+  updateEditorChrome();
+  window.requestAnimationFrame(() => {
+    state.codeEditor?.refresh();
+    if (!next && options.restoreFocus !== false) state.fileEditorFullViewFocus?.focus?.();
+    if (!next) state.fileEditorFullViewFocus = null;
+  });
+}
+
+function toggleFileEditorFullView() {
+  setFileEditorFullView(!state.fileEditorFullView);
+}
+
 function editorCursorIndex() {
   if (state.codeEditor) {
     return state.codeEditor.indexFromPos(state.codeEditor.getCursor());
@@ -941,6 +1038,8 @@ async function loadFileContent(filePath, options = {}) {
   const projectPath = activeProjectPath();
   if (!project) return;
   if (!options.skipDirtyCheck && !confirmDiscardDirtyFile()) return;
+  setFileEditorFullView(false, { restoreFocus: false });
+  state.fileEditorMode = "edit";
   const requestId = ++state.fileContentRequestId;
   const form = qs("#file-editor-form");
   form?.setAttribute("aria-busy", "true");
@@ -973,6 +1072,8 @@ function requireCurrentFileProject() {
 
 function closeFileEditor(options = {}) {
   if (!options.skipDirtyCheck && !confirmDiscardDirtyFile()) return false;
+  setFileEditorFullView(false, { restoreFocus: false });
+  state.fileEditorMode = "edit";
   state.fileContentRequestId += 1;
   state.currentFileDirty = false;
   state.currentFileProjectPath = "";
@@ -1176,8 +1277,13 @@ function updateEditorChrome() {
     col = beforeCursor.length - beforeCursor.lastIndexOf("\n");
   }
   const filePath = qs("#file-editor-path").value.trim();
+  if (!filePath && state.fileEditorFullView) setFileEditorFullView(false);
   const projectMismatch = Boolean(filePath && !currentFileProjectMatches());
   document.body.classList.toggle("files-editor-open", !!filePath);
+  syncFileEditorModeUi();
+  if (state.fileEditorFullView) {
+    qs("#file-editor-form")?.setAttribute("aria-label", `File editor: ${filePath}`);
+  }
   qs("#file-editor-position").textContent = `Ln ${line}, Col ${col}`;
   qs("#file-editor-status").textContent = filePath
     ? `${projectMismatch ? "Previous project" : (state.currentFileDirty ? "Unsaved" : "Saved")} · ${filePath}`
@@ -1187,6 +1293,14 @@ function updateEditorChrome() {
     const control = qs(selector);
     if (control) control.disabled = !filePath || projectMismatch;
   });
+  const fullViewButton = qs("#editor-full-view");
+  if (fullViewButton) {
+    fullViewButton.disabled = !filePath;
+    fullViewButton.dataset.symbol = state.fileEditorFullView ? "resize" : "maximize";
+    fullViewButton.setAttribute("aria-label", state.fileEditorFullView ? "Exit full view" : "Full view");
+    fullViewButton.title = state.fileEditorFullView ? "Exit full view" : "Full view";
+    fullViewButton.setAttribute("aria-pressed", state.fileEditorFullView ? "true" : "false");
+  }
   updateEditorSearchStatus();
 }
 
