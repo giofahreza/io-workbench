@@ -2,6 +2,8 @@
 
 `io-workbench` is the Rust rewrite scaffold for the workspace server and client suite described in `plan.md`.
 
+Landing page and product documentation: <https://workbench.giofahreza.com>.
+
 The current implementation establishes the Rust foundation and several core workflows:
 
 - Rust workspace with `iowb-*` crates.

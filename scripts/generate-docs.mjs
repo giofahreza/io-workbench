@@ -879,7 +879,7 @@ const pageDefinitions = [
     group: "Operate safely",
     type: "Operations guide",
     summary: "Run io-workbench persistently, preserve its host data, verify upgrades, and recover or archive legacy state safely.",
-    keywords: "deployment docker systemd service github release tag workbench.giofahreza.com backup upgrade rollback recovery health data workspace config import legacy persistent",
+    keywords: "deployment docker systemd service github release tag github pages landing docs production host backup upgrade rollback recovery health data workspace config import legacy persistent",
     body: [
       lead("A remote workbench should be operated as a persistent host service, not a browser tab or an expendable container. Preserve the server configuration/data and project workspace separately, put the listener behind the right network boundary, and prove each update before you rely on it."),
       section("Choose the persistent boundaries", table(
@@ -902,34 +902,34 @@ const pageDefinitions = [
         paragraph("Build the release binary with <code>cargo build --release -p iowb-cli --bin io-workbench</code>, or let the tag workflow replace <code>/opt/io-workbench/io-workbench</code>. Run the service as a dedicated non-login account where appropriate, and use " + docLink("remote-access", "Remote access") + " rather than publishing a development listener directly."),
       ].join("\n")),
       section("Release-tag production deployment", [
-        paragraph("Pushing a <code>v*</code> tag runs the release automation: it verifies the repository, publishes the checked native archives and Android APKs to GitHub Releases, then deploys the published Linux host package to <code>workbench.giofahreza.com</code>. The deployment job runs only on a dedicated private GitHub Actions runner with the <code>io-workbench-deploy</code> label. It stages and verifies the release artifact before replacing the managed binary, restarts the configured service, and checks local plus public health."),
+        paragraph("Pushing a <code>v*</code> tag runs the release automation: it verifies the repository, publishes the checked native archives and Android APKs to GitHub Releases, then deploys the published Linux host package to the configured production host. The deployment job runs only on a dedicated private GitHub Actions runner with the <code>io-workbench-deploy</code> label. It stages and verifies the release artifact before replacing the managed binary, restarts the configured service, and checks its local health."),
         table(
           ["Stage", "What the automation proves", "Operator responsibility"],
           [
             ["<strong>Release</strong>", "The tag has published the platform packages, installers, APKs, and <code>SHA256SUMS</code>.", "Review the GitHub Release asset list and checksums before treating it as an approved production version."],
-            ["<strong>Host update</strong>", "The configured Linux deployment host received the exact staged artifact and the service restarted.", "Keep service ownership, data directory, project workspace, provider CLIs, and credential material provisioned outside the replacement binary."],
-            ["<strong>Public boundary</strong>", "The workflow polls <code>https://workbench.giofahreza.com/health</code> after the local health check.", "Keep the DNS/Cloudflare or reverse-proxy route, TLS, authentication, WebSocket forwarding, and firewall policy in place."],
+            ["<strong>Host update</strong>", "The configured Linux deployment host received the exact staged artifact, restarted its service, and passed <code>DEPLOY_HEALTH_URL</code> locally.", "Keep service ownership, data directory, project workspace, provider CLIs, and credential material provisioned outside the replacement binary."],
+            ["<strong>Landing and docs</strong>", "GitHub Pages publishes the static landing and documentation site at <code>workbench.giofahreza.com</code> from <code>main</code>.", "Keep its DNS-only CNAME pointed at GitHub Pages. It is not an io-workbench server endpoint and has no <code>/health</code> route."],
           ],
         ),
-        codeCard("curl -fsS https://workbench.giofahreza.com/health", "Public production health"),
+        codeCard("curl -fsS http://127.0.0.1:8100/health", "Example local production health"),
         note("Deployment prerequisites", "The release workflow deliberately takes its SSH target, service name, installation paths, and health URLs from protected GitHub Actions secrets. Configure those once for the production host and attach <code>io-workbench-deploy</code> only to its dedicated runner. When that runner lives on the same host, use its loopback SSH endpoint; do not attach the label to a general-purpose or untrusted runner."),
         heading("Configure GitHub Actions and the production host once"),
-        paragraph("The repository files <code>deploy/README.md</code>, <code>deploy/io-workbench.service.example</code>, <code>deploy/io-workbench-deploy-runner.service.example</code>, <code>deploy/io-workbench-release.sudoers.example</code>, and <code>deploy/cloudflared-workbench-ingress.example.yml</code> are the operator starting point. Use a dedicated release directory such as <code>/opt/io-workbench</code>; do not deploy over <code>target/release</code> in a source checkout."),
+        paragraph("The repository files <code>deploy/README.md</code>, <code>deploy/io-workbench.service.example</code>, <code>deploy/io-workbench-deploy-runner.service.example</code>, and <code>deploy/io-workbench-release.sudoers.example</code> are the operator starting point. Use a dedicated release directory such as <code>/opt/io-workbench</code>; do not deploy over <code>target/release</code> in a source checkout."),
         table(
           ["GitHub secret", "Typical value", "Why it is needed"],
           [
             ["<code>DEPLOY_HOST</code>, <code>DEPLOY_USER</code>, <code>DEPLOY_SSH_KEY</code>, <code>DEPLOY_SSH_KNOWN_HOSTS</code>", "The production host, restricted deployment account/key, and its expected OpenSSH known-hosts entry. For a runner co-located with the host, use <code>127.0.0.1</code> and its loopback host key.", "Transfers only the verified Linux release artifact and pins the host key instead of trusting a fresh network lookup."],
             ["<code>DEPLOY_REMOTE_STAGE_DIR</code>", "A user-writable staging directory such as <code>/home/io-workbench/deploy</code>.", "Allows checksum verification before privileged installation."],
             ["<code>DEPLOY_LIVE_BINARY</code>, <code>DEPLOY_SERVICE_NAME</code>", "<code>/opt/io-workbench/io-workbench</code> and <code>io-workbench.service</code>.", "Defines the managed executable and the systemd service to restart."],
-            ["<code>DEPLOY_HEALTH_URL</code>", "<code>http://127.0.0.1:8100/health</code>.", "Proves the restarted host locally before the public check."],
-            ["<code>DEPLOY_SSH_PORT</code>, <code>DEPLOY_PUBLIC_HEALTH_URL</code>", "Optional; port <code>22</code> and <code>https://workbench.giofahreza.com/health</code> are the defaults.", "Overrides the network defaults only when the production layout requires it."],
+            ["<code>DEPLOY_HEALTH_URL</code>", "<code>http://127.0.0.1:8100/health</code>.", "Proves the restarted host locally after the service is replaced."],
+            ["<code>DEPLOY_SSH_PORT</code>", "Optional; defaults to port <code>22</code>.", "Overrides the controlled SSH endpoint only when the production layout requires it."],
             ["<code>IOWB_ANDROID_KEYSTORE_BASE64</code>, <code>IOWB_ANDROID_KEYSTORE_PASSWORD</code>, <code>IOWB_ANDROID_KEY_ALIAS</code>, <code>IOWB_ANDROID_KEY_PASSWORD</code>", "One stable Android signing key and its credentials.", "Keeps future APKs installable as updates rather than signature-mismatched new apps."],
             ["<code>IOWB_SUBMODULES_TOKEN</code>", "Optional read-only Contents token for the private <code>apps</code>/<code>rag</code> submodules.", "Lets the tag workflow check out the same mobile and Rust source that the tag references."],
           ],
         ),
-        codeCard("# Add this before cloudflared's final catch-all ingress rule.\n- hostname: workbench.giofahreza.com\n  service: http://127.0.0.1:8100", "Cloudflare Tunnel ingress"),
-        note("Do not skip the one-time boundary work", "Create the Cloudflare DNS/tunnel hostname, add the ingress route, reload cloudflared, register a dedicated <code>io-workbench-deploy</code> runner, give its deployment account narrowly scoped non-interactive permission using the supplied sudoers template, and store its controlled <code>DEPLOY_SSH_KNOWN_HOSTS</code> entry. The workflow never trusts a newly scanned SSH host key, and it intentionally fails its public health check until that boundary is real."),
-        paragraph("The release deployment replaces only executable code. It preserves the data/config directory and workspace, retains a timestamped prior binary, and automatically restores that prior binary if the new service fails local restart or health verification. If the public check still fails after a healthy local restart, use the workflow output to repair the tunnel/proxy boundary rather than deleting application data as an update workaround."),
+        note("Keep Pages and the host separate", "Reserve <code>workbench.giofahreza.com</code> for the GitHub Pages landing/docs CNAME. Do not add it to a Cloudflare Tunnel ingress or use it as a production API URL. If the host needs remote browser or mobile access, choose a different authenticated VPN, proxy, or tunnel hostname and verify its HTTPS/WSS boundary separately."),
+        note("Do not skip the one-time host boundary work", "Register a dedicated <code>io-workbench-deploy</code> runner, give its deployment account narrowly scoped non-interactive permission using the supplied sudoers template, and store its controlled <code>DEPLOY_SSH_KNOWN_HOSTS</code> entry. The workflow never trusts a newly scanned SSH host key."),
+        paragraph("The release deployment replaces only executable code. It preserves the data/config directory and workspace, retains a timestamped prior binary, and automatically restores that prior binary if the new service fails local restart or health verification."),
       ].join("\n")),
       section("Back up, update, and verify", compactSteps([
         ["Record the known-good state", "Capture the running version, configured paths, service/image version, and a health result before changing anything. Back up the configuration/data location and the relevant project repositories or database snapshots."],

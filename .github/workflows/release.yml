@@ -407,7 +407,7 @@ jobs:
           fi
 
   deploy-production:
-    name: Deploy workbench.giofahreza.com
+    name: Deploy production binary
     needs: publish-release
     # The deployment runner is installed on the private production host. This
     # avoids exposing SSH directly to the public internet while retaining the
@@ -423,7 +423,6 @@ jobs:
       DEPLOY_LIVE_BINARY: ${{ secrets.DEPLOY_LIVE_BINARY }}
       DEPLOY_SERVICE_NAME: ${{ secrets.DEPLOY_SERVICE_NAME }}
       DEPLOY_HEALTH_URL: ${{ secrets.DEPLOY_HEALTH_URL }}
-      DEPLOY_PUBLIC_HEALTH_URL: ${{ secrets.DEPLOY_PUBLIC_HEALTH_URL }}
     steps:
       - name: Download the Linux production archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -597,19 +596,3 @@ jobs:
           rm -f "$staged_binary"
           trap - EXIT
           REMOTE
-
-      - name: Verify workbench.giofahreza.com
-        shell: bash
-        run: |
-          set -euo pipefail
-          public_health_url="${DEPLOY_PUBLIC_HEALTH_URL:-https://workbench.giofahreza.com/health}"
-          for attempt in $(seq 1 30); do
-            if curl -fsS --max-time 10 "$public_health_url" >/dev/null; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 30 ]; then
-              echo "Public health check failed: $public_health_url" >&2
-              exit 1
-            fi
-            sleep 2
-          done

@@ -1,5 +1,0 @@
-# Insert this item before the final catch-all ingress rule in the existing
-# /etc/cloudflared/config.yml. It assumes the production systemd unit listens
-# only on the loopback port declared in deploy/io-workbench.service.example.
-- hostname: workbench.giofahreza.com
-  service: http://127.0.0.1:8100

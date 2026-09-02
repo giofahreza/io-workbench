@@ -30,11 +30,7 @@ separate sudoers policy grants only the release install and rollback commands.
    directory. Start from `io-workbench-release.sudoers.example`, replace its
    account/path/service values, validate it with `visudo -cf`, then install it
    at `/etc/sudoers.d/io-workbench-release` with mode `0440`.
-4. Create the Cloudflare DNS/tunnel route for `workbench.giofahreza.com`, then
-   merge `cloudflared-workbench-ingress.example.yml` before the catch-all
-   ingress rule and restart cloudflared. The tunnel must forward WebSockets as
-   well as HTTP.
-5. Store the deployment settings as GitHub Actions secrets:
+4. Store the deployment settings as GitHub Actions secrets:
 
    - `DEPLOY_HOST`
    - `DEPLOY_USER`
@@ -45,8 +41,7 @@ separate sudoers policy grants only the release install and rollback commands.
    - `DEPLOY_SERVICE_NAME`
    - `DEPLOY_HEALTH_URL`
 
-   `DEPLOY_SSH_PORT` and `DEPLOY_PUBLIC_HEALTH_URL` are optional. The latter
-   defaults to `https://workbench.giofahreza.com/health`.
+   `DEPLOY_SSH_PORT` is optional and defaults to `22`.
 
    Set `DEPLOY_SSH_KNOWN_HOSTS` to the complete known-hosts entry (use
    `[host]:port` notation for a non-default port). The deployment
@@ -58,3 +53,26 @@ APK releases: `IOWB_ANDROID_KEYSTORE_BASE64`,
 `IOWB_ANDROID_KEYSTORE_PASSWORD`, `IOWB_ANDROID_KEY_ALIAS`, and
 `IOWB_ANDROID_KEY_PASSWORD`. If `apps` remains a private submodule, provide
 `IOWB_SUBMODULES_TOKEN` with read-only Contents access.
+
+## GitHub Pages landing and documentation
+
+`.github/workflows/pages.yml` publishes the landing page and generated product
+documentation from `main` to GitHub Pages. It intentionally does not publish
+the authenticated io-workbench server UI or route a production server through
+the Pages hostname.
+
+Configure the GitHub Pages custom domain as `workbench.giofahreza.com`, then
+replace any existing Cloudflare Tunnel record for that host with this DNS-only
+(gray-cloud) record:
+
+```text
+Type: CNAME
+Name: workbench
+Target: giofahreza.github.io
+Proxy status: DNS only
+```
+
+Do not add `workbench.giofahreza.com` to a Cloudflare Tunnel ingress and do not
+use `/health` on that hostname. If a production io-workbench host needs remote
+access, give it a separate authenticated VPN, reverse-proxy, or tunnel hostname
+that supports HTTPS and WebSocket upgrades.

@@ -268,7 +268,7 @@
       "type": "Operations guide",
       "summary": "Run io-workbench persistently, preserve its host data, verify upgrades, and recover or archive legacy state safely.",
       "href": "/docs/deployment-and-recovery/",
-      "keywords": "deployment docker systemd service github release tag workbench.giofahreza.com backup upgrade rollback recovery health data workspace config import legacy persistent Remote access and security Operations and API",
+      "keywords": "deployment docker systemd service github release tag github pages landing docs production host backup upgrade rollback recovery health data workspace config import legacy persistent Remote access and security Operations and API",
       "headings": [
         "Choose the persistent boundaries",
         "Run a persistent container",

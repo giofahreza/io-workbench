@@ -1,0 +1,110 @@
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/pages.yml"
+      - "crates/iowb-ui/static/landing.html"
+      - "crates/iowb-ui/static/docs.html"
+      - "crates/iowb-ui/static/docs/**"
+      - "crates/iowb-ui/static/app/landing-theme.js"
+      - "crates/iowb-ui/static/app/landing.js"
+      - "crates/iowb-ui/static/app/docs.js"
+      - "crates/iowb-ui/static/styles/landing.css"
+      - "crates/iowb-ui/static/styles/docs.css"
+      - "crates/iowb-ui/static/icon.svg"
+      - "crates/iowb-ui/static/icons/codex-white.svg"
+      - "crates/iowb-ui/static/icons/claude-white.svg"
+      - "crates/iowb-ui/static/icons/gemini-ai-icon.svg"
+      - "crates/iowb-ui/static/openapi.json"
+      - "scripts/generate-docs.mjs"
+  workflow_dispatch:
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build Pages artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check generated documentation
+        run: node scripts/generate-docs.mjs --check
+
+      - name: Assemble the landing and docs site
+        shell: bash
+        run: |
+          set -euo pipefail
+          site_dir="$RUNNER_TEMP/io-workbench-pages"
+          mkdir -p "$site_dir/app" "$site_dir/styles" "$site_dir/icons" "$site_dir/landing"
+
+          cp crates/iowb-ui/static/landing.html "$site_dir/index.html"
+          # Keep the application server's historical /landing route usable in
+          # the static site as well, while the custom-domain root is the
+          # canonical landing page.
+          cp crates/iowb-ui/static/landing.html "$site_dir/landing/index.html"
+          cp crates/iowb-ui/static/docs.html "$site_dir/docs.html"
+          cp -R crates/iowb-ui/static/docs "$site_dir/docs"
+          cp crates/iowb-ui/static/app/landing-theme.js "$site_dir/app/"
+          cp crates/iowb-ui/static/app/landing.js "$site_dir/app/"
+          cp crates/iowb-ui/static/app/docs.js "$site_dir/app/"
+          cp crates/iowb-ui/static/styles/landing.css "$site_dir/styles/"
+          cp crates/iowb-ui/static/styles/docs.css "$site_dir/styles/"
+          cp crates/iowb-ui/static/icon.svg "$site_dir/"
+          cp crates/iowb-ui/static/openapi.json "$site_dir/"
+          cp crates/iowb-ui/static/icons/codex-white.svg "$site_dir/icons/"
+          cp crates/iowb-ui/static/icons/claude-white.svg "$site_dir/icons/"
+          cp crates/iowb-ui/static/icons/gemini-ai-icon.svg "$site_dir/icons/"
+          printf '%s\n' 'workbench.giofahreza.com' > "$site_dir/CNAME"
+          touch "$site_dir/.nojekyll"
+
+          test -f "$site_dir/index.html"
+          test -f "$site_dir/landing/index.html"
+          test -f "$site_dir/docs/index.html"
+          test -f "$site_dir/docs/search-index.json"
+          test -f "$site_dir/app/landing-theme.js"
+          test -f "$site_dir/app/landing.js"
+          test -f "$site_dir/app/docs.js"
+          test -f "$site_dir/styles/landing.css"
+          test -f "$site_dir/styles/docs.css"
+          test -f "$site_dir/icon.svg"
+          test -f "$site_dir/CNAME"
+          test "$(cat "$site_dir/CNAME")" = 'workbench.giofahreza.com'
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/io-workbench-pages
+
+  deploy:
+    name: Deploy Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
