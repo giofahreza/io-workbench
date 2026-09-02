@@ -1,0 +1,482 @@
+{
+  "generatedAt": "2026-09-01",
+  "docsVersion": "2026.09",
+  "pages": [
+    {
+      "title": "Documentation",
+      "category": "Product documentation",
+      "type": "Main page",
+      "summary": "Install and operate io-workbench from Web, native desktop, and mobile clients.",
+      "href": "/docs/",
+      "keywords": "documentation overview install web native desktop mobile remote workbench",
+      "headings": [
+        "Start with the path you need",
+        "How the product fits together",
+        "Guide map",
+        "Browse by task",
+        "Product boundaries"
+      ],
+      "excerpt": "io-workbench is a self-hosted remote workbench for configured agent CLIs, files, Git, databases, terminals, and reviewable delivery work."
+    },
+    {
+      "title": "Quick start",
+      "category": "Get started",
+      "type": "Tutorial",
+      "summary": "Install a released host or source build, create the first account, and prove a local workspace is ready.",
+      "href": "/docs/quick-start/",
+      "keywords": "install release binary linux macos windows source rust cargo git docker first user setup account workspace health provider cli claude codex gemini Web workspace Mobile clients Native desktop client Remote access and security",
+      "headings": [
+        "What runs where",
+        "The source of truth",
+        "Your first cockpit",
+        "A remote client",
+        "Before you start",
+        "Install a released host binary",
+        "Install from source",
+        "Open the web UI and create the first account",
+        "Verify the host before real work",
+        "Optional: run in a container",
+        "Continue with a real workflow"
+      ],
+      "excerpt": "Install io-workbench on the machine that owns your repository, provider CLI credentials, and development tools. The browser is the control surface; the host stays the place where code, processes, and agent CLIs run. What runs where Host The source of truth The Rust server, project directories, configured Claude/Codex/Gemini CLIs, Git credentials, databases, and PTY processes live on this machine. Web UI Your first co"
+    },
+    {
+      "title": "Install and update",
+      "category": "Get started",
+      "type": "Installation guide",
+      "summary": "Install checked release builds on Linux, macOS, Windows, or Android and update them without starting an unintended service.",
+      "href": "/docs/install-and-update/",
+      "keywords": "install update release binary curl powershell windows macos linux android apk sha256 checksum github releases arm64 x86_64 security Mobile clients Native desktop client Remote access and security Operations and API",
+      "headings": [
+        "Choose the right release asset",
+        "Linux and macOS: install the current host",
+        "Windows: PowerShell installer or a downloaded script",
+        "Android: install the released remote client",
+        "Verify a manual release download",
+        "Update and roll back deliberately",
+        "Release security checklist",
+        "Continue with"
+      ],
+      "excerpt": "Each version tag, such as v0.1.0 , publishes the io-workbench host binary for Linux, macOS, and Windows plus signed Android client APKs. The host executable is the self-hosted server and Web UI; Android is an authenticated remote client. Install the package that matches the device you are preparing, then deliberately start or connect it. Choose the right release asset Device What the release installs What it does Lin"
+    },
+    {
+      "title": "Web workspace",
+      "category": "Get started",
+      "type": "Tutorial",
+      "summary": "Use the browser UI from first sign-in through a reviewable agent, code, Git, data, and terminal loop.",
+      "href": "/docs/web-workspace/",
+      "keywords": "web workspace browser ui sign in add existing project command palette database shell agent prompt config claude codex gemini files git board reconnect Web workspace Agents and providers Projects and Git Database and terminal",
+      "headings": [
+        "First browser session",
+        "Start an agent session",
+        "Use the project surfaces as one delivery loop",
+        "A practical first task",
+        "Web UI boundaries",
+        "No device-local checkout",
+        "No hosted model proxy",
+        "No browser shell",
+        "Treat it as a control plane",
+        "Find these guides inside the app",
+        "Next steps"
+      ],
+      "excerpt": "The Web workspace is the primary remote desk for an io-workbench host. It gives one authenticated browser view to projects, configured agent CLIs, files, Git evidence, database work, and a live host terminal. First browser session 1 Open the server URL Use the local address from Quick start , or the HTTPS address configured by your remote-access boundary. 2 Sign in or finish setup First-user setup creates the local a"
+    },
+    {
+      "title": "Mobile apps",
+      "category": "Get started",
+      "type": "Tutorial",
+      "summary": "Install the released Android client or build it from source, use the mobile web/PWA route, and connect it safely to a running host.",
+      "href": "/docs/mobile/",
+      "keywords": "mobile android native app apk release install update adb pwa ios web harness server url emulator 10.0.2.2 lan tunnel https wss remote termux Mobile clients Database and terminal Remote access and security",
+      "headings": [
+        "Choose the mobile surface",
+        "Prepare the server before installing a client",
+        "Install the native Android app",
+        "Build from source when developing the Android client",
+        "Connect Android to the host",
+        "Use the right URL for the device",
+        "Use the PWA or browser harness",
+        "Mobile capability matrix",
+        "Use mobile in a real work loop",
+        "Continue the remote session",
+        "Review before approving",
+        "Copy structured rows on Android",
+        "Control the host PTY",
+        "First Android work cycle",
+        "If connection fails"
+      ],
+      "excerpt": "Mobile clients are remote control surfaces for a running io-workbench server. They do not run your agent CLIs, workspace processes, or PTY locally. Start the host first, then connect the phone to a reachable authenticated server URL. Choose the mobile surface Surface Best for Current delivery Android native A dedicated mobile experience with native editor and terminal controls. Signed APKs are published with every v*"
+    },
+    {
+      "title": "Native desktop client",
+      "category": "Get started",
+      "type": "Tutorial",
+      "summary": "Build and use the source-built wxWidgets desktop client to control a local or remote io-workbench host.",
+      "href": "/docs/desktop-client/",
+      "keywords": "desktop native wxwidgets cmake local remote connect login setup websocket libvterm browser launcher start local github clone workspace Native desktop client Projects and Git Remote access and security",
+      "headings": [
+        "Choose the right desktop route",
+        "Build the native client from source",
+        "Start a local host from the desktop client",
+        "Connect to a remote host",
+        "Use the desktop work loop",
+        "Run project-scoped work",
+        "Make source evidence visible",
+        "Validate on the host",
+        "Know the current limits",
+        "Continue with"
+      ],
+      "excerpt": "Use the native desktop client when you want a wxWidgets/Scintilla control surface for an io-workbench host. It does not move projects, provider CLIs, databases, or PTYs onto the desktop machine; those remain on the connected host. Choose the right desktop route Route What it is Use it when Browser launcher apps/desktop/io-workbench-desktop.sh starts a local release server, waits for /health , opens the default browse"
+    },
+    {
+      "title": "Remote access",
+      "category": "Get started",
+      "type": "How-to guide",
+      "summary": "Reach an io-workbench host from another browser or phone without exposing a development listener carelessly.",
+      "href": "/docs/remote-access/",
+      "keywords": "remote access lan host port vpn reverse proxy cloudflare tunnel https wss websocket mobile security auth Mobile clients Native desktop client Remote access and security",
+      "headings": [
+        "Choose a boundary",
+        "Temporarily listen on a trusted LAN",
+        "Remote client checklist",
+        "Credentials and transport"
+      ],
+      "excerpt": "The default server binds to 127.0.0.1:8787 , which is ideal for first-run setup. Remote use is a network-design decision: place a VPN, authenticated tunnel, or HTTPS/WSS reverse proxy in front of the control plane before a phone or outside browser connects. Choose a boundary Boundary Use it when What to verify VPN Your devices are already members of a private network. The VPN address reaches the host, the firewall is"
+    },
+    {
+      "title": "Agents and sessions",
+      "category": "Workbench workflows",
+      "type": "How-to guide",
+      "summary": "Run configured Claude, Codex, and Gemini CLIs with durable project sessions and reconnect-aware history.",
+      "href": "/docs/agents-and-sessions/",
+      "keywords": "agents sessions claude codex gemini cli prompt model resume reconnect stream history token usage Web workspace Agents and providers Projects and Git",
+      "headings": [
+        "Provider execution model",
+        "Start a session deliberately",
+        "Resume and recover",
+        "Useful companion guides"
+      ],
+      "excerpt": "io-workbench is a remote control plane around the agent CLIs you install and authenticate on the host. Choose the provider per session while keeping the project, files, Git state, terminal, and response history together. Provider execution model Provider Default host command Important boundary Claude claude --print {prompt} The Claude CLI and its authentication live on the server host. Codex codex exec {prompt} The C"
+    },
+    {
+      "title": "Projects, files, and Git",
+      "category": "Workbench workflows",
+      "type": "How-to guide",
+      "summary": "Keep host directories, file edits, diffs, branches, and remote Git operations in one reviewable project context.",
+      "href": "/docs/projects-files-git/",
+      "keywords": "projects files editor upload search replace markdown git diff commit branch remote fetch pull push clone workspace Web workspace Native desktop client Projects and Git",
+      "headings": [
+        "Add the right project to the Web workspace",
+        "Create or clone outside the browser picker",
+        "Review changes before shipping",
+        "What the Git surface supports",
+        "Status and history",
+        "Stage and commit",
+        "Remote operations",
+        "Dangerous actions need intent",
+        "Project boundary controls"
+      ],
+      "excerpt": "A project is the unit that ties an agent session to a real host directory. Files and Git tools make the change visible before you ask a terminal or agent to prove it. Add the right project to the Web workspace 1 Prepare the directory on the host The browser + Add project picker adds an existing directory; it does not create a workspace or GitHub clone. Prepare the directory through a trusted host workflow before usin"
+    },
+    {
+      "title": "Database workspace",
+      "category": "Workbench workflows",
+      "type": "How-to guide",
+      "summary": "Save connections, inspect schemas, run SQL, work with paginated data, and understand browser versus Android clipboard capabilities.",
+      "href": "/docs/database-workspace/",
+      "keywords": "database sqlite postgresql mysql mariadb schema relationships sql query pagination json import export transfer copy paste android navicat Web workspace Mobile clients Native desktop client Database and terminal",
+      "headings": [
+        "Supported connection types",
+        "Inspect and query data safely",
+        "Transfer and clipboard boundaries",
+        "Use it with the rest of the workbench"
+      ],
+      "excerpt": "The database workspace keeps data investigation beside the code and agent work that changes it. Use saved connections, schema exploration, SQL, paginated rows, and JSON jobs without turning a chat transcript into your only evidence. Supported connection types Connection Use it for Available workspace flow SQLite Local database files visible to the host. Save/test the path, inspect schema, run SQL, browse rows, and us"
+    },
+    {
+      "title": "Terminal and mobile controls",
+      "category": "Workbench workflows",
+      "type": "How-to guide",
+      "summary": "Operate a live server-hosted PTY from the browser or Android without mistaking it for a local device shell.",
+      "href": "/docs/terminal-and-mobile/",
+      "keywords": "terminal pty remote shell process resize input output abort copy paste android termux esc tab ctrl alt arrows Web workspace Mobile clients Native desktop client Database and terminal",
+      "headings": [
+        "Start a terminal in the correct project",
+        "Browser and Android controls",
+        "Full remote Shell",
+        "Native terminal renderer",
+        "Server-hosted execution",
+        "Important Android distinction",
+        "Terminal safety"
+      ],
+      "excerpt": "The browser calls this surface Shell ; it is a real PTY backed by the selected project on the server. It is for running host commands, watching output, resizing the terminal, and stopping processes—not an output-only command log. Start a terminal in the correct project 1 Select the project The Shell starts against the selected server-side project path, so check the project before running a migration, build, or destru"
+    },
+    {
+      "title": "Boards and tools",
+      "category": "Operate safely",
+      "type": "How-to guide",
+      "summary": "Turn broad work into reviewable tasks with the Agentic Board and deliberately configured command-backed tools.",
+      "href": "/docs/boards-and-tools/",
+      "keywords": "agentic board tasks validation qa approval mcp commands plugins taskmaster watchers automation notifications Agents and providers Operations and API",
+      "headings": [
+        "Run a controlled delivery loop",
+        "Command-backed integrations",
+        "Configure first, automate second"
+      ],
+      "excerpt": "The Agentic Board and tool integrations make work reviewable rather than opaque. Use them to break a broad goal into scoped tasks, provider choices, validation evidence, and explicit approval boundaries. Run a controlled delivery loop 1 Select the project and open Board Keep the task scope tied to the same host project whose files, Git state, database, and Shell you will review. 2 Author the board request Enter a Boa"
+    },
+    {
+      "title": "Security and boundaries",
+      "category": "Operate safely",
+      "type": "Explanation",
+      "summary": "Understand what authentication, host ownership, workspace limits, and transport security protect in a remote control plane.",
+      "href": "/docs/security-and-boundaries/",
+      "keywords": "security auth token otp bearer workspace root remote vpn proxy tunnel tls https wss terminal command host boundary Remote access and security Operations and API",
+      "headings": [
+        "Authentication defaults",
+        "Authentication mode consequences",
+        "Keep authority on the host",
+        "Workspace boundary",
+        "Provider credentials",
+        "Process authority",
+        "Command authority",
+        "Remote access rules",
+        "Before running a high-impact action"
+      ],
+      "excerpt": "io-workbench gives an authenticated client control over host files, configured CLIs, Git, data connections, and terminal processes. The security model is therefore about preserving clear boundaries: who can connect, what host resources they can reach, and how traffic is protected. Authentication defaults Authentication is enabled by default . With no local user, the server starts in setup mode; after registration, pr"
+    },
+    {
+      "title": "Configuration",
+      "category": "Operate safely",
+      "type": "Reference",
+      "summary": "Configure listener, storage, workspace, authentication, provider command, and runtime limits through environment variables.",
+      "href": "/docs/configuration/",
+      "keywords": "configuration environment IO_WORKBENCH_HOST PORT CONFIG_DIR DATABASE_PATH WORKSPACE_ROOT AUTH_REQUIRED TOKEN OTP_SECRET totp providers cli args stdin limits Agents and providers Remote access and security Operations and API",
+      "headings": [
+        "Important defaults",
+        "Example: controlled local override",
+        "Choose one server-login mode deliberately",
+        "Provider command configuration",
+        "Limits and integrations",
+        "Related setup"
+      ],
+      "excerpt": "io-workbench configuration uses environment variables with the IO_WORKBENCH_ prefix. Start from the safe local defaults, then make a focused change for storage, workspace scope, authentication, provider command behavior, or remote access. Important defaults Setting Default Use it to IO_WORKBENCH_HOST 127.0.0.1 Keep first-run access local; change deliberately for a trusted LAN/proxy upstream. IO_WORKBENCH_PORT 8787 Ch"
+    },
+    {
+      "title": "Deployment and recovery",
+      "category": "Operate safely",
+      "type": "Operations guide",
+      "summary": "Run io-workbench persistently, preserve its host data, verify upgrades, and recover or archive legacy state safely.",
+      "href": "/docs/deployment-and-recovery/",
+      "keywords": "deployment docker systemd service github release tag workbench.giofahreza.com backup upgrade rollback recovery health data workspace config import legacy persistent Remote access and security Operations and API",
+      "headings": [
+        "Choose the persistent boundaries",
+        "Run a persistent container",
+        "Run a source build under a service manager",
+        "Release-tag production deployment",
+        "Configure GitHub Actions and the production host once",
+        "Back up, update, and verify",
+        "Inspect old workbench data without overwriting it",
+        "Continue with"
+      ],
+      "excerpt": "A remote workbench should be operated as a persistent host service, not a browser tab or an expendable container. Preserve the server configuration/data and project workspace separately, put the listener behind the right network boundary, and prove each update before you rely on it. Choose the persistent boundaries Boundary What to preserve Why it matters Configuration and server data The configured data directory an"
+    },
+    {
+      "title": "Settings and integrations",
+      "category": "Operate safely",
+      "type": "How-to guide",
+      "summary": "Configure agents, Git identity, API material, notifications, gateway chat, runtime status, and command-backed tools without widening host authority accidentally.",
+      "href": "/docs/settings-and-integrations/",
+      "keywords": "settings agents cli status git identity api tokens credentials notifications io gateway metrics tools mcp plugins taskmaster transcription Agents and providers Operations and API",
+      "headings": [
+        "Start with the Settings map",
+        "A safe configuration sequence",
+        "Command-backed tools are host execution",
+        "Continue with"
+      ],
+      "excerpt": "Settings is the operator desk for the workbench's rich control surfaces: provider readiness, Git identity, access material, browser notifications, optional IO Gateway chat, runtime health, and command-backed tools. Use it to make a deliberate host configuration visible—not to grant a browser or phone new authority by accident. Start with the Settings map Settings tab Use it for Safe first action Agents CLI Status and"
+    },
+    {
+      "title": "Troubleshooting",
+      "category": "Reference",
+      "type": "Troubleshooting",
+      "summary": "Diagnose host startup, authentication, provider CLI, project, WebSocket, mobile, and remote-access failures.",
+      "href": "/docs/troubleshooting/",
+      "keywords": "troubleshooting health login auth token otp cli status project websocket mobile android pwa remote proxy wss Mobile clients Native desktop client Remote access and security Operations and API",
+      "headings": [
+        "First checks",
+        "Common symptoms",
+        "Remote access diagnosis",
+        "When to inspect configuration"
+      ],
+      "excerpt": "Start diagnosis at the host, then move outward through authentication, project scope, provider CLIs, and finally remote client/network details. A phone or browser error often begins with a server or proxy condition. First checks Shell Copy curl http://127.0.0.1:8787/health cargo run -p iowb-cli --bin io-workbench -- status Server unavailable : confirm the command/service is running and the host/port match the URL you"
+    },
+    {
+      "title": "API reference",
+      "category": "Reference",
+      "type": "Reference",
+      "summary": "Find health, WebSocket, and bundled OpenAPI material while treating the running server as the source of truth.",
+      "href": "/docs/api/",
+      "keywords": "api openapi health websocket ws rest authentication bearer token endpoint reference Projects and Git Remote access and security Operations and API",
+      "headings": [
+        "Key entry points",
+        "Authentication and transport",
+        "Integration workflow",
+        "Related documents"
+      ],
+      "excerpt": "The browser, Android client, and PWA use the io-workbench HTTP API and WebSocket event stream. Use this page to orient yourself, then check the bundled OpenAPI document and the running server behavior before building a separate integration. Key entry points Endpoint Purpose Notes GET /health Simple host reachability check. Use it first for local and remote diagnostics. GET /ws Live events and controls. Requires the a"
+    },
+    {
+      "title": "Get started",
+      "category": "Documentation area",
+      "type": "Category",
+      "summary": "Install a released host, open the web workspace, and connect a phone safely.",
+      "href": "/docs/category/get-started/",
+      "keywords": "get started documentation category",
+      "headings": [
+        "Guides in this area"
+      ],
+      "excerpt": "Install a released host, open the web workspace, and connect a phone safely."
+    },
+    {
+      "title": "Workbench workflows",
+      "category": "Documentation area",
+      "type": "Category",
+      "summary": "Use agents, code, Git, data, and terminals against one host project.",
+      "href": "/docs/category/workbench/",
+      "keywords": "workbench workflows documentation category",
+      "headings": [
+        "Guides in this area"
+      ],
+      "excerpt": "Use agents, code, Git, data, and terminals against one host project."
+    },
+    {
+      "title": "Operate safely",
+      "category": "Documentation area",
+      "type": "Category",
+      "summary": "Set access boundaries, configure the service, and run controlled automation.",
+      "href": "/docs/category/operations/",
+      "keywords": "operate safely documentation category",
+      "headings": [
+        "Guides in this area"
+      ],
+      "excerpt": "Set access boundaries, configure the service, and run controlled automation."
+    },
+    {
+      "title": "Reference",
+      "category": "Documentation area",
+      "type": "Category",
+      "summary": "Diagnose common problems and navigate the bundled API reference.",
+      "href": "/docs/category/reference/",
+      "keywords": "reference documentation category",
+      "headings": [
+        "Guides in this area"
+      ],
+      "excerpt": "Diagnose common problems and navigate the bundled API reference."
+    },
+    {
+      "title": "Web workspace",
+      "category": "Topic",
+      "type": "Topic",
+      "summary": "Browser setup, project selection, Chat, Files, Git, data, Shell, and review flows.",
+      "href": "/docs/topic/web-workspace/",
+      "keywords": "web workspace documentation topic",
+      "headings": [
+        "Guides for this topic",
+        "Related topics"
+      ],
+      "excerpt": "Browser setup, project selection, Chat, Files, Git, data, Shell, and review flows."
+    },
+    {
+      "title": "Mobile clients",
+      "category": "Topic",
+      "type": "Topic",
+      "summary": "Android, browser/PWA, iPhone/iPad, connection profiles, and remote handheld controls.",
+      "href": "/docs/topic/mobile-clients/",
+      "keywords": "mobile clients documentation topic",
+      "headings": [
+        "Guides for this topic",
+        "Related topics"
+      ],
+      "excerpt": "Android, browser/PWA, iPhone/iPad, connection profiles, and remote handheld controls."
+    },
+    {
+      "title": "Native desktop client",
+      "category": "Topic",
+      "type": "Topic",
+      "summary": "The source-built wxWidgets client for local or remote io-workbench hosts.",
+      "href": "/docs/topic/native-desktop-client/",
+      "keywords": "native desktop client documentation topic",
+      "headings": [
+        "Guides for this topic",
+        "Related topics"
+      ],
+      "excerpt": "The source-built wxWidgets client for local or remote io-workbench hosts."
+    },
+    {
+      "title": "Agents and providers",
+      "category": "Topic",
+      "type": "Topic",
+      "summary": "Claude, Codex, Gemini, CLI readiness, prompts, sessions, and delivery automation.",
+      "href": "/docs/topic/agents-and-providers/",
+      "keywords": "agents and providers documentation topic",
+      "headings": [
+        "Guides for this topic",
+        "Related topics"
+      ],
+      "excerpt": "Claude, Codex, Gemini, CLI readiness, prompts, sessions, and delivery automation."
+    },
+    {
+      "title": "Projects and Git",
+      "category": "Topic",
+      "type": "Topic",
+      "summary": "Host workspaces, file review, source control, workspace creation, and Git synchronization.",
+      "href": "/docs/topic/projects-and-git/",
+      "keywords": "projects and git documentation topic",
+      "headings": [
+        "Guides for this topic",
+        "Related topics"
+      ],
+      "excerpt": "Host workspaces, file review, source control, workspace creation, and Git synchronization."
+    },
+    {
+      "title": "Database and terminal",
+      "category": "Topic",
+      "type": "Topic",
+      "summary": "Saved database connections, SQL, row transfer, server PTYs, and validation evidence.",
+      "href": "/docs/topic/database-and-terminal/",
+      "keywords": "database and terminal documentation topic",
+      "headings": [
+        "Guides for this topic",
+        "Related topics"
+      ],
+      "excerpt": "Saved database connections, SQL, row transfer, server PTYs, and validation evidence."
+    },
+    {
+      "title": "Remote access and security",
+      "category": "Topic",
+      "type": "Topic",
+      "summary": "Authentication, HTTPS/WSS, VPNs, tunnels, proxy boundaries, and host authority.",
+      "href": "/docs/topic/remote-access-and-security/",
+      "keywords": "remote access and security documentation topic",
+      "headings": [
+        "Guides for this topic",
+        "Related topics"
+      ],
+      "excerpt": "Authentication, HTTPS/WSS, VPNs, tunnels, proxy boundaries, and host authority."
+    },
+    {
+      "title": "Operations and API",
+      "category": "Topic",
+      "type": "Topic",
+      "summary": "Configuration, deployment, recovery, integrations, diagnostics, and API-oriented workflows.",
+      "href": "/docs/topic/operations-and-api/",
+      "keywords": "operations and api documentation topic",
+      "headings": [
+        "Guides for this topic",
+        "Related topics"
+      ],
+      "excerpt": "Configuration, deployment, recovery, integrations, diagnostics, and API-oriented workflows."
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+[Unit]
+Description=io-workbench production host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=io-workbench
+Group=io-workbench
+WorkingDirectory=/srv/projects
+Environment=HOME=/var/lib/io-workbench
+Environment=IO_WORKBENCH_HOST=127.0.0.1
+Environment=IO_WORKBENCH_PORT=8100
+Environment=IO_WORKBENCH_CONFIG_DIR=/var/lib/io-workbench
+Environment=IO_WORKBENCH_WORKSPACE_ROOT=/srv/projects
+ExecStart=/opt/io-workbench/io-workbench start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

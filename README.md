@@ -29,13 +29,14 @@ The current implementation establishes the Rust foundation and several core work
 - Legacy data import command for copying old `~/.web-ai-cli` data into the new config directory without modifying the source.
 - Static remote mobile PWA package and desktop launcher package metadata under `apps/`.
 - Embedded static UI served by the Rust binary with project/workspace creation, file browse/edit/create/rename/delete/upload, chat, shell/process, session search/messages/model/rename, git, database, MCP/tool-runner/audio transcription, metrics, and settings views.
-- Desktop and mobile archive helper scripts for release packaging.
+- Tag-driven GitHub Release packaging for signed Android APKs and native Linux,
+  macOS, and Windows host binaries.
 
 Larger workflows from the reference app that still need deeper orchestration:
 
 - Rich editor/terminal widgets, diff viewers, markdown rendering, and list virtualization in the browser UI.
-- Native mobile app store packaging around the current PWA archive.
-- Native desktop installers around the current release archives.
+- App-store distribution and signed packaging for the separate C++/wxWidgets
+  desktop control surface.
 - Live PostgreSQL/MySQL/MariaDB integration coverage requires external database services in CI.
 
 AI commit message generation uses Direct AI when configured and falls back to a local deterministic message when Direct AI is off or unavailable.
@@ -60,6 +61,41 @@ cargo run -p iowb-cli --bin io-workbench -- sandbox /path/to/project
 cargo run -p iowb-cli --bin io-workbench -- import-legacy --dry-run
 cargo run -p iowb-cli --bin iowb -- version
 ```
+
+## Install a released host
+
+Each version Git tag, such as `v0.1.0`, publishes checksum-verified host
+packages for Linux, macOS, and Windows. The released `io-workbench` binary hosts the Web UI, project
+workspace, provider CLIs, database tools, and PTY on that computer; it is not
+the separate source-built wxWidgets desktop client.
+
+Linux or macOS:
+
+```sh
+curl -fsSL https://github.com/giofahreza/io-workbench/releases/latest/download/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://github.com/giofahreza/io-workbench/releases/latest/download/install.ps1 | iex
+```
+
+Both installers verify the selected release archive, install only for the
+current user, and do not start a background service. Start the local,
+authenticated host explicitly when ready:
+
+```sh
+io-workbench start
+```
+
+Then open `http://127.0.0.1:8787` and finish first-user setup. Android
+releases provide signed `arm64-v8a` (physical phones) and `x86_64`
+(emulators) APKs; Android is a remote client and connects to a running host.
+Use the GitHub Release assets and `SHA256SUMS` for a manual download. The
+complete device-by-device guide, including Android browser/ADB installation,
+updates, and GitHub build-attestation verification, is available at
+`/docs/install-and-update/` on the landing site.
 
 ## Configuration
 

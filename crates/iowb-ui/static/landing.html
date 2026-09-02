@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="The self-hosted multi-agent remote command center for Claude, Codex, and Gemini—plus Git, Navicat-style database work, and a live PTY terminal."
+    />
+    <meta name="theme-color" content="#f5f7f5" />
+    <title>io-workbench — Beyond Claude Remote: your whole dev machine</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <script src="/app/landing-theme.js?v=20260901-02"></script>
+    <link rel="stylesheet" href="/styles/landing.css?v=20260901-02" />
+    <script src="/app/landing.js?v=20260901-02" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <header class="site-header">
+      <div class="site-shell site-header-inner">
+        <a class="brand" href="/landing" aria-label="io-workbench landing page">
+          <span class="brand-mark" aria-hidden="true">io</span>
+          <span>io-workbench</span>
+        </a>
+
+        <nav class="site-nav" aria-label="Primary navigation">
+          <a href="#agents">Agents</a>
+          <a href="#database">Data</a>
+          <a href="#terminal">Terminal</a>
+          <a href="/docs/">Docs</a>
+        </nav>
+
+        <div class="header-controls">
+          <div class="header-actions">
+            <a class="text-link" href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">GitHub</a>
+            <a class="button button-small" href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">View on GitHub <span aria-hidden="true">↗</span></a>
+          </div>
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Toggle color theme" aria-pressed="false" title="Toggle color theme">
+            <span class="theme-toggle-icon" aria-hidden="true"></span>
+            <span class="theme-toggle-label" aria-hidden="true"></span>
+          </button>
+        </div>
+
+        <details class="mobile-menu">
+          <summary aria-label="Open navigation menu"><span></span><span></span></summary>
+          <nav aria-label="Mobile navigation">
+            <a href="#agents">Agents</a>
+            <a href="#database">Data</a>
+            <a href="#terminal">Terminal</a>
+            <a href="/docs/">Docs</a>
+            <a href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">GitHub</a>
+            <a class="button" href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">View on GitHub <span aria-hidden="true">↗</span></a>
+          </nav>
+        </details>
+      </div>
+    </header>
+
+    <main id="main-content" tabindex="-1">
+      <section class="hero site-shell">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> The self-hosted remote command center</p>
+          <h1>Beyond Claude Remote.<br />Your whole dev machine,<br /><em>from anywhere.</em></h1>
+          <p class="hero-lede">
+            io-workbench is built to replace a single-agent remote workflow with the complete desk: run your configured Claude, Codex, and Gemini CLIs beside the codebase, Git, databases, a live terminal, and the delivery plan they need. Securely expose that host through your own VPN, reverse proxy, or tunnel—and carry the desk with you.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-large" href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">View on GitHub <span aria-hidden="true">↗</span></a>
+            <a class="button button-secondary button-large" href="#workflow">Explore the remote stack <span aria-hidden="true">↓</span></a>
+          </div>
+          <ul class="proof-list" aria-label="Key benefits">
+            <li><span class="check" aria-hidden="true">✓</span> 3 agent CLIs, one project context</li>
+            <li><span class="check" aria-hidden="true">✓</span> Navicat-style data work + row copy/paste on Android</li>
+            <li><span class="check" aria-hidden="true">✓</span> Live PTY terminal with phone controls</li>
+          </ul>
+        </div>
+
+        <figure class="workbench-frame" aria-label="Illustrative io-workbench remote command center showing a project, multiple agent sessions, and connected host surfaces">
+          <div class="workbench-titlebar">
+            <div class="window-controls" aria-hidden="true"><i></i><i></i><i></i></div>
+            <div class="workbench-title"><span class="mini-brand">io</span> io-workbench <span>/</span> remote-prod</div>
+            <span class="online-status"><i aria-hidden="true"></i> Host online</span>
+          </div>
+          <div class="workbench-body" aria-hidden="true">
+            <aside class="preview-sidebar">
+              <div class="preview-label">Remote projects <span>+</span></div>
+              <div class="preview-project active"><i></i><span>commerce-api</span></div>
+              <div class="preview-project"><i></i><span>mobile-client</span></div>
+              <div class="preview-project"><i></i><span>infra</span></div>
+              <div class="preview-label sessions-label">Live agents <span>3</span></div>
+              <div class="preview-session selected"><b class="provider-badge claude">A</b><span>Ship payment retry</span></div>
+              <div class="preview-session"><b class="provider-badge codex">C</b><span>Audit migration</span></div>
+              <div class="preview-session"><b class="provider-badge gemini">G</b><span>Check incident notes</span></div>
+            </aside>
+            <section class="preview-chat">
+              <div class="preview-view-head">
+                <div><strong>Ship payment retry</strong><small><b class="provider-badge claude">A</b> Claude · Remote session</small></div>
+                <span>•••</span>
+              </div>
+              <div class="chat-message user-message"><span>You</span><p>Trace the retry path, inspect the orders schema, and make an approval-ready plan.</p></div>
+              <div class="chat-message agent-message">
+                <span><b class="provider-badge claude">A</b> Claude</span>
+                <p>I mapped the code path and the affected orders query. The plan is split into reviewable work.</p>
+                <div class="agent-code"><code>src/payments/retry.ts</code><b>+ 24</b><b class="minus">− 3</b></div>
+              </div>
+              <div class="thinking-line"><i></i> Streaming from your host…</div>
+              <div class="preview-composer">Ask from anywhere <kbd>⌘ ↵</kbd></div>
+            </section>
+            <aside class="preview-board">
+              <div class="preview-board-title"><strong>Host surfaces</strong><span>all connected</span></div>
+              <div class="host-surface database-surface"><b>▦</b><div><strong>orders-prod</strong><small>PostgreSQL · 12 tables</small></div><em>SQL</em></div>
+              <div class="host-surface terminal-surface"><b>$_</b><div><strong>shell</strong><small>PTY · 2 processes</small></div><em>live</em></div>
+              <div class="host-surface git-surface"><b>⌥</b><div><strong>checkout retry</strong><small>main · 3 changes</small></div><em>Git</em></div>
+              <div class="preview-board-foot"><span>Remote host</span><b>Server online</b></div>
+            </aside>
+          </div>
+          <div class="workbench-statusbar"><span>▱ src/payments/retry.ts</span><span>◉ main · 3 changes</span><span>〉 PTY ready</span></div>
+        </figure>
+      </section>
+
+      <section id="workflow" class="workflow-section">
+        <div class="site-shell">
+          <div class="section-intro">
+            <p class="eyebrow">A remote coding tool should do more than mirror chat</p>
+            <h2>One remote login. Every surface the work touches.</h2>
+            <p>SSH is not a workspace. io-workbench keeps the host, agents, data, shell, Git, and evidence connected—whether you open it from a laptop, desktop launcher, or phone.</p>
+          </div>
+          <ol class="workflow-steps">
+            <li><span>01</span><div><h3>Connect to your host</h3><p>Your server runs the CLIs, workspace processes, and PTY. You keep the control plane in the browser.</p></div></li>
+            <li><span>02</span><div><h3>Bring the right agent</h3><p>Choose Claude, Codex, or Gemini per task and preserve the project context around every session.</p></div></li>
+            <li><span>03</span><div><h3>Ground the work in evidence</h3><p>Inspect rows, terminal output, files, Git changes, and validation before it moves forward.</p></div></li>
+          </ol>
+        </div>
+      </section>
+
+      <section id="features" class="feature-section site-shell">
+        <article id="agents" class="feature-row">
+          <div class="feature-copy">
+            <p class="eyebrow">One remote desk. Three agents.</p>
+            <h2>Pick Claude, Codex, or Gemini—never a smaller workspace.</h2>
+            <p>Choose the provider that fits the moment, then keep its work anchored to the same project, files, Git state, host, and decisions. It is the freedom of a multi-agent bench without the context tax.</p>
+            <ul class="feature-points">
+              <li>Launch or resume configured Claude, Codex, and Gemini CLI sessions</li>
+              <li>Project-scoped history, model settings, files, and working context</li>
+              <li>Live streaming with reconnect and session recovery when the browser drops</li>
+            </ul>
+          </div>
+          <div class="feature-visual provider-visual" aria-hidden="true">
+            <div class="visual-chrome"><span>remote-prod / new session</span><i>3 providers</i></div>
+            <div class="visual-body">
+              <p>Choose the right brain for this branch</p>
+              <div class="agent-options">
+                <div class="agent-option selected"><img src="/icons/codex-white.svg" alt="" /><span><b>Codex</b><small>Implement and validate</small></span><em>✓</em></div>
+                <div class="agent-option"><img src="/icons/claude-white.svg" alt="" /><span><b>Claude</b><small>Plan with code and data</small></span></div>
+                <div class="agent-option"><img src="/icons/gemini-ai-icon.svg" alt="" /><span><b>Gemini</b><small>Investigate and compare</small></span></div>
+              </div>
+              <div class="visual-context-row"><span>Shared project context</span><b>▱ storefront · host online</b></div>
+            </div>
+          </div>
+        </article>
+
+        <article id="database" class="feature-row reverse-row">
+          <div class="feature-copy">
+            <p class="eyebrow">Navicat instincts, inside the project</p>
+            <h2>Data work that stays beside the code changing it.</h2>
+            <p>Connect real databases, trace relationships, run SQL, inspect rows, and move data without leaving the remote workspace. Your agent can reason over the same schema and evidence you are looking at—not a screenshot in another tab.</p>
+            <ul class="feature-points">
+              <li>Saved SQLite, PostgreSQL, MySQL, and MariaDB connections</li>
+              <li>Schema explorer, relationship views, SQL editor, paginated data, and SQLite table transfers</li>
+              <li>Native Android data grid can select rows and copy or paste structured JSON/CSV</li>
+            </ul>
+          </div>
+          <div class="feature-visual database-visual" aria-hidden="true">
+            <div class="data-titlebar">
+              <div class="data-title-left"><span class="data-lights"><i></i><i></i><i></i></span><b>Data workspace</b></div>
+              <span class="data-connection"><i></i> storefront-cache · SQLite</span>
+            </div>
+            <div class="data-workspace">
+              <aside class="data-sidebar">
+                <p>Connections <span>+</span></p>
+                <div class="data-connection-row active"><i></i><span><b>storefront-cache</b><small>SQLite</small></span></div>
+                <div class="data-connection-row"><i></i><span><b>orders-prod</b><small>PostgreSQL</small></span></div>
+                <p class="data-sidebar-label">Tables</p>
+                <div class="data-table-row selected">▦ orders <small>12 cols</small></div>
+                <div class="data-table-row">▦ customers <small>9 cols</small></div>
+                <div class="data-table-row">▦ payments <small>16 cols</small></div>
+              </aside>
+              <section class="data-main">
+                <div class="data-tabs"><span class="active">orders.sql</span><span>relationships</span><b>Run ⌘ ↵</b></div>
+                <pre class="data-query"><code><span>SELECT</span> id, status, total, created_at
+<span>FROM</span> orders
+<span>WHERE</span> status = <em>'retrying'</em>
+<span>ORDER BY</span> created_at <span>DESC</span>;</code></pre>
+                <div class="data-results">
+                  <div class="data-results-head"><span>4 rows · 18 ms</span><b>□ 4 selected</b></div>
+                  <div class="data-grid">
+                    <div class="data-grid-row data-grid-head"><span>id</span><span>status</span><span>total</span><span>created</span></div>
+                    <div class="data-grid-row selected"><span>ord_4821</span><span><i>retrying</i></span><span>$142.00</span><span>09:42</span></div>
+                    <div class="data-grid-row selected"><span>ord_4818</span><span><i>retrying</i></span><span>$64.00</span><span>09:31</span></div>
+                    <div class="data-grid-row selected"><span>ord_4805</span><span><i>retrying</i></span><span>$212.00</span><span>09:07</span></div>
+                  </div>
+                </div>
+              </section>
+            </div>
+            <div class="data-action-bar"><span>Android data grid · clipboard ready</span><b>Copy rows</b><b>Transfer → selected</b></div>
+          </div>
+        </article>
+
+        <article id="terminal" class="feature-row">
+          <div class="feature-copy">
+            <p class="eyebrow">The shell stays yours</p>
+            <h2>A real remote terminal—not an output pane.</h2>
+            <p>Open a server-hosted PTY from the web or Android and work like you are at the machine. Type, resize, paste, follow live output, and control the process while your workload stays safely where the code lives.</p>
+            <ul class="feature-points">
+              <li>Interactive PTY input/output, resize, restart, abort, and process controls</li>
+              <li>Clipboard copy and paste for the commands and evidence you need</li>
+              <li>Android native terminal renderer powered by Termux components, with Esc, Tab, Ctrl, Alt, and arrows</li>
+            </ul>
+          </div>
+          <div class="feature-visual terminal-visual" aria-hidden="true">
+            <div class="terminal-titlebar"><div><i></i><b>remote-prod / storefront</b></div><span>● PTY connected</span></div>
+            <div class="terminal-screen">
+              <p class="term-command"><span>gio@remote</span><b>:~/storefront</b> $ git status --short</p>
+              <p class="term-output"><i>M</i> src/checkout/retry.ts&nbsp;&nbsp;&nbsp;<i>??</i> tests/retry.spec.ts</p>
+              <p class="term-command"><span>gio@remote</span><b>:~/storefront</b> $ pnpm test checkout</p>
+              <p class="term-output dim"> RUN  v2.4.1 /srv/storefront</p>
+              <p class="term-output pass"> ✓ checkout / retries payment after a transient failure&nbsp; 42ms</p>
+              <p class="term-output pass"> ✓ checkout / preserves order id on retry&nbsp; 16ms</p>
+              <p class="term-output result"> Test Files&nbsp; <b>1 passed</b> &nbsp; Tests&nbsp; <b>2 passed</b></p>
+              <p class="term-command cursor"><span>gio@remote</span><b>:~/storefront</b> $ <i></i></p>
+            </div>
+            <div class="terminal-mobile-bar"><span>Android native renderer</span><div><kbd>Esc</kbd><kbd>Tab</kbd><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>←</kbd><kbd>↑</kbd><kbd>↓</kbd><kbd>→</kbd></div></div>
+          </div>
+        </article>
+
+        <article id="delivery" class="feature-row reverse-row">
+          <div class="feature-copy">
+            <p class="eyebrow">The outcome layer</p>
+            <h2>Make agent work visible, reviewable, and shippable.</h2>
+            <p>Turn a broad request into scoped work with a clear route to done. Use the Agentic Board to approve the plan, see what is running, add validation, and keep Git evidence attached before anything ships.</p>
+            <ul class="feature-points">
+              <li>Backlog, task hierarchy, providers, policies, and approval boundaries</li>
+              <li>Validation, QA, retries, and follow-up work in the delivery flow</li>
+              <li>Project, Git, agent, and host context stay connected from plan to proof</li>
+            </ul>
+          </div>
+          <div class="feature-visual board-visual" aria-hidden="true">
+            <div class="visual-chrome"><span>Release checkout validation</span><i>3 / 5 done</i></div>
+            <div class="kanban-columns">
+              <section><b>Backlog <small>1</small></b><div class="kanban-card muted-card">Review metrics<span>Research</span></div></section>
+              <section><b>In progress <small>1</small></b><div class="kanban-card current-card">Add API validation<span>Implementation</span><em>Codex working</em></div></section>
+              <section><b>Done <small>2</small></b><div class="kanban-card complete-card">Map current flow<span>Research</span></div><div class="kanban-card complete-card">Add test cases<span>Test</span></div></section>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="supporting-section">
+        <div class="site-shell supporting-content">
+          <p class="eyebrow">Everything a remote chat tab leaves behind</p>
+          <h2>One login, fewer handoffs, more control.</h2>
+          <div class="capability-list" role="list">
+            <span role="listitem">Persistent sessions</span><span role="listitem">Files &amp; editor</span><span role="listitem">Git &amp; diffs</span><span role="listitem">Project plans</span><span role="listitem">MCP tools</span><span role="listitem">Command runners</span><span role="listitem">Process supervision</span><span role="listitem">Project watchers</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="run-locally" class="setup-section">
+        <div class="site-shell setup-grid">
+          <div class="setup-copy">
+            <p class="eyebrow">Run it where your code lives</p>
+            <h2>Your host does the work. Your browser becomes the cockpit.</h2>
+            <p>Run io-workbench beside the repositories, databases, and provider CLIs you already trust. The host owns the code, processes, and PTY; your laptop or phone gets the control surface wherever you are.</p>
+            <p class="setup-note">● Authentication is enabled by default. For remote access, use your own VPN, reverse proxy, or authenticated tunnel; provider CLIs must be installed and configured on the server.</p>
+          </div>
+          <div class="command-card">
+            <div class="command-card-head"><span>Quick start · from a source checkout</span><span>● ready</span></div>
+            <div class="command-line source-command"><b>$</b><code>git clone --recurse-submodules https://github.com/giofahreza/io-workbench.git &amp;&amp; cd io-workbench</code></div>
+            <div class="command-line"><b>$</b><code>cargo run -p iowb-cli --bin io-workbench -- start</code></div>
+            <button class="copy-command" type="button" data-copy="git clone --recurse-submodules https://github.com/giofahreza/io-workbench.git &amp;&amp; cd io-workbench&#10;cargo run -p iowb-cli --bin io-workbench -- start">Copy commands</button>
+            <p class="copy-status" aria-live="polite"></p>
+            <div class="command-result">→ Open <code>http://127.0.0.1:8787</code></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="final-cta site-shell">
+        <p class="eyebrow">Ready when you are</p>
+        <h2>Take your whole development machine with you.</h2>
+        <div class="final-actions">
+          <a class="button button-large" href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">View on GitHub <span aria-hidden="true">↗</span></a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="site-shell footer-inner">
+        <a class="brand" href="/landing"><span class="brand-mark" aria-hidden="true">io</span><span>io-workbench</span></a>
+        <div><a href="/docs/">Docs</a><a href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">Repository</a></div>
+      </div>
+    </footer>
+  </body>
+</html>

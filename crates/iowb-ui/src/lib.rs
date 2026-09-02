@@ -18,6 +18,136 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "text/html; charset=utf-8",
             bytes: include_bytes!("../static/clear-cache.html"),
         }),
+        "landing" | "landing/" | "landing.html" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/landing.html"),
+        }),
+        "docs" | "docs/" | "docs.html" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/index.html"),
+        }),
+        "docs/quick-start" | "docs/quick-start/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/quick-start/index.html"),
+        }),
+        "docs/install-and-update" | "docs/install-and-update/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/install-and-update/index.html"),
+        }),
+        "docs/web-workspace" | "docs/web-workspace/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/web-workspace/index.html"),
+        }),
+        "docs/mobile" | "docs/mobile/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/mobile/index.html"),
+        }),
+        "docs/desktop-client" | "docs/desktop-client/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/desktop-client/index.html"),
+        }),
+        "docs/remote-access" | "docs/remote-access/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/remote-access/index.html"),
+        }),
+        "docs/agents-and-sessions" | "docs/agents-and-sessions/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/agents-and-sessions/index.html"),
+        }),
+        "docs/projects-files-git" | "docs/projects-files-git/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/projects-files-git/index.html"),
+        }),
+        "docs/database-workspace" | "docs/database-workspace/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/database-workspace/index.html"),
+        }),
+        "docs/terminal-and-mobile" | "docs/terminal-and-mobile/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/terminal-and-mobile/index.html"),
+        }),
+        "docs/boards-and-tools" | "docs/boards-and-tools/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/boards-and-tools/index.html"),
+        }),
+        "docs/security-and-boundaries" | "docs/security-and-boundaries/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/security-and-boundaries/index.html"),
+        }),
+        "docs/configuration" | "docs/configuration/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/configuration/index.html"),
+        }),
+        "docs/deployment-and-recovery" | "docs/deployment-and-recovery/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/deployment-and-recovery/index.html"),
+        }),
+        "docs/settings-and-integrations" | "docs/settings-and-integrations/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/settings-and-integrations/index.html"),
+        }),
+        "docs/troubleshooting" | "docs/troubleshooting/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/troubleshooting/index.html"),
+        }),
+        "docs/api" | "docs/api/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/api/index.html"),
+        }),
+        "docs/category/get-started" | "docs/category/get-started/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/category/get-started/index.html"),
+        }),
+        "docs/category/workbench" | "docs/category/workbench/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/category/workbench/index.html"),
+        }),
+        "docs/category/operations" | "docs/category/operations/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/category/operations/index.html"),
+        }),
+        "docs/category/reference" | "docs/category/reference/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/category/reference/index.html"),
+        }),
+        "docs/topic/web-workspace" | "docs/topic/web-workspace/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/topic/web-workspace/index.html"),
+        }),
+        "docs/topic/mobile-clients" | "docs/topic/mobile-clients/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/topic/mobile-clients/index.html"),
+        }),
+        "docs/topic/native-desktop-client" | "docs/topic/native-desktop-client/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/topic/native-desktop-client/index.html"),
+        }),
+        "docs/topic/agents-and-providers" | "docs/topic/agents-and-providers/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/topic/agents-and-providers/index.html"),
+        }),
+        "docs/topic/projects-and-git" | "docs/topic/projects-and-git/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/topic/projects-and-git/index.html"),
+        }),
+        "docs/topic/database-and-terminal" | "docs/topic/database-and-terminal/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/topic/database-and-terminal/index.html"),
+        }),
+        "docs/topic/remote-access-and-security" | "docs/topic/remote-access-and-security/" => {
+            Some(UiAsset {
+                content_type: "text/html; charset=utf-8",
+                bytes: include_bytes!("../static/docs/topic/remote-access-and-security/index.html"),
+            })
+        }
+        "docs/topic/operations-and-api" | "docs/topic/operations-and-api/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/topic/operations-and-api/index.html"),
+        }),
+        "docs/search-index.json" => Some(UiAsset {
+            content_type: "application/json; charset=utf-8",
+            bytes: include_bytes!("../static/docs/search-index.json"),
+        }),
         "manifest.webmanifest" => Some(UiAsset {
             content_type: "application/manifest+json; charset=utf-8",
             bytes: include_bytes!("../static/manifest.webmanifest"),
@@ -58,9 +188,29 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "text/css; charset=utf-8",
             bytes: include_bytes!("../static/styles.css"),
         }),
+        "styles/landing.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/landing.css"),
+        }),
+        "styles/docs.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/docs.css"),
+        }),
         "app.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app.js"),
+        }),
+        "app/landing-theme.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/landing-theme.js"),
+        }),
+        "app/landing.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/landing.js"),
+        }),
+        "app/docs.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/docs.js"),
         }),
         "app/core.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
@@ -834,6 +984,196 @@ mod tests {
         ] {
             assert!(styles.contains(selector), "missing {selector}");
         }
+    }
+
+    #[test]
+    fn documentation_assets_are_embedded_and_linked_from_the_landing_page() {
+        let docs_home = asset_text("docs/");
+        let search_index = asset_text("docs/search-index.json");
+        let landing = asset_text("landing");
+        let docs_css = asset_text("styles/docs.css");
+        let docs_script = asset_text("app/docs.js");
+
+        // Keep this list in step with `scripts/generate-docs.mjs`. Checking both
+        // forms of each path catches a missing embedded route as well as a route
+        // accidentally wired to the wrong generated article.
+        let generated_routes = [
+            ("docs/quick-start", "quick-start", "Quick start"),
+            (
+                "docs/install-and-update",
+                "install-and-update",
+                "Install and update",
+            ),
+            ("docs/web-workspace", "web-workspace", "Web workspace"),
+            ("docs/mobile", "mobile", "Mobile apps"),
+            (
+                "docs/desktop-client",
+                "desktop-client",
+                "Native desktop client",
+            ),
+            ("docs/remote-access", "remote-access", "Remote access"),
+            (
+                "docs/agents-and-sessions",
+                "agents-and-sessions",
+                "Agents and sessions",
+            ),
+            (
+                "docs/projects-files-git",
+                "projects-files-git",
+                "Projects, files, and Git",
+            ),
+            (
+                "docs/database-workspace",
+                "database-workspace",
+                "Database workspace",
+            ),
+            (
+                "docs/terminal-and-mobile",
+                "terminal-and-mobile",
+                "Terminal and mobile controls",
+            ),
+            (
+                "docs/boards-and-tools",
+                "boards-and-tools",
+                "Boards and tools",
+            ),
+            (
+                "docs/security-and-boundaries",
+                "security-and-boundaries",
+                "Security and boundaries",
+            ),
+            ("docs/configuration", "configuration", "Configuration"),
+            (
+                "docs/deployment-and-recovery",
+                "deployment-and-recovery",
+                "Deployment and recovery",
+            ),
+            (
+                "docs/settings-and-integrations",
+                "settings-and-integrations",
+                "Settings and integrations",
+            ),
+            ("docs/troubleshooting", "troubleshooting", "Troubleshooting"),
+            ("docs/api", "api", "API reference"),
+            (
+                "docs/category/get-started",
+                "category-get-started",
+                "Get started",
+            ),
+            (
+                "docs/category/workbench",
+                "category-workbench",
+                "Workbench workflows",
+            ),
+            (
+                "docs/category/operations",
+                "category-operations",
+                "Operate safely",
+            ),
+            ("docs/category/reference", "category-reference", "Reference"),
+            (
+                "docs/topic/web-workspace",
+                "topic-web-workspace",
+                "Web workspace",
+            ),
+            (
+                "docs/topic/mobile-clients",
+                "topic-mobile-clients",
+                "Mobile clients",
+            ),
+            (
+                "docs/topic/native-desktop-client",
+                "topic-native-desktop-client",
+                "Native desktop client",
+            ),
+            (
+                "docs/topic/agents-and-providers",
+                "topic-agents-and-providers",
+                "Agents and providers",
+            ),
+            (
+                "docs/topic/projects-and-git",
+                "topic-projects-and-git",
+                "Projects and Git",
+            ),
+            (
+                "docs/topic/database-and-terminal",
+                "topic-database-and-terminal",
+                "Database and terminal",
+            ),
+            (
+                "docs/topic/remote-access-and-security",
+                "topic-remote-access-and-security",
+                "Remote access and security",
+            ),
+            (
+                "docs/topic/operations-and-api",
+                "topic-operations-and-api",
+                "Operations and API",
+            ),
+        ];
+
+        assert_eq!(
+            get_asset("docs").unwrap().content_type,
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            get_asset("docs.html").unwrap().content_type,
+            "text/html; charset=utf-8"
+        );
+        for (route, page_slug, title) in generated_routes {
+            let canonical_route = format!("{route}/");
+            let canonical_asset = get_asset(&canonical_route)
+                .unwrap_or_else(|| panic!("missing generated docs route: {canonical_route}"));
+            let bare_asset =
+                get_asset(route).unwrap_or_else(|| panic!("missing generated docs route: {route}"));
+
+            assert_eq!(
+                canonical_asset.content_type, "text/html; charset=utf-8",
+                "wrong content type for {canonical_route}"
+            );
+            assert_eq!(
+                bare_asset.content_type, canonical_asset.content_type,
+                "route aliases differ for {route}"
+            );
+            assert_eq!(
+                bare_asset.bytes, canonical_asset.bytes,
+                "route aliases serve different pages for {route}"
+            );
+
+            let html = std::str::from_utf8(canonical_asset.bytes)
+                .unwrap_or_else(|_| panic!("non-UTF-8 generated docs route: {canonical_route}"));
+            assert!(
+                html.contains(&format!(r#"data-page-slug="{page_slug}""#)),
+                "generated docs route is wired to the wrong article: {canonical_route}"
+            );
+            assert!(
+                html.contains(&format!("<h1>{title}</h1>")),
+                "generated docs route is missing its expected title: {canonical_route}"
+            );
+        }
+
+        assert_eq!(
+            get_asset("docs/search-index.json").unwrap().content_type,
+            "application/json; charset=utf-8"
+        );
+        assert!(landing.contains(r#"href="/docs/""#));
+        assert!(docs_home.contains(r#"href="/styles/docs.css?v="#));
+        assert!(docs_home.contains(r#"src="/app/docs.js?v="#));
+        assert!(docs_home.contains(r#"href="/docs/web-workspace/""#));
+        assert!(docs_home.contains(r#"href="/docs/install-and-update/""#));
+        assert!(docs_home.contains(r#"href="/docs/mobile/""#));
+        assert!(docs_home.contains(r#"href="/docs/desktop-client/""#));
+        assert!(docs_home.contains(r#"href="/docs/topic/operations-and-api/""#));
+        assert!(search_index.contains(r#""href": "/docs/mobile/""#));
+        assert!(search_index.contains(r#""href": "/docs/install-and-update/""#));
+        assert!(search_index.contains(r#""href": "/docs/topic/mobile-clients/""#));
+        assert!(docs_css.contains(".docs-layout"));
+        assert!(docs_css.contains(".docs-topic-links"));
+        assert!(docs_script.contains("function installSearch()"));
+        assert!(docs_script.contains("function installActivePageState()"));
+        assert!(docs_script.contains(r#"fetch("/docs/search-index.json""#));
+        assert!(!docs_script.contains("docsTopicByPath"));
     }
 
     #[test]
