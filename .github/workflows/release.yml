@@ -409,7 +409,10 @@ jobs:
   deploy-production:
     name: Deploy workbench.giofahreza.com
     needs: publish-release
-    runs-on: ubuntu-latest
+    # The deployment runner is installed on the private production host. This
+    # avoids exposing SSH directly to the public internet while retaining the
+    # workflow's explicit SSH, checksum, rollback, and health-check boundary.
+    runs-on: [self-hosted, linux, x64, io-workbench-deploy]
     env:
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -479,20 +482,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
+          deploy_ssh_dir="$RUNNER_TEMP/io-workbench-deploy-ssh"
+          mkdir -p "$deploy_ssh_dir"
+          chmod 700 "$deploy_ssh_dir"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$deploy_ssh_dir/deploy_key"
+          chmod 600 "$deploy_ssh_dir/deploy_key"
+          printf '%s\n' "$DEPLOY_SSH_KNOWN_HOSTS" > "$deploy_ssh_dir/known_hosts"
+          chmod 644 "$deploy_ssh_dir/known_hosts"
+          printf '%s\n' "DEPLOY_SSH_DIR=$deploy_ssh_dir" >> "$GITHUB_ENV"
 
       - name: Create remote staging directory
         shell: bash
         run: |
           set -euo pipefail
           stage_dir_b64="$(printf '%s' "$DEPLOY_REMOTE_STAGE_DIR" | base64 -w0)"
-          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_SSH_PORT" \
+          ssh -i "$DEPLOY_SSH_DIR/deploy_key" -p "$DEPLOY_SSH_PORT" \
             -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$DEPLOY_SSH_DIR/known_hosts" \
             "$DEPLOY_USER@$DEPLOY_HOST" \
             "DEPLOY_STAGE_DIR_B64=$stage_dir_b64 bash -s" <<'REMOTE'
           set -euo pipefail
@@ -504,8 +510,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          scp -i ~/.ssh/deploy_key -P "$DEPLOY_SSH_PORT" \
+          scp -i "$DEPLOY_SSH_DIR/deploy_key" -P "$DEPLOY_SSH_PORT" \
             -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$DEPLOY_SSH_DIR/known_hosts" \
             release/package/io-workbench \
             "$DEPLOY_USER@$DEPLOY_HOST:$STAGED_BINARY"
 
@@ -523,8 +530,9 @@ jobs:
           service_name_b64="$(printf '%s' "$DEPLOY_SERVICE_NAME" | base64 -w0)"
           health_url_b64="$(printf '%s' "$DEPLOY_HEALTH_URL" | base64 -w0)"
           expected_sha256_b64="$(printf '%s' "$EXPECTED_SHA256" | base64 -w0)"
-          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_SSH_PORT" \
+          ssh -i "$DEPLOY_SSH_DIR/deploy_key" -p "$DEPLOY_SSH_PORT" \
             -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$DEPLOY_SSH_DIR/known_hosts" \
             "$DEPLOY_USER@$DEPLOY_HOST" \
             "DEPLOY_COMMIT_B64=$deploy_commit_b64 DEPLOY_REF_B64=$deploy_ref_b64 STAGED_BINARY_B64=$staged_binary_b64 LIVE_BINARY_B64=$live_binary_b64 SERVICE_NAME_B64=$service_name_b64 HEALTH_URL_B64=$health_url_b64 EXPECTED_SHA256_B64=$expected_sha256_b64 bash -s" <<'REMOTE'
           set -euo pipefail

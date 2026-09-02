@@ -1,0 +1,12 @@
+# Install as /etc/sudoers.d/io-workbench-release only after replacing the
+# runner account, stage path, live binary path, and systemd unit for the host.
+# Validate the final file with visudo -cf before installing it.
+
+Cmnd_Alias IOWB_RELEASE = \
+    /usr/bin/install -d -o root -g root -m 0755 /opt/io-workbench, \
+    /usr/bin/install -o root -g root -m 0755 /home/giofahreza/.cache/io-workbench-deploy/io-workbench.* /opt/io-workbench/io-workbench, \
+    /usr/bin/cp --preserve=mode\,timestamps /opt/io-workbench/io-workbench /opt/io-workbench/io-workbench.bak.*, \
+    /usr/bin/systemctl restart io-workbench-8100.service, \
+    /usr/bin/tee /opt/io-workbench/revision.json
+
+giofahreza ALL=(root) NOPASSWD: IOWB_RELEASE

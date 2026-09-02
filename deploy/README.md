@@ -1,8 +1,17 @@
 # Production deployment prerequisites
 
 The tag workflow in `.github/workflows/release.yml` deploys the published Linux
-release archive after GitHub Release publication. It deliberately does not
-invent service ownership, Cloudflare DNS, or provider credentials.
+release archive after GitHub Release publication. Its production job is pinned
+to a repo-scoped self-hosted runner carrying the `io-workbench-deploy` label.
+Put that runner on the private deployment host; this avoids exposing SSH to the
+public internet while the job retains its explicit SSH, checksum, rollback,
+and health-check boundary. Do not attach this label to a general-purpose runner
+or use it from untrusted workflows.
+
+Use `io-workbench-deploy-runner.service.example` only after registering a
+dedicated runner with the repository and giving it the `io-workbench-deploy`
+label. The runner service should run as the deployment account, while the
+separate sudoers policy grants only the release install and rollback commands.
 
 1. Create a dedicated service user, durable data directory, workspace root, and
    `/opt/io-workbench` binary directory on the deployment host.
@@ -18,7 +27,9 @@ invent service ownership, Cloudflare DNS, or provider credentials.
    the server's expected OpenSSH known-hosts line during this controlled setup;
    do not fetch and trust a host key dynamically during a deployment. Do not
    point `DEPLOY_LIVE_BINARY` at a developer checkout's `target/release`
-   directory.
+   directory. Start from `io-workbench-release.sudoers.example`, replace its
+   account/path/service values, validate it with `visudo -cf`, then install it
+   at `/etc/sudoers.d/io-workbench-release` with mode `0440`.
 4. Create the Cloudflare DNS/tunnel route for `workbench.giofahreza.com`, then
    merge `cloudflared-workbench-ingress.example.yml` before the catch-all
    ingress rule and restart cloudflared. The tunnel must forward WebSockets as

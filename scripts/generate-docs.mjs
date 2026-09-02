@@ -902,7 +902,7 @@ const pageDefinitions = [
         paragraph("Build the release binary with <code>cargo build --release -p iowb-cli --bin io-workbench</code>, or let the tag workflow replace <code>/opt/io-workbench/io-workbench</code>. Run the service as a dedicated non-login account where appropriate, and use " + docLink("remote-access", "Remote access") + " rather than publishing a development listener directly."),
       ].join("\n")),
       section("Release-tag production deployment", [
-        paragraph("Pushing a <code>v*</code> tag runs the release automation: it verifies the repository, publishes the checked native archives and Android APKs to GitHub Releases, then deploys the published Linux host package to <code>workbench.giofahreza.com</code>. The deployment job stages and verifies the release artifact before replacing the managed binary, restarts the configured service, and checks local plus public health."),
+        paragraph("Pushing a <code>v*</code> tag runs the release automation: it verifies the repository, publishes the checked native archives and Android APKs to GitHub Releases, then deploys the published Linux host package to <code>workbench.giofahreza.com</code>. The deployment job runs only on a dedicated private GitHub Actions runner with the <code>io-workbench-deploy</code> label. It stages and verifies the release artifact before replacing the managed binary, restarts the configured service, and checks local plus public health."),
         table(
           ["Stage", "What the automation proves", "Operator responsibility"],
           [
@@ -912,13 +912,13 @@ const pageDefinitions = [
           ],
         ),
         codeCard("curl -fsS https://workbench.giofahreza.com/health", "Public production health"),
-        note("Deployment prerequisites", "The release workflow deliberately takes its SSH target, service name, installation paths, and health URLs from protected GitHub Actions secrets. Configure those once for the production host and limit the SSH key to the deployment account; a tag cannot safely invent a DNS route, service account, or provider credential."),
+        note("Deployment prerequisites", "The release workflow deliberately takes its SSH target, service name, installation paths, and health URLs from protected GitHub Actions secrets. Configure those once for the production host and attach <code>io-workbench-deploy</code> only to its dedicated runner. When that runner lives on the same host, use its loopback SSH endpoint; do not attach the label to a general-purpose or untrusted runner."),
         heading("Configure GitHub Actions and the production host once"),
-        paragraph("The repository files <code>deploy/README.md</code>, <code>deploy/io-workbench.service.example</code>, and <code>deploy/cloudflared-workbench-ingress.example.yml</code> are the operator starting point. Use a dedicated release directory such as <code>/opt/io-workbench</code>; do not deploy over <code>target/release</code> in a source checkout."),
+        paragraph("The repository files <code>deploy/README.md</code>, <code>deploy/io-workbench.service.example</code>, <code>deploy/io-workbench-deploy-runner.service.example</code>, <code>deploy/io-workbench-release.sudoers.example</code>, and <code>deploy/cloudflared-workbench-ingress.example.yml</code> are the operator starting point. Use a dedicated release directory such as <code>/opt/io-workbench</code>; do not deploy over <code>target/release</code> in a source checkout."),
         table(
           ["GitHub secret", "Typical value", "Why it is needed"],
           [
-            ["<code>DEPLOY_HOST</code>, <code>DEPLOY_USER</code>, <code>DEPLOY_SSH_KEY</code>, <code>DEPLOY_SSH_KNOWN_HOSTS</code>", "The production host, restricted deployment account/key, and its expected OpenSSH known-hosts entry.", "Transfers only the verified Linux release artifact and pins the host key instead of trusting a fresh network lookup."],
+            ["<code>DEPLOY_HOST</code>, <code>DEPLOY_USER</code>, <code>DEPLOY_SSH_KEY</code>, <code>DEPLOY_SSH_KNOWN_HOSTS</code>", "The production host, restricted deployment account/key, and its expected OpenSSH known-hosts entry. For a runner co-located with the host, use <code>127.0.0.1</code> and its loopback host key.", "Transfers only the verified Linux release artifact and pins the host key instead of trusting a fresh network lookup."],
             ["<code>DEPLOY_REMOTE_STAGE_DIR</code>", "A user-writable staging directory such as <code>/home/io-workbench/deploy</code>.", "Allows checksum verification before privileged installation."],
             ["<code>DEPLOY_LIVE_BINARY</code>, <code>DEPLOY_SERVICE_NAME</code>", "<code>/opt/io-workbench/io-workbench</code> and <code>io-workbench.service</code>.", "Defines the managed executable and the systemd service to restart."],
             ["<code>DEPLOY_HEALTH_URL</code>", "<code>http://127.0.0.1:8100/health</code>.", "Proves the restarted host locally before the public check."],
@@ -928,7 +928,7 @@ const pageDefinitions = [
           ],
         ),
         codeCard("# Add this before cloudflared's final catch-all ingress rule.\n- hostname: workbench.giofahreza.com\n  service: http://127.0.0.1:8100", "Cloudflare Tunnel ingress"),
-        note("Do not skip the one-time boundary work", "Create the Cloudflare DNS/tunnel hostname, add the ingress route, reload cloudflared, give the deployment account narrowly scoped non-interactive permission to install the release binary and restart only this service, and store its controlled <code>DEPLOY_SSH_KNOWN_HOSTS</code> entry. The workflow never trusts a newly scanned SSH host key, and it intentionally fails its public health check until that boundary is real."),
+        note("Do not skip the one-time boundary work", "Create the Cloudflare DNS/tunnel hostname, add the ingress route, reload cloudflared, register a dedicated <code>io-workbench-deploy</code> runner, give its deployment account narrowly scoped non-interactive permission using the supplied sudoers template, and store its controlled <code>DEPLOY_SSH_KNOWN_HOSTS</code> entry. The workflow never trusts a newly scanned SSH host key, and it intentionally fails its public health check until that boundary is real."),
         paragraph("The release deployment replaces only executable code. It preserves the data/config directory and workspace, retains a timestamped prior binary, and automatically restores that prior binary if the new service fails local restart or health verification. If the public check still fails after a healthy local restart, use the workflow output to repair the tunnel/proxy boundary rather than deleting application data as an update workaround."),
       ].join("\n")),
       section("Back up, update, and verify", compactSteps([
