@@ -30,6 +30,15 @@ async fn status(
     let mut untracked = Vec::new();
     let mut conflicted = Vec::new();
     let mut files = Vec::new();
+    let (staged_line_stats, unstaged_line_stats) = tokio::join!(
+        git_line_change_stats(&project_path, true),
+        git_line_change_stats(&project_path, false),
+    );
+    // Status should remain useful even when a repository has an unusual diff
+    // driver or an unreadable path. The line counts are supplemental UI data,
+    // so fall back to zero rather than failing the entire status request.
+    let staged_line_stats = staged_line_stats.unwrap_or_default();
+    let unstaged_line_stats = unstaged_line_stats.unwrap_or_default();
 
     for (status, path, submodule_state) in parse_status_entries_detailed_bytes(&output.stdout_bytes) {
         if status == "??" {
@@ -43,10 +52,21 @@ async fn status(
         } else if status.contains('M') || status.contains('R') || status.contains('C') {
             modified.push(path.clone());
         }
+        let (staged_additions, staged_deletions) =
+            staged_line_stats.get(&path).copied().unwrap_or_default();
+        let (mut unstaged_additions, unstaged_deletions) =
+            unstaged_line_stats.get(&path).copied().unwrap_or_default();
+        if status == "??" && unstaged_additions == 0 && unstaged_deletions == 0 {
+            unstaged_additions = untracked_line_count(&project_path, &path).await.unwrap_or(0);
+        }
         files.push(GitFileStatus {
             path,
             status,
             submodule_state,
+            staged_additions,
+            staged_deletions,
+            unstaged_additions,
+            unstaged_deletions,
         });
     }
 
@@ -66,6 +86,66 @@ async fn status(
         files,
         raw: output.stdout,
     }))
+}
+
+async fn git_line_change_stats(
+    repository_path: &Path,
+    staged: bool,
+) -> Result<HashMap<String, (usize, usize)>> {
+    let args = if staged {
+        vec![
+            "diff".to_string(),
+            "--cached".to_string(),
+            "--numstat".to_string(),
+            "-z".to_string(),
+            "--no-renames".to_string(),
+            "--".to_string(),
+        ]
+    } else {
+        vec![
+            "diff".to_string(),
+            "--numstat".to_string(),
+            "-z".to_string(),
+            "--no-renames".to_string(),
+            "--".to_string(),
+        ]
+    };
+    let output = git(repository_path, args).await?;
+    Ok(parse_git_numstat(&output.stdout_bytes))
+}
+
+fn parse_git_numstat(output: &[u8]) -> HashMap<String, (usize, usize)> {
+    output
+        .split(|byte| *byte == 0)
+        .filter_map(|record| {
+            let mut fields = record.splitn(3, |byte| *byte == b'\t');
+            let additions = parse_numstat_count(fields.next()?);
+            let deletions = parse_numstat_count(fields.next()?);
+            let path = normalize_repo_relative_path(&String::from_utf8_lossy(fields.next()?));
+            (!path.is_empty()).then_some((path, (additions, deletions)))
+        })
+        .collect()
+}
+
+fn parse_numstat_count(value: &[u8]) -> usize {
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+async fn untracked_line_count(repository_path: &Path, relative_path: &str) -> Result<usize> {
+    let path = safe_repo_child(repository_path, relative_path)?;
+    let metadata = fs::metadata(&path).await.map_err(io_server_error)?;
+    if metadata.is_dir() {
+        return Ok(0);
+    }
+    let content = fs::read(path).await.map_err(io_server_error)?;
+    if content.is_empty() {
+        return Ok(0);
+    }
+    Ok(content.iter().filter(|byte| **byte == b'\n').count()
+        + usize::from(!content.ends_with(b"\n")))
 }
 
 async fn conflicts(

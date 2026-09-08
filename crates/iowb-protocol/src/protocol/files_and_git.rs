@@ -176,6 +176,14 @@ pub struct GitFileStatus {
     pub status: String,
     #[serde(rename = "submoduleState", default, skip_serializing_if = "Option::is_none")]
     pub submodule_state: Option<String>,
+    #[serde(rename = "stagedAdditions", default)]
+    pub staged_additions: usize,
+    #[serde(rename = "stagedDeletions", default)]
+    pub staged_deletions: usize,
+    #[serde(rename = "unstagedAdditions", default)]
+    pub unstaged_additions: usize,
+    #[serde(rename = "unstagedDeletions", default)]
+    pub unstaged_deletions: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

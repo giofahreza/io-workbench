@@ -118,6 +118,16 @@
     }
 
     #[test]
+    fn parses_git_numstat_records_and_ignores_binary_counts() {
+        let stats = parse_git_numstat(
+            b"12\t4\tsrc/file.rs\0-\t-\tassets/logo.png\0",
+        );
+
+        assert_eq!(stats.get("src/file.rs"), Some(&(12, 4)));
+        assert_eq!(stats.get("assets/logo.png"), Some(&(0, 0)));
+    }
+
+    #[test]
     fn parses_porcelain_v2_rename_destination_and_skips_original_path() {
         let output = "2 R. N... 100644 100644 100644 abc def R100 new name.txt\0old name.txt\0";
 
