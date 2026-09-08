@@ -66,6 +66,8 @@ jobs:
           node --check scripts/serve-landing.mjs
           node scripts/generate-docs.mjs --check
           sh -n scripts/install.sh
+          sh scripts/install.sh --help >/dev/null
+          pwsh -NoLogo -NoProfile -Command '$tokens = $null; $errors = $null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "scripts/install.ps1"), [ref]$tokens, [ref]$errors) | Out-Null; if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_; }; exit 1 }'
 
   package-native:
     name: Package ${{ matrix.platform }}
