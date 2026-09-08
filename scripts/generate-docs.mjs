@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDirectory = join(repositoryRoot, "crates", "iowb-ui", "static", "docs");
-const assetVersion = "20260901-05";
+const assetVersion = "20260904-01";
 const docsVersion = "2026.09";
 const updated = "September 1, 2026";
 const generatorArguments = process.argv.slice(2);
@@ -231,12 +231,12 @@ const pageDefinitions = [
         "<strong>Git</strong> is required to clone the repository and to use workspace Git tools.",
         "<strong>Submodule access</strong>: the root clone uses HTTPS but its current submodule URLs use GitHub SSH. Make sure an SSH key/agent can access GitHub, or rewrite the relevant submodule URLs to HTTPS and run <code>git submodule sync --recursive &amp;&amp; git submodule update --init --recursive</code> if the recursive clone cannot fetch them.",
         "<strong>A host project directory</strong> should be available under the workspace policy you intend to use.",
-        "<strong>Provider CLIs</strong> must be installed and authenticated on this host for each provider you plan to use. io-workbench supervises those CLIs; it does not install or authenticate them for you.",
+        "<strong>Provider CLIs</strong> must be installed and authenticated on this host for each provider you plan to use. The release installer can optionally install Codex, Claude Code, and Gemini CLI, then hand off to each provider's own login flow; it never collects provider credentials itself.",
       ])),
       section("Install a released host binary", [
-        paragraph("Release tags publish checked native host packages for Linux, macOS, and Windows. The one-line installer detects the operating system and CPU, verifies the release checksum, installs the command for the current user, and never starts a service on its own."),
+        paragraph("Release tags publish checked native host packages for Linux, macOS, and Windows. The Unix one-line installer detects the operating system and CPU, verifies the release checksum, installs the command for the current user, then—when it has a terminal—offers a reviewable local setup. Its safe defaults remain loopback-only, authenticated, and manual-start."),
         codeCard("curl -fsSL https://github.com/giofahreza/io-workbench/releases/latest/download/install.sh | sh", "Linux or macOS"),
-        paragraph("For the Windows command, architecture choices, manual archive installs, Android APKs, checksum verification, and update procedure, use " + docLink("install-and-update", "Install and update") + ". After installation, start the local host deliberately with <code>io-workbench start</code>. Its default address is <code>http://127.0.0.1:8787</code> and authentication remains enabled."),
+        paragraph("For the setup choices, Windows command, architecture choices, manual archive installs, Android APKs, checksum verification, and update procedure, use " + docLink("install-and-update", "Install and update") + ". After installation, either follow the printed start command or open the configured local URL. Authentication remains enabled."),
       ].join("\n")),
       section("Install from source", [
         paragraph("For development or an unreleased build, clone recursively so the checkout includes its submodules, then start the server from the repository root."),
@@ -253,10 +253,14 @@ const pageDefinitions = [
         note("Default storage", "Unless overridden, configuration is stored under <code>~/.io-workbench</code>, the server database is <code>~/.io-workbench/io-workbench.db</code>, and the workspace root starts at the host user home directory."),
       ].join("\n")),
       section("Verify the host before real work", [
-        paragraph("Use the health endpoint to prove the running service is reachable. Use <code>status</code> separately to print the CLI's configured runtime information; it is not a substitute for a live health check."),
+        paragraph("Use <code>doctor</code> after a first install or upgrade to inspect the local binary, storage/workspace paths, listener safety, available host tools, and the configured health endpoint. It is repair-oriented and makes no changes. Use <code>status</code> separately to print the CLI's configured runtime information; it is not a substitute for a live health check."),
+        codeCard("io-workbench doctor --require-running", "First-install and post-upgrade verification"),
+        codeCard("io-workbench doctor --json --require-running", "Machine-readable verification"),
+        codeCard("io-workbench setup", "Print the non-mutating setup and repair checklist"),
         codeCard("curl http://127.0.0.1:8787/health", "Runtime health"),
-        codeCard("cargo run -p iowb-cli --bin io-workbench -- status", "Configuration summary"),
+        codeCard("io-workbench status", "Configuration summary"),
         list([
+          "<strong>Doctor</strong> exits unsuccessfully for a configuration or required-health error. Its normal mode keeps missing optional provider tools and a host that is not running as repairable warnings; use <code>--strict</code> when warnings must also fail automation.",
           "<strong>Health</strong> should report that the server is reachable.",
           "<strong>Status</strong> prints CLI configuration details; use it to inspect setup, not to prove a remote service is responding.",
           "<strong>Settings → Agents → CLI Status</strong> is a readiness hint: it checks CLI version plus configured credential material. After it looks ready, prove the provider with one small, non-destructive agent task.",
@@ -279,8 +283,8 @@ const pageDefinitions = [
     title: "Install and update",
     group: "Get started",
     type: "Installation guide",
-    summary: "Install checked release builds on Linux, macOS, Windows, or Android and update them without starting an unintended service.",
-    keywords: "install update release binary curl powershell windows macos linux android apk sha256 checksum github releases arm64 x86_64 security",
+    summary: "Install checked release builds on Linux, macOS, Windows, or Android and choose a safe local host setup.",
+    keywords: "install update release binary curl powershell windows macos linux android apk sha256 checksum github releases arm64 x86_64 systemd launchagent launchd io gateway codex claude gemini security",
     body: [
       lead("Each version tag, such as <code>v0.1.0</code>, publishes the io-workbench host binary for Linux, macOS, and Windows plus signed Android client APKs. The host executable is the self-hosted server and Web UI; Android is an authenticated remote client. Install the package that matches the device you are preparing, then deliberately start or connect it."),
       section("Choose the right release asset", table(
@@ -293,25 +297,47 @@ const pageDefinitions = [
         ],
       )),
       section("Linux and macOS: install the current host", [
-        paragraph("Use this convenience command in a terminal. It resolves the latest GitHub Release, detects <code>x86_64</code> or <code>aarch64</code>, downloads the matching archive, checks it against that release's <code>SHA256SUMS</code>, and installs the commands into <code>~/.local/bin</code>. It does not use <code>sudo</code> and does not create or start a service."),
+        paragraph("Use this convenience command in a terminal. It resolves the latest GitHub Release, detects <code>x86_64</code> or <code>aarch64</code>, downloads the matching archive, checks it against that release's <code>SHA256SUMS</code>, and installs the commands into <code>~/.local/bin</code>. It never uses <code>sudo</code>. With a terminal, it asks you to approve its first-run choices before downloading."),
         codeCard("curl -fsSL https://github.com/giofahreza/io-workbench/releases/latest/download/install.sh | sh", "Linux or macOS"),
         steps([
+          ["Review the local authority", "Choose an existing workspace root deliberately. That directory is the browser's file-picker boundary; the default is your home directory. Choose a configuration/data directory separately; the default is <code>~/.io-workbench</code>."],
+          ["Keep the safe listener", "The default address is <code>127.0.0.1:8787</code>. The installer warns and requires confirmation before a non-loopback bind. Authentication is always written as enabled; create the first browser account rather than putting credentials into an installer command."],
+          ["Choose persistence only when wanted", "On Linux, you can opt into a <code>systemd --user</code> service and optionally systemd linger. On macOS, you can opt into a per-user LaunchAgent that starts at graphical sign-in and restarts after failure. Both run under your real user home so selected provider CLIs can see their native credential files."],
           ["Make the command visible", "Open a new terminal. If <code>io-workbench</code> is not found, add <code>export PATH=\"$HOME/.local/bin:$PATH\"</code> to the shell startup file you use, then open a new terminal."],
-          ["Start the host deliberately", "Run <code>io-workbench start</code>. It listens on <code>127.0.0.1:8787</code> by default; open that local URL and complete first-user setup. Authentication stays enabled."],
           ["Choose a remote boundary before sharing", "For another device, use the " + docLink("remote-access", "Remote access") + " guide to put the host behind a trusted LAN, VPN, authenticated tunnel, or HTTPS/WSS proxy. Do not expose a development listener directly."],
         ]),
+        section("Optional host tools and provider setup", [
+          paragraph("The same questionnaire can install IO Gateway and any combination of Codex, Claude Code, and Gemini CLI. Provider installs use a user-owned npm prefix (<code>~/.local</code> by default); the installer does not install Node.js, use <code>sudo</code>, edit global provider settings, or collect API keys."),
+          list([
+            "<strong>IO Gateway</strong>: the opt-in install stays separate and is not auto-started by io-workbench. Complete its own provider setup, then after first sign-in enter its URL and proxy key in <strong>Settings → IO Gateway</strong>. Do not copy its key into an installer command or another CLI configuration file.",
+            "<strong>Codex</strong>: optional install package <code>@openai/codex</code>; optional native sign-in handoff runs <code>codex login</code>.",
+            "<strong>Claude Code</strong>: optional install package <code>@anthropic-ai/claude-code</code>; optional native sign-in handoff runs <code>claude auth login</code>.",
+            "<strong>Gemini CLI</strong>: optional install package <code>@google/gemini-cli</code>; optional native setup starts <code>gemini</code>, where you choose its supported sign-in method.",
+          ]),
+          paragraph("When a provider CLI is selected or already available, the interactive installer offers an offline readiness check after optional native sign-in. It runs the CLI version and its native auth-status command where one exists; it does not read credentials or send a model request. A separate <code>--test-providers</code> choice sends one minimal request in a fresh temporary workspace with provider-specific read-only/no-tool flags and a 90-second limit. That test is off by default because it can consume quota or incur cost; a failure is reported as guidance and does not undo an otherwise successful binary installation."),
+          codeCard("curl -fsSL https://github.com/giofahreza/io-workbench/releases/latest/download/install.sh | sh -s -- \\\n+  --non-interactive --with-codex --check-providers --no-test-providers", "Offline provider readiness only"),
+          codeCard("curl -fsSL https://github.com/giofahreza/io-workbench/releases/latest/download/install.sh | sh -s -- \\\n+  --non-interactive --test-providers", "Explicit live provider probe (may use quota)"),
+          note("No terminal means no surprise setup", "For <code>curl | sh</code> in CI or other noninteractive use, the script reads no answers from standard input. Its <code>auto</code> choices install only the verified binary: no new startup item, linger, gateway, provider CLI, or provider login. An installer-managed systemd service or macOS LaunchAgent from an earlier run is preserved on upgrade. Use explicit flags or environment values when automating; <code>--configure-clis</code> deliberately requires a real terminal.", true),
+          codeCard("curl -fsSL https://github.com/giofahreza/io-workbench/releases/latest/download/install.sh | sh -s -- \\\n  --non-interactive --host 127.0.0.1 --port 8787 \\\n  --workspace-root \"$HOME/projects\" --autostart --with-codex --no-configure-clis", "Repeatable Linux setup"),
+        ].join("\n")),
+        note("macOS LaunchAgent lifecycle", "Choosing startup on macOS writes <code>~/Library/LaunchAgents/com.giofahreza.io-workbench.plist</code>. The installer updates and restarts only a current-user plist carrying its managed marker; it refuses to overwrite another item. A normal upgrade preserves and refreshes that marked agent. <code>--no-autostart</code> leaves an existing agent alone; use <code>--disable-autostart</code> to boot out and remove only the marked agent, without removing your binary, data, workspace, or provider credentials.", true),
+        codeCard("curl -fsSL https://github.com/giofahreza/io-workbench/releases/latest/download/install.sh | sh -s -- --disable-autostart", "Remove the installer-managed macOS startup item"),
         note("macOS security prompt", "The release is a command-line archive, not a notarized desktop application bundle. Verify the release checksum and GitHub repository before running it; follow your organization's macOS policy if Gatekeeper asks for confirmation instead of broadly disabling Gatekeeper."),
       ].join("\n")),
       section("Windows: PowerShell installer or a downloaded script", [
-        paragraph("Run the following in PowerShell to install the current x86_64 host package. The installer verifies the matching release checksum, installs into <code>%LOCALAPPDATA%\\Programs\\io-workbench</code>, adds that location to the current user's PATH when possible, and prints the next command. It does not start a host or register a service."),
+        paragraph("Run the following in PowerShell to install the current host package. The installer verifies the matching release checksum, installs into <code>%LOCALAPPDATA%\\Programs\\io-workbench</code>, adds that location to the current user's PATH when possible, and—when it has a terminal—offers the same reviewable runtime choices as the Unix installer."),
         codeCard("irm https://github.com/giofahreza/io-workbench/releases/latest/download/install.ps1 | iex", "PowerShell"),
         paragraph("If you prefer to download and inspect the script instead of piping it into PowerShell, use the literal <code>curl.exe</code> flow below. Run it from a writable directory, inspect the file, then execute it with your normal PowerShell policy."),
         codeCard("curl.exe -fL -o .\\install-iowb.ps1 https://github.com/giofahreza/io-workbench/releases/latest/download/install.ps1\nGet-Content .\\install-iowb.ps1\n.\\install-iowb.ps1", "PowerShell with curl.exe"),
         steps([
+          ["Review authority and network choices", "Choose a configuration/data directory and existing workspace root. The defaults are <code>%USERPROFILE%\\io-workbench</code> and your user profile. Keep the default loopback address <code>127.0.0.1:8787</code> unless you have an HTTPS/WSS VPN, tunnel, or proxy boundary; authentication stays enabled."],
+          ["Choose Windows persistence only when wanted", "The opt-in startup option registers and starts a per-user Windows <strong>Scheduled Task</strong> named <code>io-workbench</code>. It launches a marked PowerShell wrapper at sign-in with your real user home and selected runtime settings. This is the Windows equivalent, not systemd. <code>-NoAutoStart</code> removes only a task previously marked as installer-managed."],
+          ["Install optional host tools", "You can opt into IO Gateway and any combination of Codex, Claude Code, and Gemini CLI. CLI packages use a user-owned npm prefix under <code>%LOCALAPPDATA%\\io-workbench\\npm</code>; install Node.js separately with your approved method. The installer never captures provider credentials or edits global provider configuration."],
+          ["Open native login only by consent", "The optional login handoff runs <code>codex login</code>, <code>claude auth login</code>, or <code>gemini</code> for available CLIs. Complete the provider's own browser or terminal flow. For IO Gateway, finish its separate localhost setup, then enter its URL and proxy key in <strong>Settings → IO Gateway</strong> after first sign-in."],
           ["Open a fresh terminal", "PATH changes made for the user account are picked up by a new PowerShell or Windows Terminal window. If your policy blocks local script execution, inspect the downloaded file and use the approved execution-policy process rather than weakening system-wide policy."],
-          ["Start only when ready", "Run <code>io-workbench start</code>, then open <code>http://127.0.0.1:8787</code>. The default listener is local-only and the app's normal authentication flow remains enabled."],
-          ["Use a service manager for persistence", "A foreground terminal is suitable for a first local check. For a host that must survive sign-out or restart, follow " + docLink("deployment-and-recovery", "Deployment and recovery") + " and configure a deliberate service identity, data path, and remote boundary."],
         ]),
+        note("Noninteractive Windows install", "Without an interactive terminal, <code>auto</code> does not create a new task, gateway, provider CLI, or provider login. A task already marked as installer-managed is preserved on a normal upgrade. Use explicit switches for repeatable setup; native provider login deliberately requires a real terminal.", true),
+        codeCard("curl.exe -fL -o .\\install-iowb.ps1 https://github.com/giofahreza/io-workbench/releases/latest/download/install.ps1\n.\\install-iowb.ps1 -NonInteractive -BindHost 127.0.0.1 -Port 8787 -WorkspaceRoot \"$HOME\\projects\" -AutoStart -InstallCodex -NoConfigureClis", "Repeatable Windows setup"),
       ].join("\n")),
       section("Android: install the released remote client", [
         paragraph("On a typical physical Android phone, open the ARM64 APK URL in the browser and install it with Android's package installer. The x86_64 APK is for a matching Android emulator; it is not the normal physical-phone choice."),
@@ -333,19 +359,22 @@ const pageDefinitions = [
         note("What a release checksum proves", "<code>SHA256SUMS</code> from the same GitHub Release catches corruption and selecting the wrong asset, but it shares the GitHub Release trust boundary and is not an independently signed authenticity proof. For release-build provenance, verify the downloaded file with GitHub CLI: <code>gh attestation verify &lt;downloaded-file&gt; --repo giofahreza/io-workbench</code>."),
         note("Windows comparison", "Compare the hexadecimal value from <code>Get-FileHash</code> with the line for the same asset in <code>SHA256SUMS</code>. The release installer performs that exact asset-to-checksum check automatically; manual downloads require you to make the comparison."),
       ].join("\n")),
-      section("Update and roll back deliberately", table(
+      section("Update and roll back deliberately", [
+        paragraph("After replacing a host binary, restart only the service or process you deliberately manage, then run <code>io-workbench doctor --require-running</code>. Its JSON form, <code>io-workbench doctor --json --require-running</code>, is suitable for a deployment health gate. If a required check fails, preserve the data directory and use the printed repair guidance instead of deleting it."),
+        table(
         ["Device", "Normal update", "If something is wrong"],
         [
           ["<strong>Linux / macOS</strong>", "Run the same installer again, then stop/restart only the host process or service you intentionally manage.", "Keep the previous archive/binary and back up <code>~/.io-workbench</code> plus projects before a production update. Use the " + docLink("deployment-and-recovery", "deployment guide") + " for a service rollback."],
           ["<strong>Windows</strong>", "Close any running host process, rerun the installer, then start the new binary when ready.", "Keep data and project directories separate from the program directory. Restore the earlier verified archive only after stopping the managed process."],
           ["<strong>Android</strong>", "Download the next APK for the same ABI and install it over the existing app. A release signed with the same key is treated as an update and preserves app data.", "If Android reports a signature mismatch, stop and verify that the APK is the official release asset; do not uninstall by default and lose local profiles before checking provenance."],
         ],
-      )),
+        ),
+      ].join("\n")),
       section("Release security checklist", list([
         "<strong>Prefer a version tag</strong>: use <code>releases/latest/download</code> only when you deliberately want the newest stable release; use a versioned asset such as <code>v0.1.0</code> when you need a repeatable deployment.",
         "<strong>Understand the convenience trade-off</strong>: <code>curl | sh</code> and <code>irm | iex</code> are fast paths. Download the installer first, inspect it, and run it locally when your security policy requires review.",
         "<strong>Verify before execution</strong>: release installers verify native archives; compare <code>SHA256SUMS</code> yourself for any manual archive or APK install, and use <code>gh attestation verify</code> when you need GitHub build provenance.",
-        "<strong>Do not put credentials in installer commands</strong>: provider CLIs and their authentication remain on the host after the binary install. Keep credentials in that controlled host/service environment, never in a copied installer URL or mobile screenshot.",
+        "<strong>Do not put credentials in installer commands</strong>: the installer can launch a selected provider's native login flow, but never accepts or stores provider API keys, passwords, tokens, OTP secrets, or an IO Gateway proxy key. Keep credentials in the controlled host/provider environment.",
       ])),
       section("Continue with", paragraph("After installing a host, use " + docLink("quick-start", "Quick start") + " for first-user setup and a local health check, " + docLink("web-workspace", "Web workspace") + " for the browser workflow, " + docLink("mobile", "Mobile apps") + " for connection profiles and device behavior, and " + docLink("deployment-and-recovery", "Deployment and recovery") + " before operating a persistent public host.")),
     ].join("\n"),
@@ -914,7 +943,7 @@ const pageDefinitions = [
         codeCard("curl -fsS http://127.0.0.1:8100/health", "Example local production health"),
         note("Deployment prerequisites", "The release workflow deliberately takes its SSH target, service name, installation paths, and health URLs from protected GitHub Actions secrets. Configure those once for the production host and attach <code>io-workbench-deploy</code> only to its dedicated runner. When that runner lives on the same host, use its loopback SSH endpoint; do not attach the label to a general-purpose or untrusted runner."),
         heading("Configure GitHub Actions and the production host once"),
-        paragraph("The repository files <code>deploy/README.md</code>, <code>deploy/io-workbench.service.example</code>, <code>deploy/io-workbench-deploy-runner.service.example</code>, and <code>deploy/io-workbench-release.sudoers.example</code> are the operator starting point. Use a dedicated release directory such as <code>/opt/io-workbench</code>; do not deploy over <code>target/release</code> in a source checkout."),
+        paragraph("The repository files <code>docs/deployment.md</code>, <code>deploy/io-workbench.service.example</code>, <code>deploy/io-workbench-deploy-runner.service.example</code>, and <code>deploy/io-workbench-release.sudoers.example</code> are the operator starting point. Use a dedicated release directory such as <code>/opt/io-workbench</code>; do not deploy over <code>target/release</code> in a source checkout."),
         table(
           ["GitHub secret", "Typical value", "Why it is needed"],
           [
@@ -1161,7 +1190,8 @@ function renderHeader() {
   return [
     '<a class="skip-link" href="#docs-content">Skip to docs content</a>',
     '<header class="docs-header"><div class="docs-shell docs-header-inner">',
-    '<a class="docs-brand" href="/landing" aria-label="io-workbench home"><span class="docs-brand-mark" aria-hidden="true">io</span><span>io-workbench</span></a>',
+    '<a class="docs-brand" href="/landing" aria-label="io-workbench home"><span class="docs-brand-mark" aria-hidden="true">i/o</span><span>io-workbench</span></a>',
+    '<span class="docs-header-separator" aria-hidden="true"></span><span class="docs-header-kicker">Field guide</span>',
     '<nav class="docs-site-nav" aria-label="Site navigation"><a href="/landing">Home</a><a href="/docs/" aria-current="page">Docs</a><a href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">GitHub</a></nav>',
     '<button class="docs-theme-toggle" type="button" data-theme-toggle aria-label="Toggle color theme" aria-pressed="false" title="Toggle color theme"><span class="docs-theme-icon" aria-hidden="true"></span><span class="docs-theme-label" aria-hidden="true"></span></button>',
     "</div></header>",
@@ -1199,8 +1229,8 @@ function renderSidebar(activeSlug) {
 
   return [
     '<aside class="docs-sidebar" aria-label="Documentation topics">',
-    '<label class="docs-search" for="docs-search"><span>Search docs</span><input id="docs-search" type="search" autocomplete="off" placeholder="Search guides" /></label>',
-    '<div id="docs-search-results" class="docs-search-results" aria-live="polite"></div>',
+    '<div class="docs-sidebar-heading"><span>Field index</span><strong>Guides &amp; procedures</strong></div>',
+    '<div class="docs-search-panel"><label class="docs-search" for="docs-search"><span>Search field guide</span><input id="docs-search" type="search" autocomplete="off" placeholder="Find a procedure" aria-controls="docs-search-results" aria-expanded="false" /></label><div id="docs-search-results" class="docs-search-results" aria-live="polite"></div></div>',
     '<nav class="docs-nav" aria-label="Documentation navigation">',
     '<a class="docs-home-link' + (activeSlug ? "" : " is-active") + '" href="/docs/" data-doc-link data-title="Documentation" data-category="Product documentation" data-summary="Install and use io-workbench from web, native desktop, and mobile clients." data-keywords="documentation overview install web desktop mobile remote agents database terminal"' + (activeSlug ? "" : ' aria-current="page"') + ">Docs home</a>",
     groupsHtml,
@@ -1220,6 +1250,20 @@ function renderMeta(page) {
     ["Updated", updated],
   ];
   return '<dl class="docs-meta">' + values.map((value) => "<div><dt>" + escapeHtml(value[0]) + "</dt><dd>" + escapeHtml(value[1]) + "</dd></div>").join("") + "</dl>";
+}
+
+function documentCode(slug) {
+  const value = slug ? String(slug).toUpperCase().replace(/[^A-Z0-9]+/g, ".") : "FIELD.INDEX";
+  return "IOWB / " + value.replace(/^\.+|\.+$/g, "");
+}
+
+function renderHeading(label, title, meta, slug) {
+  return [
+    '<div class="docs-heading">',
+    '<div class="docs-heading-top"><div class="docs-heading-main"><p class="docs-eyebrow">' + escapeHtml(label) + "</p><h1>" + escapeHtml(title) + '</h1></div><p class="docs-document-code" aria-label="Document identification">' + escapeHtml(documentCode(slug)) + "</p></div>",
+    meta,
+    "</div>",
+  ].join("");
 }
 
 function renderTopicLinks(page) {
@@ -1247,7 +1291,7 @@ function renderRelated(page) {
 function renderArticle(page) {
   return [
     '<article id="docs-content" class="docs-content docs-article" data-page-slug="' + escapeHtml(page.slug) + '" data-page-group="' + escapeHtml(page.group) + '">',
-    '<div class="docs-heading"><p class="docs-eyebrow">' + escapeHtml(page.group) + "</p><h1>" + escapeHtml(page.title) + "</h1>" + renderMeta(page) + "</div>",
+    renderHeading(page.group, page.title, renderMeta(page), page.slug),
     renderTopicLinks(page),
     page.body,
     renderRelated(page),
@@ -1263,21 +1307,21 @@ function renderShell(title, description, activeSlug, article) {
     '<meta charset="utf-8" />',
     '<meta name="viewport" content="width=device-width, initial-scale=1" />',
     '<meta name="description" content="' + escapeHtml(description) + '" />',
-    '<meta name="theme-color" content="#f4f7f5" />',
+    '<meta name="theme-color" content="#f0ede5" />',
     "<title>" + escapeHtml(title) + " — io-workbench Docs</title>",
     '<link rel="icon" href="/icon.svg" type="image/svg+xml" />',
     '<script src="/app/landing-theme.js?v=' + assetVersion + '"></script>',
     '<link rel="stylesheet" href="/styles/docs.css?v=' + assetVersion + '" />',
     '<script src="/app/docs.js?v=' + assetVersion + '" defer></script>',
     "</head>",
-    "<body>",
+    '<body class="docs-field-guide">',
     renderHeader(),
     '<main class="docs-page-shell"><div class="docs-layout docs-shell">',
     renderSidebar(activeSlug),
     article,
-    '<aside class="docs-on-page" aria-label="On this page"><p>On this page</p><nav id="on-this-page"></nav></aside>',
+    '<aside class="docs-on-page" aria-label="On this page"><p><span>Page index</span><strong>On this page</strong></p><nav id="on-this-page"></nav></aside>',
     "</div></main>",
-    '<footer class="docs-footer docs-shell"><span>io-workbench Docs</span><div><a href="/landing">Home</a><a href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">GitHub</a></div></footer>',
+    '<footer class="docs-footer docs-shell"><div class="docs-footer-stamp"><span>io-workbench</span><small>Field guide / ' + escapeHtml(docsVersion) + '</small></div><div><a href="/landing">Home</a><a href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">GitHub</a></div></footer>',
     "</body>",
     "</html>",
     "",
@@ -1290,7 +1334,7 @@ function renderHome() {
     .filter(Boolean);
   const article = [
     '<article id="docs-content" class="docs-content docs-article docs-index-page" data-page-slug="" data-page-group="">',
-    '<div class="docs-heading"><p class="docs-eyebrow">Product documentation</p><h1>Documentation</h1><dl class="docs-meta"><div><dt>Product</dt><dd>io-workbench</dd></div><div><dt>Docs version</dt><dd>' + docsVersion + "</dd></div><div><dt>Updated</dt><dd>" + updated + "</dd></div></dl></div>",
+    renderHeading("Product documentation", "Documentation", '<dl class="docs-meta"><div><dt>Product</dt><dd>io-workbench</dd></div><div><dt>Docs version</dt><dd>' + docsVersion + "</dd></div><div><dt>Updated</dt><dd>" + updated + "</dd></div></dl>", ""),
     lead("Install and operate a self-hosted remote workbench for configured Claude, Codex, and Gemini CLIs. These guides cover release binaries, Android APKs, Web, native desktop, and mobile flows—not just the feature list."),
     section("Start with the path you need", pageList(startPages.map((page) => ({
       title: page.title,
@@ -1329,7 +1373,7 @@ function renderCategory(group) {
   const groupPages = pages.filter((page) => page.group === group.title);
   const article = [
     '<article id="docs-content" class="docs-content docs-article docs-category-page" data-page-slug="category-' + escapeHtml(group.slug) + '" data-page-group="Documentation area">',
-    '<div class="docs-heading"><p class="docs-eyebrow">Documentation area</p><h1>' + escapeHtml(group.title) + "</h1><dl class=\"docs-meta\"><div><dt>Guides</dt><dd>" + groupPages.length + "</dd></div><div><dt>Docs version</dt><dd>" + docsVersion + "</dd></div></dl></div>",
+    renderHeading("Documentation area", group.title, '<dl class="docs-meta"><div><dt>Guides</dt><dd>' + groupPages.length + "</dd></div><div><dt>Docs version</dt><dd>" + docsVersion + "</dd></div></dl>", "category-" + group.slug),
     lead(escapeHtml(group.description)),
     section("Guides in this area", pageList(groupPages.map((page) => ({
       title: page.title,
@@ -1348,7 +1392,7 @@ function renderTopic(topic) {
     .filter((item) => topicPages.some((page) => page.topics.includes(item.title)));
   const article = [
     '<article id="docs-content" class="docs-content docs-article docs-category-page" data-page-slug="topic-' + escapeHtml(topic.slug) + '" data-page-group="Topic">',
-    '<div class="docs-heading"><p class="docs-eyebrow">Topic</p><h1>' + escapeHtml(topic.title) + "</h1><dl class=\"docs-meta\"><div><dt>Guides</dt><dd>" + topicPages.length + "</dd></div><div><dt>Docs version</dt><dd>" + docsVersion + "</dd></div></dl></div>",
+    renderHeading("Topic", topic.title, '<dl class="docs-meta"><div><dt>Guides</dt><dd>' + topicPages.length + "</dd></div><div><dt>Docs version</dt><dd>" + docsVersion + "</dd></div></dl>", "topic-" + topic.slug),
     lead(escapeHtml(topic.description)),
     section("Guides for this topic", pageList(topicPages.map((page) => ({
       title: page.title,

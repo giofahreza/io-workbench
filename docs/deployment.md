@@ -8,14 +8,14 @@ public internet while the job retains its explicit SSH, checksum, rollback,
 and health-check boundary. Do not attach this label to a general-purpose runner
 or use it from untrusted workflows.
 
-Use `io-workbench-deploy-runner.service.example` only after registering a
+Use `deploy/io-workbench-deploy-runner.service.example` only after registering a
 dedicated runner with the repository and giving it the `io-workbench-deploy`
 label. The runner service should run as the deployment account, while the
 separate sudoers policy grants only the release install and rollback commands.
 
 1. Create a dedicated service user, durable data directory, workspace root, and
    `/opt/io-workbench` binary directory on the deployment host.
-2. Install `io-workbench.service.example` as a systemd unit after replacing the
+2. Install `deploy/io-workbench.service.example` as a systemd unit after replacing the
    example paths and user. Enable it once with `systemctl enable --now
    io-workbench`.
 3. Provision the deployment SSH user with narrowly scoped passwordless
@@ -27,7 +27,7 @@ separate sudoers policy grants only the release install and rollback commands.
    the server's expected OpenSSH known-hosts line during this controlled setup;
    do not fetch and trust a host key dynamically during a deployment. Do not
    point `DEPLOY_LIVE_BINARY` at a developer checkout's `target/release`
-   directory. Start from `io-workbench-release.sudoers.example`, replace its
+   directory. Start from `deploy/io-workbench-release.sudoers.example`, replace its
    account/path/service values, validate it with `visudo -cf`, then install it
    at `/etc/sudoers.d/io-workbench-release` with mode `0440`.
 4. Store the deployment settings as GitHub Actions secrets:

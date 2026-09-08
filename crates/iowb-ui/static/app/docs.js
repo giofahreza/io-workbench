@@ -1,13 +1,16 @@
 const themeStorageKey = "iowb.landing.theme";
-const darkThemeColor = "#0c1310";
-const lightThemeColor = "#f4f7f5";
+const darkThemeColor = "#141515";
+const lightThemeColor = "#f0ede5";
 const root = document.documentElement;
 const themeToggle = document.querySelector("[data-theme-toggle]");
 const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
 const article = document.querySelector(".docs-article");
+const docsLayout = document.querySelector(".docs-layout");
+const sidebar = document.querySelector(".docs-sidebar");
 const outline = document.getElementById("on-this-page");
 const searchInput = document.getElementById("docs-search");
 const searchResults = document.getElementById("docs-search-results");
+const mobileFieldIndexQuery = window.matchMedia("(max-width: 820px)");
 const legacyDocsHashRoutes = Object.freeze({
   overview: "/docs/",
   "quick-start": "/docs/quick-start/",
@@ -232,6 +235,41 @@ function installMobileOutline() {
   });
 }
 
+function installMobileFieldIndex() {
+  if (!article || !docsLayout || !sidebar) return;
+  let disclosure = null;
+
+  function sync() {
+    if (mobileFieldIndexQuery.matches) {
+      if (!disclosure) {
+        disclosure = document.createElement("details");
+        disclosure.className = "docs-mobile-field-index";
+        const summary = document.createElement("summary");
+        summary.textContent = "Field index";
+        disclosure.append(summary);
+      }
+
+      if (!disclosure.isConnected) {
+        article.querySelector(".docs-heading")?.after(disclosure);
+      }
+      if (sidebar.parentElement !== disclosure) disclosure.append(sidebar);
+      return;
+    }
+
+    if (sidebar.parentElement === disclosure) {
+      docsLayout.insertBefore(sidebar, article);
+    }
+    disclosure?.remove();
+  }
+
+  sync();
+  if (mobileFieldIndexQuery.addEventListener) {
+    mobileFieldIndexQuery.addEventListener("change", sync);
+  } else {
+    mobileFieldIndexQuery.addListener(sync);
+  }
+}
+
 function installHeadingSpy(headings) {
   const links = [...document.querySelectorAll(".docs-on-page a")];
   if (!links.length || !headings.length) return;
@@ -299,6 +337,7 @@ function installSearch() {
 
   function clearResults() {
     searchResults.classList.remove("is-visible");
+    searchInput.setAttribute("aria-expanded", "false");
     searchResults.replaceChildren();
   }
 
@@ -333,6 +372,7 @@ function installSearch() {
 
     searchResults.replaceChildren();
     searchResults.classList.add("is-visible");
+    searchInput.setAttribute("aria-expanded", "true");
     if (!matches.length) {
       const empty = document.createElement("p");
       empty.className = "docs-search-empty";
@@ -358,7 +398,12 @@ function installSearch() {
     if (event.key === "Escape") {
       searchInput.value = "";
       clearResults();
+      searchInput.blur();
     }
+  });
+
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest(".docs-search-panel")) clearResults();
   });
 }
 
@@ -388,6 +433,7 @@ function installCopyButtons() {
 
 installActivePageState();
 installBreadcrumbs();
+installMobileFieldIndex();
 const headings = buildOutline();
 installMobileOutline();
 installHeadingSpy(headings);
