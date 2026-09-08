@@ -44,13 +44,13 @@ function sidebarStatePayload() {
 }
 
 function saveSidebarStateLocal(payload = sidebarStatePayload()) {
-  window.localStorage.setItem("iowb.projectOrder", JSON.stringify(payload.projectOrder || []));
-  window.localStorage.setItem("iowb.projectMeta", JSON.stringify(payload.projectMeta || {}));
-  window.localStorage.setItem("iowb.expandedProjects", JSON.stringify(payload.expandedProjectPaths || []));
+  safeLocalStorageSetJson("iowb.projectOrder", payload.projectOrder || []);
+  safeLocalStorageSetJson("iowb.projectMeta", payload.projectMeta || {});
+  safeLocalStorageSetJson("iowb.expandedProjects", payload.expandedProjectPaths || []);
   if (Object.prototype.hasOwnProperty.call(payload, "pinnedChatSessions")) {
-    window.localStorage.setItem(PINNED_CHAT_SESSIONS_KEY, JSON.stringify(payload.pinnedChatSessions || []));
+    safeLocalStorageSetJson(PINNED_CHAT_SESSIONS_KEY, payload.pinnedChatSessions || []);
   }
-  if (payload.updatedAt) window.localStorage.setItem(SIDEBAR_STATE_UPDATED_KEY, payload.updatedAt);
+  if (payload.updatedAt) safeLocalStorageSet(SIDEBAR_STATE_UPDATED_KEY, payload.updatedAt);
 }
 
 function applySidebarStatePayload(payload) {
@@ -76,7 +76,7 @@ async function loadSidebarState() {
     const body = await api("/api/settings");
     const remote = (body?.settings || []).find((entry) => entry.key === SIDEBAR_STATE_SETTING_KEY)?.value;
     if (!remote || typeof remote !== "object") return false;
-    const localUpdatedAt = Date.parse(window.localStorage.getItem(SIDEBAR_STATE_UPDATED_KEY) || "") || 0;
+    const localUpdatedAt = Date.parse(safeLocalStorageGet(SIDEBAR_STATE_UPDATED_KEY, "") || "") || 0;
     const remoteUpdatedAt = Date.parse(remote.updatedAt || "") || 0;
     if (!localUpdatedAt || (remoteUpdatedAt && remoteUpdatedAt >= localUpdatedAt)) {
       return applySidebarStatePayload(remote);
@@ -300,7 +300,7 @@ function setActiveProject(projectPath) {
     }
   }
   state.activeProjectPath = nextProjectPath;
-  window.localStorage.setItem("iowb.activeProjectPath", state.activeProjectPath);
+  safeLocalStorageSet("iowb.activeProjectPath", state.activeProjectPath);
   ["#active-project"].forEach((selector) => {
     const select = qs(selector);
     if (select) select.value = projectPath;
@@ -401,7 +401,7 @@ function normalizePinnedChatSessions(entries) {
 }
 
 function savePinnedChatSessionsLocal(entries = state.pinnedChatSessions) {
-  window.localStorage.setItem(PINNED_CHAT_SESSIONS_KEY, JSON.stringify(normalizePinnedChatSessions(entries)));
+  safeLocalStorageSetJson(PINNED_CHAT_SESSIONS_KEY, normalizePinnedChatSessions(entries));
 }
 
 function sharedPinnedChatSessionsPayload(entries = state.pinnedChatSessions) {

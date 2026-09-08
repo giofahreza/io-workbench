@@ -3,6 +3,7 @@
 // Legacy entrypoint: keep direct links working while the main loader uses
 // the explicit feature files below.
 const GIT_MODULES = Object.freeze([
+  "/vendor/markdown-it/markdown-it.min.js",
   "/app/workspace/git/status.js",
   "/app/workspace/git/commit.js",
   "/app/workspace/git/chat_composer.js",
@@ -16,7 +17,7 @@ const GIT_MODULES = Object.freeze([
 function loadGitModule(path) {
   return new Promise((resolve, reject) => {
     const script = document.createElement("script");
-    script.src = `${path}?v=${encodeURIComponent("20260830-01")}`;
+    script.src = `${path}?v=${encodeURIComponent("20260901-02")}`;
     script.async = false;
     script.addEventListener("load", resolve, { once: true });
     script.addEventListener(

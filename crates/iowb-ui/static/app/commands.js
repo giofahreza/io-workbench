@@ -263,6 +263,13 @@ function commandPaletteCommands() {
       },
     },
     {
+      id: "product-docs",
+      title: "Open Product Docs",
+      section: "Web",
+      keywords: "documentation install setup web mobile remote database terminal",
+      run: () => window.open("/docs/", "_blank", "noopener"),
+    },
+    {
       id: "api-docs",
       title: "Open API Docs",
       section: "Web",
@@ -467,7 +474,7 @@ function bindCommandPalette() {
 
 function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
-  window.localStorage.setItem(APP_VERSION_STORAGE_KEY, APP_VERSION);
+  safeLocalStorageSet(APP_VERSION_STORAGE_KEY, APP_VERSION);
   const hadController = Boolean(navigator.serviceWorker.controller);
 
   const reloadForUpdatedShell = (reason = "service-worker") => {

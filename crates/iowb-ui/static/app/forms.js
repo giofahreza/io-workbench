@@ -484,7 +484,7 @@ function bindForms() {
       });
       state.token = body.token || "";
       window.sessionStorage.setItem(TOKEN_STORAGE_KEY, state.token);
-      window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+      safeLocalStorageRemove(TOKEN_STORAGE_KEY);
       qs("#auth-password").value = "";
       await bootstrapProtected();
       showToast(mode === "setup" ? "Account created" : "Signed in", "ok");
@@ -501,7 +501,7 @@ function bindForms() {
     }
     state.token = "";
     window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
-    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+    safeLocalStorageRemove(TOKEN_STORAGE_KEY);
     showAuthPanel(authPanelMode());
     if (state.ws) state.ws.close();
     showToast("Signed out", "ok");

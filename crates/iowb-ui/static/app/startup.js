@@ -1,4 +1,7 @@
 async function bootstrapProtected() {
+  // Compact/migrate any cache created by an older shell before it can
+  // compete with the history request or the other browser preferences.
+  persistChatTranscriptCache();
   const canLoadProtected = await loadAuthStatus();
   if (!canLoadProtected) {
     setWsStatus("error");
@@ -17,10 +20,10 @@ async function bootstrapProtected() {
     renderChatFooter(persistedSessions[lastSessionId]);
   }
   connectWs();
-  const savedView = window.localStorage.getItem("iowb.lastView") || activeView() || "chat";
+  const savedView = safeLocalStorageGet("iowb.lastView", "") || activeView() || "chat";
   const targetView = qs(`#${savedView}-view`) ? savedView : "chat";
   const savedProjectPath = activeChatSelectionMatchesServer()
-    ? (window.localStorage.getItem(ACTIVE_CHAT_PROJECT_KEY) || "")
+    ? (safeLocalStorageGet(ACTIVE_CHAT_PROJECT_KEY, "") || "")
     : "";
   if (savedProjectPath && state.projects.some((project) => project.path === savedProjectPath)) {
     setActiveProject(savedProjectPath);
@@ -180,7 +183,7 @@ function appendChat(value, opts = {}) {
 }
 
 function renderChatBubbleHtml(value) {
-  return renderMarkdownLiteWithSections(value).body;
+  return renderMarkdownLiteWithSections(value, { assistant: true }).body;
 }
 
 function appendChatLine(value) {

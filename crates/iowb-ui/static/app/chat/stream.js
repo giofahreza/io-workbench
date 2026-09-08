@@ -222,7 +222,7 @@ function replayToolLine(content) {
 }
 
 function stripAnsi(value) {
-  return String(value || "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+  return String(value || "").replace(/\u001B(?:[@-_]|\[[0-?]*[ -/]*[@-~])/g, "");
 }
 
 function normalizeChatToolHeading(value) {

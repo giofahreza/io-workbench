@@ -427,6 +427,15 @@
   background: transparent;
 }
 
+#chat-output .chat-line-text .markdown-image {
+  display: block;
+  width: min(100%, 260px);
+  max-height: 260px;
+  border-radius: 8px;
+  object-fit: contain;
+  background: color-mix(in srgb, var(--bg) 76%, var(--panel));
+}
+
 #chat-output .chat-line-assistant.chat-line-tool-message {
   padding-block: 1px;
 }

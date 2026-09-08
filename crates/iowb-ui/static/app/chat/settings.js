@@ -71,7 +71,7 @@ function renderSettings() {
 function setSettingsTab(tab) {
   const next = tab || "agents";
   state.activeSettingsTab = next;
-  window.localStorage.setItem("iowb.settingsTab", next);
+  safeLocalStorageSet("iowb.settingsTab", next);
   document.querySelectorAll("[data-settings-tab]").forEach((button) => {
     const active = button.dataset.settingsTab === next;
     button.classList.toggle("active", active);
@@ -199,7 +199,7 @@ async function copyText(value) {
 }
 
 function savePreferences() {
-  window.localStorage.setItem("iowb.webPreferences", JSON.stringify(state.preferences));
+  safeLocalStorageSetJson("iowb.webPreferences", state.preferences);
 }
 
 function terminalSizeFromSettings() {

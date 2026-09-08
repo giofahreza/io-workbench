@@ -513,7 +513,8 @@
 }
 
 .sidebar-history-item.pinned {
-  border-color: color-mix(in srgb, var(--warn) 35%, var(--line));
+  border: 0px;
+  background: #212529;
 }
 
 .sidebar-history-item.pinned-reorderable {

@@ -155,7 +155,7 @@ async function switchView(view) {
   if (subtitle) subtitle.textContent = VIEW_SUBTITLES[view] || "";
   closeMoreSheet();
   closeSidebar();
-  window.localStorage.setItem("iowb.lastView", view);
+  safeLocalStorageSet("iowb.lastView", view);
   if (view === "shell") {
     await Promise.all([ensureXterm(), loadView(view)]);
   } else {

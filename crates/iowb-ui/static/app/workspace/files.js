@@ -510,7 +510,7 @@ function fileEntriesSelectable(entries) {
 
 function setFileTreeViewMode(mode) {
   state.fileViewMode = ["simple", "compact", "detailed"].includes(mode) ? mode : "detailed";
-  window.localStorage.setItem("iowb.fileViewMode", state.fileViewMode);
+  safeLocalStorageSet("iowb.fileViewMode", state.fileViewMode);
   renderFileEntries();
 }
 

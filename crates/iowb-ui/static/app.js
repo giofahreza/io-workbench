@@ -1,7 +1,7 @@
 "use strict";
 
 const TOKEN_STORAGE_KEY = "iowb.token";
-const APP_VERSION = "20260830-01";
+const APP_VERSION = "20260901-02";
 const APP_MODULES = Object.freeze([
   "/app/core.js",
   "/app/sidebar.js",
@@ -15,6 +15,7 @@ const APP_MODULES = Object.freeze([
   "/app/workspace/git/status.js",
   "/app/workspace/git/commit.js",
   "/app/workspace/git/chat_composer.js",
+  "/vendor/markdown-it/markdown-it.min.js",
   "/app/workspace/git/markdown.js",
   "/app/workspace/git/session_actions.js",
   "/app/workspace/git/conflicts.js",
@@ -31,7 +32,11 @@ const APP_MODULES = Object.freeze([
   "/app/startup.js",
 ]);
 
-window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+try {
+  window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+} catch {
+  // Local storage is optional; token handling uses sessionStorage.
+}
 
 function loadAppModule(path) {
   return new Promise((resolve, reject) => {

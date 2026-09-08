@@ -90,10 +90,10 @@ function persistChatPromptHistory() {
     .filter(Boolean)
     .sort((left, right) => String(left.timestamp).localeCompare(String(right.timestamp)) || String(left.id).localeCompare(String(right.id)))
     .slice(-MAX_PROMPT_HISTORY);
-  window.localStorage.setItem(chatPromptHistoryStorageKey(), JSON.stringify({
+  safeLocalStorageSetJson(chatPromptHistoryStorageKey(), {
     prompts: state.chatPromptHistory,
     hasOlder: state.chatPromptHistoryHasOlder === true,
-  }));
+  });
 }
 
 function mergeChatPromptHistory(items, options = {}) {

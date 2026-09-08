@@ -264,6 +264,14 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app/workspace/git/chat_composer.js"),
         }),
+        "vendor/markdown-it/markdown-it.min.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/vendor/markdown-it/markdown-it.min.js"),
+        }),
+        "vendor/markdown-it/LICENSE" => Some(UiAsset {
+            content_type: "text/plain; charset=utf-8",
+            bytes: include_bytes!("../static/vendor/markdown-it/LICENSE"),
+        }),
         "app/workspace/git/markdown.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app/workspace/git/markdown.js"),

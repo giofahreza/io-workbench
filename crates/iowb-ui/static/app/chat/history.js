@@ -29,21 +29,21 @@ function chatCacheKey(sessionId) {
 }
 
 function activeChatSelectionMatchesServer() {
-  const savedServer = window.localStorage.getItem(ACTIVE_CHAT_SERVER_KEY) || "";
+  const savedServer = safeLocalStorageGet(ACTIVE_CHAT_SERVER_KEY, "") || "";
   return savedServer && savedServer === normalizedWebServerUrl();
 }
 
 function savedActiveChatSessionId() {
   if (!activeChatSelectionMatchesServer()) return "";
-  return (window.localStorage.getItem(ACTIVE_CHAT_SESSION_KEY) || "").trim();
+  return (safeLocalStorageGet(ACTIVE_CHAT_SESSION_KEY, "") || "").trim();
 }
 
 function persistActiveChatSelection(sessionId = state.chatSessionId, projectPath = activeProjectPath()) {
   const id = (sessionId || "").trim();
   if (!id) return;
-  window.localStorage.setItem(ACTIVE_CHAT_SESSION_KEY, id);
-  window.localStorage.setItem(ACTIVE_CHAT_SERVER_KEY, normalizedWebServerUrl());
-  window.localStorage.setItem(ACTIVE_CHAT_PROJECT_KEY, projectPath || "");
+  safeLocalStorageSet(ACTIVE_CHAT_SESSION_KEY, id);
+  safeLocalStorageSet(ACTIVE_CHAT_SERVER_KEY, normalizedWebServerUrl());
+  safeLocalStorageSet(ACTIVE_CHAT_PROJECT_KEY, projectPath || "");
   state.preferences.lastChatSessionId = id;
   savePreferences();
 }
@@ -51,25 +51,273 @@ function persistActiveChatSelection(sessionId = state.chatSessionId, projectPath
 function clearActiveChatSelection(sessionId = state.chatSessionId) {
   const saved = savedActiveChatSessionId();
   if (sessionId && saved && saved !== sessionId) return;
-  window.localStorage.removeItem(ACTIVE_CHAT_SESSION_KEY);
-  window.localStorage.removeItem(ACTIVE_CHAT_SERVER_KEY);
-  window.localStorage.removeItem(ACTIVE_CHAT_PROJECT_KEY);
+  safeLocalStorageRemove(ACTIVE_CHAT_SESSION_KEY);
+  safeLocalStorageRemove(ACTIVE_CHAT_SERVER_KEY);
+  safeLocalStorageRemove(ACTIVE_CHAT_PROJECT_KEY);
+}
+
+function serializedChatCacheStorageBytes(value) {
+  try {
+    const serialized = typeof value === "string" ? value : JSON.stringify(value);
+    return typeof serialized === "string"
+      ? serialized.length * 2
+      : Number.MAX_SAFE_INTEGER;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+function truncateChatCacheText(value, maxChars) {
+  const text = String(value ?? "");
+  const limit = Math.max(0, Number(maxChars) || 0);
+  if (text.length <= limit) return text;
+  if (!limit) return "";
+  const marker = "\n[content truncated in local cache]\n";
+  if (limit <= marker.length) return text.slice(-limit);
+  const remaining = limit - marker.length;
+  const headChars = Math.floor(remaining / 3);
+  return `${text.slice(0, headChars)}${marker}${text.slice(-remaining + headChars)}`;
+}
+
+function compactChatCacheMetadata(raw) {
+  const source = raw?.metadata && typeof raw.metadata === "object"
+    ? raw.metadata
+    : (raw?.meta && typeof raw.meta === "object" ? raw.meta : null);
+  if (!source) return null;
+  const metadata = {};
+  [
+    "kind",
+    "cli",
+    "provider",
+    "model",
+    "effort",
+    "mode",
+    "thinking",
+    "fast",
+    "sentAt",
+    "receivedAt",
+    "elapsed",
+    "elapsedMs",
+    "tokenUsage",
+  ].forEach((field) => {
+    const value = source[field];
+    if (value === undefined || value === null) return;
+    if (["string", "number", "boolean"].includes(typeof value)) {
+      metadata[field] = typeof value === "string"
+        ? truncateChatCacheText(value, 4096)
+        : value;
+    } else if (field === "tokenUsage" && typeof value === "object") {
+      const usage = {};
+      ["used", "input", "output", "total", "missingAttempts", "partialAttempts", "completeness"]
+        .forEach((usageField) => {
+          const usageValue = value[usageField];
+          if (usageValue !== undefined && usageValue !== null) usage[usageField] = usageValue;
+        });
+      if (Object.keys(usage).length) metadata[field] = usage;
+    }
+  });
+  return Object.keys(metadata).length ? metadata : null;
+}
+
+function compactChatCacheSession(session) {
+  if (!session || typeof session !== "object") return null;
+  const compact = {};
+  [
+    "id",
+    "title",
+    "summary",
+    "provider",
+    "__provider",
+    "cli",
+    "projectPath",
+    "projectName",
+    "nativeSessionId",
+    "native_session_id",
+    "messageCount",
+    "message_count",
+    "status",
+    "active",
+    "pending",
+    "external",
+    "boardSession",
+    "board_session",
+    "boardId",
+    "board_id",
+    "boardRunId",
+    "board_run_id",
+    "boardTaskId",
+    "board_task_id",
+    "model",
+    "effort",
+    "mode",
+    "thinking",
+    "fast",
+    "lastActivity",
+    "updatedAt",
+    "createdAt",
+  ].forEach((field) => {
+    const value = session[field];
+    if (value === undefined || value === null) return;
+    if (typeof value === "string") compact[field] = truncateChatCacheText(value, 4096);
+    else if (["number", "boolean"].includes(typeof value)) compact[field] = value;
+  });
+  return Object.keys(compact).length ? compact : null;
+}
+
+function compactChatCacheMessage(raw, contentLimit, includeMetadata = true) {
+  if (!raw || typeof raw !== "object") return null;
+  const message = {};
+  ["id", "role", "timestamp", "receivedAt", "provider"].forEach((field) => {
+    const value = raw[field];
+    if (value !== undefined && value !== null) {
+      message[field] = typeof value === "string" ? truncateChatCacheText(value, 4096) : value;
+    }
+  });
+  message.content = truncateChatCacheText(raw.content, contentLimit);
+  if (includeMetadata) {
+    const metadata = compactChatCacheMetadata(raw);
+    if (metadata) message.metadata = metadata;
+  }
+  return message;
+}
+
+function buildBoundedChatCacheEntry(raw, messages, droppedMessages, contentLimit, streamLimit, options = {}) {
+  const offset = Math.max(0, Number(raw.offset) || 0) + droppedMessages;
+  const totalCount = Math.max(Number(raw.totalCount) || 0, offset + messages.length);
+  const sessionId = truncateChatCacheText(raw.sessionId, 1024);
+  const entry = {
+    key: truncateChatCacheText(raw.key, 2048),
+    sessionId,
+    projectPath: truncateChatCacheText(raw.projectPath, 4096),
+    session: options.includeSession === false ? null : compactChatCacheSession(raw.session),
+    status: truncateChatCacheText(raw.status, 64),
+    messages: messages
+      .map((message) => compactChatCacheMessage(message, contentLimit, options.includeMetadata !== false))
+      .filter(Boolean),
+    offset,
+    totalCount,
+    streamingBuffer: raw.live
+      ? truncateChatCacheText(raw.streamingBuffer, streamLimit)
+      : "",
+    live: raw.live === true,
+    updatedAt: truncateChatCacheText(raw.updatedAt, 64),
+  };
+  if (!entry.session) delete entry.session;
+  return entry;
+}
+
+function boundedChatCacheEntry(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const originalMessages = Array.isArray(raw.messages) ? raw.messages : [];
+  let messages = originalMessages.slice(-MAX_CHAT_TRANSCRIPT_CACHE_MESSAGES);
+  let droppedMessages = originalMessages.length - messages.length;
+  let contentLimit = MAX_CHAT_TRANSCRIPT_MESSAGE_CONTENT_CHARS;
+  let streamLimit = MAX_CHAT_TRANSCRIPT_STREAMING_CONTENT_CHARS;
+  let entry = buildBoundedChatCacheEntry(
+    raw,
+    messages,
+    droppedMessages,
+    contentLimit,
+    streamLimit,
+  );
+
+  while (
+    serializedChatCacheStorageBytes(entry) > MAX_CHAT_TRANSCRIPT_CACHE_ENTRY_STORAGE_BYTES
+    && messages.length > 1
+  ) {
+    messages = messages.slice(1);
+    droppedMessages += 1;
+    entry = buildBoundedChatCacheEntry(
+      raw,
+      messages,
+      droppedMessages,
+      contentLimit,
+      streamLimit,
+    );
+  }
+
+  for (const limit of [64 * 1024, 32 * 1024, 16 * 1024, 8 * 1024, 4 * 1024, 1024, 0]) {
+    if (serializedChatCacheStorageBytes(entry) <= MAX_CHAT_TRANSCRIPT_CACHE_ENTRY_STORAGE_BYTES) break;
+    contentLimit = limit;
+    streamLimit = Math.min(MAX_CHAT_TRANSCRIPT_STREAMING_CONTENT_CHARS, limit * 2 / 3);
+    entry = buildBoundedChatCacheEntry(
+      raw,
+      messages,
+      droppedMessages,
+      contentLimit,
+      streamLimit,
+    );
+  }
+
+  if (serializedChatCacheStorageBytes(entry) > MAX_CHAT_TRANSCRIPT_CACHE_ENTRY_STORAGE_BYTES) {
+    entry = buildBoundedChatCacheEntry(
+      raw,
+      messages.slice(-1),
+      droppedMessages + Math.max(0, messages.length - 1),
+      0,
+      0,
+      { includeSession: false, includeMetadata: false },
+    );
+  }
+  return entry;
+}
+
+function boundedChatTranscriptCacheEntries(entries) {
+  const normalized = (Array.isArray(entries) ? entries : [])
+    .map(boundedChatCacheEntry)
+    .filter((entry) => entry?.key && entry.sessionId)
+    .slice(-MAX_CHAT_TRANSCRIPT_CACHE);
+  let retained = [];
+  for (let index = normalized.length - 1; index >= 0 && retained.length < MAX_CHAT_TRANSCRIPT_CACHE; index -= 1) {
+    const next = [normalized[index], ...retained];
+    if (
+      retained.length > 0
+      && serializedChatCacheStorageBytes({ version: CHAT_TRANSCRIPT_CACHE_VERSION, entries: next })
+        > MAX_CHAT_TRANSCRIPT_CACHE_STORAGE_BYTES
+    ) {
+      break;
+    }
+    retained = next;
+  }
+  return retained;
 }
 
 function chatCacheEntries() {
   if (!state.chatTranscriptCache || state.chatTranscriptCache.version !== CHAT_TRANSCRIPT_CACHE_VERSION) {
     state.chatTranscriptCache = { version: CHAT_TRANSCRIPT_CACHE_VERSION, entries: [] };
+    state.chatTranscriptCacheNormalized = true;
   }
   if (!Array.isArray(state.chatTranscriptCache.entries)) {
     state.chatTranscriptCache.entries = [];
+  }
+  if (!state.chatTranscriptCacheNormalized) {
+    state.chatTranscriptCache.entries = boundedChatTranscriptCacheEntries(state.chatTranscriptCache.entries);
+    state.chatTranscriptCacheNormalized = true;
   }
   return state.chatTranscriptCache.entries;
 }
 
 function persistChatTranscriptCache() {
-  const entries = chatCacheEntries().slice(-MAX_CHAT_TRANSCRIPT_CACHE);
+  const entries = boundedChatTranscriptCacheEntries(chatCacheEntries());
   state.chatTranscriptCache = { version: CHAT_TRANSCRIPT_CACHE_VERSION, entries };
-  window.localStorage.setItem(CHAT_TRANSCRIPT_CACHE_KEY, JSON.stringify(state.chatTranscriptCache));
+  state.chatTranscriptCacheNormalized = true;
+  let persisted = false;
+  try {
+    persisted = safeLocalStorageSet(CHAT_TRANSCRIPT_CACHE_KEY, JSON.stringify(state.chatTranscriptCache));
+  } catch {
+    persisted = false;
+  }
+  if (persisted) return true;
+  // The cache is disposable. Removing an older oversized value can free
+  // enough quota for future preferences/drafts even when this write cannot
+  // be committed right now; history loading must continue either way.
+  safeLocalStorageRemove(CHAT_TRANSCRIPT_CACHE_KEY);
+  localStorageWriteFailures.add(CHAT_TRANSCRIPT_CACHE_KEY);
+  try {
+    return safeLocalStorageSet(CHAT_TRANSCRIPT_CACHE_KEY, JSON.stringify(state.chatTranscriptCache));
+  } catch {
+    return false;
+  }
 }
 
 function cachedChatSession(sessionId) {
@@ -146,8 +394,8 @@ function rememberCurrentChatSession(patch = {}) {
     projectPath,
     session: boardSession && session ? { ...session, boardSession: true } : session,
     status: patch.status || (session ? sidebarSessionStatus(session) : "") || (chatSessionIsLive(sessionId) ? "running" : "completed"),
-    messages: split.messages.slice(-CHAT_HISTORY_PAGE_SIZE * 2),
-    offset: Math.max(0, offset + Math.max(0, split.messages.length - CHAT_HISTORY_PAGE_SIZE * 2)),
+    messages: split.messages.slice(-MAX_CHAT_TRANSCRIPT_CACHE_MESSAGES),
+    offset: Math.max(0, offset + Math.max(0, split.messages.length - MAX_CHAT_TRANSCRIPT_CACHE_MESSAGES)),
     totalCount: Math.max(totalCount, split.messages.length),
     streamingBuffer: (patch.live ?? chatSessionIsLive(sessionId))
       ? streamingBuffer.slice(-CHAT_LIVE_RENDER_MAX_CHARS)
@@ -303,11 +551,11 @@ function chatDisplaySettings() {
 }
 
 function saveChatDisplaySettings(settings) {
-  window.localStorage.setItem(chatDisplaySettingsKey(), JSON.stringify({
+  safeLocalStorageSetJson(chatDisplaySettingsKey(), {
     expandThinking: settings.expandThinking !== false,
     expandParameters: settings.expandParameters !== false,
     autoScrollToBottom: settings.autoScrollToBottom === true,
-  }));
+  });
 }
 
 function isChatNearBottom() {

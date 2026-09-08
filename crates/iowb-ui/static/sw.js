@@ -1,4 +1,4 @@
-const APP_VERSION = "20260830-01";
+const APP_VERSION = "20260901-02";
 const CACHE_NAME = `io-workbench-web-${APP_VERSION}`;
 const CORE_ASSETS = [
   "/",
@@ -29,6 +29,7 @@ const CORE_ASSETS = [
   `/app/workspace/git/status.js?v=${APP_VERSION}`,
   `/app/workspace/git/commit.js?v=${APP_VERSION}`,
   `/app/workspace/git/chat_composer.js?v=${APP_VERSION}`,
+  `/vendor/markdown-it/markdown-it.min.js?v=${APP_VERSION}`,
   `/app/workspace/git/markdown.js?v=${APP_VERSION}`,
   `/app/workspace/git/session_actions.js?v=${APP_VERSION}`,
   `/app/workspace/git/conflicts.js?v=${APP_VERSION}`,

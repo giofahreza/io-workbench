@@ -14,6 +14,15 @@ const CHAT_ACTIVE_POLL_INTERVAL_MS = 2000;
 const CHAT_COMPLETION_RECONCILE_DELAYS_MS = [280, 750, 1500, 3000];
 const CHAT_TRANSCRIPT_CACHE_VERSION = 1;
 const MAX_CHAT_TRANSCRIPT_CACHE = 16;
+const MAX_CHAT_TRANSCRIPT_CACHE_MESSAGES = 60;
+// Keep this well below the browser's usual per-origin localStorage quota so
+// chat history remains usable alongside preferences, drafts, and sidebar
+// state. Browser quota accounting is implementation-dependent, so the web
+// cache measures serialized UTF-16 storage conservatively.
+const MAX_CHAT_TRANSCRIPT_CACHE_STORAGE_BYTES = 3 * 1024 * 1024;
+const MAX_CHAT_TRANSCRIPT_CACHE_ENTRY_STORAGE_BYTES = 256 * 1024;
+const MAX_CHAT_TRANSCRIPT_MESSAGE_CONTENT_CHARS = 96 * 1024;
+const MAX_CHAT_TRANSCRIPT_STREAMING_CONTENT_CHARS = 64 * 1024;
 const CHAT_AUTOSCROLL_THRESHOLD_PX = 160;
 const CHAT_HISTORY_LOAD_THRESHOLD_PX = 96;
 const MAX_PROMPT_HISTORY = 80;
@@ -38,12 +47,59 @@ document.documentElement.classList.toggle(
   /\bAndroid\b/i.test(navigator.userAgent || ""),
 );
 
+const localStorageWriteFailures = new Set();
+
+function safeLocalStorageGet(key, fallback = null) {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value === null ? fallback : value;
+  } catch {
+    return fallback;
+  }
+}
+
+function safeLocalStorageSet(key, value) {
+  try {
+    window.localStorage.setItem(key, value);
+    localStorageWriteFailures.delete(key);
+    return true;
+  } catch (error) {
+    if (!localStorageWriteFailures.has(key)) {
+      localStorageWriteFailures.add(key);
+      console.warn(`[io-workbench] localStorage write skipped for ${key}`, error);
+    }
+    return false;
+  }
+}
+
+function safeLocalStorageSetJson(key, value) {
+  try {
+    return safeLocalStorageSet(key, JSON.stringify(value));
+  } catch (error) {
+    if (!localStorageWriteFailures.has(key)) {
+      localStorageWriteFailures.add(key);
+      console.warn(`[io-workbench] localStorage serialization skipped for ${key}`, error);
+    }
+    return false;
+  }
+}
+
+function safeLocalStorageRemove(key) {
+  try {
+    window.localStorage.removeItem(key);
+    localStorageWriteFailures.delete(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function readJsonStorage(key, fallback) {
   try {
-    const raw = window.localStorage.getItem(key);
+    const raw = safeLocalStorageGet(key, "");
     return raw ? JSON.parse(raw) : fallback;
   } catch {
-    window.localStorage.removeItem(key);
+    safeLocalStorageRemove(key);
     return fallback;
   }
 }
@@ -100,7 +156,7 @@ const state = {
   fileContextMenu: null,
   sessionContextMenu: null,
   fileUploadTargetPath: "",
-  fileViewMode: window.localStorage.getItem("iowb.fileViewMode") || "detailed",
+  fileViewMode: safeLocalStorageGet("iowb.fileViewMode", "") || "detailed",
   editorSearch: {
     query: "",
     matches: [],
@@ -137,6 +193,7 @@ const state = {
   chatManualCompactionSuppressedResponsesBySession: {},
   chatOutputBuffersBySession: {},
   chatTranscriptCache: readJsonStorage(CHAT_TRANSCRIPT_CACHE_KEY, { version: CHAT_TRANSCRIPT_CACHE_VERSION, entries: [] }),
+  chatTranscriptCacheNormalized: false,
   chatReconcileTimers: {},
   chatActivityPollTimer: null,
   chatSuppressAutoOpenOnce: false,
@@ -172,7 +229,7 @@ const state = {
   pinnedChatSessionsDirty: false,
   pinnedChatSessionsLoadGeneration: 0,
   pinnedChatSessionsSaveChain: Promise.resolve(),
-  activeProjectPath: window.localStorage.getItem("iowb.activeProjectPath") || "",
+  activeProjectPath: safeLocalStorageGet("iowb.activeProjectPath", "") || "",
   expandedProjectPaths: new Set(readJsonStorage("iowb.expandedProjects", [])),
   limits: {
     files: 250,
@@ -208,7 +265,7 @@ const state = {
   pointerProjectDrag: null,
   pointerPinnedChatDrag: null,
   chatSwipe: null,
-  activeSettingsTab: window.localStorage.getItem("iowb.settingsTab") || "agents",
+  activeSettingsTab: safeLocalStorageGet("iowb.settingsTab", "") || "agents",
   suppressSidebarProjectClickUntil: 0,
   sidebarStatePersistTimer: null,
   commandPalette: {

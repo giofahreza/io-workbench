@@ -110,15 +110,15 @@ function chatDraftStorageKey(scope = chatDraftScope()) {
 }
 
 function readLocalChatPromptDraft(sessionId = state.chatSessionId) {
-  return window.localStorage.getItem(chatDraftStorageKey(chatDraftScope(sessionId))) || "";
+  return safeLocalStorageGet(chatDraftStorageKey(chatDraftScope(sessionId)), "") || "";
 }
 
 function writeLocalChatPromptDraft(content, sessionId = state.chatSessionId) {
   const key = chatDraftStorageKey(chatDraftScope(sessionId));
   if (String(content || "").trim()) {
-    window.localStorage.setItem(key, content || "");
+    safeLocalStorageSet(key, content || "");
   } else {
-    window.localStorage.removeItem(key);
+    safeLocalStorageRemove(key);
   }
 }
 
