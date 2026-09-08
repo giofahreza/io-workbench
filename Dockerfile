@@ -17,7 +17,8 @@ RUN apt-get update \
 ENV IO_WORKBENCH_HOST=0.0.0.0 \
     IO_WORKBENCH_PORT=8787 \
     IO_WORKBENCH_CONFIG_DIR=/data \
-    IO_WORKBENCH_WORKSPACE_ROOT=/workspace
+    IO_WORKBENCH_WORKSPACE_ROOT=/workspace \
+    MALLOC_ARENA_MAX=4
 
 RUN mkdir -p /data /workspace
 
