@@ -8,3 +8,21 @@
 apps/mobile/androidApp/google-services.json
 *service-account*.json
 .playwright-mcp/
+
+# Local io-workbench data and unpacked Android package inspection output.
+/.io-workbench/
+/AndroidManifest.xml
+/DebugProbesKt.bin
+/META-INF/
+/assets/
+/classes*.dex
+/client_analytics.proto
+/firebase-encoders*.properties
+/kotlin/
+/lib/
+/messaging_event*.proto
+/org/
+/play-services-*.properties
+/res/
+/resources.arsc
+/values/
