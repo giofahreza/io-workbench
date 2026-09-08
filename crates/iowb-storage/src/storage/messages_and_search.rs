@@ -41,6 +41,182 @@ impl Storage {
         })
     }
 
+    pub fn visit_messages_ordered(
+        &self,
+        session_id: &str,
+        mut visitor: impl FnMut(ChatMessage),
+    ) -> Result<()> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, role, content, timestamp, metadata
+                FROM messages
+                WHERE session_id = ?1
+                ORDER BY timestamp ASC, id ASC
+                "#,
+            )?;
+            let mut rows = stmt.query(params![session_id])?;
+            while let Some(row) = rows.next()? {
+                let role = parse_role(&row.get::<_, String>(1)?);
+                let timestamp = parse_time_sql(row.get::<_, String>(3)?)?;
+                let metadata_raw: String = row.get(4)?;
+                visitor(ChatMessage {
+                    id: row.get(0)?,
+                    role,
+                    content: row.get(2)?,
+                    timestamp,
+                    metadata: serde_json::from_str(&metadata_raw).unwrap_or(Value::Null),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub fn visit_message_references_ordered(
+        &self,
+        session_id: &str,
+        through: Option<DateTime<Utc>>,
+        mut visitor: impl FnMut(StoredMessageReference),
+    ) -> Result<()> {
+        self.with_connection(|conn| {
+            let query = if through.is_some() {
+                r#"
+                SELECT id, timestamp
+                FROM messages
+                WHERE session_id = ?1 AND timestamp <= ?2
+                ORDER BY timestamp ASC, id ASC
+                "#
+            } else {
+                r#"
+                SELECT id, timestamp
+                FROM messages
+                WHERE session_id = ?1
+                ORDER BY timestamp ASC, id ASC
+                "#
+            };
+            let mut stmt = conn.prepare(query)?;
+            let mut rows = if let Some(through) = through {
+                stmt.query(params![session_id, through.to_rfc3339()])?
+            } else {
+                stmt.query(params![session_id])?
+            };
+            while let Some(row) = rows.next()? {
+                visitor(StoredMessageReference {
+                    id: row.get(0)?,
+                    timestamp: parse_time_sql(row.get::<_, String>(1)?)?,
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub fn visit_messages_after(
+        &self,
+        session_id: &str,
+        timestamp: DateTime<Utc>,
+        mut visitor: impl FnMut(ChatMessage),
+    ) -> Result<()> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, role, content, timestamp, metadata
+                FROM messages
+                WHERE session_id = ?1 AND timestamp > ?2
+                ORDER BY timestamp ASC, id ASC
+                "#,
+            )?;
+            let mut rows = stmt.query(params![session_id, timestamp.to_rfc3339()])?;
+            while let Some(row) = rows.next()? {
+                let role = parse_role(&row.get::<_, String>(1)?);
+                let message_timestamp = parse_time_sql(row.get::<_, String>(3)?)?;
+                let metadata_raw: String = row.get(4)?;
+                visitor(ChatMessage {
+                    id: row.get(0)?,
+                    role,
+                    content: row.get(2)?,
+                    timestamp: message_timestamp,
+                    metadata: serde_json::from_str(&metadata_raw).unwrap_or(Value::Null),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub fn visit_assistant_messages_ordered(
+        &self,
+        session_id: &str,
+        mut visitor: impl FnMut(ChatMessage),
+    ) -> Result<()> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, role, content, timestamp, metadata
+                FROM messages
+                WHERE session_id = ?1 AND role = 'assistant'
+                ORDER BY timestamp ASC, id ASC
+                "#,
+            )?;
+            let mut rows = stmt.query(params![session_id])?;
+            while let Some(row) = rows.next()? {
+                let role = parse_role(&row.get::<_, String>(1)?);
+                let timestamp = parse_time_sql(row.get::<_, String>(3)?)?;
+                let metadata_raw: String = row.get(4)?;
+                visitor(ChatMessage {
+                    id: row.get(0)?,
+                    role,
+                    content: row.get(2)?,
+                    timestamp,
+                    metadata: serde_json::from_str(&metadata_raw).unwrap_or(Value::Null),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    pub fn messages_by_ids(
+        &self,
+        session_id: &str,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, ChatMessage>> {
+        if message_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.with_connection(|conn| {
+            let placeholders = std::iter::repeat_n("?", message_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                r#"
+                SELECT id, role, content, timestamp, metadata
+                FROM messages
+                WHERE session_id = ? AND id IN ({placeholders})
+                "#
+            );
+            let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(message_ids.len() + 1);
+            values.push(&session_id);
+            values.extend(message_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map(values.as_slice(), |row| {
+                let role = parse_role(&row.get::<_, String>(1)?);
+                let timestamp = parse_time_sql(row.get::<_, String>(3)?)?;
+                let metadata_raw: String = row.get(4)?;
+                Ok(ChatMessage {
+                    id: row.get(0)?,
+                    role,
+                    content: row.get(2)?,
+                    timestamp,
+                    metadata: serde_json::from_str(&metadata_raw).unwrap_or(Value::Null),
+                })
+            })?;
+            let mut messages = HashMap::with_capacity(message_ids.len());
+            for row in rows {
+                let message = row?;
+                messages.insert(message.id.clone(), message);
+            }
+            Ok(messages)
+        })
+    }
+
     /// Return messages ordered by oldest-first with a `limit`/`offset` window.
     /// `total_count` reports the full message count so callers can implement
     /// "load older" lazy pagination.
@@ -260,5 +436,4 @@ impl Storage {
             Ok(results)
         })
     }
-
 }

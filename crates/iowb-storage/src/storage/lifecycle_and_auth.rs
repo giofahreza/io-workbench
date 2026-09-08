@@ -120,6 +120,9 @@ impl Storage {
                 CREATE INDEX IF NOT EXISTS idx_messages_session_role_time
                     ON messages(session_id, role, timestamp, id);
 
+                CREATE INDEX IF NOT EXISTS idx_messages_session_time
+                    ON messages(session_id, timestamp, id);
+
                 CREATE TABLE IF NOT EXISTS api_keys (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL,
@@ -836,5 +839,4 @@ impl Storage {
             .map_err(StorageError::from)
         })
     }
-
 }

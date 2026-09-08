@@ -259,13 +259,12 @@ impl SessionManager {
         session_id: &str,
     ) -> Result<Vec<ChatMessage>> {
         let stored = sanitize_context_materialization_messages(self.messages(session_id)?);
-        let compacted_at = match latest_context_compaction_marker_timestamp(&stored) {
-            Some(compacted_at) => Some(compacted_at),
-            None => self
+        let compacted_at = match self.storage.latest_active_context_rollover(session_id)? {
+            Some(rollover) => self
                 .storage
-                .latest_context_rollover(session_id)?
-                .filter(|rollover| rollover.state == "active")
-                .and_then(|rollover| rollover.activated_at),
+                .context_compaction_marker_timestamp(session_id, &rollover.id)?
+                .or(rollover.activated_at),
+            None => latest_context_compaction_marker_timestamp(&stored),
         };
         let Some(record) = self.external_record_for_messages(session_id).await else {
             return Ok(stored);
@@ -279,6 +278,225 @@ impl SessionManager {
             external.as_ref().clone(),
             compacted_at,
         ))
+    }
+
+    async fn active_context_messages_page_including_external(
+        &self,
+        session_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<(Vec<ChatMessage>, usize)>> {
+        self.active_context_messages_window_including_external(
+            session_id,
+            limit.clamp(1, 500),
+            Some(offset),
+        )
+        .await
+    }
+
+    async fn active_context_messages_tail_including_external(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Option<(Vec<ChatMessage>, usize)>> {
+        self.active_context_messages_window_including_external(session_id, limit, None)
+            .await
+    }
+
+    async fn active_context_messages_window_including_external(
+        &self,
+        session_id: &str,
+        limit: usize,
+        offset: Option<usize>,
+    ) -> Result<Option<(Vec<ChatMessage>, usize)>> {
+        for attempt in 0..2 {
+            if let Some(window) = self
+                .active_context_messages_window_once(session_id, limit, offset)
+                .await?
+            {
+                return Ok(Some(window));
+            }
+            if attempt == 0 {
+                warn!(
+                    session_id,
+                    "active context transcript changed while building a snapshot; retrying"
+                );
+            }
+        }
+        Ok(None)
+    }
+
+    async fn active_context_messages_window_once(
+        &self,
+        session_id: &str,
+        limit: usize,
+        offset: Option<usize>,
+    ) -> Result<Option<(Vec<ChatMessage>, usize)>> {
+        let Some(rollover) = self.storage.latest_active_context_rollover(session_id)? else {
+            return Ok(None);
+        };
+        let compacted_at = self
+            .storage
+            .context_compaction_marker_timestamp(session_id, &rollover.id)?
+            .or(rollover.activated_at);
+
+        let mut hidden_stored_message_ids = HashSet::new();
+        self.storage
+            .visit_assistant_messages_ordered(session_id, |message| {
+                if is_persisted_codex_live_transcript_message(&message) {
+                    hidden_stored_message_ids.insert(message.id);
+                }
+            })?;
+
+        let mut stored = Vec::new();
+        self.storage.visit_message_references_ordered(
+            session_id,
+            compacted_at,
+            |reference| {
+                if !hidden_stored_message_ids.contains(&reference.id) {
+                    stored.push(ActiveContextMessageDescriptor::from_stored_reference(reference));
+                }
+            },
+        )?;
+        if let Some(compacted_at) = compacted_at {
+            self.storage.visit_messages_after(session_id, compacted_at, |message| {
+                if !is_persisted_codex_live_transcript_message(&message) {
+                    stored.push(ActiveContextMessageDescriptor::from_message(
+                        ActiveContextMessageSource::Stored(message.id.clone()),
+                        &message,
+                    ));
+                }
+            })?;
+        }
+
+        let mut external = Vec::new();
+        let mut external_record = None;
+        let mut external_fingerprint = None;
+        let mut parsed_external = None;
+        let mut used_persisted_external = false;
+
+        if compacted_at.is_some()
+            && let Some(record) = self.external_record_for_messages(session_id).await
+        {
+            let file_path = record.file_path.display().to_string();
+            let fingerprint = external_file_fingerprint(&record.file_path);
+            if let Some(fingerprint) = fingerprint.as_ref() {
+                let storage_fingerprint = ExternalHistoryFingerprint {
+                    file_identity: fingerprint.file_identity.as_deref(),
+                    file_size: fingerprint.file_size,
+                    modified_nanos: fingerprint.modified_nanos,
+                    parser_version: EXTERNAL_MESSAGE_PARSER_VERSION,
+                };
+                used_persisted_external = self.storage.visit_external_messages_if_current(
+                    record.summary.provider,
+                    &record.summary.id,
+                    &file_path,
+                    &storage_fingerprint,
+                    |sequence, message| {
+                        external.push(ActiveContextMessageDescriptor::from_message(
+                            ActiveContextMessageSource::External(sequence),
+                            &message,
+                        ));
+                    },
+                )?;
+            }
+            if !used_persisted_external {
+                let messages = self.external_messages(&record).await;
+                for (sequence, message) in messages.iter().enumerate() {
+                    external.push(ActiveContextMessageDescriptor::from_message(
+                        ActiveContextMessageSource::External(sequence),
+                        message,
+                    ));
+                }
+                if fingerprint.is_some()
+                    && external_file_fingerprint(&record.file_path) != fingerprint
+                {
+                    return Ok(None);
+                }
+                parsed_external = Some(messages);
+            }
+            external_record = Some((record, file_path));
+            external_fingerprint = fingerprint;
+        }
+
+        let merged = merge_active_context_message_descriptors(stored, external, compacted_at);
+        let total = merged.len();
+        let start = offset
+            .map(|offset| offset.min(total))
+            .unwrap_or_else(|| total.saturating_sub(limit));
+        let end = start.saturating_add(limit).min(total);
+        let selected = &merged[start..end];
+
+        let stored_ids = selected
+            .iter()
+            .filter_map(|message| match &message.source {
+                ActiveContextMessageSource::Stored(id) => Some(id.clone()),
+                ActiveContextMessageSource::External(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let external_sequences = selected
+            .iter()
+            .filter_map(|message| match &message.source {
+                ActiveContextMessageSource::Stored(_) => None,
+                ActiveContextMessageSource::External(sequence) => Some(*sequence),
+            })
+            .collect::<Vec<_>>();
+        let mut stored_messages = self.storage.messages_by_ids(session_id, &stored_ids)?;
+        let mut external_messages = if external_sequences.is_empty() {
+            HashMap::new()
+        } else if let Some(messages) = parsed_external {
+            external_sequences
+                .iter()
+                .filter_map(|sequence| {
+                    messages
+                        .get(*sequence)
+                        .cloned()
+                        .map(|message| (*sequence, message))
+                })
+                .collect()
+        } else {
+            let Some((record, file_path)) = external_record.as_ref() else {
+                return Ok(None);
+            };
+            let Some(fingerprint) = external_fingerprint.as_ref() else {
+                return Ok(None);
+            };
+            if external_file_fingerprint(&record.file_path).as_ref() != Some(fingerprint) {
+                return Ok(None);
+            }
+            let storage_fingerprint = ExternalHistoryFingerprint {
+                file_identity: fingerprint.file_identity.as_deref(),
+                file_size: fingerprint.file_size,
+                modified_nanos: fingerprint.modified_nanos,
+                parser_version: EXTERNAL_MESSAGE_PARSER_VERSION,
+            };
+            let Some(messages) = self.storage.external_messages_by_sequences_if_current(
+                record.summary.provider,
+                &record.summary.id,
+                file_path,
+                &storage_fingerprint,
+                &external_sequences,
+            )?
+            else {
+                return Ok(None);
+            };
+            messages
+        };
+
+        let mut messages = Vec::with_capacity(selected.len());
+        for descriptor in selected {
+            let message = match &descriptor.source {
+                ActiveContextMessageSource::Stored(id) => stored_messages.remove(id),
+                ActiveContextMessageSource::External(sequence) => {
+                    external_messages.remove(sequence)
+                }
+            };
+            let Some(message) = message else {
+                return Ok(None);
+            };
+            messages.push(message);
+        }
+        Ok(Some((messages, total)))
     }
 
     async fn external_messages_tail_for_session(
@@ -497,5 +715,4 @@ impl SessionManager {
         }
         messages
     }
-
 }

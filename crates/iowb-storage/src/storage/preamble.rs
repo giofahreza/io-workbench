@@ -40,6 +40,12 @@ pub struct Storage {
 }
 
 #[derive(Debug, Clone)]
+pub struct StoredMessageReference {
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
 pub struct StoredUser {
     pub id: String,
     pub username: String,

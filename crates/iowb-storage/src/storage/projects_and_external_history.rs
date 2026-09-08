@@ -383,6 +383,80 @@ impl Storage {
         })
     }
 
+    pub fn visit_external_messages_if_current(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        file_path: &str,
+        fingerprint: &ExternalHistoryFingerprint<'_>,
+        mut visitor: impl FnMut(usize, ChatMessage),
+    ) -> Result<bool> {
+        self.with_connection(|conn| {
+            if !external_message_state_matches(conn, provider, session_id, file_path, fingerprint)?
+            {
+                return Ok(false);
+            }
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT sequence, message_json
+                FROM external_history_messages
+                WHERE provider = ?1 AND session_id = ?2 AND file_path = ?3
+                ORDER BY sequence ASC
+                "#,
+            )?;
+            let mut rows = stmt.query(params![provider.as_str(), session_id, file_path])?;
+            while let Some(row) = rows.next()? {
+                let sequence =
+                    usize::try_from(nonnegative_u64(row.get::<_, i64>(0)?)).unwrap_or(usize::MAX);
+                let message_json: String = row.get(1)?;
+                visitor(sequence, serde_json::from_str(&message_json)?);
+            }
+            Ok(true)
+        })
+    }
+
+    pub fn external_messages_by_sequences_if_current(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        file_path: &str,
+        fingerprint: &ExternalHistoryFingerprint<'_>,
+        sequences: &[usize],
+    ) -> Result<Option<HashMap<usize, ChatMessage>>> {
+        self.with_connection(|conn| {
+            if !external_message_state_matches(conn, provider, session_id, file_path, fingerprint)?
+            {
+                return Ok(None);
+            }
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT message_json
+                FROM external_history_messages
+                WHERE provider = ?1 AND session_id = ?2 AND file_path = ?3 AND sequence = ?4
+                "#,
+            )?;
+            let mut messages = HashMap::with_capacity(sequences.len());
+            for sequence in sequences {
+                let message = stmt
+                    .query_row(
+                        params![
+                            provider.as_str(),
+                            session_id,
+                            file_path,
+                            bounded_i64(*sequence as u64),
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let Some(message) = message else {
+                    return Ok(None);
+                };
+                messages.insert(*sequence, serde_json::from_str(&message)?);
+            }
+            Ok(Some(messages))
+        })
+    }
+
     pub fn replace_external_messages(
         &self,
         provider: Provider,
@@ -449,5 +523,4 @@ impl Storage {
             Ok(())
         })
     }
-
 }

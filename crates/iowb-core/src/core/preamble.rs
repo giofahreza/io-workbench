@@ -31,7 +31,7 @@ use iowb_protocol::{
 };
 use iowb_storage::{
     CreateSessionForkOutcome, ExternalHistoryFingerprint, Storage, StoredChatRunAttempt,
-    StoredDurableChatRun, StoredSessionContextRollover,
+    StoredDurableChatRun, StoredMessageReference, StoredSessionContextRollover,
 };
 use serde_json::Value;
 use sha1::Sha1;

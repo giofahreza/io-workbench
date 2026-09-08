@@ -128,6 +128,84 @@ impl Storage {
         })
     }
 
+    pub fn latest_active_context_rollover(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredSessionContextRollover>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                    SELECT id, user_id, session_id, request_id, kind, failed_message_id,
+                           trigger_run_id, retry_run_id, from_native_session_id,
+                           candidate_native_session_id, state, handoff, observed_bytes,
+                           limit_bytes, error, created_at, updated_at, activated_at
+                    FROM session_context_rollovers
+                    WHERE session_id = ?1 AND state = 'active'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                "#,
+                params![session_id],
+                map_session_context_rollover_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    pub fn context_compaction_marker_timestamp(
+        &self,
+        session_id: &str,
+        rollover_id: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        self.with_connection(|conn| {
+            let exact = conn
+                .query_row(
+                    r#"
+                    SELECT timestamp
+                    FROM messages
+                    WHERE session_id = ?1
+                      AND json_extract(
+                            CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                            '$.kind'
+                          ) = 'context_compaction'
+                      AND json_extract(
+                            CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                            '$.rolloverId'
+                          ) = ?2
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT 1
+                "#,
+                    params![session_id, rollover_id],
+                    |row| parse_time_sql(row.get::<_, String>(0)?),
+                )
+                .optional()?;
+            if exact.is_some() {
+                return Ok(exact);
+            }
+
+            conn.query_row(
+                r#"
+                    SELECT timestamp
+                    FROM messages
+                    WHERE session_id = ?1
+                      AND (
+                        json_extract(
+                            CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                            '$.kind'
+                        ) = 'context_compaction'
+                        OR content LIKE 'Context compacted here%'
+                      )
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT 1
+                "#,
+                params![session_id],
+                |row| parse_time_sql(row.get::<_, String>(0)?),
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
     pub fn context_rollover_for_request(
         &self,
         user_id: &str,
@@ -355,5 +433,4 @@ impl Storage {
             Ok(sessions)
         })
     }
-
 }

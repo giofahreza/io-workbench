@@ -237,6 +237,16 @@ impl SessionManager {
         offset: usize,
     ) -> Result<(Vec<ChatMessage>, usize)> {
         if self.storage.has_active_context_rollover(session_id)? {
+            if let Some(page) = self
+                .active_context_messages_page_including_external(session_id, limit, offset)
+                .await?
+            {
+                return Ok(page);
+            }
+            warn!(
+                session_id,
+                "falling back to full active-context materialization after concurrent history changes"
+            );
             let messages = self
                 .active_context_messages_including_external(session_id)
                 .await?;
@@ -261,6 +271,16 @@ impl SessionManager {
     ) -> Result<(Vec<ChatMessage>, usize)> {
         let limit = limit.clamp(1, 500);
         if self.storage.has_active_context_rollover(session_id)? {
+            if let Some(page) = self
+                .active_context_messages_tail_including_external(session_id, limit)
+                .await?
+            {
+                return Ok(page);
+            }
+            warn!(
+                session_id,
+                "falling back to full active-context materialization after concurrent history changes"
+            );
             let messages = self
                 .active_context_messages_including_external(session_id)
                 .await?;
@@ -315,5 +335,4 @@ impl SessionManager {
             .storage
             .list_user_prompts_page(session_id, limit, before.as_ref())?)
     }
-
 }

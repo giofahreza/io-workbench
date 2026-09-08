@@ -45,6 +45,74 @@
     }
 
     #[test]
+    fn active_context_reference_merge_scopes_matches_to_post_compaction_history() {
+        let compacted_at = Utc::now();
+        let descriptor = |source, role, content: &str, timestamp| {
+            ActiveContextMessageDescriptor::from_message(
+                source,
+                &ChatMessage {
+                    id: "test".to_string(),
+                    role,
+                    content: content.to_string(),
+                    timestamp,
+                    metadata: Value::Null,
+                },
+            )
+        };
+        let stored = vec![
+            descriptor(
+                ActiveContextMessageSource::Stored("before".to_string()),
+                MessageRole::User,
+                "reused prompt",
+                compacted_at - chrono::Duration::seconds(1),
+            ),
+            descriptor(
+                ActiveContextMessageSource::Stored("local".to_string()),
+                MessageRole::Assistant,
+                "local response",
+                compacted_at + chrono::Duration::seconds(1),
+            ),
+        ];
+        let external = vec![
+            descriptor(
+                ActiveContextMessageSource::External(0),
+                MessageRole::User,
+                "reused prompt",
+                compacted_at + chrono::Duration::milliseconds(1),
+            ),
+            descriptor(
+                ActiveContextMessageSource::External(1),
+                MessageRole::Assistant,
+                "native response",
+                compacted_at + chrono::Duration::seconds(1),
+            ),
+            descriptor(
+                ActiveContextMessageSource::External(2),
+                MessageRole::Assistant,
+                "Context ready.",
+                compacted_at + chrono::Duration::seconds(2),
+            ),
+        ];
+
+        let merged =
+            merge_active_context_message_descriptors(stored, external, Some(compacted_at));
+        let sources = merged
+            .iter()
+            .map(|message| message.source.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sources,
+            vec![
+                ActiveContextMessageSource::Stored("before".to_string()),
+                ActiveContextMessageSource::External(0),
+                ActiveContextMessageSource::Stored("local".to_string()),
+                ActiveContextMessageSource::External(1),
+            ]
+        );
+    }
+
+    #[test]
     fn normalizes_codex_app_server_live_notifications() {
         let mut normalizer = CodexAppServerLiveOutputNormalizer::default();
         let mut output = String::new();

@@ -499,11 +499,7 @@ impl SessionManager {
     ) -> Result<Option<String>> {
         let Some(last_user_prompt) = self
             .storage
-            .list_messages(session_id)?
-            .into_iter()
-            .rev()
-            .find(|message| message.role == MessageRole::User)
-            .map(|message| message.content)
+            .latest_user_message_content(session_id)?
             .filter(|content| !content.trim().is_empty())
         else {
             return Ok(None);
@@ -566,5 +562,4 @@ impl SessionManager {
         }
         sessions
     }
-
 }

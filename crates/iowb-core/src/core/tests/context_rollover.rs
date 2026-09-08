@@ -1182,7 +1182,10 @@
             role: MessageRole::System,
             content: "Context compacted here. Earlier messages remain visible, while subsequent replies use a clean Codex context.".to_string(),
             timestamp: compacted_at,
-            metadata: serde_json::json!({"kind": "context_compaction"}),
+            metadata: serde_json::json!({
+                "kind": "context_compaction",
+                "rolloverId": rollover.id.clone(),
+            }),
         };
         let mut stored_session = state
             .sessions
@@ -1255,12 +1258,38 @@
             "{contents:#?}"
         );
 
+        for (offset, limit) in [(0, 2), (1, 2), (2, 3), (4, 10)] {
+            let (page, total) = state
+                .sessions
+                .messages_page_including_external(&session.id, limit, offset)
+                .await
+                .expect("optimized page");
+            let expected = messages
+                [offset.min(messages.len())..offset.saturating_add(limit).min(messages.len())]
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>();
+            let actual = page
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(total, messages.len());
+            assert_eq!(actual, expected, "offset {offset}, limit {limit}");
+        }
+
         let (tail, total) = state
             .sessions
             .messages_tail_including_external(&session.id, 3)
             .await
             .expect("tail");
         assert_eq!(total, messages.len());
+        assert_eq!(
+            tail.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(),
+            messages[messages.len().saturating_sub(3)..]
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>()
+        );
         assert!(
             tail.iter()
                 .any(|message| message.content == "Post-compact native answer."),

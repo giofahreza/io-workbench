@@ -1,3 +1,98 @@
+use std::hash::Hash;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActiveContextMessageSource {
+    Stored(String),
+    External(usize),
+}
+
+#[derive(Debug, Clone)]
+struct ActiveContextMessageDescriptor {
+    source: ActiveContextMessageSource,
+    timestamp: DateTime<Utc>,
+    match_digest: [u8; 32],
+    context_rollover_setup: bool,
+}
+
+impl ActiveContextMessageDescriptor {
+    fn from_stored_reference(reference: StoredMessageReference) -> Self {
+        Self {
+            source: ActiveContextMessageSource::Stored(reference.id),
+            timestamp: reference.timestamp,
+            match_digest: [0; 32],
+            context_rollover_setup: false,
+        }
+    }
+
+    fn from_message(source: ActiveContextMessageSource, message: &ChatMessage) -> Self {
+        Self {
+            source,
+            timestamp: message.timestamp,
+            match_digest: message_match_digest(message),
+            context_rollover_setup: is_context_rollover_setup_message(message),
+        }
+    }
+}
+
+fn message_match_digest(message: &ChatMessage) -> [u8; 32] {
+    let role = match message.role {
+        MessageRole::System => b"system".as_slice(),
+        MessageRole::User => b"user".as_slice(),
+        MessageRole::Assistant => b"assistant".as_slice(),
+        MessageRole::Tool => b"tool".as_slice(),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(role);
+    hasher.update([0]);
+    hasher.update(message.content.trim().as_bytes());
+    hasher.finalize().into()
+}
+
+fn merge_active_context_message_descriptors(
+    stored: Vec<ActiveContextMessageDescriptor>,
+    external: Vec<ActiveContextMessageDescriptor>,
+    compacted_at: Option<DateTime<Utc>>,
+) -> Vec<ActiveContextMessageDescriptor> {
+    let Some(compacted_at) = compacted_at else {
+        return stored;
+    };
+
+    let stored_keys = stored
+        .iter()
+        .filter(|message| message.timestamp > compacted_at)
+        .map(|message| message.match_digest)
+        .collect::<Vec<_>>();
+    let external_indexes = external
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.timestamp > compacted_at && !message.context_rollover_setup)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let external_keys = external_indexes
+        .iter()
+        .map(|index| external[*index].match_digest)
+        .collect::<Vec<_>>();
+    let mut matched_external = vec![false; external.len()];
+    for (_, external_index) in ordered_text_matches(&stored_keys, &external_keys) {
+        matched_external[external_indexes[external_index]] = true;
+    }
+
+    let mut merged = stored;
+    merged.extend(
+        external
+            .into_iter()
+            .enumerate()
+            .filter(|(index, message)| {
+                !matched_external[*index]
+                    && message.timestamp > compacted_at
+                    && !message.context_rollover_setup
+            })
+            .map(|(_, message)| message),
+    );
+    merged.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    merged
+}
+
 fn estimate_external_messages_bytes(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
@@ -419,7 +514,10 @@ fn sanitize_context_handoff_text(value: &str) -> String {
         .to_string()
 }
 
-fn ordered_text_matches(left: &[String], right: &[String]) -> Vec<(usize, usize)> {
+fn ordered_text_matches<T>(left: &[T], right: &[T]) -> Vec<(usize, usize)>
+where
+    T: Eq + Hash,
+{
     if left.len().saturating_mul(right.len()) > ORDERED_TEXT_MATCH_MATRIX_MAX_CELLS {
         return ordered_text_matches_greedy(left, right);
     }
@@ -450,18 +548,18 @@ fn ordered_text_matches(left: &[String], right: &[String]) -> Vec<(usize, usize)
     matches
 }
 
-fn ordered_text_matches_greedy(left: &[String], right: &[String]) -> Vec<(usize, usize)> {
-    let mut positions = HashMap::<&str, VecDeque<usize>>::new();
+fn ordered_text_matches_greedy<T>(left: &[T], right: &[T]) -> Vec<(usize, usize)>
+where
+    T: Eq + Hash,
+{
+    let mut positions = HashMap::<&T, VecDeque<usize>>::new();
     for (index, value) in right.iter().enumerate() {
-        positions
-            .entry(value.as_str())
-            .or_default()
-            .push_back(index);
+        positions.entry(value).or_default().push_back(index);
     }
     let mut next_right_index = 0usize;
     let mut matches = Vec::new();
     for (left_index, value) in left.iter().enumerate() {
-        let Some(indices) = positions.get_mut(value.as_str()) else {
+        let Some(indices) = positions.get_mut(value) else {
             continue;
         };
         while indices
