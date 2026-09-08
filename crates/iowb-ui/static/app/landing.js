@@ -1,6 +1,6 @@
 const themeStorageKey = "iowb.landing.theme";
-const darkThemeColor = "#101715";
-const lightThemeColor = "#f5f7f5";
+const darkThemeColor = "#141515";
+const lightThemeColor = "#f0ede5";
 const root = document.documentElement;
 const themeToggle = document.querySelector("[data-theme-toggle]");
 const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");

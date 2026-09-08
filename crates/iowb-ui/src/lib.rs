@@ -160,6 +160,56 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "image/svg+xml; charset=utf-8",
             bytes: include_bytes!("../static/icon.svg"),
         }),
+        "images/landing/workbench-chat-dark-20260907.webp" => Some(UiAsset {
+            content_type: "image/webp",
+            bytes: include_bytes!("../static/images/landing/workbench-chat-dark-20260907.webp"),
+        }),
+        "images/landing/workbench-chat-dark-mobile-20260907.webp" => Some(UiAsset {
+            content_type: "image/webp",
+            bytes: include_bytes!(
+                "../static/images/landing/workbench-chat-dark-mobile-20260907.webp"
+            ),
+        }),
+        "images/landing/provider-picker-dark-20260907.webp" => Some(UiAsset {
+            content_type: "image/webp",
+            bytes: include_bytes!("../static/images/landing/provider-picker-dark-20260907.webp"),
+        }),
+        "images/landing/provider-picker-dark-mobile-20260907.webp" => Some(UiAsset {
+            content_type: "image/webp",
+            bytes: include_bytes!(
+                "../static/images/landing/provider-picker-dark-mobile-20260907.webp"
+            ),
+        }),
+        "images/landing/database-query-dark-20260907.webp" => Some(UiAsset {
+            content_type: "image/webp",
+            bytes: include_bytes!("../static/images/landing/database-query-dark-20260907.webp"),
+        }),
+        "images/landing/database-query-dark-mobile-20260907.webp" => Some(UiAsset {
+            content_type: "image/webp",
+            bytes: include_bytes!(
+                "../static/images/landing/database-query-dark-mobile-20260907.webp"
+            ),
+        }),
+        "images/landing/terminal-session-dark-20260907.webp" => Some(UiAsset {
+            content_type: "image/webp",
+            bytes: include_bytes!("../static/images/landing/terminal-session-dark-20260907.webp"),
+        }),
+        "images/landing/terminal-session-dark-mobile-20260907.webp" => Some(UiAsset {
+            content_type: "image/webp",
+            bytes: include_bytes!(
+                "../static/images/landing/terminal-session-dark-mobile-20260907.webp"
+            ),
+        }),
+        "images/landing/agentic-board-dark-20260907.webp" => Some(UiAsset {
+            content_type: "image/webp",
+            bytes: include_bytes!("../static/images/landing/agentic-board-dark-20260907.webp"),
+        }),
+        "images/landing/agentic-board-dark-mobile-20260907.webp" => Some(UiAsset {
+            content_type: "image/webp",
+            bytes: include_bytes!(
+                "../static/images/landing/agentic-board-dark-mobile-20260907.webp"
+            ),
+        }),
         "icons/codex.svg" => Some(UiAsset {
             content_type: "image/svg+xml; charset=utf-8",
             bytes: include_bytes!("../static/icons/codex.svg"),
@@ -191,6 +241,64 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
         "styles/landing.css" => Some(UiAsset {
             content_type: "text/css; charset=utf-8",
             bytes: include_bytes!("../static/styles/landing.css"),
+        }),
+        "fonts/ibm-plex/IBMPlexSans-Regular-Latin1.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexSans-Regular-Latin1.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexSans-Regular-Pi.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexSans-Regular-Pi.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexSans-SemiBold-Latin1.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexSans-SemiBold-Latin1.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexSans-SemiBold-Pi.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexSans-SemiBold-Pi.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexSans-Bold-Latin1.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexSans-Bold-Latin1.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexSans-Bold-Pi.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexSans-Bold-Pi.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexMono-Regular-Latin1.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexMono-Regular-Latin1.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexMono-Regular-Pi.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexMono-Regular-Pi.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexMono-Medium-Latin1.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexMono-Medium-Latin1.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexMono-Medium-Pi.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexMono-Medium-Pi.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexMono-SemiBold-Latin1.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexMono-SemiBold-Latin1.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexMono-SemiBold-Pi.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!("../static/fonts/ibm-plex/IBMPlexMono-SemiBold-Pi.woff2"),
+        }),
+        "fonts/ibm-plex/IBMPlexSansCondensed-SemiBold-Latin1.woff2" => Some(UiAsset {
+            content_type: "font/woff2",
+            bytes: include_bytes!(
+                "../static/fonts/ibm-plex/IBMPlexSansCondensed-SemiBold-Latin1.woff2"
+            ),
+        }),
+        "fonts/ibm-plex/LICENSE.txt" => Some(UiAsset {
+            content_type: "text/plain; charset=utf-8",
+            bytes: include_bytes!("../static/fonts/ibm-plex/LICENSE.txt"),
         }),
         "styles/docs.css" => Some(UiAsset {
             content_type: "text/css; charset=utf-8",
@@ -992,6 +1100,85 @@ mod tests {
         ] {
             assert!(styles.contains(selector), "missing {selector}");
         }
+    }
+
+    #[test]
+    fn landing_assets_embed_the_self_hosted_plex_type_system() {
+        let landing = asset_text("landing");
+        let css = asset_text("styles/landing.css");
+        let font_assets = [
+            "fonts/ibm-plex/IBMPlexSans-Regular-Latin1.woff2",
+            "fonts/ibm-plex/IBMPlexSans-Regular-Pi.woff2",
+            "fonts/ibm-plex/IBMPlexSans-SemiBold-Latin1.woff2",
+            "fonts/ibm-plex/IBMPlexSans-SemiBold-Pi.woff2",
+            "fonts/ibm-plex/IBMPlexSans-Bold-Latin1.woff2",
+            "fonts/ibm-plex/IBMPlexSans-Bold-Pi.woff2",
+            "fonts/ibm-plex/IBMPlexMono-Regular-Latin1.woff2",
+            "fonts/ibm-plex/IBMPlexMono-Regular-Pi.woff2",
+            "fonts/ibm-plex/IBMPlexMono-Medium-Latin1.woff2",
+            "fonts/ibm-plex/IBMPlexMono-Medium-Pi.woff2",
+            "fonts/ibm-plex/IBMPlexMono-SemiBold-Latin1.woff2",
+            "fonts/ibm-plex/IBMPlexMono-SemiBold-Pi.woff2",
+            "fonts/ibm-plex/IBMPlexSansCondensed-SemiBold-Latin1.woff2",
+        ];
+
+        for path in font_assets {
+            let asset =
+                get_asset(path).unwrap_or_else(|| panic!("missing landing font asset: {path}"));
+            assert_eq!(
+                asset.content_type, "font/woff2",
+                "wrong content type for {path}"
+            );
+            assert!(
+                asset.bytes.starts_with(b"wOF2"),
+                "invalid WOFF2 header for {path}"
+            );
+        }
+
+        let license = asset_text("fonts/ibm-plex/LICENSE.txt");
+        assert!(license.contains("SIL Open Font License, Version 1.1"));
+        assert!(css.contains("font-family: \"IBM Plex Sans\""));
+        assert!(css.contains("font-family: \"IBM Plex Mono\""));
+        assert!(css.contains("font-family: \"IBM Plex Sans Condensed\""));
+        assert!(landing.contains("/fonts/ibm-plex/IBMPlexSans-Regular-Latin1.woff2"));
+        assert!(landing.contains("/fonts/ibm-plex/IBMPlexSans-Bold-Latin1.woff2"));
+        assert!(landing.contains("class=\"theme-icon-moon\""));
+        assert!(landing.contains("class=\"theme-icon-sun\""));
+    }
+
+    #[test]
+    fn landing_embeds_real_dark_product_captures() {
+        let landing = asset_text("landing");
+        let asset_paths = [
+            "images/landing/workbench-chat-dark-20260907.webp",
+            "images/landing/workbench-chat-dark-mobile-20260907.webp",
+            "images/landing/provider-picker-dark-20260907.webp",
+            "images/landing/provider-picker-dark-mobile-20260907.webp",
+            "images/landing/database-query-dark-20260907.webp",
+            "images/landing/database-query-dark-mobile-20260907.webp",
+            "images/landing/terminal-session-dark-20260907.webp",
+            "images/landing/terminal-session-dark-mobile-20260907.webp",
+            "images/landing/agentic-board-dark-20260907.webp",
+            "images/landing/agentic-board-dark-mobile-20260907.webp",
+        ];
+
+        for asset_path in asset_paths {
+            let capture = get_asset(asset_path)
+                .unwrap_or_else(|| panic!("missing landing product capture: {asset_path}"));
+
+            assert_eq!(capture.content_type, "image/webp");
+            assert!(capture.bytes.starts_with(b"RIFF"));
+            assert_eq!(capture.bytes.get(8..12), Some(b"WEBP".as_slice()));
+            assert!(landing.contains(&format!("/{asset_path}")));
+        }
+
+        assert!(landing.contains("class=\"workbench-frame product-capture\""));
+        assert!(landing.contains("<picture>"));
+        assert!(!landing.contains("workbench-chat-demo-20260906.webp"));
+        assert!(!landing.contains("Choose the right brain for this branch"));
+        assert!(!landing.contains("storefront-cache · SQLite"));
+        assert!(!landing.contains("remote-prod / storefront"));
+        assert!(!landing.contains("Release checkout validation"));
     }
 
     #[test]

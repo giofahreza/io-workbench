@@ -14,6 +14,8 @@ on:
       - "crates/iowb-ui/static/app/docs.js"
       - "crates/iowb-ui/static/styles/landing.css"
       - "crates/iowb-ui/static/styles/docs.css"
+      - "crates/iowb-ui/static/fonts/ibm-plex/**"
+      - "crates/iowb-ui/static/images/landing/**"
       - "crates/iowb-ui/static/icon.svg"
       - "crates/iowb-ui/static/icons/codex-white.svg"
       - "crates/iowb-ui/static/icons/claude-white.svg"
@@ -53,7 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           site_dir="$RUNNER_TEMP/io-workbench-pages"
-          mkdir -p "$site_dir/app" "$site_dir/styles" "$site_dir/icons" "$site_dir/landing"
+          mkdir -p "$site_dir/app" "$site_dir/styles" "$site_dir/icons" "$site_dir/fonts" "$site_dir/images" "$site_dir/landing"
 
           cp crates/iowb-ui/static/landing.html "$site_dir/index.html"
           # Keep the application server's historical /landing route usable in
@@ -67,6 +69,8 @@ jobs:
           cp crates/iowb-ui/static/app/docs.js "$site_dir/app/"
           cp crates/iowb-ui/static/styles/landing.css "$site_dir/styles/"
           cp crates/iowb-ui/static/styles/docs.css "$site_dir/styles/"
+          cp -R crates/iowb-ui/static/fonts/ibm-plex "$site_dir/fonts/ibm-plex"
+          cp -R crates/iowb-ui/static/images/landing "$site_dir/images/landing"
           cp crates/iowb-ui/static/icon.svg "$site_dir/"
           cp crates/iowb-ui/static/openapi.json "$site_dir/"
           cp crates/iowb-ui/static/icons/codex-white.svg "$site_dir/icons/"
@@ -84,6 +88,19 @@ jobs:
           test -f "$site_dir/app/docs.js"
           test -f "$site_dir/styles/landing.css"
           test -f "$site_dir/styles/docs.css"
+          test -f "$site_dir/fonts/ibm-plex/IBMPlexSans-Regular-Latin1.woff2"
+          test -f "$site_dir/fonts/ibm-plex/IBMPlexMono-Regular-Latin1.woff2"
+          test -f "$site_dir/fonts/ibm-plex/LICENSE.txt"
+          test -f "$site_dir/images/landing/workbench-chat-dark-20260907.webp"
+          test -f "$site_dir/images/landing/workbench-chat-dark-mobile-20260907.webp"
+          test -f "$site_dir/images/landing/provider-picker-dark-20260907.webp"
+          test -f "$site_dir/images/landing/provider-picker-dark-mobile-20260907.webp"
+          test -f "$site_dir/images/landing/database-query-dark-20260907.webp"
+          test -f "$site_dir/images/landing/database-query-dark-mobile-20260907.webp"
+          test -f "$site_dir/images/landing/terminal-session-dark-20260907.webp"
+          test -f "$site_dir/images/landing/terminal-session-dark-mobile-20260907.webp"
+          test -f "$site_dir/images/landing/agentic-board-dark-20260907.webp"
+          test -f "$site_dir/images/landing/agentic-board-dark-mobile-20260907.webp"
           test -f "$site_dir/icon.svg"
           test -f "$site_dir/CNAME"
           test "$(cat "$site_dir/CNAME")" = 'workbench.giofahreza.com'
