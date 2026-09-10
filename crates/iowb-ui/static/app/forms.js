@@ -130,6 +130,8 @@ function bindForms() {
   qs("#git-repository")?.addEventListener("change", (event) => {
     state.gitSelectedRepositoryId = event.currentTarget.value;
     state.gitStatus = null;
+    state.gitBranches = null;
+    renderGitBranchSelector(null, null);
     loadGitStatus().catch(showError);
   });
   qs("#refresh-db").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadDbConnections).catch(showError));
@@ -331,7 +333,7 @@ function bindForms() {
   qs("#git-stage").addEventListener("click", () => gitSelectedFileOperation("/api/git/stage").catch(showError));
   qs("#git-unstage").addEventListener("click", () => gitSelectedFileOperation("/api/git/unstage").catch(showError));
   qs("#git-checkout").addEventListener("click", () => gitBranchOperation("/api/git/checkout").catch(showError));
-  qs("#git-create-branch").addEventListener("click", () => gitBranchOperation("/api/git/create-branch").catch(showError));
+  qs("#git-create-branch").addEventListener("click", () => createGitBranch().catch(showError));
   qs("#git-delete-branch").addEventListener("click", () => gitBranchOperation("/api/git/delete-branch").catch(showError));
   qs("#git-set-remote").addEventListener("click", () => setGitRemote().catch(showError));
   qs("#git-publish").addEventListener("click", () => publishCurrentBranch().catch(showError));

@@ -44,6 +44,7 @@ async function loadGitWorkspace(options = {}) {
 function renderGitRepositorySelector(workspace = state.gitWorkspace) {
   const selector = qs("#git-repository");
   const message = qs("#git-workspace-message");
+  const messageText = message?.querySelector(".git-workspace-message-text");
   if (!selector) return;
   const repositories = workspace?.repositories || [];
   selector.innerHTML = repositories.length
@@ -55,17 +56,21 @@ function renderGitRepositorySelector(workspace = state.gitWorkspace) {
     : '<option value="">No Git repositories found</option>';
   selector.disabled = !repositories.length;
   if (message) {
+    const setMessage = (text) => {
+      if (messageText) messageText.textContent = text;
+      else message.textContent = text;
+    };
     if (!repositories.length) {
-      message.textContent = "This project is a workspace with no Git repositories. Use Init only after confirming a new root repository.";
+      setMessage("This project is a workspace with no Git repositories. Use Init only after confirming a new root repository.");
     } else if (!workspace.hasRootRepository && repositories.filter((repository) => repository.initialized).length > 1) {
-      message.textContent = "Git workspace · no main repository · choose a repository before running Git operations.";
+      setMessage("Git workspace · no main repository · choose a repository before running Git operations.");
     } else if (!selectedGitRepositoryId()) {
-      message.textContent = "Choose an initialized Git repository to continue.";
+      setMessage("Choose an initialized Git repository to continue.");
     } else {
       const selected = repositories.find((repository) => repository.id === selectedGitRepositoryId());
-      message.textContent = selected
+      setMessage(selected
         ? `${selected.name} · ${selected.kind || "repository"} · all Git operations stay inside this worktree`
-        : "Git operations are scoped to the selected worktree.";
+        : "Git operations are scoped to the selected worktree.");
     }
   }
 }
@@ -78,8 +83,10 @@ async function loadGitStatus(options = {}) {
   } catch (error) {
     state.gitStatus = null;
     state.gitRemoteStatus = null;
+    state.gitBranches = null;
     state.gitSelectedFiles = new Set();
     renderGitRepositorySelector(null);
+    renderGitBranchSelector(null, null);
     renderGitSummary(null);
     qs("#git-files").innerHTML = "";
     setOutput("#git-output", error.message || String(error), "error-output");
@@ -88,7 +95,9 @@ async function loadGitStatus(options = {}) {
   if (!selectedGitRepositoryId() || selectedGitRepository()?.initialized === false) {
     state.gitStatus = null;
     state.gitRemoteStatus = null;
+    state.gitBranches = null;
     state.gitSelectedFiles = new Set();
+    renderGitBranchSelector(null, null);
     renderGitSummary(null);
     qs("#git-files").innerHTML = selectedGitRepository()?.initialized === false
       ? '<p class="empty">This repository is an uninitialized submodule. Use Init to check it out before viewing status.</p>'
@@ -98,18 +107,23 @@ async function loadGitStatus(options = {}) {
   }
   qs("#git-files").innerHTML = '<p class="empty">Loading source control.</p>';
   qs("#git-output").innerHTML = "";
+  state.gitBranches = null;
   let body;
   try {
-    const [statusBody, remoteStatus] = await Promise.all([
+    const [statusBody, remoteStatus, branches] = await Promise.all([
       api(gitQuery("/api/git/status")),
       api(gitQuery("/api/git/remote-status")).catch(() => null),
+      api(gitQuery("/api/git/branches")).catch(() => null),
     ]);
     body = statusBody;
     state.gitRemoteStatus = remoteStatus;
+    state.gitBranches = branches;
   } catch (error) {
     state.gitStatus = null;
     state.gitRemoteStatus = null;
+    state.gitBranches = null;
     state.gitSelectedFiles = new Set();
+    renderGitBranchSelector(null, null);
     renderGitSummary(null);
     qs("#git-files").innerHTML = "";
     setOutput("#git-output", error.message || String(error), "error-output");
@@ -122,6 +136,7 @@ async function loadGitStatus(options = {}) {
   if (body.branch && !qs("#git-branch").value.trim()) {
     qs("#git-branch").value = body.branch;
   }
+  renderGitBranchSelector(body, state.gitBranches);
   renderGitSummary(body);
   renderGitFiles();
   if (state.gitActiveView === "changes") {
@@ -147,8 +162,83 @@ async function loadGitStatus(options = {}) {
   }
 }
 
+function setGitBranchSelection(value) {
+  const next = String(value || "").trim();
+  const control = qs("#git-branch");
+  if (!control) return;
+  if (control.tagName === "SELECT") {
+    if (next && !Array.from(control.options).some((option) => option.value === next)) {
+      const option = document.createElement("option");
+      option.value = next;
+      option.textContent = /^[0-9a-f]{7,}$/i.test(next)
+        ? `Revision ${next.slice(0, 12)}`
+        : next;
+      option.dataset.temporary = "true";
+      control.append(option);
+    }
+    control.value = next;
+  } else {
+    control.value = next;
+  }
+}
+
+function ensureGitBranchControl(selectable) {
+  const current = qs("#git-branch");
+  if (!current) return null;
+  const expectedTag = selectable ? "SELECT" : "INPUT";
+  if (current.tagName !== expectedTag) {
+    const replacement = document.createElement(selectable ? "select" : "input");
+    replacement.id = "git-branch";
+    replacement.name = "branch";
+    replacement.setAttribute("aria-label", "Branch");
+    replacement.className = current.className;
+    current.replaceWith(replacement);
+  }
+  return qs("#git-branch");
+}
+
+function renderGitBranchSelector(status = state.gitStatus, branches = state.gitBranches) {
+  const repository = selectedGitRepository();
+  const currentBranch = String(status?.branch || repository?.branch || "").trim();
+  const localBranches = Array.isArray(branches?.localBranches)
+    ? [...new Set(branches.localBranches
+      .map((branch) => String(branch).replace(/^\*\s*/, "").trim())
+      .filter(Boolean))]
+    : [];
+  const canSelect = Boolean(branches && localBranches.length);
+
+  if (canSelect) {
+    const control = ensureGitBranchControl(true);
+    if (!control) return;
+    const options = [...new Set([...localBranches, currentBranch].filter(Boolean))];
+    control.innerHTML = options
+      .map((branch) => `<option value="${escapeHtml(branch)}">${escapeHtml(branch)}</option>`)
+      .join("");
+    control.value = currentBranch && options.includes(currentBranch)
+      ? currentBranch
+      : options[0] || "";
+    control.disabled = options.length === 0;
+    control.title = "Select a local branch";
+    return;
+  }
+
+  const control = ensureGitBranchControl(false);
+  if (!control) return;
+  control.value = currentBranch;
+  control.readOnly = true;
+  control.disabled = false;
+  control.placeholder = currentBranch
+    ? "Current branch"
+    : branches
+      ? "No local branch available"
+      : "Branch unavailable";
+  control.title = currentBranch
+    ? "Current branch; load branch data to select another branch"
+    : "No selectable branch is available";
+}
+
 function renderGitSummary(status = state.gitStatus) {
-  const target = qs("#git-summary");
+  const target = qs(".git-workspace-summary");
   const files = gitFilesFromStatus(status);
   const staged = files.filter(isStagedGitFile);
   const unstaged = files.filter(isUnstagedGitFile);

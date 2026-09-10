@@ -78,13 +78,14 @@
 }
 
 .main-tab-switcher button {
-  display: inline-grid;
+  display: grid;
   width: 34px;
   min-width: 34px;
   min-height: 28px;
   gap: 0;
-  align-items: center;
-  justify-content: center;
+  place-items: center;
+  align-content: center;
+  justify-items: center;
   border-color: transparent;
   border-radius: 7px;
   padding: 0;

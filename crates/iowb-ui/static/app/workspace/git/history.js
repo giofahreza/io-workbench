@@ -10,7 +10,7 @@ function renderGitBranches(selector, body) {
   ].join("") || '<p class="empty">No branches found.</p>';
   target.querySelectorAll("[data-branch-name]").forEach((button) => {
     button.addEventListener("click", () => {
-      qs("#git-branch").value = button.dataset.branchName;
+      setGitBranchSelection(button.dataset.branchName);
     });
   });
 }
@@ -50,7 +50,7 @@ function renderGitCommits(selector, body) {
   });
   target.querySelectorAll("[data-commit-use]").forEach((button) => {
     button.addEventListener("click", () => {
-      qs("#git-branch").value = button.dataset.commitUse;
+      setGitBranchSelection(button.dataset.commitUse);
     });
   });
 }
@@ -197,8 +197,8 @@ function renderGitRemoteStatus(selector, body) {
 }
 
 async function publishCurrentBranch() {
-  if (!qs("#git-branch").value.trim() && state.gitStatus?.branch) {
-    qs("#git-branch").value = state.gitStatus.branch;
+  if (!qs("#git-branch")?.value.trim() && state.gitStatus?.branch) {
+    setGitBranchSelection(state.gitStatus.branch);
   }
   await gitBranchOperation("/api/git/publish");
 }
@@ -208,9 +208,15 @@ async function syncGitRemote() {
   await gitOperation("/api/git/push");
 }
 
-async function gitBranchOperation(path) {
+async function createGitBranch() {
+  const branch = window.prompt("New branch name", "")?.trim();
+  if (!branch) return;
+  await gitBranchOperation("/api/git/create-branch", branch);
+}
+
+async function gitBranchOperation(path, branchOverride = null) {
   const project = activeProjectKey();
-  const branch = qs("#git-branch").value.trim();
+  const branch = String(branchOverride ?? qs("#git-branch")?.value ?? "").trim();
   if (!project || !branch) return;
   const body = await api(path, {
     method: "POST",

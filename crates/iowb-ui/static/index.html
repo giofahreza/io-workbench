@@ -189,7 +189,6 @@
                 <button id="editor-find-next" class="icon-button" type="button" aria-label="Next match" title="Next match" data-symbol="chevron-down"></button>
                 <button id="editor-replace-one" class="icon-button" type="button" aria-label="Replace match" title="Replace match" data-symbol="replace"></button>
                 <button id="editor-replace-all" class="icon-button" type="button" aria-label="Replace all matches" title="Replace all matches" data-symbol="replace-all"></button>
-                <button id="editor-go-line" class="icon-button" type="button" aria-label="Go to line" title="Go to line" data-symbol="corner-down-right"></button>
               </div>
             </div>
             <div id="file-editor-shell" class="editor-shell">
@@ -565,14 +564,22 @@
 
       <section id="git-view" class="panel view workbench-panel git-panel">
         <div class="git-workspace-picker">
-          <label for="git-repository"><span>Repository</span><select id="git-repository"><option value="">Loading Git workspace…</option></select></label>
-          <p id="git-workspace-message" class="meta">Git operations are scoped to one selected worktree.</p>
+          <div id="git-workspace-message" class="meta git-workspace-message">
+            <span class="git-workspace-message-text">Git operations are scoped to one selected worktree.</span>
+            <div class="git-workspace-summary" aria-live="polite"></div>
+          </div>
         </div>
         <div class="git-action-header">
-          <label>
-            <span>Branch</span>
-            <input id="git-branch" name="branch" />
-          </label>
+          <div class="git-repository-branch-controls">
+            <label for="git-repository">
+              <span>Repository</span>
+              <select id="git-repository"><option value="">Loading Git workspace…</option></select>
+            </label>
+            <label for="git-branch">
+              <span>Branch</span>
+              <input id="git-branch" name="branch" placeholder="Current branch" readonly />
+            </label>
+          </div>
           <div class="git-header-actions">
             <button id="git-fetch" class="icon-button" type="button" aria-label="Fetch" title="Fetch" data-symbol="refresh">Fetch</button>
             <button id="git-pull" class="icon-button" type="button" aria-label="Pull" title="Pull" data-symbol="download">Pull</button>
@@ -595,22 +602,23 @@
           <button type="button" data-git-view-tab="tags" data-symbol="tag" role="tab" aria-selected="false">Tags</button>
         </div>
         <div class="form-grid git-project-row git-changes-controls">
-          <label>
-            <span>Commit Message</span>
-            <input id="git-message" name="message" />
-          </label>
           <label class="compact-field">
             <span>Filter Files</span>
             <input id="git-filter" name="filter" placeholder="Filter changed files" />
           </label>
-        </div>
-        <div class="button-row git-toolbar git-changes-controls">
           <button id="git-init" class="icon-button" type="button" aria-label="Init repository" title="Init repository" data-symbol="plus">Init</button>
           <button id="git-initial-commit" class="icon-button" type="button" aria-label="Initial commit" title="Initial commit" data-symbol="check">Initial</button>
           <button id="git-stage" class="icon-button" type="button" aria-label="Stage selected files" title="Stage selected files" data-symbol="plus">Stage</button>
           <button id="git-unstage" class="icon-button" type="button" aria-label="Unstage selected files" title="Unstage selected files" data-symbol="minus">Unstage</button>
           <button id="git-discard" class="icon-button" type="button" aria-label="Discard selected changes" title="Discard selected changes" data-symbol="trash">Discard</button>
           <button id="git-delete-untracked" class="icon-button" type="button" aria-label="Delete selected untracked files" title="Delete selected untracked files" data-symbol="trash">Delete Untracked</button>
+          <button id="git-select-all" class="icon-button" type="button" aria-label="Select all changed files" title="Select all changed files" data-symbol="check-square">Select All</button>
+          <button id="git-select-none" class="icon-button" type="button" aria-label="Select no files" title="Select no files" data-symbol="square">Select None</button>
+          <button id="git-generate-message" class="icon-button" type="button" aria-label="Generate commit message" title="Generate commit message" data-symbol="sparkles">Generate Message</button>
+          <button id="git-commit" class="icon-button" type="button" aria-label="Review selected files before committing" title="Review and commit selected files" data-symbol="check">Commit Selected</button>
+          <button id="git-diff" class="icon-button" type="button" aria-label="Show diff" title="Show diff" data-symbol="diff">Diff</button>
+          <button id="git-file-diff" class="icon-button" type="button" aria-label="Review selected file" title="Review selected file" data-symbol="file-search">File Review</button>
+          <button id="git-conflicts" class="icon-button" type="button" aria-label="Show conflicts" title="Show conflicts" data-symbol="alert">Conflicts</button>
         </div>
         <div class="form-grid git-branch-row git-branches-controls">
           <label>
@@ -642,16 +650,6 @@
           </label>
           <button id="git-create-tag" class="icon-button" type="button" aria-label="Create tag" title="Create tag" data-symbol="tag">Tag</button>
         </div>
-        <div class="button-row git-selection-row git-changes-controls">
-          <button id="git-select-all" class="icon-button" type="button" aria-label="Select all changed files" title="Select all changed files" data-symbol="check-square">Select All</button>
-          <button id="git-select-none" class="icon-button" type="button" aria-label="Select no files" title="Select no files" data-symbol="square">Select None</button>
-          <button id="git-generate-message" class="icon-button" type="button" aria-label="Generate commit message" title="Generate commit message" data-symbol="sparkles">Generate Message</button>
-          <button id="git-commit" class="icon-button" type="button" aria-label="Commit selected files" title="Commit selected files" data-symbol="check">Commit Selected</button>
-          <button id="git-diff" class="icon-button" type="button" aria-label="Show diff" title="Show diff" data-symbol="diff">Diff</button>
-          <button id="git-file-diff" class="icon-button" type="button" aria-label="Review selected file" title="Review selected file" data-symbol="file-search">File Review</button>
-          <button id="git-conflicts" class="icon-button" type="button" aria-label="Show conflicts" title="Show conflicts" data-symbol="alert">Conflicts</button>
-        </div>
-        <div id="git-summary" class="summary-grid"></div>
         <div class="git-main">
           <div id="git-files" class="list git-file-list"></div>
           <div id="git-output" class="output-panel git-output"></div>

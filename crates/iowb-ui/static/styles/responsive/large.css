@@ -494,18 +494,18 @@ th {
 
   .git-action-header {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     padding: 8px 12px;
   }
 
-  .git-action-header label {
-    flex: 0 1 128px;
-    min-width: 98px;
+  .git-repository-branch-controls {
+    flex: 1 1 360px;
   }
 
   .git-header-actions {
-    flex: 1 1 auto;
+    flex: 1 1 420px;
     min-width: 0;
     flex-wrap: nowrap;
     justify-content: flex-end;
