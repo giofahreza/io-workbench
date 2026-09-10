@@ -148,19 +148,19 @@
               <button id="editor-close" class="icon-button editor-close" type="button" aria-label="Back to files" title="Back to files" data-symbol="arrow-left"></button>
               <label class="editor-path-field">
                 <span>File</span>
-                <input id="file-editor-path" name="filePath" />
+                <div class="editor-path-control">
+                  <input id="file-editor-path" name="filePath" />
+                  <button id="copy-file-path" class="icon-button editor-path-copy" type="button" aria-label="Copy file path" title="Copy file path" data-symbol="copy"></button>
+                </div>
               </label>
               <div class="editor-primary-actions">
                 <div id="file-editor-mode-toggle" class="editor-view-toggle" role="group" aria-label="File view mode">
-                  <button id="file-edit-mode" type="button" class="editor-view-option active" data-file-editor-mode="edit" aria-pressed="true">Edit</button>
-                  <button id="file-preview-mode" type="button" class="editor-view-option" data-file-editor-mode="preview" aria-pressed="false">Preview</button>
+                  <button id="file-edit-mode" class="icon-button editor-view-option active" type="button" aria-label="Edit file" title="Edit file" data-file-editor-mode="edit" data-symbol="pencil" aria-pressed="true"></button>
+                  <button id="file-preview-mode" class="icon-button editor-view-option" type="button" aria-label="Preview file" title="Preview file" data-file-editor-mode="preview" data-symbol="eye" aria-pressed="false"></button>
                 </div>
-                <button id="editor-create-file" class="icon-button" type="button" aria-label="New File (Cmd+N)" title="New File (Cmd+N)" data-symbol="file-plus"></button>
-                <button id="editor-create-directory" class="icon-button" type="button" aria-label="New Folder (Cmd+Shift+N)" title="New Folder (Cmd+Shift+N)" data-symbol="folder-plus"></button>
                 <span class="ops-separator" aria-hidden="true"></span>
                 <button type="submit" class="primary-action icon-button" aria-label="Save file" title="Save file" data-symbol="save"></button>
                 <button id="reload-file" class="icon-button" type="button" aria-label="Reload file" title="Reload file" data-symbol="refresh"></button>
-                <button id="copy-file-path" class="icon-button" type="button" aria-label="Copy file path" title="Copy file path" data-symbol="copy"></button>
                 <button id="editor-full-view" class="icon-button" type="button" aria-label="Full view" title="Full view" data-symbol="maximize"></button>
               </div>
             </div>
@@ -171,15 +171,11 @@
             <div class="editor-command-grid">
               <label>
                 <span>Search</span>
-                <input id="editor-search" name="search" />
+                <input id="editor-search" name="search" placeholder="find" />
               </label>
               <label>
                 <span>Replace</span>
-                <input id="editor-replace" name="replace" />
-              </label>
-              <label>
-                <span>Line</span>
-                <input id="editor-goto-line" name="line" type="number" min="1" value="1" />
+                <input id="editor-replace" name="replace" placeholder="replace" />
               </label>
             </div>
             <div class="editor-command-row">

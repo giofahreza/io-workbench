@@ -1247,10 +1247,13 @@ async function copyCurrentFilePath(event) {
   showToast("Copied file path", "ok");
   const button = event?.currentTarget;
   if (!button) return;
-  const label = button.textContent;
-  button.textContent = "Copied";
+  const label = button.getAttribute("aria-label") || "Copy file path";
+  const title = button.title || "Copy file path";
+  button.setAttribute("aria-label", "Copied");
+  button.title = "Copied";
   window.setTimeout(() => {
-    button.textContent = label;
+    button.setAttribute("aria-label", label);
+    button.title = title;
   }, 900);
 }
 
@@ -1289,7 +1292,7 @@ function updateEditorChrome() {
     ? `${projectMismatch ? "Previous project" : (state.currentFileDirty ? "Unsaved" : "Saved")} · ${filePath}`
     : "No file loaded";
   qs("#file-editor-status")?.classList.toggle("warn", projectMismatch);
-  ["#file-editor-form button[type='submit']", "#delete-file", "#reload-file", "#rename-file"].forEach((selector) => {
+  ["#file-editor-form button[type='submit']", "#copy-file-path", "#delete-file", "#reload-file", "#rename-file"].forEach((selector) => {
     const control = qs(selector);
     if (control) control.disabled = !filePath || projectMismatch;
   });
@@ -1418,15 +1421,6 @@ function replaceAllEditorMatches() {
   setEditorText(parts.join(qs("#editor-replace").value));
   state.currentFileDirty = true;
   resetEditorSearch();
-  updateEditorChrome();
-}
-
-function goToEditorLine() {
-  const lineNumber = Math.max(1, Number(qs("#editor-goto-line")?.value) || 1);
-  const lines = editorText().split("\n");
-  const targetLine = Math.min(lineNumber, lines.length);
-  const index = lines.slice(0, targetLine - 1).reduce((total, line) => total + line.length + 1, 0);
-  setEditorSelection(index);
   updateEditorChrome();
 }
 

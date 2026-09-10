@@ -763,6 +763,32 @@ body:not(.files-editor-open) .file-editor-pane {
   flex: 1 1 260px;
 }
 
+.editor-path-control {
+  position: relative;
+  min-width: 0;
+}
+
+.editor-path-control input {
+  padding-right: 42px;
+}
+
+.editor-path-copy {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  width: 30px;
+  min-width: 30px;
+  min-height: 30px;
+  transform: translateY(-50%);
+  border-color: transparent;
+  background: transparent;
+}
+
+.editor-path-copy:hover,
+.editor-path-copy:focus-visible {
+  background: var(--panel-soft);
+}
+
 .editor-primary-actions {
   flex: 0 0 auto;
   flex-wrap: wrap;
@@ -1017,7 +1043,7 @@ body.file-editor-full-view {
 
 .editor-command-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 92px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 6px;
 }
 

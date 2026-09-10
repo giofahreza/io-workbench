@@ -800,7 +800,7 @@ th {
 
   .editor-command-row .row-actions {
     display: grid;
-    grid-template-columns: repeat(5, minmax(38px, 1fr));
+    grid-template-columns: repeat(4, minmax(38px, 1fr));
     width: 100%;
   }
 

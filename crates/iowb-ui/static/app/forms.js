@@ -284,12 +284,6 @@ function bindForms() {
   qs("#editor-find-next").addEventListener("click", () => findEditorMatch(1));
   qs("#editor-replace-one").addEventListener("click", replaceEditorMatch);
   qs("#editor-replace-all").addEventListener("click", replaceAllEditorMatches);
-  qs("#editor-go-line").addEventListener("click", goToEditorLine);
-  qs("#editor-goto-line").addEventListener("keydown", (event) => {
-    if (event.key !== "Enter") return;
-    event.preventDefault();
-    goToEditorLine();
-  });
   qs("#file-editor-form").addEventListener("submit", (event) => saveFile(event).catch(showError));
   qs("#editor-close")?.addEventListener("click", () => closeFileEditor());
   document.querySelectorAll("[data-file-editor-mode]").forEach((button) => {
@@ -298,8 +292,6 @@ function bindForms() {
   qs("#editor-full-view")?.addEventListener("click", toggleFileEditorFullView);
   qs("#create-file").addEventListener("click", () => startCreateFileTreePath(false, qs("#files-path")?.value || "."));
   qs("#create-directory").addEventListener("click", () => startCreateFileTreePath(true, qs("#files-path")?.value || "."));
-  qs("#editor-create-file")?.addEventListener("click", () => startCreateFileTreePath(false, qs("#files-path")?.value || "."));
-  qs("#editor-create-directory")?.addEventListener("click", () => startCreateFileTreePath(true, qs("#files-path")?.value || "."));
   qs("#delete-file").addEventListener("click", () => deletePath().catch(showError));
   qs("#download-file").addEventListener("click", downloadCurrentFile);
   qs("#reload-file").addEventListener("click", (event) => withButtonLoading(event.currentTarget, reloadCurrentFile).catch(showError));
