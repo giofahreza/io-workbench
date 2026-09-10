@@ -8,6 +8,7 @@
 apps/mobile/androidApp/google-services.json
 *service-account*.json
 .playwright-mcp/
+/reference/
 
 # Local io-workbench data and unpacked Android package inspection output.
 /.io-workbench/
