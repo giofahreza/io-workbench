@@ -320,8 +320,8 @@ function bindForms() {
   qs("#rename-session-action")?.addEventListener("click", () => renameSelectedSession().catch(showError));
   qs("#git-init").addEventListener("click", () => initializeGitRepository().catch(showError));
   qs("#git-initial-commit").addEventListener("click", () => createGitInitialCommit().catch(showError));
-  qs("#git-generate-message").addEventListener("click", () => generateGitMessage().catch(showError));
-  qs("#git-commit").addEventListener("click", () => commitGitSelection().catch(showError));
+  qs("#git-generate-message").addEventListener("click", () => openGitCommitModal({ generateOnOpen: true }));
+  qs("#git-commit").addEventListener("click", () => openGitCommitModal());
   qs("#git-diff").addEventListener("click", () => gitDiffSelected().catch(showError));
   qs("#git-file-diff").addEventListener("click", () => gitFileDiffSelected().catch(showError));
   qs("#git-conflicts").addEventListener("click", () => loadGitConflicts().catch(showError));

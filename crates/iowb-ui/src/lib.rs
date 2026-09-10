@@ -1402,6 +1402,28 @@ mod tests {
     }
 
     #[test]
+    fn git_commit_requires_modal_review_and_exposes_ai_drafting() {
+        let html = asset_text("index.html");
+        let forms = asset_text("app/forms.js");
+        let commit_dialog = asset_text("app/workspace/git/commit.js");
+        let git_actions = asset_text("app/workspace/git/session_actions.js");
+
+        assert!(html.contains(r#"id="git-commit""#));
+        assert!(!html.contains(r#"id="git-message""#));
+        assert!(forms.contains("openGitCommitModal()"));
+        assert!(forms.contains("openGitCommitModal({ generateOnOpen: true })"));
+        assert!(!forms.contains("commitGitSelection()"));
+        assert!(commit_dialog.contains(r#"<textarea id="git-message""#));
+        assert!(commit_dialog.contains(r#"aria-modal="true""#));
+        assert!(commit_dialog.contains("Generate with AI"));
+        assert!(commit_dialog.contains("data-git-commit-submit"));
+        assert!(commit_dialog.contains("trapGitCommitModalFocus"));
+        assert!(commit_dialog.contains("Select at least one changed file before committing."));
+        assert!(git_actions.contains("/api/git/generate-commit-message"));
+        assert!(git_actions.contains("/api/git/commit"));
+    }
+
+    #[test]
     fn shared_identity_assets_are_embedded_across_public_and_web_shells() {
         let brand_mark = asset_text("brand-mark.svg");
         let brand_loader = asset_text("brand-loader.svg");

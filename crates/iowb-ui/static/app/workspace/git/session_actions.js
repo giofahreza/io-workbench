@@ -79,8 +79,10 @@ async function generateGitMessage() {
     method: "POST",
     body: JSON.stringify(gitBody({ files })),
   });
-  qs("#git-message").value = body.message || "";
-  renderGeneratedGitMessage(body.message || "");
+  const message = body.message || "";
+  if (qs("#git-message")) qs("#git-message").value = message;
+  state.gitCommitMessage = message;
+  renderGeneratedGitMessage(message);
 }
 
 async function initializeGitRepository() {
@@ -119,14 +121,19 @@ async function createGitInitialCommit() {
 async function commitGitSelection() {
   const project = activeProjectKey();
   const files = selectedGitFiles();
-  const message = qs("#git-message").value.trim();
-  if (!project || !files.length || !message) return;
+  const message = String(qs("#git-message")?.value || state.gitCommitMessage || "").trim();
+  if (!project || !files.length || !message) return false;
   const body = await api("/api/git/commit", {
     method: "POST",
     body: JSON.stringify(gitBody({ files, message })),
   });
   renderGitOperation(body);
-  await loadGitStatus();
+  try {
+    await loadGitStatus();
+  } catch {
+    showToast("Commit created, but the Git status could not be refreshed.", "warn");
+  }
+  return true;
 }
 
 async function gitOperation(path) {
