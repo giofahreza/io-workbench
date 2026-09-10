@@ -77,6 +77,7 @@ async function loadGitStatus(options = {}) {
     await loadGitWorkspace(options);
   } catch (error) {
     state.gitStatus = null;
+    state.gitRemoteStatus = null;
     state.gitSelectedFiles = new Set();
     renderGitRepositorySelector(null);
     renderGitSummary(null);
@@ -86,6 +87,7 @@ async function loadGitStatus(options = {}) {
   }
   if (!selectedGitRepositoryId() || selectedGitRepository()?.initialized === false) {
     state.gitStatus = null;
+    state.gitRemoteStatus = null;
     state.gitSelectedFiles = new Set();
     renderGitSummary(null);
     qs("#git-files").innerHTML = selectedGitRepository()?.initialized === false
@@ -98,9 +100,15 @@ async function loadGitStatus(options = {}) {
   qs("#git-output").innerHTML = "";
   let body;
   try {
-    body = await api(gitQuery("/api/git/status"));
+    const [statusBody, remoteStatus] = await Promise.all([
+      api(gitQuery("/api/git/status")),
+      api(gitQuery("/api/git/remote-status")).catch(() => null),
+    ]);
+    body = statusBody;
+    state.gitRemoteStatus = remoteStatus;
   } catch (error) {
     state.gitStatus = null;
+    state.gitRemoteStatus = null;
     state.gitSelectedFiles = new Set();
     renderGitSummary(null);
     qs("#git-files").innerHTML = "";
@@ -121,7 +129,16 @@ async function loadGitStatus(options = {}) {
       ? state.currentGitDiffFile
       : nextFiles[0]?.path;
     if (previewFile) {
-      await gitDiffForFile(previewFile);
+      const previewStatus = nextFiles.find((file) => file.path === previewFile);
+      const hasStagedPreview = isStagedGitFile(previewStatus);
+      const hasUnstagedPreview = isUnstagedGitFile(previewStatus);
+      const currentPreviewSideAvailable = state.currentGitDiffFile === previewFile
+        && state.currentGitDiffStaged !== null
+        && (state.currentGitDiffStaged ? hasStagedPreview : hasUnstagedPreview);
+      const previewStaged = currentPreviewSideAvailable
+        ? state.currentGitDiffStaged
+        : hasStagedPreview;
+      await gitDiffForFile(previewFile, previewStaged);
     } else {
       renderGitStatus(body);
     }
@@ -132,14 +149,31 @@ async function loadGitStatus(options = {}) {
 
 function renderGitSummary(status = state.gitStatus) {
   const target = qs("#git-summary");
-  const count = gitFilesFromStatus(status).length;
+  const files = gitFilesFromStatus(status);
+  const staged = files.filter(isStagedGitFile);
+  const unstaged = files.filter(isUnstagedGitFile);
+  const remote = state.gitRemoteStatus;
+  const remoteLabel = remote
+    ? remote.hasUpstream
+      ? `↑${remote.ahead ?? 0} ↓${remote.behind ?? 0}`
+      : remote.hasRemote ? "no upstream" : "no remote"
+    : "remote unavailable";
+  const count = files.length;
   const countTarget = qs("#git-change-count");
   if (countTarget) countTarget.textContent = String(count);
-  if (target) target.innerHTML = "";
+  if (target) {
+    target.innerHTML = [
+      ["Branch", status?.branch || "detached"],
+      ["Changed", count],
+      ["Staged", staged.length],
+      ["Unstaged", unstaged.length],
+      ["Remote", remoteLabel],
+    ].map(([label, value]) => `<div class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
+  }
 }
 
 function setGitActiveView(view, options = {}) {
-  const nextView = ["changes", "history", "branches"].includes(view) ? view : "changes";
+  const nextView = ["changes", "history", "branches", "stash", "tags"].includes(view) ? view : "changes";
   state.gitActiveView = nextView;
   const panel = qs("#git-view");
   if (panel) panel.dataset.gitView = nextView;
@@ -158,12 +192,20 @@ function setGitActiveView(view, options = {}) {
     gitRead("/api/git/commits?limit=25", renderGitCommits).catch(showError);
   } else if (nextView === "branches") {
     gitRead("/api/git/branches", renderGitBranches).catch(showError);
+  } else if (nextView === "stash") {
+    gitRead("/api/git/stashes", renderGitStashes).catch(showError);
+  } else if (nextView === "tags") {
+    gitRead("/api/git/tags", renderGitTags).catch(showError);
   }
 }
 
 function gitFilesFromStatus(status = state.gitStatus) {
   if (!status) return [];
-  if (Array.isArray(status.files) && status.files.length) return status.files;
+  if (Array.isArray(status.files) && status.files.length) {
+    return status.files
+      .map((file) => normalizeGitFile(file))
+      .filter(Boolean);
+  }
   const groups = [
     ["modified", "M"],
     ["conflicted", "UU"],
@@ -171,23 +213,66 @@ function gitFilesFromStatus(status = state.gitStatus) {
     ["deleted", "D"],
     ["untracked", "U"],
   ];
-  return groups.flatMap(([key, code]) => (status[key] || []).map((path) => ({ path, status: code })));
+  return groups.flatMap(([key, code]) => (status[key] || [])
+    .map((file) => normalizeGitFile(file, code))
+    .filter(Boolean));
 }
 
-function gitStatusLabel(status) {
+function normalizeGitFile(file, fallbackStatus = "M") {
+  if (typeof file === "string") return { path: normalizedGitRelativePath(file), status: fallbackStatus };
+  if (!file || !file.path) return null;
+  return {
+    ...file,
+    path: normalizedGitRelativePath(file.path),
+    status: String(file.status ?? fallbackStatus).padEnd(2, " ").slice(0, 2),
+  };
+}
+
+function gitPorcelainStatus(status = "") {
+  return String(status).padEnd(2, " ").slice(0, 2);
+}
+
+function gitSideStatus(fileOrStatus, staged = null) {
+  const status = gitPorcelainStatus(typeof fileOrStatus === "object" ? fileOrStatus.status : fileOrStatus);
+  if (staged === null) return status.trim() || status;
+  if (status === "??") return staged ? "" : "?";
+  const code = status[staged ? 0 : 1];
+  return code && code !== " " && code !== "." ? code : "";
+}
+
+function isStagedGitFile(file) {
+  const status = gitPorcelainStatus(file?.status);
+  return status !== "??" && status[0] !== " " && status[0] !== ".";
+}
+
+function isUnstagedGitFile(file) {
+  const status = gitPorcelainStatus(file?.status);
+  return status === "??" || (status[1] !== " " && status[1] !== ".");
+}
+
+function gitLineCount(file, staged, kind) {
+  const key = staged ? `staged${kind}` : `unstaged${kind}`;
+  return Number(file?.[key]) || 0;
+}
+
+function gitStatusLabel(status, staged = null) {
+  const code = staged === null ? String(status || "") : gitSideStatus(status, staged);
   if (isGitConflictStatus(status)) return "Conflicted";
-  if (String(status).includes("M")) return "Modified";
-  if (String(status).includes("A")) return "Added";
-  if (String(status).includes("D")) return "Deleted";
-  if (status === "U" || status === "??") return "Untracked";
-  return status || "Changed";
+  if (code === "M") return "Modified";
+  if (code === "A") return "Added";
+  if (code === "D") return "Deleted";
+  if (code === "R") return "Renamed";
+  if (code === "C") return "Copied";
+  if (code === "U" || code === "?") return "Untracked";
+  return code || "Changed";
 }
 
-function gitStatusClass(status) {
+function gitStatusClass(status, staged = null) {
   if (isGitConflictStatus(status)) return "status-conflict";
-  if (String(status).includes("A")) return "status-a";
-  if (String(status).includes("D")) return "status-d";
-  if (status === "U" || status === "??") return "status-u";
+  const code = staged === null ? String(status || "") : gitSideStatus(status, staged);
+  if (code.includes("A")) return "status-a";
+  if (code.includes("D")) return "status-d";
+  if (code === "U" || code === "?") return "status-u";
   return "status-m";
 }
 
@@ -261,8 +346,9 @@ function gitChangeSectionHtml(group, label, files, emptyText, actionLabel) {
   const action = actionLabel
     ? `<button type="button" data-git-section-action="${group}">${escapeHtml(actionLabel)}</button>`
     : "";
+  const staged = group === "staged";
   const body = files.length
-    ? gitTreeHtml(buildGitFileTree(files), group, 0)
+    ? gitTreeHtml(buildGitFileTree(files), group, 0, staged)
     : `<div class="git-change-empty">${escapeHtml(emptyText)}</div>`;
   return `<section class="git-change-section" data-git-change-section="${escapeHtml(group)}">
     <header class="git-change-header">
@@ -273,13 +359,13 @@ function gitChangeSectionHtml(group, label, files, emptyText, actionLabel) {
   </section>`;
 }
 
-function gitTreeHtml(node, group, depth) {
-  const folders = node.folders.map((folder) => gitFolderHtml(folder, group, depth)).join("");
-  const files = node.files.map((file) => gitFileRowHtml(file, depth)).join("");
+function gitTreeHtml(node, group, depth, staged) {
+  const folders = node.folders.map((folder) => gitFolderHtml(folder, group, depth, staged)).join("");
+  const files = node.files.map((file) => gitFileRowHtml(file, depth, staged)).join("");
   return `${folders}${files}`;
 }
 
-function gitFolderHtml(folder, group, depth) {
+function gitFolderHtml(folder, group, depth, staged) {
   const key = `${group}:${folder.path}`;
   const collapsed = state.gitCollapsedFolders.has(key);
   const files = gitFolderFiles(folder).join("\n");
@@ -291,33 +377,40 @@ function gitFolderHtml(folder, group, depth) {
       </span>
       <span class="git-change-count">${countGitFolderFiles(folder)}</span>
     </button>
-    ${collapsed ? "" : gitTreeHtml(folder, group, depth + 1)}
+    ${collapsed ? "" : gitTreeHtml(folder, group, depth + 1, staged)}
     <template data-git-folder-files="${escapeHtml(key)}">${escapeHtml(files)}</template>
   </div>`;
 }
 
-function gitFileRowHtml(file, depth) {
-  const active = state.currentGitDiffFile === file.path ? " active" : "";
-  const statusLabel = gitStatusLabel(file.status);
-  const statusClass = gitStatusClass(file.status);
+function gitFileRowHtml(file, depth, staged) {
+  const active = state.currentGitDiffFile === file.path && state.currentGitDiffStaged === staged ? " active" : "";
+  const statusCode = gitSideStatus(file, staged);
+  const statusLabel = gitStatusLabel(file.status, staged);
+  const statusClass = gitStatusClass(file.status, staged);
   const checked = state.gitSelectedFiles.has(file.path) ? " checked" : "";
-  const isUntracked = file.status === "U" || file.status === "??";
+  const isUntracked = statusCode === "?" || file.status === "U" || file.status === "??";
+  const isConflict = isGitConflictStatus(file.status);
   const isSubmodule = isGitSubmoduleFile(file);
   const canStage = canStageGitFile(file);
+  const canDiscard = !staged && isUnstagedGitFile(file) && canDiscardGitFile(file);
+  const canOperate = canStage && !isConflict;
+  const operation = staged ? "/api/git/unstage" : "/api/git/stage";
+  const additions = gitLineCount(file, staged, "Additions");
+  const deletions = gitLineCount(file, staged, "Deletions");
   return `<article class="git-file-row${active}${isGitConflictStatus(file.status) ? " conflicted" : ""}" data-git-file-row="${escapeHtml(file.path)}" style="padding-left:${12 + depth * 16}px">
-    <input type="checkbox" data-git-file="${escapeHtml(file.path)}" aria-label="Stage ${escapeHtml(file.path)}"${checked}${canStage ? "" : " disabled"} />
-    <button type="button" class="git-file-main" data-git-file-preview="${escapeHtml(file.path)}" title="${escapeHtml(file.path)}">
+    <input type="checkbox" data-git-file="${escapeHtml(file.path)}" aria-label="Select ${escapeHtml(file.path)}"${checked}${canStage ? "" : " disabled"} />
+    <button type="button" class="git-file-main" data-git-file-preview="${escapeHtml(file.path)}" data-git-file-staged="${staged}" title="${escapeHtml(file.path)}">
       <span class="git-file-icon" aria-hidden="true"></span>
       <strong>${escapeHtml(file.name || file.path)}</strong>
     </button>
     <span class="git-row-actions">
       <button type="button" class="icon-button" data-git-open-file="${escapeHtml(file.path)}" aria-label="Open file" title="Open file" data-symbol="open"></button>
-      <button type="button" class="icon-button" data-git-file-diff="${escapeHtml(file.path)}" aria-label="Show diff" title="Show diff" data-symbol="diff"></button>
-      ${isGitConflictStatus(file.status) && !isSubmodule ? `<button type="button" class="icon-button" data-git-conflict-file="${escapeHtml(file.path)}" aria-label="Resolve conflict" title="Resolve conflict" data-symbol="alert"></button>` : ""}
-      ${canDiscard && (/[MDU]/.test(file.status) || isGitConflictStatus(file.status))
-    ? `<button type="button" class="icon-button" data-git-file-action="${escapeHtml(file.path)}" data-git-file-status="${escapeHtml(file.status)}" aria-label="${isUntracked ? "Delete untracked file" : "Discard changes"}" title="${isUntracked ? "Delete untracked file" : "Discard changes"}" data-symbol="trash"></button>`
-    : ""}
-      <span class="git-status-badge ${statusClass}" title="${escapeHtml(statusLabel)}">${escapeHtml(file.status)}</span>
+      <button type="button" class="icon-button" data-git-file-diff="${escapeHtml(file.path)}" data-git-file-staged="${staged}" aria-label="Show diff" title="Show diff" data-symbol="diff"></button>
+      ${isConflict && !isSubmodule ? `<button type="button" class="icon-button" data-git-conflict-file="${escapeHtml(file.path)}" aria-label="Resolve conflict" title="Resolve conflict" data-symbol="alert"></button>` : ""}
+      ${canOperate ? `<button type="button" class="icon-button" data-git-file-operation="${operation}" data-git-file-operation-path="${escapeHtml(file.path)}" aria-label="${staged ? "Unstage" : "Stage"} file" title="${staged ? "Unstage" : "Stage"} file" data-symbol="${staged ? "minus" : "plus"}"></button>` : ""}
+      ${canDiscard ? `<button type="button" class="icon-button" data-git-file-action="${escapeHtml(file.path)}" data-git-file-status="${escapeHtml(file.status)}" aria-label="${isUntracked ? "Delete untracked file" : "Discard changes"}" title="${isUntracked ? "Delete untracked file" : "Discard changes"}" data-symbol="trash"></button>` : ""}
+      <span class="git-line-stats" title="${escapeHtml(statusLabel)}">+${additions} −${deletions}</span>
+      <span class="git-status-badge ${statusClass}" title="${escapeHtml(statusLabel)}">${escapeHtml(statusCode || "·")}</span>
     </span>
   </article>`;
 }
@@ -326,15 +419,13 @@ function bindGitFileTree(root) {
   root.querySelector("[data-git-open-commit]")?.addEventListener("click", openGitCommitModal);
   root.querySelectorAll("[data-git-section-action]").forEach((button) => {
     button.addEventListener("click", () => {
+      const unstaging = button.dataset.gitSectionAction === "staged";
       const files = gitFilesFromStatus(state.gitStatus)
+        .filter(unstaging ? isStagedGitFile : isUnstagedGitFile)
         .filter(canStageGitFile)
         .map((file) => file.path);
-      if (button.dataset.gitSectionAction === "changes") {
-        state.gitSelectedFiles = new Set(files);
-      } else {
-        state.gitSelectedFiles = new Set();
-      }
-      renderGitFiles();
+      state.gitSelectedFiles = new Set(files);
+      gitSelectedFileOperation(unstaging ? "/api/git/unstage" : "/api/git/stage").catch(showError);
     });
   });
   root.querySelectorAll("[data-git-folder-toggle]").forEach((button) => {
@@ -356,7 +447,16 @@ function bindGitFileTree(root) {
   root.querySelectorAll("[data-git-file-preview], [data-git-file-diff]").forEach((button) => {
     button.addEventListener("click", (event) => {
       event.preventDefault();
-      gitDiffForFile(button.dataset.gitFilePreview || button.dataset.gitFileDiff).catch(showError);
+      gitDiffForFile(
+        button.dataset.gitFilePreview || button.dataset.gitFileDiff,
+        button.dataset.gitFileStaged === "true",
+      ).catch(showError);
+    });
+  });
+  root.querySelectorAll("[data-git-file-operation]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      gitFileOperation(button.dataset.gitFileOperation, button.dataset.gitFileOperationPath).catch(showError);
     });
   });
   root.querySelectorAll("[data-git-open-file]").forEach((button) => {
@@ -385,6 +485,7 @@ function renderGitFiles() {
     return !filter || `${file.status} ${file.path}`.toLowerCase().includes(filter);
   });
   const target = qs("#git-files");
+  const selected = files.filter((file) => state.gitSelectedFiles.has(file.path));
   if (!files.length) {
     target.innerHTML = `<div class="git-commit-inline">
       <span>0 files selected</span>
@@ -393,11 +494,11 @@ function renderGitFiles() {
     <div class="git-change-empty">Working tree is clean.</div>`;
     return;
   }
-  const staged = files.filter((file) => state.gitSelectedFiles.has(file.path));
-  const changes = files.filter((file) => !state.gitSelectedFiles.has(file.path));
+  const staged = files.filter(isStagedGitFile);
+  const changes = files.filter(isUnstagedGitFile);
   target.innerHTML = `<div class="git-commit-inline">
-      <span>${staged.length} file${staged.length === 1 ? "" : "s"} selected</span>
-      <button type="button" data-git-open-commit${staged.length ? "" : " disabled"} data-symbol="check">Commit</button>
+      <span>${selected.length} file${selected.length === 1 ? "" : "s"} selected</span>
+      <button type="button" data-git-open-commit${selected.length ? "" : " disabled"} data-symbol="check">Commit</button>
     </div>
     ${gitChangeSectionHtml("staged", "Staged", staged, "No staged files", staged.length ? "Unstage All" : "")}
     ${gitChangeSectionHtml("changes", "Changes", changes, changes.length ? "" : "All changes staged", changes.length ? "Stage All" : "")}`;

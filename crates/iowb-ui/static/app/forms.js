@@ -323,12 +323,11 @@ function bindForms() {
   qs("#git-diff").addEventListener("click", () => gitDiffSelected().catch(showError));
   qs("#git-file-diff").addEventListener("click", () => gitFileDiffSelected().catch(showError));
   qs("#git-conflicts").addEventListener("click", () => loadGitConflicts().catch(showError));
-  qs("#git-branches").addEventListener("click", () => setGitActiveView("branches"));
-  qs("#git-commits").addEventListener("click", () => setGitActiveView("history"));
   qs("#git-remote-status").addEventListener("click", () => gitRead("/api/git/remote-status", renderGitRemoteStatus).catch(showError));
   qs("#git-fetch").addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => gitOperation("/api/git/fetch")).catch(showError));
   qs("#git-pull").addEventListener("click", () => gitOperation("/api/git/pull").catch(showError));
   qs("#git-push").addEventListener("click", () => gitOperation("/api/git/push").catch(showError));
+  qs("#git-sync").addEventListener("click", () => syncGitRemote().catch(showError));
   qs("#git-stage").addEventListener("click", () => gitSelectedFileOperation("/api/git/stage").catch(showError));
   qs("#git-unstage").addEventListener("click", () => gitSelectedFileOperation("/api/git/unstage").catch(showError));
   qs("#git-checkout").addEventListener("click", () => gitBranchOperation("/api/git/checkout").catch(showError));
@@ -339,6 +338,8 @@ function bindForms() {
   qs("#git-revert-local").addEventListener("click", () => gitOperation("/api/git/revert-local-commit").catch(showError));
   qs("#git-discard").addEventListener("click", () => gitSelectedFileOperation("/api/git/discard").catch(showError));
   qs("#git-delete-untracked").addEventListener("click", () => gitSelectedFileOperation("/api/git/delete-untracked").catch(showError));
+  qs("#git-create-stash").addEventListener("click", () => createGitStash().catch(showError));
+  qs("#git-create-tag").addEventListener("click", () => createGitTag().catch(showError));
   qs("#db-create-form").addEventListener("submit", (event) => createDbConnection(event).catch(showError));
   qs("#db-new-connection").addEventListener("click", resetDbConnectionForm);
   qs("#db-test-unsaved").addEventListener("click", () => testDbConnectionForm().catch(showError));

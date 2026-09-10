@@ -7,6 +7,8 @@
   border-radius: 6px;
   background: color-mix(in srgb, var(--bg) 70%, var(--panel));
   white-space: pre-wrap;
+  direction: ltr;
+  text-align: left;
 }
 
 body.wrap-output .output-panel,
@@ -24,9 +26,17 @@ body:not(.wrap-output) .side-by-side pre {
 }
 
 .json-output,
-.diff-view pre {
+.diff-view,
+.diff-view pre,
+.side-by-side pre,
+.message-body pre,
+.message-body pre code,
+.markdown-code,
+.terminal-output {
   font-family: var(--font-mono);
   font-size: 13px;
+  direction: ltr;
+  text-align: left;
 }
 
 .output-title {

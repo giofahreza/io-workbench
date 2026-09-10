@@ -7,7 +7,7 @@
     <meta name="theme-color" content="#0f766e" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20260901-02" />
+    <link rel="stylesheet" href="/styles.css?v=20260910-07" />
   </head>
   <body class="auth-pending">
     <aside class="sidebar">
@@ -571,8 +571,10 @@
             <button id="git-fetch" class="icon-button" type="button" aria-label="Fetch" title="Fetch" data-symbol="refresh">Fetch</button>
             <button id="git-pull" class="icon-button" type="button" aria-label="Pull" title="Pull" data-symbol="download">Pull</button>
             <button id="git-push" class="icon-button" type="button" aria-label="Push" title="Push" data-symbol="upload">Push</button>
+            <button id="git-sync" class="icon-button" type="button" aria-label="Sync" title="Sync" data-symbol="refresh">Sync</button>
             <button id="git-publish" class="icon-button" type="button" aria-label="Publish branch" title="Publish branch" data-symbol="upload">Publish</button>
             <button id="git-revert-local" class="icon-button" type="button" aria-label="Revert local changes" title="Revert local changes" data-symbol="undo">Revert Local</button>
+            <button id="git-remote-status" class="icon-button" type="button" aria-label="Remote status" title="Remote status" data-symbol="globe">Remote</button>
             <button id="refresh-git" class="icon-button" type="button" aria-label="Refresh git" title="Refresh git" data-symbol="refresh"></button>
           </div>
         </div>
@@ -583,6 +585,8 @@
           </button>
           <button type="button" data-git-view-tab="history" data-symbol="clock" role="tab" aria-selected="false">Commits</button>
           <button type="button" data-git-view-tab="branches" data-symbol="nav-git" role="tab" aria-selected="false">Branches</button>
+          <button type="button" data-git-view-tab="stash" data-symbol="archive" role="tab" aria-selected="false">Stash</button>
+          <button type="button" data-git-view-tab="tags" data-symbol="tag" role="tab" aria-selected="false">Tags</button>
         </div>
         <div class="form-grid git-project-row git-changes-controls">
           <label>
@@ -600,6 +604,7 @@
           <button id="git-stage" class="icon-button" type="button" aria-label="Stage selected files" title="Stage selected files" data-symbol="plus">Stage</button>
           <button id="git-unstage" class="icon-button" type="button" aria-label="Unstage selected files" title="Unstage selected files" data-symbol="minus">Unstage</button>
           <button id="git-discard" class="icon-button" type="button" aria-label="Discard selected changes" title="Discard selected changes" data-symbol="trash">Discard</button>
+          <button id="git-delete-untracked" class="icon-button" type="button" aria-label="Delete selected untracked files" title="Delete selected untracked files" data-symbol="trash">Delete Untracked</button>
         </div>
         <div class="form-grid git-branch-row git-branches-controls">
           <label>
@@ -612,10 +617,24 @@
           <button id="git-create-branch" class="icon-button" type="button" aria-label="Create branch" title="Create branch" data-symbol="branch-plus">Create Branch</button>
           <button id="git-delete-branch" class="icon-button" type="button" aria-label="Delete branch" title="Delete branch" data-symbol="trash">Delete Branch</button>
           <button id="git-set-remote" class="icon-button" type="button" aria-label="Set remote" title="Set remote" data-symbol="link">Set Remote</button>
-          <button id="git-delete-untracked" class="icon-button" type="button" aria-label="Delete untracked files" title="Delete untracked files" data-symbol="trash">Delete Untracked</button>
-          <button id="git-branches" class="icon-button" type="button" aria-label="Branches" title="Branches" data-symbol="nav-git">Branches</button>
-          <button id="git-commits" class="icon-button" type="button" aria-label="History" title="History" data-symbol="clock">History</button>
-          <button id="git-remote-status" class="icon-button" type="button" aria-label="Remote status" title="Remote status" data-symbol="globe">Remote</button>
+        </div>
+        <div class="form-grid git-stash-row git-stash-controls">
+          <label>
+            <span>Stash Message</span>
+            <input id="git-stash-message" name="stashMessage" placeholder="Optional stash message" />
+          </label>
+          <button id="git-create-stash" class="icon-button" type="button" aria-label="Create stash" title="Create stash" data-symbol="archive">Stash</button>
+        </div>
+        <div class="form-grid git-tag-row git-tags-controls">
+          <label>
+            <span>Tag</span>
+            <input id="git-tag-name" name="tagName" placeholder="v1.0.0" />
+          </label>
+          <label>
+            <span>Tag Message</span>
+            <input id="git-tag-message" name="tagMessage" placeholder="Optional annotated tag message" />
+          </label>
+          <button id="git-create-tag" class="icon-button" type="button" aria-label="Create tag" title="Create tag" data-symbol="tag">Tag</button>
         </div>
         <div class="button-row git-selection-row git-changes-controls">
           <button id="git-select-all" class="icon-button" type="button" aria-label="Select all changed files" title="Select all changed files" data-symbol="check-square">Select All</button>
@@ -1161,6 +1180,6 @@
     </nav>
     <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
-    <script src="/app.js?v=20260901-02" defer></script>
+    <script src="/app.js?v=20260910-07" defer></script>
   </body>
 </html>

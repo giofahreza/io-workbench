@@ -1062,6 +1062,8 @@ body.file-editor-full-view {
   resize: vertical;
   white-space: pre;
   overflow: auto;
+  direction: ltr;
+  text-align: left;
 }
 
 body.code-editor-active .editor-shell {
@@ -1092,13 +1094,29 @@ body.code-editor-active #file-editor-lines {
   color: var(--muted);
 }
 
-.editor-shell pre {
+.editor-shell #file-editor-lines {
   overflow: hidden;
   padding: 9px 8px;
   text-align: right;
+  direction: ltr;
   user-select: none;
   color: var(--muted);
   background: color-mix(in srgb, var(--panel) 75%, var(--bg));
+}
+
+.editor-shell .CodeMirror,
+.editor-shell .CodeMirror-code,
+.editor-shell .CodeMirror pre {
+  direction: ltr;
+  text-align: left;
+}
+
+.editor-shell .CodeMirror pre {
+  overflow: visible;
+  padding: 0;
+  user-select: text;
+  color: inherit;
+  background: transparent;
 }
 
 .button-row {
@@ -1283,4 +1301,12 @@ pre {
   border: 1px solid var(--line);
   border-radius: 6px;
   background: color-mix(in srgb, var(--bg) 70%, var(--panel));
+  direction: ltr;
+  text-align: left;
+}
+
+pre code,
+code {
+  direction: ltr;
+  text-align: left;
 }

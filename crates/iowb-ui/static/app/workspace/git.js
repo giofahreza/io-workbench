@@ -17,7 +17,7 @@ const GIT_MODULES = Object.freeze([
 function loadGitModule(path) {
   return new Promise((resolve, reject) => {
     const script = document.createElement("script");
-    script.src = `${path}?v=${encodeURIComponent("20260901-02")}`;
+    script.src = `${path}?v=${encodeURIComponent("20260910-07")}`;
     script.async = false;
     script.addEventListener("load", resolve, { once: true });
     script.addEventListener(

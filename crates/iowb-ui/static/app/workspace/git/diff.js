@@ -4,13 +4,14 @@ function renderGitDiff(file, body) {
   state.currentGitDiffFile = file;
   target.className = "output-panel diff-view";
   const status = gitFilesFromStatus(state.gitStatus).find((item) => item.path === file)?.status || "";
+  const staged = state.currentGitDiffStaged;
   const statusBadge = status
-    ? `<span class="git-status-badge ${gitStatusClass(status)}" title="${escapeHtml(gitStatusLabel(status))}">${escapeHtml(status)}</span>`
+    ? `<span class="git-status-badge ${gitStatusClass(status, staged)}" title="${escapeHtml(gitStatusLabel(status, staged))}">${escapeHtml(gitSideStatus(status, staged) || status)}</span>`
     : "";
   const header = `<div class="git-diff-header">
     <div class="git-diff-title">
       <strong>${escapeHtml(file)}</strong>
-      <span>${escapeHtml(status ? gitStatusLabel(status) : "Diff preview")}</span>
+      <span>${escapeHtml(status ? gitStatusLabel(status, staged) : "Diff preview")}</span>
     </div>
     <div class="git-diff-actions">
       ${statusBadge}
@@ -25,13 +26,13 @@ function renderGitDiff(file, body) {
   const parsed = parseDiffHunks(diff);
   const truncated = body.isTruncated ? '<span class="badge warn">truncated</span>' : "";
   const fileStatus = gitFilesFromStatus(state.gitStatus).find((item) => item.path === file);
+  const hunkOperation = staged === true ? "unstage" : "stage";
   const controls = parsed.hunks.length && (!fileStatus || !isGitSubmoduleFile(fileStatus))
     ? `<div class="diff-toolbar">
         <span>${parsed.hunks.length} hunk(s) ${truncated}</span>
         <button type="button" data-git-hunks-select="all">Select All</button>
         <button type="button" data-git-hunks-select="none">Select None</button>
-        <button type="button" data-git-hunks-apply="stage">Stage Hunks</button>
-        <button type="button" data-git-hunks-apply="unstage">Unstage Hunks</button>
+        <button type="button" data-git-hunks-apply="${hunkOperation}">${hunkOperation === "stage" ? "Stage" : "Unstage"} Hunks</button>
       </div>`
     : "";
   const prelude = parsed.prelude.length
@@ -105,7 +106,7 @@ async function applySelectedGitHunks(operation) {
   });
   renderGitOperation(body);
   await loadGitStatus().catch(() => {});
-  await gitDiffForFile(file).catch(() => {});
+  await gitDiffForFile(file, state.currentGitDiffStaged).catch(() => {});
 }
 
 function renderGitFileReview(file, body) {

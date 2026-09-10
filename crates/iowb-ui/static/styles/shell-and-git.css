@@ -234,13 +234,32 @@ body.xterm-active .shell-terminal {
 }
 
 .git-panel {
-  grid-template-rows: auto auto minmax(0, 1fr);
   overflow: hidden;
+}
+
+/* Git has several view-specific control rows. Let them flow in document
+   order instead of putting them after a three-row grid whose third track can
+   collapse to zero when the hidden controls change. */
+.view.active.workbench-panel.git-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.git-panel > * {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.git-panel > .git-main {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .git-action-header,
 .git-project-row,
 .git-branch-row,
+.git-stash-row,
+.git-tag-row,
 .git-toolbar,
 .git-selection-row {
   flex: none;
@@ -278,13 +297,28 @@ body.xterm-active .shell-terminal {
 .git-view-tabs {
   display: flex;
   flex: none;
+  height: 39px;
+  min-height: 39px;
+  max-height: 39px;
+  box-sizing: border-box;
+  align-items: stretch;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
 }
 
+.git-view-tabs::-webkit-scrollbar {
+  display: none;
+}
+
 .git-view-tabs button {
   display: inline-flex;
+  height: 38px;
   min-height: 38px;
+  max-height: 38px;
+  box-sizing: border-box;
   flex: 1 1 0;
   gap: 7px;
   align-items: center;
@@ -292,6 +326,7 @@ body.xterm-active .shell-terminal {
   border: 0;
   border-radius: 0;
   padding: 8px 12px;
+  white-space: nowrap;
   color: var(--muted);
   background: transparent;
   font-size: 13px;
@@ -321,6 +356,14 @@ body.xterm-active .shell-terminal {
   grid-template-columns: minmax(0, 1fr) minmax(180px, 0.34fr);
 }
 
+.git-stash-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.git-tag-row {
+  grid-template-columns: minmax(140px, 0.38fr) minmax(0, 1fr) auto;
+}
+
 .git-action-header label span,
 .git-project-row label span,
 .git-branch-row label span,
@@ -339,10 +382,12 @@ body.xterm-active .shell-terminal {
 
 .git-project-row,
 .git-branch-row,
+.git-stash-row,
+.git-tag-row,
 .git-toolbar,
 .git-selection-row,
 .git-panel .summary-grid {
-  display: none !important;
+  display: none;
 }
 
 .git-toolbar,
@@ -366,28 +411,64 @@ body.xterm-active .shell-terminal {
   background: var(--panel-soft);
 }
 
+.git-panel[data-git-view="changes"] .git-changes-controls,
+.git-panel[data-git-view="branches"] .git-branches-controls,
+.git-panel[data-git-view="stash"] .git-stash-controls,
+.git-panel[data-git-view="tags"] .git-tags-controls {
+  display: flex;
+}
+
+.git-panel[data-git-view="changes"] .git-project-row,
+.git-panel[data-git-view="branches"] .git-branch-row,
+.git-panel[data-git-view="stash"] .git-stash-row,
+.git-panel[data-git-view="tags"] .git-tag-row {
+  display: grid;
+}
+
+.git-panel[data-git-view="changes"] .git-changes-controls {
+  display: flex;
+}
+
+.git-panel[data-git-view="branches"] .git-branches-controls {
+  display: flex;
+}
+
+.git-panel[data-git-view="stash"] .git-stash-controls,
+.git-panel[data-git-view="tags"] .git-tags-controls {
+  display: grid;
+}
+
 .git-panel:not([data-git-view="branches"]) .git-branches-controls {
   display: none;
 }
 
 .git-panel[data-git-view="branches"] .git-changes-controls,
-.git-panel[data-git-view="history"] .git-changes-controls {
+.git-panel[data-git-view="history"] .git-changes-controls,
+.git-panel[data-git-view="stash"] .git-changes-controls,
+.git-panel[data-git-view="tags"] .git-changes-controls {
   display: none;
 }
 
 .git-panel[data-git-view="branches"] #git-summary,
 .git-panel[data-git-view="branches"] #git-files,
 .git-panel[data-git-view="history"] #git-summary,
-.git-panel[data-git-view="history"] #git-files {
+.git-panel[data-git-view="history"] #git-files,
+.git-panel[data-git-view="stash"] #git-summary,
+.git-panel[data-git-view="stash"] #git-files,
+.git-panel[data-git-view="tags"] #git-summary,
+.git-panel[data-git-view="tags"] #git-files {
   display: none;
 }
 
 .git-panel[data-git-view="branches"] .git-main,
-.git-panel[data-git-view="history"] .git-main {
+.git-panel[data-git-view="history"] .git-main,
+.git-panel[data-git-view="stash"] .git-main,
+.git-panel[data-git-view="tags"] .git-main {
   grid-template-columns: minmax(0, 1fr);
 }
 
 .git-panel .summary-grid {
+  display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   margin: 0;
   padding: 8px 12px;
@@ -646,6 +727,25 @@ body.xterm-active .shell-terminal {
   border-color: color-mix(in srgb, var(--danger) 70%, var(--line));
   background: color-mix(in srgb, var(--danger) 10%, transparent);
   color: var(--danger);
+}
+
+.git-line-stats {
+  min-width: max-content;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.git-line-stats::first-letter {
+  color: var(--ok);
+}
+
+.git-record-row .row-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: flex-end;
 }
 
 .git-row-actions {

@@ -154,12 +154,13 @@ async function gitDiffSelected() {
   await gitDiffForFile(file);
 }
 
-async function gitDiffForFile(file) {
+async function gitDiffForFile(file, staged) {
   const project = activeProjectKey();
   if (!project || !file) return;
   state.currentGitDiffFile = file;
+  state.currentGitDiffStaged = staged === undefined ? null : staged;
   renderGitFiles();
-  const body = await api(gitQuery("/api/git/diff", { file }));
+  const body = await api(gitQuery("/api/git/diff", { file, staged }));
   renderGitDiff(file, body);
 }
 
