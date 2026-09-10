@@ -1,83 +1,72 @@
-const themeStorageKey = "iowb.landing.theme";
-const darkThemeColor = "#141515";
-const lightThemeColor = "#f0ede5";
-const root = document.documentElement;
-const themeToggle = document.querySelector("[data-theme-toggle]");
-const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
+const menu = document.querySelector(".menu");
 
-function savedTheme() {
-  try {
-    const theme = window.localStorage.getItem(themeStorageKey);
-    return theme === "light" || theme === "dark" ? theme : null;
-  } catch {
-    return null;
+if (menu) {
+  const summary = menu.querySelector("summary");
+
+  for (const link of menu.querySelectorAll("a")) {
+    link.addEventListener("click", () => {
+      menu.open = false;
+    });
   }
+
+  document.addEventListener("click", (event) => {
+    if (menu.open && !menu.contains(event.target)) menu.open = false;
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && menu.open) {
+      menu.open = false;
+      summary?.focus();
+    }
+  });
 }
 
-function systemPreferredTheme() {
-  return systemTheme.matches ? "dark" : "light";
+const copyStatus = document.getElementById("copy-status");
+
+function fallbackCopy(text) {
+  const input = document.createElement("textarea");
+  input.value = text;
+  input.setAttribute("readonly", "");
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.append(input);
+  input.select();
+  const copied = document.execCommand("copy");
+  input.remove();
+  if (!copied) throw new Error("Copy command failed");
 }
 
-function applyTheme(theme) {
-  const nextTheme = theme === "dark" ? "dark" : "light";
-  root.dataset.theme = nextTheme;
-  document.querySelector('meta[name="theme-color"]')?.setAttribute(
-    "content",
-    nextTheme === "dark" ? darkThemeColor : lightThemeColor,
-  );
-
-  if (!themeToggle) return;
-  const nextThemeLabel = nextTheme === "dark" ? "light" : "dark";
-  themeToggle.setAttribute("aria-label", "Switch to " + nextThemeLabel + " theme");
-  themeToggle.setAttribute("aria-pressed", String(nextTheme === "dark"));
-  themeToggle.title = "Switch to " + nextThemeLabel + " theme";
-}
-
-applyTheme(savedTheme() ?? systemPreferredTheme());
-
-themeToggle?.addEventListener("click", () => {
-  const nextTheme = root.dataset.theme === "dark" ? "light" : "dark";
-  try {
-    window.localStorage.setItem(themeStorageKey, nextTheme);
-  } catch {
-    // The current visit still uses the selected theme when storage is unavailable.
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
   }
-  applyTheme(nextTheme);
-});
 
-function followSystemTheme(event) {
-  if (!savedTheme()) applyTheme(event.matches ? "dark" : "light");
-}
-
-if (systemTheme.addEventListener) {
-  systemTheme.addEventListener("change", followSystemTheme);
-} else {
-  systemTheme.addListener(followSystemTheme);
+  fallbackCopy(text);
 }
 
 for (const button of document.querySelectorAll("[data-copy]")) {
   button.addEventListener("click", async () => {
     const command = button.dataset.copy;
-    const status = button.parentElement?.querySelector(".copy-status");
-    if (!command || !status) return;
+    if (!command) return;
+
+    const originalLabel = button.textContent;
+    const label = button.dataset.copyLabel || "Command";
 
     try {
-      await navigator.clipboard.writeText(command);
-      status.textContent = "Copied";
+      await copyText(command);
+      button.dataset.copyState = "copied";
       button.textContent = "Copied";
+      if (copyStatus) copyStatus.textContent = `${label} copied to the clipboard.`;
+
+      window.setTimeout(() => {
+        button.dataset.copyState = "";
+        button.textContent = originalLabel;
+      }, 1800);
     } catch {
-      status.textContent = "Select and copy the command";
+      if (copyStatus) {
+        copyStatus.textContent = `Unable to copy the ${label.toLowerCase()}. Select it from the command block instead.`;
+      }
     }
-
-    window.setTimeout(() => {
-      status.textContent = "";
-      button.textContent = "Copy commands";
-    }, 1800);
-  });
-}
-
-for (const link of document.querySelectorAll(".mobile-menu a")) {
-  link.addEventListener("click", () => {
-    link.closest("details")?.removeAttribute("open");
   });
 }

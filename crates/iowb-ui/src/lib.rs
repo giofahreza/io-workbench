@@ -1155,8 +1155,8 @@ mod tests {
         assert!(css.contains("font-family: \"IBM Plex Sans Condensed\""));
         assert!(landing.contains("/fonts/ibm-plex/IBMPlexSans-Regular-Latin1.woff2"));
         assert!(landing.contains("/fonts/ibm-plex/IBMPlexSans-Bold-Latin1.woff2"));
-        assert!(landing.contains("class=\"theme-icon-moon\""));
-        assert!(landing.contains("class=\"theme-icon-sun\""));
+        assert!(landing.contains("class=\"theme-toggle-led\""));
+        assert!(!landing.contains("theme-icon-sun"));
     }
 
     #[test]
@@ -1185,7 +1185,7 @@ mod tests {
             assert!(landing.contains(&format!("/{asset_path}")));
         }
 
-        assert!(landing.contains("class=\"workbench-frame product-capture\""));
+        assert!(landing.contains("class=\"hero-capture product-capture\""));
         assert!(landing.contains("<picture>"));
         assert!(!landing.contains("workbench-chat-demo-20260906.webp"));
         assert!(!landing.contains("Choose the right brain for this branch"));
