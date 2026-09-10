@@ -1438,7 +1438,7 @@ mod tests {
         assert!(landing.contains("data-brand-loader"));
         assert!(docs.contains("/styles/brand.css?v=20260910-05"));
         assert!(docs.contains("/brand-loader.svg?v=20260910-05"));
-        assert!(app.contains("/icon.svg?v=20260910-07"));
+        assert!(app.contains("/icon.svg?v=20260910-14"));
         assert!(app.contains("data-brand-loader"));
         assert!(service_worker.contains("/brand-mark.svg"));
         assert!(service_worker.contains("/brand-loader.svg"));

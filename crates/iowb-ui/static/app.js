@@ -1,7 +1,7 @@
 "use strict";
 
 const TOKEN_STORAGE_KEY = "iowb.token";
-const APP_VERSION = "20260910-07";
+const APP_VERSION = "20260910-14";
 const APP_MODULES = Object.freeze([
   "/app/core.js",
   "/app/sidebar.js",
