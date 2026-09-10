@@ -1,16 +1,10 @@
-const themeStorageKey = "iowb.landing.theme";
-const darkThemeColor = "#141515";
-const lightThemeColor = "#f0ede5";
-const root = document.documentElement;
-const themeToggle = document.querySelector("[data-theme-toggle]");
-const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
 const article = document.querySelector(".docs-article");
 const docsLayout = document.querySelector(".docs-layout");
 const sidebar = document.querySelector(".docs-sidebar");
 const outline = document.getElementById("on-this-page");
 const searchInput = document.getElementById("docs-search");
 const searchResults = document.getElementById("docs-search-results");
-const mobileFieldIndexQuery = window.matchMedia("(max-width: 820px)");
+const mobileGuideIndexQuery = window.matchMedia("(max-width: 820px)");
 const legacyDocsHashRoutes = Object.freeze({
   overview: "/docs/",
   "quick-start": "/docs/quick-start/",
@@ -49,56 +43,6 @@ function redirectLegacyDocsHash() {
 }
 
 redirectLegacyDocsHash();
-
-function savedTheme() {
-  try {
-    const theme = window.localStorage.getItem(themeStorageKey);
-    return theme === "light" || theme === "dark" ? theme : null;
-  } catch {
-    return null;
-  }
-}
-
-function preferredTheme() {
-  return systemTheme.matches ? "dark" : "light";
-}
-
-function applyTheme(theme) {
-  const nextTheme = theme === "dark" ? "dark" : "light";
-  root.dataset.theme = nextTheme;
-  document.querySelector('meta[name="theme-color"]')?.setAttribute(
-    "content",
-    nextTheme === "dark" ? darkThemeColor : lightThemeColor,
-  );
-
-  if (!themeToggle) return;
-  const nextThemeLabel = nextTheme === "dark" ? "light" : "dark";
-  themeToggle.setAttribute("aria-label", "Switch to " + nextThemeLabel + " theme");
-  themeToggle.setAttribute("aria-pressed", String(nextTheme === "dark"));
-  themeToggle.title = "Switch to " + nextThemeLabel + " theme";
-}
-
-applyTheme(savedTheme() ?? preferredTheme());
-
-themeToggle?.addEventListener("click", () => {
-  const nextTheme = root.dataset.theme === "dark" ? "light" : "dark";
-  try {
-    window.localStorage.setItem(themeStorageKey, nextTheme);
-  } catch {
-    // The selected theme still applies for this visit when storage is unavailable.
-  }
-  applyTheme(nextTheme);
-});
-
-function followSystemTheme(event) {
-  if (!savedTheme()) applyTheme(event.matches ? "dark" : "light");
-}
-
-if (systemTheme.addEventListener) {
-  systemTheme.addEventListener("change", followSystemTheme);
-} else {
-  systemTheme.addListener(followSystemTheme);
-}
 
 function slugify(value) {
   return value
@@ -235,17 +179,17 @@ function installMobileOutline() {
   });
 }
 
-function installMobileFieldIndex() {
+function installMobileGuideIndex() {
   if (!article || !docsLayout || !sidebar) return;
   let disclosure = null;
 
   function sync() {
-    if (mobileFieldIndexQuery.matches) {
+    if (mobileGuideIndexQuery.matches) {
       if (!disclosure) {
         disclosure = document.createElement("details");
-        disclosure.className = "docs-mobile-field-index";
+        disclosure.className = "docs-mobile-guide-index";
         const summary = document.createElement("summary");
-        summary.textContent = "Field index";
+        summary.textContent = "Browse guides";
         disclosure.append(summary);
       }
 
@@ -263,10 +207,10 @@ function installMobileFieldIndex() {
   }
 
   sync();
-  if (mobileFieldIndexQuery.addEventListener) {
-    mobileFieldIndexQuery.addEventListener("change", sync);
+  if (mobileGuideIndexQuery.addEventListener) {
+    mobileGuideIndexQuery.addEventListener("change", sync);
   } else {
-    mobileFieldIndexQuery.addListener(sync);
+    mobileGuideIndexQuery.addListener(sync);
   }
 }
 
@@ -433,7 +377,7 @@ function installCopyButtons() {
 
 installActivePageState();
 installBreadcrumbs();
-installMobileFieldIndex();
+installMobileGuideIndex();
 const headings = buildOutline();
 installMobileOutline();
 installHeadingSpy(headings);

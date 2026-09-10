@@ -1400,4 +1400,25 @@ mod tests {
         assert!(service_worker.contains("`/styles.css?v=${APP_VERSION}`"));
         assert!(service_worker.contains("`/app.js?v=${APP_VERSION}`"));
     }
+
+    #[test]
+    fn shared_identity_assets_are_embedded_across_public_and_web_shells() {
+        let brand_mark = asset_text("brand-mark.svg");
+        let brand_loader = asset_text("brand-loader.svg");
+        let landing = asset_text("landing");
+        let docs = asset_text("docs/");
+        let app = asset_text("index.html");
+        let service_worker = asset_text("sw.js");
+
+        assert!(brand_mark.contains("io-workbench signal"));
+        assert!(brand_loader.contains("scan-port"));
+        assert!(landing.contains("/brand-mark.svg?v=20260910-05"));
+        assert!(landing.contains("data-brand-loader"));
+        assert!(docs.contains("/styles/brand.css?v=20260910-05"));
+        assert!(docs.contains("/brand-loader.svg?v=20260910-05"));
+        assert!(app.contains("/icon.svg?v=20260910-07"));
+        assert!(app.contains("data-brand-loader"));
+        assert!(service_worker.contains("/brand-mark.svg"));
+        assert!(service_worker.contains("/brand-loader.svg"));
+    }
 }

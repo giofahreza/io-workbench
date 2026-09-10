@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDirectory = join(repositoryRoot, "crates", "iowb-ui", "static", "docs");
-const assetVersion = "20260904-01";
+const assetVersion = "20260910-05";
 const docsVersion = "2026.09";
 const updated = "September 1, 2026";
 const generatorArguments = process.argv.slice(2);
@@ -1190,10 +1190,10 @@ function renderHeader() {
   return [
     '<a class="skip-link" href="#docs-content">Skip to docs content</a>',
     '<header class="docs-header"><div class="docs-shell docs-header-inner">',
-    '<a class="docs-brand" href="/landing" aria-label="io-workbench home"><span class="docs-brand-mark" aria-hidden="true">i/o</span><span>io-workbench</span></a>',
-    '<span class="docs-header-separator" aria-hidden="true"></span><span class="docs-header-kicker">Field guide</span>',
-    '<nav class="docs-site-nav" aria-label="Site navigation"><a href="/landing">Home</a><a href="/docs/" aria-current="page">Docs</a><a href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">GitHub</a></nav>',
-    '<button class="docs-theme-toggle" type="button" data-theme-toggle aria-label="Toggle color theme" aria-pressed="false" title="Toggle color theme"><span class="docs-theme-icon" aria-hidden="true"></span><span class="docs-theme-label" aria-hidden="true"></span></button>',
+    '<a class="docs-brand" href="/landing" aria-label="io-workbench home"><img class="brand-signal" src="/brand-mark.svg?v=' + assetVersion + '" alt="" /><span>io-workbench</span></a>',
+    '<span class="docs-header-kicker"><i aria-hidden="true"></i> Documentation</span>',
+    '<nav class="docs-site-nav" aria-label="Site navigation"><a href="/landing">Product</a><a href="/docs/" aria-current="page">Docs</a><a href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">GitHub</a></nav>',
+    '<div class="docs-header-actions"><a class="docs-header-release" href="https://github.com/giofahreza/io-workbench/releases" target="_blank" rel="noreferrer">Get release <span aria-hidden="true">↗</span></a><button class="theme-toggle" type="button" data-theme-toggle aria-pressed="false" aria-label="Switch theme"><span class="theme-toggle-led" aria-hidden="true"></span><span data-theme-label>Dark</span></button></div>',
     "</div></header>",
   ].join("\n");
 }
@@ -1229,15 +1229,15 @@ function renderSidebar(activeSlug) {
 
   return [
     '<aside class="docs-sidebar" aria-label="Documentation topics">',
-    '<div class="docs-sidebar-heading"><span>Field index</span><strong>Guides &amp; procedures</strong></div>',
-    '<div class="docs-search-panel"><label class="docs-search" for="docs-search"><span>Search field guide</span><input id="docs-search" type="search" autocomplete="off" placeholder="Find a procedure" aria-controls="docs-search-results" aria-expanded="false" /></label><div id="docs-search-results" class="docs-search-results" aria-live="polite"></div></div>',
+    '<div class="docs-sidebar-heading"><span><i aria-hidden="true"></i> Documentation map</span><strong>Find the next useful route.</strong></div>',
+    '<div class="docs-search-panel"><label class="docs-search" for="docs-search"><span>Search the docs</span><input id="docs-search" type="search" autocomplete="off" placeholder="Install, Git, terminal…" aria-controls="docs-search-results" aria-expanded="false" /></label><div id="docs-search-results" class="docs-search-results" aria-live="polite"></div></div>',
     '<nav class="docs-nav" aria-label="Documentation navigation">',
-    '<a class="docs-home-link' + (activeSlug ? "" : " is-active") + '" href="/docs/" data-doc-link data-title="Documentation" data-category="Product documentation" data-summary="Install and use io-workbench from web, native desktop, and mobile clients." data-keywords="documentation overview install web desktop mobile remote agents database terminal"' + (activeSlug ? "" : ' aria-current="page"') + ">Docs home</a>",
+    '<a class="docs-home-link' + (activeSlug ? "" : " is-active") + '" href="/docs/" data-doc-link data-title="Documentation" data-category="Product documentation" data-summary="Install and use io-workbench from web, native desktop, and mobile clients." data-keywords="documentation overview install web desktop mobile remote agents database terminal"' + (activeSlug ? "" : ' aria-current="page"') + "><span>Documentation home</span></a>",
     groupsHtml,
     '<div class="docs-nav-group"><p class="docs-nav-label">Browse topics</p>',
     topicCategories.map((topic) => topicSidebarLink(topic, activeSlug)).join(""),
     "</div></nav>",
-    '<p class="docs-sidebar-note">The server owns the project, agent CLIs, processes, and PTY. Web, native desktop, and mobile are authenticated control surfaces.</p>',
+    '<p class="docs-sidebar-note"><i aria-hidden="true"></i>The host holds the project, agent CLIs, processes, and PTY. Every client is simply a secure way back in.</p>',
     "</aside>",
   ].join("\n");
 }
@@ -1252,15 +1252,11 @@ function renderMeta(page) {
   return '<dl class="docs-meta">' + values.map((value) => "<div><dt>" + escapeHtml(value[0]) + "</dt><dd>" + escapeHtml(value[1]) + "</dd></div>").join("") + "</dl>";
 }
 
-function documentCode(slug) {
-  const value = slug ? String(slug).toUpperCase().replace(/[^A-Z0-9]+/g, ".") : "FIELD.INDEX";
-  return "IOWB / " + value.replace(/^\.+|\.+$/g, "");
-}
-
-function renderHeading(label, title, meta, slug) {
+function renderHeading(label, title, meta) {
   return [
     '<div class="docs-heading">',
-    '<div class="docs-heading-top"><div class="docs-heading-main"><p class="docs-eyebrow">' + escapeHtml(label) + "</p><h1>" + escapeHtml(title) + '</h1></div><p class="docs-document-code" aria-label="Document identification">' + escapeHtml(documentCode(slug)) + "</p></div>",
+    '<span class="docs-heading-orbit" aria-hidden="true"><i></i><b></b></span>',
+    '<div class="docs-heading-top"><div class="docs-heading-main"><p class="docs-eyebrow"><i aria-hidden="true"></i>' + escapeHtml(label) + "</p><h1>" + escapeHtml(title) + '</h1></div><p class="docs-heading-status"><i aria-hidden="true"></i>host-ready knowledge</p></div>',
     meta,
     "</div>",
   ].join("");
@@ -1291,7 +1287,7 @@ function renderRelated(page) {
 function renderArticle(page) {
   return [
     '<article id="docs-content" class="docs-content docs-article" data-page-slug="' + escapeHtml(page.slug) + '" data-page-group="' + escapeHtml(page.group) + '">',
-    renderHeading(page.group, page.title, renderMeta(page), page.slug),
+    renderHeading(page.group, page.title, renderMeta(page)),
     renderTopicLinks(page),
     page.body,
     renderRelated(page),
@@ -1302,26 +1298,32 @@ function renderArticle(page) {
 function renderShell(title, description, activeSlug, article) {
   return [
     "<!doctype html>",
-    '<html lang="en">',
+    '<html lang="en" data-theme="dark">',
     "<head>",
     '<meta charset="utf-8" />',
     '<meta name="viewport" content="width=device-width, initial-scale=1" />',
     '<meta name="description" content="' + escapeHtml(description) + '" />',
-    '<meta name="theme-color" content="#f0ede5" />',
+    '<meta name="color-scheme" content="dark" />',
+    '<meta name="theme-color" content="#080a0f" data-theme-color-light="#173133" data-theme-color-dark="#080a0f" />',
     "<title>" + escapeHtml(title) + " — io-workbench Docs</title>",
     '<link rel="icon" href="/icon.svg" type="image/svg+xml" />',
+    '<link rel="preload" href="/brand-loader.svg?v=' + assetVersion + '" as="image" type="image/svg+xml" />',
+    '<link rel="preload" href="/fonts/ibm-plex/IBMPlexSans-Regular-Latin1.woff2" as="font" type="font/woff2" crossorigin />',
+    '<link rel="preload" href="/fonts/ibm-plex/IBMPlexSans-Bold-Latin1.woff2" as="font" type="font/woff2" crossorigin />',
     '<script src="/app/landing-theme.js?v=' + assetVersion + '"></script>',
+    '<link rel="stylesheet" href="/styles/brand.css?v=' + assetVersion + '" />',
     '<link rel="stylesheet" href="/styles/docs.css?v=' + assetVersion + '" />',
     '<script src="/app/docs.js?v=' + assetVersion + '" defer></script>',
     "</head>",
-    '<body class="docs-field-guide">',
+    '<body class="docs-site">',
+    '<div class="brand-loader" data-brand-loader role="status" aria-live="polite" aria-label="Opening io-workbench"><div class="brand-loader__inner"><img class="brand-loader__mark" src="/brand-loader.svg?v=' + assetVersion + '" alt="" /><span class="brand-loader__label">Opening workbench</span></div></div>',
     renderHeader(),
     '<main class="docs-page-shell"><div class="docs-layout docs-shell">',
     renderSidebar(activeSlug),
     article,
-    '<aside class="docs-on-page" aria-label="On this page"><p><span>Page index</span><strong>On this page</strong></p><nav id="on-this-page"></nav></aside>',
+    '<aside class="docs-on-page" aria-label="On this page"><p><span><i aria-hidden="true"></i>Page path</span><strong>On this page</strong></p><nav id="on-this-page"></nav></aside>',
     "</div></main>",
-    '<footer class="docs-footer docs-shell"><div class="docs-footer-stamp"><span>io-workbench</span><small>Field guide / ' + escapeHtml(docsVersion) + '</small></div><div><a href="/landing">Home</a><a href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">GitHub</a></div></footer>',
+    '<footer class="docs-footer docs-shell"><a class="docs-footer-brand" href="/landing"><img class="brand-signal" src="/brand-mark.svg?v=' + assetVersion + '" alt="" /><span><strong>io-workbench</strong><small>Documentation / ' + escapeHtml(docsVersion) + '</small></span></a><p>Keep the project, the tools, and the proof on the host you own.</p><div class="docs-footer-links"><a href="/landing">Product</a><a href="https://github.com/giofahreza/io-workbench" target="_blank" rel="noreferrer">GitHub <span aria-hidden="true">↗</span></a></div></footer>',
     "</body>",
     "</html>",
     "",
@@ -1334,9 +1336,10 @@ function renderHome() {
     .filter(Boolean);
   const article = [
     '<article id="docs-content" class="docs-content docs-article docs-index-page" data-page-slug="" data-page-group="">',
-    renderHeading("Product documentation", "Documentation", '<dl class="docs-meta"><div><dt>Product</dt><dd>io-workbench</dd></div><div><dt>Docs version</dt><dd>' + docsVersion + "</dd></div><div><dt>Updated</dt><dd>" + updated + "</dd></div></dl>", ""),
+    renderHeading("Product documentation", "Documentation", '<dl class="docs-meta"><div><dt>Product</dt><dd>io-workbench</dd></div><div><dt>Docs version</dt><dd>' + docsVersion + "</dd></div><div><dt>Updated</dt><dd>" + updated + "</dd></div></dl>"),
     lead("Install and operate a self-hosted remote workbench for configured Claude, Codex, and Gemini CLIs. These guides cover release binaries, Android APKs, Web, native desktop, and mobile flows—not just the feature list."),
-    section("Start with the path you need", pageList(startPages.map((page) => ({
+    '<div class="docs-index-brief"><div><span class="docs-card-kicker">First session</span><p>Start with the route that matches the surface in your hand. The work stays connected to the same host.</p></div><a class="docs-action" href="/docs/quick-start/">Begin with Quick start <span aria-hidden="true">↗</span></a></div>',
+    section("Choose your route", pageList(startPages.map((page) => ({
       title: page.title,
       summary: page.summary,
       href: pageUrl(page),
@@ -1373,7 +1376,7 @@ function renderCategory(group) {
   const groupPages = pages.filter((page) => page.group === group.title);
   const article = [
     '<article id="docs-content" class="docs-content docs-article docs-category-page" data-page-slug="category-' + escapeHtml(group.slug) + '" data-page-group="Documentation area">',
-    renderHeading("Documentation area", group.title, '<dl class="docs-meta"><div><dt>Guides</dt><dd>' + groupPages.length + "</dd></div><div><dt>Docs version</dt><dd>" + docsVersion + "</dd></div></dl>", "category-" + group.slug),
+    renderHeading("Documentation area", group.title, '<dl class="docs-meta"><div><dt>Guides</dt><dd>' + groupPages.length + "</dd></div><div><dt>Docs version</dt><dd>" + docsVersion + "</dd></div></dl>"),
     lead(escapeHtml(group.description)),
     section("Guides in this area", pageList(groupPages.map((page) => ({
       title: page.title,
@@ -1392,7 +1395,7 @@ function renderTopic(topic) {
     .filter((item) => topicPages.some((page) => page.topics.includes(item.title)));
   const article = [
     '<article id="docs-content" class="docs-content docs-article docs-category-page" data-page-slug="topic-' + escapeHtml(topic.slug) + '" data-page-group="Topic">',
-    renderHeading("Topic", topic.title, '<dl class="docs-meta"><div><dt>Guides</dt><dd>' + topicPages.length + "</dd></div><div><dt>Docs version</dt><dd>" + docsVersion + "</dd></div></dl>", "topic-" + topic.slug),
+    renderHeading("Topic", topic.title, '<dl class="docs-meta"><div><dt>Guides</dt><dd>' + topicPages.length + "</dd></div><div><dt>Docs version</dt><dd>" + docsVersion + "</dd></div></dl>"),
     lead(escapeHtml(topic.description)),
     section("Guides for this topic", pageList(topicPages.map((page) => ({
       title: page.title,
