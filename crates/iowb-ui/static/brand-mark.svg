@@ -1,7 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
-  <title id="title">io-workbench</title>
-  <rect width="128" height="128" rx="28" fill="#080a0f" />
-  <rect x="1.5" y="1.5" width="125" height="125" rx="26.5" fill="none" stroke="#f6f7fb" stroke-opacity=".13" stroke-width="3" />
+  <title id="title">io-workbench signal</title>
   <g fill="none" stroke="#f6f7fb" stroke-linecap="round" stroke-linejoin="round" stroke-width="8">
     <path d="M64 31v13" />
     <path d="m64 44 26 15v30l-26 15-26-15V59Z" />

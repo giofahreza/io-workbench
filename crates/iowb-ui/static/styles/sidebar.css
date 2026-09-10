@@ -19,15 +19,11 @@
   margin-bottom: 4px;
 }
 
-.brand-mark {
-  display: grid;
+.brand-signal {
+  display: block;
   width: 38px;
   height: 38px;
-  place-items: center;
-  border-radius: 8px;
-  background: var(--accent);
-  color: white;
-  font-weight: 800;
+  flex: 0 0 auto;
 }
 
 .brand strong,

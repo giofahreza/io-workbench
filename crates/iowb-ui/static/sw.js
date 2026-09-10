@@ -1,9 +1,10 @@
-const APP_VERSION = "20260901-02";
+const APP_VERSION = "20260910-07";
 const CACHE_NAME = `io-workbench-web-${APP_VERSION}`;
 const CORE_ASSETS = [
   "/",
   "/index.html",
   `/styles.css?v=${APP_VERSION}`,
+  `/styles/brand.css?v=${APP_VERSION}`,
   `/app.js?v=${APP_VERSION}`,
   `/styles/base.css?v=${APP_VERSION}`,
   `/styles/sidebar.css?v=${APP_VERSION}`,
@@ -46,6 +47,8 @@ const CORE_ASSETS = [
   `/app/startup.js?v=${APP_VERSION}`,
   "/manifest.webmanifest",
   "/icon.svg",
+  "/brand-mark.svg",
+  "/brand-loader.svg",
   "/icons/codex.svg",
   "/icons/codex-white.svg",
   "/icons/claude-ai-icon.svg",

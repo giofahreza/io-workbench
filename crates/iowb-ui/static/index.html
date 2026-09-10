@@ -4,15 +4,21 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>io-workbench</title>
-    <meta name="theme-color" content="#0f766e" />
+    <meta name="theme-color" content="#080a0f" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/styles.css?v=20260910-07" />
   </head>
   <body class="auth-pending">
+    <div class="brand-loader" data-brand-loader role="status" aria-live="polite" aria-label="Opening io-workbench">
+      <div class="brand-loader__inner">
+        <img class="brand-loader__mark" src="/brand-loader.svg?v=20260910-07" alt="" />
+        <span class="brand-loader__label">Connecting to workbench</span>
+      </div>
+    </div>
     <aside class="sidebar">
       <div class="brand">
-        <span class="brand-mark">io</span>
+        <img class="brand-signal" src="/icon.svg?v=20260910-07" alt="" />
         <span>
           <strong>io-workbench</strong>
           <small class="brand-status status" aria-label="Connection status">
@@ -52,7 +58,7 @@
     <main class="workspace">
       <section id="auth-panel" class="panel auth-panel hidden">
         <div class="auth-card">
-          <div class="auth-logo">io</div>
+          <img class="auth-logo" src="/icon.svg?v=20260910-07" alt="" />
           <h2 id="auth-title">Setup</h2>
           <p id="auth-description">Create or enter your io-workbench credentials.</p>
           <form id="auth-form" class="auth-form">

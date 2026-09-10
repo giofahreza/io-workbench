@@ -1,7 +1,7 @@
 "use strict";
 
 const TOKEN_STORAGE_KEY = "iowb.token";
-const APP_VERSION = "20260901-02";
+const APP_VERSION = "20260910-07";
 const APP_MODULES = Object.freeze([
   "/app/core.js",
   "/app/sidebar.js",
@@ -38,6 +38,22 @@ try {
   // Local storage is optional; token handling uses sessionStorage.
 }
 
+let brandLoaderReleased = false;
+
+function releaseBrandLoader() {
+  if (brandLoaderReleased) return;
+  brandLoaderReleased = true;
+  document.documentElement.classList.add("brand-ready");
+
+  const loader = document.querySelector("[data-brand-loader]");
+  if (!loader) return;
+  loader.setAttribute("aria-hidden", "true");
+  window.setTimeout(() => loader.remove(), 380);
+}
+
+window.addEventListener("iowb:app-ready", releaseBrandLoader, { once: true });
+window.setTimeout(releaseBrandLoader, 7000);
+
 function loadAppModule(path) {
   return new Promise((resolve, reject) => {
     const script = document.createElement("script");
@@ -63,6 +79,7 @@ async function loadApplication() {
     document.body.classList.remove("auth-pending");
     const summary = document.querySelector("#server-summary");
     if (summary) summary.textContent = error.message;
+    releaseBrandLoader();
   }
 }
 

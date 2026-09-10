@@ -1,47 +1,51 @@
 async function bootstrapProtected() {
-  // Compact/migrate any cache created by an older shell before it can
-  // compete with the history request or the other browser preferences.
-  persistChatTranscriptCache();
-  const canLoadProtected = await loadAuthStatus();
-  if (!canLoadProtected) {
-    setWsStatus("error");
-    return;
-  }
-  await loadSidebarState().catch(() => {});
-  await loadSharedPinnedChatSessions().catch(() => {});
-  await loadProjects().catch(showError);
-  applyPreferences();
-  // Re-apply the most recently persisted chat session overrides so the
-  // chat-controls row reflects what was used for the last conversation.
-  const persistedSessions = readSessionOverrides();
-  const lastSessionId = state.preferences.lastChatSessionId;
-  if (lastSessionId && persistedSessions[lastSessionId]) {
-    loadSessionOverridesIntoState(lastSessionId);
-    renderChatFooter(persistedSessions[lastSessionId]);
-  }
-  connectWs();
-  const savedView = safeLocalStorageGet("iowb.lastView", "") || activeView() || "chat";
-  const targetView = qs(`#${savedView}-view`) ? savedView : "chat";
-  const savedProjectPath = activeChatSelectionMatchesServer()
-    ? (safeLocalStorageGet(ACTIVE_CHAT_PROJECT_KEY, "") || "")
-    : "";
-  if (savedProjectPath && state.projects.some((project) => project.path === savedProjectPath)) {
-    setActiveProject(savedProjectPath);
-  }
-  const savedSessionId = savedActiveChatSessionId();
-  if (targetView === "chat" && savedSessionId) {
-    state.chatSessionId = savedSessionId;
-    renderCachedChatSession(savedSessionId);
-  }
-  await switchView(targetView);
-  if (targetView === "chat" && savedSessionId) {
-    const session = findChatSession(savedSessionId);
-    await pickChatSession(savedSessionId, sessionProjectPath(session, savedProjectPath || activeProjectPath())).catch(showError);
-  } else if (targetView === "chat" && !state.chatSessionId) {
-    // If we landed on the chat view and nothing is selected, auto-open the
-    // most recent session for the current project (or the most recent session
-    // across all projects if no project is currently active).
-    await autoOpenLatestChatSession().catch(showError);
+  try {
+    // Compact/migrate any cache created by an older shell before it can
+    // compete with the history request or the other browser preferences.
+    persistChatTranscriptCache();
+    const canLoadProtected = await loadAuthStatus();
+    if (!canLoadProtected) {
+      setWsStatus("error");
+      return;
+    }
+    await loadSidebarState().catch(() => {});
+    await loadSharedPinnedChatSessions().catch(() => {});
+    await loadProjects().catch(showError);
+    applyPreferences();
+    // Re-apply the most recently persisted chat session overrides so the
+    // chat-controls row reflects what was used for the last conversation.
+    const persistedSessions = readSessionOverrides();
+    const lastSessionId = state.preferences.lastChatSessionId;
+    if (lastSessionId && persistedSessions[lastSessionId]) {
+      loadSessionOverridesIntoState(lastSessionId);
+      renderChatFooter(persistedSessions[lastSessionId]);
+    }
+    connectWs();
+    const savedView = safeLocalStorageGet("iowb.lastView", "") || activeView() || "chat";
+    const targetView = qs(`#${savedView}-view`) ? savedView : "chat";
+    const savedProjectPath = activeChatSelectionMatchesServer()
+      ? (safeLocalStorageGet(ACTIVE_CHAT_PROJECT_KEY, "") || "")
+      : "";
+    if (savedProjectPath && state.projects.some((project) => project.path === savedProjectPath)) {
+      setActiveProject(savedProjectPath);
+    }
+    const savedSessionId = savedActiveChatSessionId();
+    if (targetView === "chat" && savedSessionId) {
+      state.chatSessionId = savedSessionId;
+      renderCachedChatSession(savedSessionId);
+    }
+    await switchView(targetView);
+    if (targetView === "chat" && savedSessionId) {
+      const session = findChatSession(savedSessionId);
+      await pickChatSession(savedSessionId, sessionProjectPath(session, savedProjectPath || activeProjectPath())).catch(showError);
+    } else if (targetView === "chat" && !state.chatSessionId) {
+      // If we landed on the chat view and nothing is selected, auto-open the
+      // most recent session for the current project (or the most recent session
+      // across all projects if no project is currently active).
+      await autoOpenLatestChatSession().catch(showError);
+    }
+  } finally {
+    window.dispatchEvent(new Event("iowb:app-ready"));
   }
 }
 

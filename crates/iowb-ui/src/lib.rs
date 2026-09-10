@@ -160,6 +160,14 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "image/svg+xml; charset=utf-8",
             bytes: include_bytes!("../static/icon.svg"),
         }),
+        "brand-mark.svg" => Some(UiAsset {
+            content_type: "image/svg+xml; charset=utf-8",
+            bytes: include_bytes!("../static/brand-mark.svg"),
+        }),
+        "brand-loader.svg" => Some(UiAsset {
+            content_type: "image/svg+xml; charset=utf-8",
+            bytes: include_bytes!("../static/brand-loader.svg"),
+        }),
         "images/landing/workbench-chat-dark-20260907.webp" => Some(UiAsset {
             content_type: "image/webp",
             bytes: include_bytes!("../static/images/landing/workbench-chat-dark-20260907.webp"),
@@ -237,6 +245,10 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
         "styles.css" => Some(UiAsset {
             content_type: "text/css; charset=utf-8",
             bytes: include_bytes!("../static/styles.css"),
+        }),
+        "styles/brand.css" => Some(UiAsset {
+            content_type: "text/css; charset=utf-8",
+            bytes: include_bytes!("../static/styles/brand.css"),
         }),
         "styles/landing.css" => Some(UiAsset {
             content_type: "text/css; charset=utf-8",
@@ -659,6 +671,7 @@ mod tests {
     fn styles_source() -> String {
         [
             "styles.css",
+            "styles/brand.css",
             "styles/base.css",
             "styles/sidebar.css",
             "styles/layout.css",

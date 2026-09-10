@@ -125,15 +125,11 @@ body.auth-active .auth-panel {
 }
 
 .auth-logo {
-  display: grid;
+  display: block;
   width: 62px;
   height: 62px;
-  place-items: center;
   margin: 0 auto;
   border-radius: 10px;
-  background: var(--accent);
-  color: white;
-  font-weight: 800;
 }
 
 .auth-card label {

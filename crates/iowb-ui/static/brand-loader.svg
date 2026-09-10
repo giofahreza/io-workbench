@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Preparing io-workbench">
+  <defs>
+    <filter id="workbench-glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="2.8" />
+    </filter>
+    <path id="workbench-lead" d="M64 31v13" />
+    <path id="workbench-port" d="m64 44 26 15v30l-26 15-26-15V59Z" />
+  </defs>
+  <style>
+    .base { fill: none; stroke: #f6f7fb; stroke-linecap: round; stroke-linejoin: round; stroke-width: 8; opacity: .2; }
+    .trace { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .lead { stroke: #f6f7fb; stroke-width: 8; stroke-dasharray: 14 30; animation: scan-lead 1.7s linear infinite; }
+    .port { stroke: #59dfc4; stroke-width: 8; stroke-dasharray: 38 142; animation: scan-port 1.7s linear infinite; }
+    .glow { opacity: .62; filter: url(#workbench-glow); }
+    @keyframes scan-lead { to { stroke-dashoffset: -44; } }
+    @keyframes scan-port { to { stroke-dashoffset: 180; } }
+    @media (prefers-reduced-motion: reduce) {
+      .trace { animation: none; stroke-dasharray: none; }
+    }
+  </style>
+  <circle cx="64" cy="17" r="5" fill="#f6f7fb" opacity=".24" />
+  <g class="base">
+    <use href="#workbench-lead" />
+    <use href="#workbench-port" />
+  </g>
+  <g class="glow">
+    <use class="trace lead" href="#workbench-lead" stroke-width="15" />
+    <use class="trace port" href="#workbench-port" stroke-width="15" />
+  </g>
+  <circle cx="64" cy="17" r="5" fill="#f6f7fb" />
+  <use class="trace lead" href="#workbench-lead" />
+  <use class="trace port" href="#workbench-port" />
+</svg>
