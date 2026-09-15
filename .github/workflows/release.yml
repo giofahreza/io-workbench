@@ -276,38 +276,6 @@ jobs:
           test -x "$toolchain_bin/x86_64-linux-android26-clang"
           test -f "$CMAKE_TOOLCHAIN_FILE"
 
-          # The source-build fallback applies this narrowly scoped overlay for
-          # Android/Termux compatibility. Build the release runtimes from the
-          # same source, then reverse it before the job leaves its checkout.
-          # Starting clean and checking the reverse patch prevent this step
-          # from ever masking an unexpected source-tree change.
-          overlay_path="scripts/termux-source-overlay.patch"
-          test -f "$overlay_path"
-          test ! -L "$overlay_path"
-          git diff --quiet
-          git diff --cached --quiet
-          git apply --check "$overlay_path"
-          overlay_applied=0
-          restore_overlay() {
-            restore_status=$?
-            trap - EXIT HUP INT TERM
-            if [ "$overlay_applied" -eq 1 ]; then
-              if git apply --reverse --check "$overlay_path" && \
-                git apply --reverse "$overlay_path" && \
-                git diff --quiet && git diff --cached --quiet; then
-                overlay_applied=0
-              else
-                echo 'Could not restore the Termux source compatibility overlay.' >&2
-                restore_status=1
-              fi
-            fi
-            exit "$restore_status"
-          }
-          trap restore_overlay EXIT
-          trap 'exit 130' HUP INT TERM
-          git apply "$overlay_path"
-          overlay_applied=1
-
           mkdir -p dist
           build_runtime() {
             target=$1

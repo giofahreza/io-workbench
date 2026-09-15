@@ -41,13 +41,11 @@ INSTALL_PROGRESS_FAILURE_RECORDED=0
 # Android receives only concise lifecycle feedback. Its detailed diagnostics
 # stay in Termux, while a manual shell invocation retains the helpful tail.
 INSTALL_PROGRESS_FROM_ANDROID=0
-# The Android APK may bundle a narrowly scoped source overlay while changes are
-# awaiting publication upstream. It lives beside this installer so the Android
-# handoff can persist and execute both files in Termux private storage. A user
-# who deliberately selects another repository/ref is never surprised by the
-# official overlay unless they explicitly provide one through the environment.
+# The official source now carries its Android/Termux compatibility changes.
+# Keep an overlay as an explicit recovery/development escape hatch only; a
+# selected source revision must never receive a stale bundled patch by default.
 INSTALLER_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd) || INSTALLER_DIR=
-TERMUX_SOURCE_OVERLAY_PATH=${IO_WORKBENCH_TERMUX_SOURCE_OVERLAY:-"$INSTALLER_DIR/termux-source-overlay.patch"}
+TERMUX_SOURCE_OVERLAY_PATH=${IO_WORKBENCH_TERMUX_SOURCE_OVERLAY:-}
 TERMUX_SOURCE_OVERLAY_ENABLED=0
 TERMUX_SOURCE_OVERLAY_APPLIED=0
 # This small manifest is copied from the signed Android APK. It is the trust
@@ -527,12 +525,9 @@ if [ "$SOURCE_OPTIONS_REQUESTED" -eq 1 ] && [ "$INSTALL_METHOD" != source ]; the
     fail '--repo and --ref are source-build options. Add --build-from-source to use them.' 2
 fi
 
-if [ "$INSTALL_METHOD" = source ] && [ -n "${IO_WORKBENCH_TERMUX_SOURCE_OVERLAY:-}" ]; then
+if [ "$INSTALL_METHOD" = source ] && [ -n "$TERMUX_SOURCE_OVERLAY_PATH" ]; then
     [ -f "$TERMUX_SOURCE_OVERLAY_PATH" ] || \
         fail "the requested Termux source overlay does not exist: $TERMUX_SOURCE_OVERLAY_PATH" 2
-    TERMUX_SOURCE_OVERLAY_ENABLED=1
-elif [ "$INSTALL_METHOD" = source ] && [ "$REPOSITORY" = "$OFFICIAL_REPOSITORY" ] && [ "$REF" = "$OFFICIAL_REF" ] && \
-    [ -f "$TERMUX_SOURCE_OVERLAY_PATH" ]; then
     TERMUX_SOURCE_OVERLAY_ENABLED=1
 fi
 
@@ -817,10 +812,10 @@ recover_interrupted_termux_source_overlay() {
     if git -C "$SOURCE_DIR" diff --quiet && git -C "$SOURCE_DIR" diff --cached --quiet; then
         return 0
     fi
-    # An interrupted native build can leave only our uncommitted overlay in
-    # the installer-owned checkout. Reverse it only when Git proves that the
-    # exact overlay is present; any other user change remains protected by the
-    # ordinary dirty-check below.
+    # An interrupted native build can leave only the requested uncommitted
+    # overlay in the installer-owned checkout. Reverse it only when Git proves
+    # that the exact overlay is present; any other user change remains
+    # protected by the ordinary dirty-check below.
     if git -C "$SOURCE_DIR" diff --cached --quiet && \
         git -C "$SOURCE_DIR" apply --reverse --check "$TERMUX_SOURCE_OVERLAY_PATH"; then
         note 'restoring an interrupted Termux source compatibility overlay.'
@@ -843,9 +838,9 @@ restore_termux_source_overlay() {
 apply_termux_source_overlay() {
     [ "$TERMUX_SOURCE_OVERLAY_ENABLED" -eq 1 ] || return 0
     if ! git -C "$SOURCE_DIR" apply --check "$TERMUX_SOURCE_OVERLAY_PATH"; then
-        fail 'the bundled Termux source compatibility overlay no longer matches the selected source. Update io-workbench Mobile or use a matching published source revision.'
+        fail 'the requested Termux source compatibility overlay no longer matches the selected source. Use a matching source revision or remove the overlay.'
     fi
-    note 'applying the bundled Termux source compatibility overlay for this native build.'
+    note 'applying the requested Termux source compatibility overlay for this native build.'
     run_or_fail 'Termux source compatibility overlay' git -C "$SOURCE_DIR" apply "$TERMUX_SOURCE_OVERLAY_PATH"
     TERMUX_SOURCE_OVERLAY_APPLIED=1
 }
