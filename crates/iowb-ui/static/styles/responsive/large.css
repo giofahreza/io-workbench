@@ -3,7 +3,7 @@
     display: none;
   }
 
-  .board-panel {
+  .view.active.workbench-panel.board-panel {
     padding: 12px;
   }
 
@@ -29,7 +29,7 @@
   }
 
   .board-columns {
-    grid-template-columns: repeat(6, minmax(260px, 82vw));
+    grid-template-columns: repeat(5, minmax(260px, 82vw));
   }
 }
 

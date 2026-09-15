@@ -341,6 +341,7 @@ function initXterm() {
 }
 
 bindNavigation();
+bindWorkspaceViewShortcuts();
 bindFloatingNavigationPosition();
 bindPinnedChatShortcuts();
 bindCommandPalette();

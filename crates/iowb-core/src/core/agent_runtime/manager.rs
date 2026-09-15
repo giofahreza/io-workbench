@@ -95,6 +95,11 @@ impl AgentRuntimeManager {
                 .args(&command.args)
                 .current_dir(&context.project_path)
                 .env("PATH", augmented_user_path())
+                // A Termux-local host owns its loopback bearer, not the
+                // provider CLI it starts. Keep that credential out of agent
+                // process environments even when this manager is embedded
+                // outside the normal server startup path.
+                .env_remove("IO_WORKBENCH_TOKEN")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Claude {
@@ -139,7 +144,7 @@ impl AgentRuntimeManager {
                     DURABLE_AGENT_SCOPE_ENV,
                     durable_agent_run_scope(context.storage.path()),
                 );
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 if let Some((owner_pid, owner_start)) = current_process_identity() {
                     child_command
                         .env(DURABLE_AGENT_OWNER_PID_ENV, owner_pid.to_string())

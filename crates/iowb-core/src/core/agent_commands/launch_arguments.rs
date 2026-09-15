@@ -117,8 +117,13 @@ fn default_agent_args_with_resume(
             },
             Some("read-only") => match provider {
                 Provider::Claude => {
+                    // Claude Code 2.1.x (the newest release that remains
+                    // native-Termux compatible) does not accept `readonly`.
+                    // Its long-supported plan mode still permits inspection
+                    // while preventing edits, which is the closest safe
+                    // cross-version meaning of io-workbench's read-only mode.
                     args.push("--permission-mode".to_string());
-                    args.push("readonly".to_string());
+                    args.push("plan".to_string());
                 }
                 Provider::Codex => {
                     args.push("--sandbox".to_string());

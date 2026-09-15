@@ -72,6 +72,29 @@
     }
 
     #[test]
+    fn claude_read_only_mode_uses_cross_version_plan_permission_mode() {
+        let args = default_agent_args_with(
+            Provider::Claude,
+            "inspect the repository without making changes",
+            Some("read-only"),
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "plan"]),
+            "args: {args:?}"
+        );
+        assert!(
+            !args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "readonly"]),
+            "args: {args:?}"
+        );
+    }
+
+    #[test]
     fn claude_prefixed_model_uses_cli_runtime_with_prefixed_gateway_model_arg() {
         assert_eq!(
             effective_agent_command_provider(Provider::Claude, Some("cld:claude-sonnet-5")),

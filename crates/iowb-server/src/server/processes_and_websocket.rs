@@ -191,6 +191,7 @@ async fn handle_ws_command(
         WsClientCommand::Subscribe {
             session_ids,
             chat_session_ids,
+            process_ids,
             ..
         } => {
             *board_session_subscriptions =
@@ -212,6 +213,35 @@ async fn handle_ws_command(
                     // `direct_tx`. Waiting on a full channel here would
                     // deadlock a reconnect with many active replays.
                     if direct_tx.try_send(event).is_err() {
+                        break;
+                    }
+                }
+            }
+            // Terminal output is transient, but a mobile Activity may be
+            // recreated while its long-lived Termux PTY survives. Replay a
+            // small bounded tail only for the explicit process ids the
+            // authenticated client says it owns. Live output still comes via
+            // the regular hub subscription below.
+            let mut replayed_processes = HashSet::new();
+            for process_id in process_ids
+                .into_iter()
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+                .filter(|id| replayed_processes.insert(id.clone()))
+                .take(TERMINAL_REPLAY_MAX_PROCESSES)
+            {
+                let Ok(chunks) = state.processes.output_snapshot(&process_id).await else {
+                    continue;
+                };
+                for chunk in chunks {
+                    if direct_tx
+                        .try_send(WsServerEvent::ProcessOutput {
+                            process_id: process_id.clone(),
+                            stream: chunk.stream,
+                            data: chunk.data,
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -452,3 +482,4 @@ async fn send_ws_event(
     });
     sender.send(Message::Text(payload.into())).await
 }
+const TERMINAL_REPLAY_MAX_PROCESSES: usize = 4;

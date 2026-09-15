@@ -22,6 +22,11 @@ pub enum WsClientCommand {
             skip_serializing_if = "Option::is_none"
         )]
         chat_session_ids: Option<Vec<String>>,
+        /// Active terminal process ids whose bounded transcript should be
+        /// replayed after this websocket reconnects. Older clients omit it
+        /// and continue to receive live process events unchanged.
+        #[serde(default, rename = "processIds", skip_serializing_if = "Vec::is_empty")]
+        process_ids: Vec<String>,
     },
     StartSession {
         provider: Provider,
@@ -205,7 +210,7 @@ pub enum SessionRuntimeStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProcessStream {
     Stdout,

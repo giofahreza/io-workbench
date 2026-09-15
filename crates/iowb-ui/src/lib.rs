@@ -94,6 +94,10 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "text/html; charset=utf-8",
             bytes: include_bytes!("../static/docs/api/index.html"),
         }),
+        "docs/keyboard-mappings" | "docs/keyboard-mappings/" => Some(UiAsset {
+            content_type: "text/html; charset=utf-8",
+            bytes: include_bytes!("../static/docs/keyboard-mappings/index.html"),
+        }),
         "docs/category/get-started" | "docs/category/get-started/" => Some(UiAsset {
             content_type: "text/html; charset=utf-8",
             bytes: include_bytes!("../static/docs/category/get-started/index.html"),
@@ -910,18 +914,122 @@ mod tests {
     }
 
     #[test]
-    fn board_mobile_config_exposes_malformed_tool_call_repair_policy() {
+    fn board_is_project_scoped_and_its_workspace_stays_usable() {
+        let html = asset_text("index.html");
+        let source = app_source();
+        let styles = styles_source();
+        let board_styles = asset_text("styles/board.css");
+        let main_tabs = html
+            .split_once(r#"<nav class="main-tab-switcher""#)
+            .map(|(_, rest)| rest)
+            .expect("main tab switcher")
+            .split_once("</nav>")
+            .map(|(tabs, _)| tabs)
+            .expect("main tab switcher end");
+
+        assert!(main_tabs.contains(r#"data-view="board""#));
+        assert!(!main_tabs.contains(r#"data-view="chat""#));
+        assert!(source.contains(r#"await switchView("board").catch(showError);"#));
+        assert!(source.contains("data-sidebar-project-sessions-toggle"));
+        assert!(source.contains("boardLoadRequestId"));
+        assert!(html.contains(r#"id="board-config-modal""#));
+        assert!(html.contains(r#"data-board-config-open"#));
+        assert!(html.contains(r#"id="board-config-open" class="icon-button" type="button" aria-label="Configure board" title="Configure board" data-symbol="settings-2" data-board-config-open"#));
+        assert!(html.contains("<fieldset class=\"board-config-group\">"));
+        assert!(!html.contains(r#"class="board-advanced-options""#));
+        assert!(html.contains(r#"id="board-start-submit""#));
+        assert!(html.contains(r#"id="board-task-submit""#));
+        assert!(styles.contains(".view.active.workbench-panel.board-panel"));
+        assert!(styles.contains("overflow: auto;"));
+        assert!(styles.contains(".board-config-modal"));
+        assert!(styles.contains(".board-config-dialog"));
+        assert!(styles.contains(".board-compose-row.board-create-mode"));
+        assert!(styles.contains("grid-template-columns: repeat(5, minmax(260px, 82vw));"));
+        assert!(!styles.contains("grid-template-columns: repeat(6, minmax(260px, 82vw));"));
+        assert!(source.contains("withButtonLoading(submit, async () => {"));
+        assert!(board_styles.contains("grid-template-rows: none;"));
+        assert!(
+            html.find("id=\"board-columns\"").expect("board columns")
+                < html.find("id=\"board-details\"").expect("board details")
+        );
+    }
+
+    #[test]
+    fn workspace_keyboard_shortcuts_cycle_the_primary_project_views() {
+        let navigation = asset_text("app/navigation.js");
+        let startup = asset_text("app/startup.js");
+
+        assert!(navigation.contains(
+            "const WORKSPACE_SHORTCUT_VIEWS = Object.freeze([\"files\", \"chat\", \"git\", \"board\"]);"
+        ));
+        assert!(navigation.contains("function workspaceShortcutDirection(event)"));
+        assert!(navigation.contains("event.ctrlKey || event.metaKey"));
+        assert!(navigation.contains("event.altKey || event.shiftKey"));
+        assert!(navigation.contains("event.code === \"Comma\" || event.key === \",\""));
+        assert!(navigation.contains("event.code === \"Period\" || event.key === \".\""));
+        assert!(navigation.contains("function bindWorkspaceViewShortcuts()"));
+        assert!(navigation.contains("switchView(WORKSPACE_SHORTCUT_VIEWS[nextIndex]).catch(showError);"));
+        assert!(startup.contains("bindWorkspaceViewShortcuts();"));
+    }
+
+    #[test]
+    fn board_config_modal_matches_mobile_execution_controls() {
         let html = asset_text("index.html");
         let source = app_source();
 
-        for id in ["board-tool-repair-enabled", "board-tool-repair-retries"] {
+        for id in [
+            "board-next-provider",
+            "board-next-model",
+            "board-reasoning-effort",
+            "board-thinking",
+            "board-fast",
+            "board-scheduled-start",
+            "board-tools-preset",
+            "board-rag-index-on-bootstrap",
+            "board-rag-query-enabled",
+            "board-rag-ingest-task-results",
+            "board-rag-ingest-validation-errors",
+            "board-rag-scopes",
+            "board-task-model-breakdown",
+            "board-task-model-implementation",
+            "board-task-model-qa",
+            "board-task-model-qa-fix",
+            "board-task-model-agents",
+            "board-task-model-final-qa",
+            "board-tool-repair-enabled",
+            "board-tool-repair-retries",
+            "board-auto-retry-reset-attempts",
+        ] {
             assert!(html.contains(&format!(r#"id="{id}""#)), "missing {id}");
         }
-        assert!(source.contains("const repairMalformedToolCalls ="));
-        assert!(source.contains("const toolRepairRetries ="));
-        assert!(source.contains("repairMalformedToolCalls,"));
-        assert!(source.contains("malformedToolCallRepairRetries: toolRepairRetries"));
+        for capability in [
+            "reasoningEffort",
+            "taskModelOverrides",
+            "toolsSettings",
+            "scheduledStartAt",
+            "ingestTaskResults",
+            "ingestValidationErrors",
+            "repairMalformedToolCalls",
+            "malformedToolCallRepairRetries",
+            "resetAttempts",
+            "saveBoardConfiguration",
+            "bindBoardConfigModal",
+        ] {
+            assert!(source.contains(capability), "missing {capability}");
+        }
         assert!(source.contains("Tool repair:"));
+        assert!(source.contains("modelStrategy.reasoningEffort ?? modelStrategy.effort"));
+        let save_configuration = source
+            .split_once("async function saveBoardConfiguration()")
+            .map(|(_, value)| value)
+            .expect("save board configuration function");
+        assert!(
+            save_configuration
+                .find("/model-strategy")
+                .expect("model strategy update")
+                < save_configuration.find("/model\", {").expect("model update"),
+            "save the explicit model after the strategy-derived model"
+        );
     }
 
     #[test]
@@ -1073,6 +1181,7 @@ mod tests {
             "file-editor-mode-toggle",
             "file-edit-mode",
             "file-preview-mode",
+            "save-file",
             "editor-full-view",
             "file-editor-shell",
             "file-editor-preview",
@@ -1095,7 +1204,11 @@ mod tests {
         }
         assert!(source.contains("typeof renderMarkdownSegment === \"function\""));
         assert!(source.contains("renderer(content)"));
-        assert!(source.contains("state.fileEditorMode = \"edit\""));
+        assert!(source.contains("function focusFileEditor()"));
+        assert!(source.contains("focusFileEditor();"));
+        assert!(source.contains(
+            "state.fileEditorMode = isMarkdownFile(body.path) ? \"preview\" : \"edit\";"
+        ));
         assert!(source.contains("state.fileEditorFullView = false"));
         assert!(source.contains("setFileEditorFullView(false);"));
         assert!(source.contains(
@@ -1105,14 +1218,38 @@ mod tests {
 
         for selector in [
             ".file-editor-pane.file-editor-preview-mode",
+            ".file-editor-pane.file-editor-preview-mode #save-file",
+            ".file-editor-pane.file-editor-preview-mode .editor-save-separator",
             ".editor-shell.file-editor-preview-mode",
             ".markdown-file-preview",
             ".markdown-file-content",
+            ".editor-shell .CodeMirror-cursor",
             ".file-editor-pane.file-editor-full-view",
             "body.file-editor-full-view",
         ] {
             assert!(styles.contains(selector), "missing {selector}");
         }
+        assert!(styles.contains("border-left-color: var(--text);"));
+    }
+
+    #[test]
+    fn folder_browser_can_create_a_project_folder() {
+        let html = asset_text("index.html");
+        let source = app_source();
+
+        assert!(html.contains(r#"id="folder-browser-create""#));
+        for helper in [
+            "function joinFilesystemPath(parentPath, folderName)",
+            "async function createFolderInFolderBrowser()",
+            "browser.action !== \"add-project\"",
+        ] {
+            assert!(source.contains(helper), "missing {helper}");
+        }
+        assert!(source.contains("/api/create-folder"));
+        assert!(source.contains("Enter one folder name without path separators."));
+        assert!(source.contains(
+            "withButtonLoading(event.currentTarget, createFolderInFolderBrowser).catch(showError);"
+        ));
     }
 
     #[test]
@@ -1197,6 +1334,7 @@ mod tests {
     #[test]
     fn documentation_assets_are_embedded_and_linked_from_the_landing_page() {
         let docs_home = asset_text("docs/");
+        let keyboard_mappings = asset_text("docs/keyboard-mappings/");
         let search_index = asset_text("docs/search-index.json");
         let landing = asset_text("landing");
         let docs_css = asset_text("styles/docs.css");
@@ -1263,6 +1401,11 @@ mod tests {
             ),
             ("docs/troubleshooting", "troubleshooting", "Troubleshooting"),
             ("docs/api", "api", "API reference"),
+            (
+                "docs/keyboard-mappings",
+                "keyboard-mappings",
+                "Keyboard mappings",
+            ),
             (
                 "docs/category/get-started",
                 "category-get-started",
@@ -1372,10 +1515,15 @@ mod tests {
         assert!(docs_home.contains(r#"href="/docs/install-and-update/""#));
         assert!(docs_home.contains(r#"href="/docs/mobile/""#));
         assert!(docs_home.contains(r#"href="/docs/desktop-client/""#));
+        assert!(docs_home.contains(r#"href="/docs/keyboard-mappings/""#));
         assert!(docs_home.contains(r#"href="/docs/topic/operations-and-api/""#));
         assert!(search_index.contains(r#""href": "/docs/mobile/""#));
         assert!(search_index.contains(r#""href": "/docs/install-and-update/""#));
+        assert!(search_index.contains(r#""href": "/docs/keyboard-mappings/""#));
         assert!(search_index.contains(r#""href": "/docs/topic/mobile-clients/""#));
+        assert!(keyboard_mappings.contains("Web workspace — desktop browser"));
+        assert!(keyboard_mappings.contains("Mobile apps — Android and web harness/PWA"));
+        assert!(keyboard_mappings.contains("Alt+P"));
         assert!(docs_css.contains(".docs-layout"));
         assert!(docs_css.contains(".docs-topic-links"));
         assert!(docs_script.contains("function installSearch()"));
@@ -1430,7 +1578,9 @@ mod tests {
         let landing = asset_text("landing");
         let docs = asset_text("docs/");
         let app = asset_text("index.html");
+        let app_script = asset_text("app.js");
         let service_worker = asset_text("sw.js");
+        let version = app_version(app_script);
 
         assert!(brand_mark.contains("io-workbench signal"));
         assert!(brand_loader.contains("scan-port"));
@@ -1438,7 +1588,7 @@ mod tests {
         assert!(landing.contains("data-brand-loader"));
         assert!(docs.contains("/styles/brand.css?v=20260910-05"));
         assert!(docs.contains("/brand-loader.svg?v=20260910-05"));
-        assert!(app.contains("/icon.svg?v=20260910-14"));
+        assert!(app.contains(&format!("/icon.svg?v={version}")));
         assert!(app.contains("data-brand-loader"));
         assert!(service_worker.contains("/brand-mark.svg"));
         assert!(service_worker.contains("/brand-loader.svg"));

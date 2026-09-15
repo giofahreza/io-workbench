@@ -135,8 +135,13 @@ fn preferred_user_command(command: &str) -> Option<String> {
 }
 
 async fn command_version(command: &str) -> Option<String> {
+    // Node-based provider wrappers routinely need more than two seconds on a
+    // cold Android/Termux process. Keep the status check bounded, but leave
+    // enough room for Gemini's wrapper to start before declaring an installed
+    // CLI missing.
+    const PROVIDER_VERSION_TIMEOUT: Duration = Duration::from_secs(8);
     let result = tokio::time::timeout(
-        Duration::from_secs(2),
+        PROVIDER_VERSION_TIMEOUT,
         Command::new(command)
             .arg("--version")
             .env("PATH", augmented_user_path())
@@ -154,33 +159,46 @@ async fn command_version(command: &str) -> Option<String> {
 
 fn provider_auth_hint(provider: Provider) -> Option<String> {
     let env_key = match provider {
-        Provider::Claude => ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
-            .into_iter()
-            .find(|key| env_has_value(key)),
-        Provider::Codex => ["OPENAI_API_KEY"]
-            .into_iter()
-            .find(|key| env_has_value(key)),
-        Provider::Gemini => ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
-            .into_iter()
-            .find(|key| env_has_value(key)),
+        Provider::Claude => first_present_auth_env_key(CLAUDE_AUTH_ENV_KEYS),
+        Provider::Codex => first_present_auth_env_key(&["OPENAI_API_KEY"]),
+        Provider::Gemini => first_present_auth_env_key(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
     };
     if let Some(env_key) = env_key {
         return Some(format!("API Key Auth ({env_key})"));
     }
 
     let home = home_dir()?;
-    let configured = match provider {
-        Provider::Claude => home.join(".claude").join(".credentials.json").is_file(),
-        Provider::Codex => home.join(".codex").join("auth.json").is_file(),
-        Provider::Gemini => home.join(".gemini").join("oauth_creds.json").is_file(),
-    };
-    configured.then(|| "Configured on disk".to_string())
+    match provider {
+        Provider::Claude => {
+            let claude_dir = home.join(".claude");
+            if claude_settings_has_auth_token(&claude_dir.join("settings.json")) {
+                Some("Configured in Claude settings".to_string())
+            } else {
+                claude_dir
+                    .join(".credentials.json")
+                    .is_file()
+                    .then(|| "Configured on disk".to_string())
+            }
+        }
+        Provider::Codex => home
+            .join(".codex")
+            .join("auth.json")
+            .is_file()
+            .then(|| "Configured on disk".to_string()),
+        Provider::Gemini => home
+            .join(".gemini")
+            .join("oauth_creds.json")
+            .is_file()
+            .then(|| "Configured on disk".to_string()),
+    }
 }
 
 fn auth_method(provider: Provider, auth: Option<&str>) -> Option<&'static str> {
     auth.map(|auth| {
         if auth.starts_with("API Key Auth") {
             "api_key"
+        } else if auth == "Configured in Claude settings" {
+            "settings_file"
         } else {
             match provider {
                 Provider::Claude | Provider::Codex | Provider::Gemini => "credentials_file",
@@ -193,6 +211,45 @@ fn env_has_value(key: &str) -> bool {
     env::var(key)
         .ok()
         .is_some_and(|value| !value.trim().is_empty())
+}
+
+const CLAUDE_AUTH_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+
+fn first_present_auth_env_key<'a>(keys: &'a [&'a str]) -> Option<&'a str> {
+    first_present_auth_key(keys, env_has_value)
+}
+
+fn first_present_auth_key<'a>(
+    keys: &'a [&'a str],
+    has_value: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    keys.iter().copied().find(|key| has_value(key))
+}
+
+/// Detects Claude's file-backed authentication without ever returning, logging,
+/// or otherwise retaining the secret. This supports both direct Anthropic keys
+/// and compatible third-party endpoints (such as MiniMax) configured through
+/// Claude Code's documented `settings.json` environment section.
+fn claude_settings_has_auth_token(settings_path: &Path) -> bool {
+    std::fs::read_to_string(settings_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+        .is_some_and(|settings| {
+            settings
+                .get("env")
+                .and_then(Value::as_object)
+                .is_some_and(|env| {
+                    CLAUDE_AUTH_ENV_KEYS.iter().any(|key| {
+                        env.get(*key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| !value.trim().is_empty())
+                    })
+                })
+        })
 }
 
 fn home_dir() -> Option<PathBuf> {

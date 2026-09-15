@@ -94,6 +94,43 @@
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn sqlite_query_rejects_multi_statement_scripts_before_mutating() {
+        let path = env::temp_dir().join(format!("{}.sqlite", new_id("database-script-test")));
+        drop(Connection::open(&path).expect("create test database"));
+
+        let error = execute_sqlite_query(
+            &sqlite_test_connection(&path),
+            "CREATE TABLE audit_items (id INTEGER PRIMARY KEY); INSERT INTO audit_items VALUES (1);",
+            100,
+        )
+        .expect_err("multi-statement scripts must not silently run only their prefix");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.body.error.contains("one SQL statement at a time"));
+
+        let connection = Connection::open(&path).expect("reopen database after rejected script");
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'audit_items'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect rejected script side effects");
+        assert_eq!(table_count, 0, "the first statement must not be applied");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_single_statement_guard_allows_literals_comments_and_triggers() {
+        assert!(ensure_sqlite_single_statement("SELECT ';' AS punctuation;").is_ok());
+        assert!(ensure_sqlite_single_statement("SELECT 1; -- trailing comment\n").is_ok());
+        assert!(ensure_sqlite_single_statement(
+            "CREATE TRIGGER audit_trigger AFTER INSERT ON records BEGIN UPDATE records SET id = id; END;"
+        )
+        .is_ok());
+    }
+
     #[tokio::test]
     async fn sqlite_transfer_source_reads_beyond_former_row_limit() {
         let path = env::temp_dir().join(format!("{}.sqlite", new_id("database-transfer-test")));

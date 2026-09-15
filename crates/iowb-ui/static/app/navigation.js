@@ -6,6 +6,35 @@ function bindNavigation() {
   });
 }
 
+// Keep keyboard workspace navigation deliberately focused on the four views
+// that make up the everyday project loop. Shell, settings, and database stay
+// directly available through their own navigation controls instead of making
+// this shortcut unpredictable.
+const WORKSPACE_SHORTCUT_VIEWS = Object.freeze(["files", "chat", "git", "board"]);
+
+function workspaceShortcutDirection(event) {
+  if (!event || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return 0;
+  if (event.code === "Comma" || event.key === ",") return -1;
+  if (event.code === "Period" || event.key === ".") return 1;
+  return 0;
+}
+
+function bindWorkspaceViewShortcuts() {
+  document.addEventListener("keydown", (event) => {
+    const direction = workspaceShortcutDirection(event);
+    if (!direction) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.repeat) return;
+
+    const currentIndex = WORKSPACE_SHORTCUT_VIEWS.indexOf(activeView());
+    const nextIndex = currentIndex < 0
+      ? (direction < 0 ? WORKSPACE_SHORTCUT_VIEWS.length - 1 : 0)
+      : (currentIndex + direction + WORKSPACE_SHORTCUT_VIEWS.length) % WORKSPACE_SHORTCUT_VIEWS.length;
+    switchView(WORKSPACE_SHORTCUT_VIEWS[nextIndex]).catch(showError);
+  }, true);
+}
+
 function scheduleShellFit(syncServer = false, delay = 120) {
   if (!state.shellTerm || activeView() !== "shell") return;
   window.clearTimeout(state.shellFitTimer);

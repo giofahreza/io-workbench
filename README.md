@@ -18,7 +18,7 @@ A remote agent chat is useful, but delivery work also touches source code, branc
 
 ## Install
 
-Released Linux, macOS, and Windows archives contain the `io-workbench` host binary. Android releases are signed remote-client APKs that connect to a running host.
+Released Linux, macOS, and Windows archives contain the `io-workbench` host binary. Android releases are signed client APKs: they can connect to a remote host, or the Android app can manage an optional local host running inside a separately installed Termux environment.
 
 ### Linux and macOS
 
@@ -38,7 +38,9 @@ The Windows installer offers the same safe host and optional CLI/Gateway choices
 
 ### Android
 
-Download the appropriate signed APK (`arm64-v8a` for most phones, `x86_64` for emulators) from the [latest release](https://github.com/giofahreza/io-workbench/releases/latest). The [install and update guide](https://workbench.giofahreza.com/docs/install-and-update/) covers checksums, updates, ADB, and browser/PWA options.
+Download the appropriate signed APK (`arm64-v8a` for most phones, `x86_64` for emulators) from the [latest release](https://github.com/giofahreza/io-workbench/releases/latest). It can use a normal remote host, or—on Android—an optional local Termux host at `http://127.0.0.1:8787`.
+
+For the local route, install official Termux from its GitHub releases or F-Droid, then open **Choose server → Local runtime** (or **Add server** / **Settings → Server Status**) and use **Manage** in io-workbench Mobile. Grant the documented Termux command permission, enable Termux's `allow-external-apps=true` safety gate, and choose **Install verified runtime**. Termux downloads the matching version-pinned Android/Bionic runtime, verifies its APK-pinned size and SHA-256 before it runs, then makes `io-workbench-local` available in a normal Termux shell. The normal local route does not install Rust, Clang, Node.js, or a build toolchain; provider CLIs can be installed later only when you opt in. **Build from source instead** remains an explicit recovery/development choice. The server chooser shows six truthful live stages while Termux works; use the Termux log only when you need detailed diagnostics. Projects, Git state, terminal processes, databases, provider CLI credentials, and a random private local token stay in Termux's sandbox. The app receives that token only through its explicit Termux callback and remains the authenticated localhost client. The [mobile guide](https://workbench.giofahreza.com/docs/mobile/) covers the security boundary, first install, and recovery details.
 
 ## Start a host
 

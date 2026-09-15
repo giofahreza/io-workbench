@@ -1,0 +1,1188 @@
+diff --git a/crates/iowb-cli/src/lib.rs b/crates/iowb-cli/src/lib.rs
+index bc5267d..4232cec 100644
+--- a/crates/iowb-cli/src/lib.rs
++++ b/crates/iowb-cli/src/lib.rs
+@@ -176,13 +176,23 @@ struct DoctorReport {
+ }
+
+ pub fn run() -> anyhow::Result<()> {
++    // Capture the local bearer in AppConfig, then remove its bootstrap
++    // environment variable before tracing or Tokio can create threads. This
++    // keeps it out of every ordinary server, Git, MCP, doctor, and provider
++    // child process while the in-memory config continues to authenticate the
++    // loopback host.
++    let cli = Cli::parse();
++    let config = apply_overrides(AppConfig::from_env()?, &cli);
++    // SAFETY: this happens before tracing initialization and runtime creation,
++    // so no library worker thread can concurrently access the process
++    // environment.
++    unsafe {
++        env::remove_var("IO_WORKBENCH_TOKEN");
++    }
+     init_tracing();
+
+     let runtime = tokio::runtime::Runtime::new()?;
+-    runtime.block_on(async {
+-        let cli = Cli::parse();
+-        let config = apply_overrides(AppConfig::from_env()?, &cli);
+-
++    runtime.block_on(async move {
+         match cli.command.unwrap_or(Command::Start) {
+             Command::Start => iowb_server::serve(config).await,
+             Command::Status => {
+diff --git a/crates/iowb-core/src/codex_app_server/protocol.rs b/crates/iowb-core/src/codex_app_server/protocol.rs
+index 75dfb10..ca92fe4 100644
+--- a/crates/iowb-core/src/codex_app_server/protocol.rs
++++ b/crates/iowb-core/src/codex_app_server/protocol.rs
+@@ -23,6 +23,9 @@ fn app_server_command(command: &OsString, launch_options: &CodexAppServerLaunchO
+         child_command.args(&launch_options.args);
+     }
+     child_command.env("PATH", augmented_user_path());
++    // Do not pass the server's Termux-local loopback bearer into Codex's
++    // app-server subprocess. The parent already keeps it in AppConfig.
++    child_command.env_remove("IO_WORKBENCH_TOKEN");
+     for (key, value) in &launch_options.env {
+         child_command.env(key, value);
+     }
+diff --git a/crates/iowb-core/src/core/agent_commands/launch_arguments.rs b/crates/iowb-core/src/core/agent_commands/launch_arguments.rs
+index c91082b..de8ed8a 100644
+--- a/crates/iowb-core/src/core/agent_commands/launch_arguments.rs
++++ b/crates/iowb-core/src/core/agent_commands/launch_arguments.rs
+@@ -117,8 +117,13 @@ fn default_agent_args_with_resume(
+             },
+             Some("read-only") => match provider {
+                 Provider::Claude => {
++                    // Claude Code 2.1.x (the newest release that remains
++                    // native-Termux compatible) does not accept `readonly`.
++                    // Its long-supported plan mode still permits inspection
++                    // while preventing edits, which is the closest safe
++                    // cross-version meaning of io-workbench's read-only mode.
+                     args.push("--permission-mode".to_string());
+-                    args.push("readonly".to_string());
++                    args.push("plan".to_string());
+                 }
+                 Provider::Codex => {
+                     args.push("--sandbox".to_string());
+diff --git a/crates/iowb-core/src/core/agent_runtime/manager.rs b/crates/iowb-core/src/core/agent_runtime/manager.rs
+index 7a77ea3..ce73637 100644
+--- a/crates/iowb-core/src/core/agent_runtime/manager.rs
++++ b/crates/iowb-core/src/core/agent_runtime/manager.rs
+@@ -95,6 +95,11 @@ impl AgentRuntimeManager {
+                 .args(&command.args)
+                 .current_dir(&context.project_path)
+                 .env("PATH", augmented_user_path())
++                // A Termux-local host owns its loopback bearer, not the
++                // provider CLI it starts. Keep that credential out of agent
++                // process environments even when this manager is embedded
++                // outside the normal server startup path.
++                .env_remove("IO_WORKBENCH_TOKEN")
+                 .stdout(Stdio::piped())
+                 .stderr(Stdio::piped());
+             if context.runtime == ChatRuntime::IoGateway && runtime_provider == Provider::Claude {
+@@ -139,7 +144,7 @@ impl AgentRuntimeManager {
+                     DURABLE_AGENT_SCOPE_ENV,
+                     durable_agent_run_scope(context.storage.path()),
+                 );
+-                #[cfg(target_os = "linux")]
++                #[cfg(any(target_os = "linux", target_os = "android"))]
+                 if let Some((owner_pid, owner_start)) = current_process_identity() {
+                     child_command
+                         .env(DURABLE_AGENT_OWNER_PID_ENV, owner_pid.to_string())
+diff --git a/crates/iowb-core/src/core/agent_runtime/process_ownership.rs b/crates/iowb-core/src/core/agent_runtime/process_ownership.rs
+index f4467b8..ab2f804 100644
+--- a/crates/iowb-core/src/core/agent_runtime/process_ownership.rs
++++ b/crates/iowb-core/src/core/agent_runtime/process_ownership.rs
+@@ -3,9 +3,10 @@ fn isolate_agent_process(command: &mut Command) {
+     command.process_group(0);
+
+     // A forced SIGKILL gives Rust no opportunity to run cleanup code. On
+-    // Linux, ask the kernel to kill the provider CLI when its server parent
+-    // disappears so startup recovery never overlaps an orphaned old turn.
+-    #[cfg(target_os = "linux")]
++    // Linux and Android use the same kernel facility. Ask it to kill the
++    // provider CLI when its server parent disappears so startup recovery
++    // never overlaps an orphaned old turn.
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     unsafe {
+         command.pre_exec(|| {
+             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+@@ -31,20 +32,20 @@ fn durable_agent_run_scope(database_path: &Path) -> String {
+     ))
+ }
+
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn process_start_time(process_id: libc::pid_t) -> Option<u64> {
+     let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
+     let (_, fields) = stat.rsplit_once(')')?;
+     fields.split_whitespace().nth(19)?.parse().ok()
+ }
+
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn current_process_identity() -> Option<(libc::pid_t, u64)> {
+     let process_id = std::process::id() as libc::pid_t;
+     process_start_time(process_id).map(|start_time| (process_id, start_time))
+ }
+
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn process_environment_value<'a>(environment: &'a [u8], key: &str) -> Option<&'a [u8]> {
+     let key = key.as_bytes();
+     environment
+@@ -52,7 +53,7 @@ fn process_environment_value<'a>(environment: &'a [u8], key: &str) -> Option<&'a
+         .find_map(|entry| entry.strip_prefix(key)?.strip_prefix(b"="))
+ }
+
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn marked_process_owner_is_alive(environment: &[u8]) -> bool {
+     let owner_pid = process_environment_value(environment, DURABLE_AGENT_OWNER_PID_ENV)
+         .and_then(|value| std::str::from_utf8(value).ok())
+@@ -73,15 +74,15 @@ fn marked_process_owner_is_alive(environment: &[u8]) -> bool {
+ /// Kill provider descendants left behind by a stopped server before a durable
+ /// continuation is launched. A process must match both the run and canonical
+ /// database path, and its recorded server owner must no longer be alive.
+-/// Linux `/proc` exposes these inherited markers even when the original
+-/// process-group leader has already exited.
++/// Linux and Android `/proc` expose these inherited markers even when the
++/// original process-group leader has already exited.
+ #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+ pub struct OrphanedAgentRunCleanup {
+     pub terminated_process_groups: usize,
+     pub live_owner: bool,
+ }
+
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub fn terminate_orphaned_agent_run_processes(
+     run_id: &str,
+     database_path: impl AsRef<Path>,
+@@ -159,7 +160,7 @@ pub fn terminate_orphaned_agent_run_processes(
+     }
+ }
+
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ pub fn terminate_orphaned_agent_run_processes(
+     _run_id: &str,
+     _database_path: impl AsRef<Path>,
+diff --git a/crates/iowb-process/src/lib.rs b/crates/iowb-process/src/lib.rs
+index c61728b..5a30857 100644
+--- a/crates/iowb-process/src/lib.rs
++++ b/crates/iowb-process/src/lib.rs
+@@ -1,9 +1,9 @@
+ use std::{
+-    collections::HashMap,
++    collections::{HashMap, VecDeque},
+     io::{Read, Write},
+     path::PathBuf,
+     process::Stdio,
+-    sync::{Arc, mpsc as std_mpsc},
++    sync::{Arc, Mutex as StdMutex, mpsc as std_mpsc},
+     time::Duration,
+ };
+
+@@ -21,6 +21,17 @@ use uuid::Uuid;
+ const PROCESS_EVENT_CAPACITY: usize = 512;
+ const PROCESS_INPUT_CAPACITY: usize = 256;
+ const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8192;
++// Keep enough recent output for a client that reconnects to an active PTY,
++// without letting a long-running terminal consume unbounded server memory.
++const PROCESS_OUTPUT_REPLAY_BYTES: usize = 64 * 1024;
++// A shell can leave an inherited pipe open after its own process exits. Drain
++// ordinary process output briefly, then stop its readers so a terminal exit
++// cannot be delayed indefinitely or followed by stale output events.
++const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
++// A background descendant can keep a slave PTY open after its shell exits.
++// Give the reader a short chance to drain, then gate further chunks so exit
++// remains prompt and can never be followed by stale terminal output.
++const PTY_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+ #[derive(Debug, Error)]
+ pub enum ProcessError {
+@@ -55,6 +66,15 @@ pub enum ProcessEvent {
+     },
+ }
+
++/// A bounded, in-memory output chunk that can be replayed to a client that
++/// reconnects to an active process. It deliberately is not persisted: a
++/// process and its terminal screen both end when the server stops.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ProcessOutputChunk {
++    pub stream: ProcessStream,
++    pub data: String,
++}
++
+ #[derive(Clone)]
+ pub struct ProcessManager {
+     processes: Arc<RwLock<HashMap<String, Arc<ProcessRecord>>>>,
+@@ -64,6 +84,30 @@ pub struct ProcessManager {
+ struct ProcessRecord {
+     info: ProcessInfo,
+     control_tx: ProcessControlSender,
++    output: Arc<StdMutex<ProcessOutputBuffer>>,
++}
++
++#[derive(Default)]
++struct ProcessOutputBuffer {
++    chunks: VecDeque<ProcessOutputChunk>,
++    byte_len: usize,
++}
++
++impl ProcessOutputBuffer {
++    fn push(&mut self, stream: ProcessStream, data: String) {
++        self.byte_len = self.byte_len.saturating_add(data.len());
++        self.chunks.push_back(ProcessOutputChunk { stream, data });
++        while self.byte_len > PROCESS_OUTPUT_REPLAY_BYTES {
++            let Some(removed) = self.chunks.pop_front() else {
++                break;
++            };
++            self.byte_len = self.byte_len.saturating_sub(removed.data.len());
++        }
++    }
++
++    fn snapshot(&self) -> Vec<ProcessOutputChunk> {
++        self.chunks.iter().cloned().collect()
++    }
+ }
+
+ enum ProcessControlSender {
+@@ -112,6 +156,10 @@ impl ProcessManager {
+             .stdin(Stdio::piped())
+             .stdout(Stdio::piped())
+             .stderr(Stdio::piped());
++        // The local Termux host keeps its loopback bearer in its own process
++        // environment. A user terminal (and every CLI it starts) must never
++        // inherit that host credential.
++        command.env_remove("IO_WORKBENCH_TOKEN");
+
+         if let Some(cwd) = &cwd {
+             command.current_dir(cwd);
+@@ -133,6 +181,7 @@ impl ProcessManager {
+             pty: false,
+         };
+
++        let output = Arc::new(StdMutex::new(ProcessOutputBuffer::default()));
+         self.processes.write().await.insert(
+             id.clone(),
+             Arc::new(ProcessRecord {
+@@ -141,6 +190,7 @@ impl ProcessManager {
+                     input_tx,
+                     kill_tx: Mutex::new(Some(kill_tx)),
+                 },
++                output: Arc::clone(&output),
+             }),
+         );
+
+@@ -148,60 +198,68 @@ impl ProcessManager {
+             spawn_input_writer(self.events.clone(), id.clone(), stdin, input_rx);
+         }
+
+-        if let Some(stdout) = stdout {
++        let stdout_reader = stdout.map(|stdout| {
+             spawn_output_reader(
+                 self.events.clone(),
+                 id.clone(),
+                 ProcessStream::Stdout,
+                 stdout,
+-            );
+-        }
++                Arc::clone(&output),
++            )
++        });
+
+-        if let Some(stderr) = stderr {
++        let stderr_reader = stderr.map(|stderr| {
+             spawn_output_reader(
+                 self.events.clone(),
+                 id.clone(),
+                 ProcessStream::Stderr,
+                 stderr,
+-            );
+-        }
++                Arc::clone(&output),
++            )
++        });
+
+         let events = self.events.clone();
+         let processes = Arc::clone(&self.processes);
+         let process_id = id.clone();
+         tokio::spawn(async move {
+-            tokio::select! {
++            let completion = tokio::select! {
+                 status = child.wait() => {
+                     match status {
+-                        Ok(status) => {
+-                            let _ = events.send(ProcessEvent::Exited {
+-                                process_id: process_id.clone(),
+-                                code: status.code(),
+-                            });
+-                        }
+-                        Err(error) => {
+-                            let _ = events.send(ProcessEvent::Failed {
+-                                process_id: process_id.clone(),
+-                                message: error.to_string(),
+-                            });
+-                        }
++                        Ok(status) => ProcessCompletion::Exited(status.code()),
++                        Err(error) => ProcessCompletion::Failed(error.to_string()),
+                     }
+                 }
+                 _ = kill_rx => {
+-                    let kill_result = child.kill().await;
++                    ProcessCompletion::Killed(child.kill().await.err().map(|error| error.to_string()))
++                }
++            };
++            processes.write().await.remove(&process_id);
++            drain_output_reader(stdout_reader).await;
++            drain_output_reader(stderr_reader).await;
++
++            match completion {
++                ProcessCompletion::Exited(code) => {
++                    let _ = events.send(ProcessEvent::Exited { process_id, code });
++                }
++                ProcessCompletion::Killed(error) => {
+                     let _ = events.send(ProcessEvent::Exited {
+                         process_id: process_id.clone(),
+                         code: None,
+                     });
+-                    if let Err(error) = kill_result {
++                    if let Some(message) = error {
+                         let _ = events.send(ProcessEvent::Failed {
+-                            process_id: process_id.clone(),
+-                            message: error.to_string(),
++                            process_id,
++                            message,
+                         });
+                     }
+                 }
++                ProcessCompletion::Failed(message) => {
++                    let _ = events.send(ProcessEvent::Failed {
++                        process_id,
++                        message,
++                    });
++                }
+             }
+-            processes.write().await.remove(&process_id);
+         });
+
+         Ok(ProcessStartResponse { id, started_at })
+@@ -222,6 +280,10 @@ impl ProcessManager {
+
+         let mut command = CommandBuilder::new(&request.command);
+         command.args(&request.args);
++        // See the matching tokio Command call above. CommandBuilder starts
++        // with the parent environment, so remove the host-only bearer before
++        // the PTY child is spawned.
++        command.env_remove("IO_WORKBENCH_TOKEN");
+         configure_pty_environment(&mut command);
+         if let Some(cwd) = &cwd {
+             command.cwd(cwd);
+@@ -244,15 +306,24 @@ impl ProcessManager {
+             pty: true,
+         };
+
++        let output = Arc::new(StdMutex::new(ProcessOutputBuffer::default()));
+         self.processes.write().await.insert(
+             id.clone(),
+             Arc::new(ProcessRecord {
+                 info,
+                 control_tx: ProcessControlSender::Blocking(control_tx),
++                output: Arc::clone(&output),
+             }),
+         );
+
+-        spawn_pty_reader(self.events.clone(), id.clone(), reader);
++        let output_gate = Arc::new(StdMutex::new(true));
++        let reader_done = spawn_pty_reader(
++            self.events.clone(),
++            id.clone(),
++            reader,
++            Arc::clone(&output_gate),
++            Arc::clone(&output),
++        );
+         spawn_pty_control(
+             self.events.clone(),
+             id.clone(),
+@@ -265,25 +336,39 @@ impl ProcessManager {
+         let events = self.events.clone();
+         let processes = Arc::clone(&self.processes);
+         let process_id = id.clone();
+-        tokio::task::spawn_blocking(move || {
+-            match child.wait() {
+-                Ok(status) => {
+-                    let code = i32::try_from(status.exit_code()).ok();
+-                    let _ = events.send(ProcessEvent::Exited {
+-                        process_id: process_id.clone(),
+-                        code,
+-                    });
++        tokio::spawn(async move {
++            let completion = match tokio::task::spawn_blocking(move || child.wait()).await {
++                Ok(Ok(status)) => ProcessCompletion::Exited(i32::try_from(status.exit_code()).ok()),
++                Ok(Err(error)) => ProcessCompletion::Failed(error.to_string()),
++                Err(error) => ProcessCompletion::Failed(format!("PTY wait task failed: {error}")),
++            };
++
++            // Dropping the control sender closes the master PTY once its
++            // control thread wakes. Most readers then finish immediately,
++            // but a background descendant can retain the slave indefinitely.
++            // Bound that drain and close the output gate before publishing
++            // exit, so clients never see a final chunk after their terminal
++            // is marked closed.
++            processes.write().await.remove(&process_id);
++            let _ = tokio::time::timeout(PTY_OUTPUT_DRAIN_TIMEOUT, reader_done).await;
++
++            let mut output_open = output_gate
++                .lock()
++                .expect("PTY output gate lock must not be poisoned");
++            *output_open = false;
++            match completion {
++                ProcessCompletion::Exited(code) => {
++                    let _ = events.send(ProcessEvent::Exited { process_id, code });
+                 }
+-                Err(error) => {
++                ProcessCompletion::Killed(_) => unreachable!("PTY control handles termination"),
++                ProcessCompletion::Failed(message) => {
+                     let _ = events.send(ProcessEvent::Failed {
+-                        process_id: process_id.clone(),
+-                        message: error.to_string(),
++                        process_id,
++                        message,
+                     });
+                 }
+             }
+-            tokio::runtime::Handle::current().spawn(async move {
+-                processes.write().await.remove(&process_id);
+-            });
++            drop(output_open);
+         });
+
+         Ok(ProcessStartResponse { id, started_at })
+@@ -323,6 +408,23 @@ impl ProcessManager {
+             .collect()
+     }
+
++    /// Returns the recent output for an active process. This is used only to
++    /// restore a terminal view after a client reconnects; normal output still
++    /// flows through the live event stream.
++    pub async fn output_snapshot(&self, process_id: &str) -> Result<Vec<ProcessOutputChunk>> {
++        let output = {
++            let processes = self.processes.read().await;
++            processes
++                .get(process_id)
++                .map(|record| Arc::clone(&record.output))
++        }
++        .ok_or(ProcessError::NotFound)?;
++        Ok(output
++            .lock()
++            .expect("process output buffer lock must not be poisoned")
++            .snapshot())
++    }
++
+     pub async fn abort(&self, process_id: &str) -> Result<()> {
+         self.send_control(process_id, ProcessControl::Kill).await
+     }
+@@ -353,12 +455,33 @@ impl Default for ProcessManager {
+     }
+ }
+
++enum ProcessCompletion {
++    Exited(Option<i32>),
++    Killed(Option<String>),
++    Failed(String),
++}
++
++async fn drain_output_reader(reader: Option<tokio::task::JoinHandle<()>>) {
++    let Some(mut reader) = reader else {
++        return;
++    };
++    if tokio::time::timeout(PROCESS_OUTPUT_DRAIN_TIMEOUT, &mut reader)
++        .await
++        .is_err()
++    {
++        reader.abort();
++        let _ = reader.await;
++    }
++}
++
+ fn spawn_output_reader<R>(
+     events: broadcast::Sender<ProcessEvent>,
+     process_id: String,
+     stream: ProcessStream,
+     reader: R,
+-) where
++    output: Arc<StdMutex<ProcessOutputBuffer>>,
++) -> tokio::task::JoinHandle<()>
++where
+     R: tokio::io::AsyncRead + Unpin + Send + 'static,
+ {
+     tokio::spawn(async move {
+@@ -368,10 +491,15 @@ fn spawn_output_reader<R>(
+             match reader.read(&mut buffer).await {
+                 Ok(0) => break,
+                 Ok(read) => {
++                    let data = String::from_utf8_lossy(&buffer[..read]).into_owned();
++                    output
++                        .lock()
++                        .expect("process output buffer lock must not be poisoned")
++                        .push(stream, data.clone());
+                     let _ = events.send(ProcessEvent::Output {
+                         process_id: process_id.clone(),
+                         stream,
+-                        data: String::from_utf8_lossy(&buffer[..read]).into_owned(),
++                        data,
+                     });
+                 }
+                 Err(error) => {
+@@ -383,26 +511,40 @@ fn spawn_output_reader<R>(
+                 }
+             }
+         }
+-    });
++    })
+ }
+
+ fn spawn_pty_reader(
+     events: broadcast::Sender<ProcessEvent>,
+     process_id: String,
+     mut reader: Box<dyn Read + Send>,
+-) {
++    output_gate: Arc<StdMutex<bool>>,
++    output: Arc<StdMutex<ProcessOutputBuffer>>,
++) -> oneshot::Receiver<()> {
++    let (done_tx, done_rx) = oneshot::channel();
+     std::thread::spawn(move || {
+         let mut buffer = vec![0_u8; PROCESS_OUTPUT_CHUNK_BYTES];
+         loop {
+             match reader.read(&mut buffer) {
+                 Ok(0) => break,
+                 Ok(read) => {
+-                    let _ = events.send(ProcessEvent::Output {
+-                        process_id: process_id.clone(),
+-                        stream: ProcessStream::Stdout,
+-                        data: String::from_utf8_lossy(&buffer[..read]).into_owned(),
+-                    });
++                    let output_open = output_gate
++                        .lock()
++                        .expect("PTY output gate lock must not be poisoned");
++                    if *output_open {
++                        let data = String::from_utf8_lossy(&buffer[..read]).into_owned();
++                        output
++                            .lock()
++                            .expect("process output buffer lock must not be poisoned")
++                            .push(ProcessStream::Stdout, data.clone());
++                        let _ = events.send(ProcessEvent::Output {
++                            process_id: process_id.clone(),
++                            stream: ProcessStream::Stdout,
++                            data,
++                        });
++                    }
+                 }
++                Err(error) if is_normal_pty_close(&error) => break,
+                 Err(error) => {
+                     let _ = events.send(ProcessEvent::Failed {
+                         process_id: process_id.clone(),
+@@ -412,7 +554,23 @@ fn spawn_pty_reader(
+                 }
+             }
+         }
++        let _ = done_tx.send(());
+     });
++    done_rx
++}
++
++fn is_normal_pty_close(error: &std::io::Error) -> bool {
++    #[cfg(unix)]
++    {
++        // Unix PTY masters report EIO when the slave closes. It is their
++        // end-of-stream signal, not a user-visible terminal failure.
++        error.raw_os_error() == Some(5)
++    }
++    #[cfg(not(unix))]
++    {
++        let _ = error;
++        false
++    }
+ }
+
+ fn configure_pty_environment(command: &mut CommandBuilder) {
+@@ -499,7 +657,7 @@ fn spawn_input_writer(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use tokio::time::{Duration, timeout};
++    use tokio::time::{Duration, Instant, timeout};
+
+     #[tokio::test]
+     async fn writes_process_input_to_child_stdin() {
+@@ -595,6 +753,182 @@ mod tests {
+         assert!(saw_output);
+     }
+
++    #[tokio::test]
++    async fn pty_exit_is_published_after_final_output() {
++        let manager = ProcessManager::new();
++        let mut events = manager.subscribe();
++        let started = manager
++            .start(ProcessStartRequest {
++                command: "/bin/sh".to_string(),
++                args: vec![
++                    "-lc".to_string(),
++                    "printf 'PTY_FINAL_OUTPUT\\n'".to_string(),
++                ],
++                cwd: None,
++                pty: true,
++                cols: 80,
++                rows: 24,
++            })
++            .await
++            .expect("PTY process starts");
++
++        let mut saw_final_output = false;
++        for _ in 0..12 {
++            match timeout(Duration::from_secs(2), events.recv())
++                .await
++                .expect("event arrives")
++                .expect("event stream open")
++            {
++                ProcessEvent::Output {
++                    process_id, data, ..
++                } if process_id == started.id && data.contains("PTY_FINAL_OUTPUT") => {
++                    saw_final_output = true;
++                }
++                ProcessEvent::Exited { process_id, .. } if process_id == started.id => {
++                    assert!(
++                        saw_final_output,
++                        "terminal exit must not precede its final PTY output"
++                    );
++                    return;
++                }
++                ProcessEvent::Failed {
++                    process_id,
++                    message,
++                } if process_id == started.id => panic!("PTY process failed: {message}"),
++                _ => {}
++            }
++        }
++
++        panic!("did not receive terminal exit for the PTY process");
++    }
++
++    #[tokio::test]
++    async fn pty_exit_stays_prompt_when_a_background_child_keeps_the_slave_open() {
++        let manager = ProcessManager::new();
++        let mut events = manager.subscribe();
++        let started = manager
++            .start(ProcessStartRequest {
++                command: "/bin/sh".to_string(),
++                args: vec![
++                    "-lc".to_string(),
++                    "(sleep 2; printf 'PTY_LATE_OUTPUT\\n') & printf 'PTY_EARLY_OUTPUT\\n'"
++                        .to_string(),
++                ],
++                cwd: None,
++                pty: true,
++                cols: 80,
++                rows: 24,
++            })
++            .await
++            .expect("PTY process starts");
++
++        let mut saw_early_output = false;
++        let exit_deadline = Instant::now() + Duration::from_secs(3);
++        loop {
++            let remaining = exit_deadline
++                .checked_duration_since(Instant::now())
++                .expect("PTY exit must be prompt despite its background child");
++            match timeout(remaining, events.recv())
++                .await
++                .expect("event arrives before the exit deadline")
++                .expect("event stream open")
++            {
++                ProcessEvent::Output {
++                    process_id, data, ..
++                } if process_id == started.id && data.contains("PTY_EARLY_OUTPUT") => {
++                    saw_early_output = true;
++                }
++                ProcessEvent::Exited { process_id, .. } if process_id == started.id => break,
++                ProcessEvent::Failed {
++                    process_id,
++                    message,
++                } if process_id == started.id => panic!("PTY process failed: {message}"),
++                _ => {}
++            }
++        }
++        assert!(
++            saw_early_output,
++            "terminal exit must retain already-read output"
++        );
++
++        // The child still owns the slave for roughly another second. The
++        // output gate must prevent that late data from following exit.
++        let late_output_deadline = Instant::now() + Duration::from_secs(2);
++        loop {
++            let Some(remaining) = late_output_deadline.checked_duration_since(Instant::now())
++            else {
++                break;
++            };
++            match timeout(remaining, events.recv()).await {
++                Err(_) => break,
++                Ok(Ok(ProcessEvent::Output {
++                    process_id, data, ..
++                })) if process_id == started.id && data.contains("PTY_LATE_OUTPUT") => {
++                    panic!("terminal output must not follow its exit event");
++                }
++                Ok(Ok(_)) => {}
++                Ok(Err(error)) => panic!("event stream failed: {error}"),
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn pipe_exit_is_published_after_stdout_and_stderr() {
++        let manager = ProcessManager::new();
++        let mut events = manager.subscribe();
++        let started = manager
++            .start(ProcessStartRequest {
++                command: "/bin/sh".to_string(),
++                args: vec![
++                    "-c".to_string(),
++                    "printf 'PIPE_STDOUT\\n'; printf 'PIPE_STDERR\\n' >&2".to_string(),
++                ],
++                cwd: None,
++                pty: false,
++                cols: 80,
++                rows: 24,
++            })
++            .await
++            .expect("pipe process starts");
++
++        let mut saw_stdout = false;
++        let mut saw_stderr = false;
++        for _ in 0..12 {
++            match timeout(Duration::from_secs(2), events.recv())
++                .await
++                .expect("event arrives")
++                .expect("event stream open")
++            {
++                ProcessEvent::Output {
++                    process_id,
++                    stream: ProcessStream::Stdout,
++                    data,
++                } if process_id == started.id && data.contains("PIPE_STDOUT") => {
++                    saw_stdout = true;
++                }
++                ProcessEvent::Output {
++                    process_id,
++                    stream: ProcessStream::Stderr,
++                    data,
++                } if process_id == started.id && data.contains("PIPE_STDERR") => {
++                    saw_stderr = true;
++                }
++                ProcessEvent::Exited { process_id, .. } if process_id == started.id => {
++                    assert!(saw_stdout, "process exit must follow stdout output");
++                    assert!(saw_stderr, "process exit must follow stderr output");
++                    return;
++                }
++                ProcessEvent::Failed {
++                    process_id,
++                    message,
++                } if process_id == started.id => panic!("pipe process failed: {message}"),
++                _ => {}
++            }
++        }
++
++        panic!("did not receive process exit for the pipe process");
++    }
++
+     #[tokio::test]
+     async fn pty_process_gets_browser_terminal_environment() {
+         let manager = ProcessManager::new();
+@@ -637,4 +971,72 @@ mod tests {
+
+         assert!(saw_output);
+     }
++
++    #[tokio::test]
++    async fn active_pty_output_can_be_replayed_after_a_client_reconnect() {
++        let manager = ProcessManager::new();
++        let mut events = manager.subscribe();
++        let started = manager
++            .start(ProcessStartRequest {
++                command: "/bin/sh".to_string(),
++                args: vec![
++                    "-lc".to_string(),
++                    "printf 'PTY_REPLAY_MARKER'; read line".to_string(),
++                ],
++                cwd: None,
++                pty: true,
++                cols: 80,
++                rows: 24,
++            })
++            .await
++            .expect("PTY starts");
++
++        for _ in 0..12 {
++            match timeout(Duration::from_secs(2), events.recv())
++                .await
++                .expect("event arrives")
++                .expect("event stream open")
++            {
++                ProcessEvent::Output {
++                    process_id, data, ..
++                } if process_id == started.id && data.contains("PTY_REPLAY_MARKER") => break,
++                ProcessEvent::Failed {
++                    process_id,
++                    message,
++                } if process_id == started.id => panic!("PTY process failed: {message}"),
++                _ => continue,
++            }
++        }
++
++        let replay = manager
++            .output_snapshot(&started.id)
++            .await
++            .expect("active PTY has a replay buffer");
++        assert!(
++            replay
++                .iter()
++                .any(|chunk| chunk.data.contains("PTY_REPLAY_MARKER")),
++            "the active PTY transcript should include output produced before a client reconnects"
++        );
++
++        manager
++            .write_input(&started.id, b"\n".to_vec())
++            .await
++            .expect("PTY accepts cleanup input");
++    }
++
++    #[test]
++    fn process_output_replay_keeps_a_bounded_tail() {
++        let mut output = ProcessOutputBuffer::default();
++        output.push(
++            ProcessStream::Stdout,
++            "a".repeat(PROCESS_OUTPUT_REPLAY_BYTES),
++        );
++        output.push(ProcessStream::Stderr, "b".to_string());
++
++        let replay = output.snapshot();
++        assert_eq!(replay.len(), 1);
++        assert_eq!(replay[0].stream, ProcessStream::Stderr);
++        assert_eq!(replay[0].data, "b");
++    }
+ }
+diff --git a/crates/iowb-protocol/src/protocol/websocket.rs b/crates/iowb-protocol/src/protocol/websocket.rs
+index 2557275..4c8dc68 100644
+--- a/crates/iowb-protocol/src/protocol/websocket.rs
++++ b/crates/iowb-protocol/src/protocol/websocket.rs
+@@ -22,6 +22,11 @@ pub enum WsClientCommand {
+             skip_serializing_if = "Option::is_none"
+         )]
+         chat_session_ids: Option<Vec<String>>,
++        /// Active terminal process ids whose bounded transcript should be
++        /// replayed after this websocket reconnects. Older clients omit it
++        /// and continue to receive live process events unchanged.
++        #[serde(default, rename = "processIds", skip_serializing_if = "Vec::is_empty")]
++        process_ids: Vec<String>,
+     },
+     StartSession {
+         provider: Provider,
+@@ -205,7 +210,7 @@ pub enum SessionRuntimeStatus {
+     Failed,
+ }
+
+-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "lowercase")]
+ pub enum ProcessStream {
+     Stdout,
+diff --git a/crates/iowb-server/src/database/sqlite.rs b/crates/iowb-server/src/database/sqlite.rs
+index 6a48cff..ac26c1a 100644
+--- a/crates/iowb-server/src/database/sqlite.rs
++++ b/crates/iowb-server/src/database/sqlite.rs
+@@ -196,11 +196,81 @@ fn sqlite_relational_schema(
+     })
+ }
+
++const SQLITE_SINGLE_STATEMENT_ERROR: &str = "SQLite Run Query executes one SQL statement at a time. Split a script into separate Run Query actions.";
++
++/// `rusqlite::Connection::prepare` deliberately prepares only the first SQL
++/// statement in its input. Without this guard a request such as `CREATE ...;
++/// INSERT ...;` reports success after applying only `CREATE`, which is both
++/// surprising and unsafe for the database workspace.
++///
++/// Ask SQLite where a statement is complete instead of trying to split on
++/// semicolons ourselves: quoted strings, comments, and trigger bodies may
++/// contain semicolons that are not statement boundaries.
++fn ensure_sqlite_single_statement(sql: &str) -> Result<()> {
++    for (index, byte) in sql.bytes().enumerate() {
++        if byte != b';' {
++            continue;
++        }
++        let prefix = std::ffi::CString::new(&sql[..=index]).map_err(|_| {
++            ServerError::new(StatusCode::BAD_REQUEST, "SQL must not contain a NUL byte")
++        })?;
++        // SAFETY: `CString` gives SQLite a valid, NUL-terminated SQL buffer
++        // for this read-only completeness check.
++        let complete = unsafe { rusqlite::ffi::sqlite3_complete(prefix.as_ptr()) != 0 };
++        if !complete {
++            continue;
++        }
++        if sqlite_tail_has_statement(&sql[index + 1..]) {
++            return Err(ServerError::new(
++                StatusCode::BAD_REQUEST,
++                SQLITE_SINGLE_STATEMENT_ERROR,
++            ));
++        }
++        return Ok(());
++    }
++    Ok(())
++}
++
++/// A completed statement may be followed by whitespace, empty semicolons, or
++/// SQL comments. Any other token starts a second statement and must be
++/// rejected before the first statement can mutate the database.
++fn sqlite_tail_has_statement(tail: &str) -> bool {
++    let bytes = tail.as_bytes();
++    let mut index = 0;
++    while index < bytes.len() {
++        match bytes[index] {
++            byte if byte.is_ascii_whitespace() || byte == b';' => index += 1,
++            b'-' if bytes.get(index + 1) == Some(&b'-') => {
++                index += 2;
++                while index < bytes.len() && bytes[index] != b'\n' {
++                    index += 1;
++                }
++            }
++            b'/' if bytes.get(index + 1) == Some(&b'*') => {
++                index += 2;
++                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
++                {
++                    index += 1;
++                }
++                if index + 1 >= bytes.len() {
++                    // Preserve SQLite's own syntax error for an unterminated
++                    // trailing comment instead of accepting a partial script.
++                    return true;
++                }
++                index += 2;
++            }
++            _ => return true,
++        }
++    }
++    false
++}
++
+ fn execute_sqlite_query(
+     connection: &StoredDatabaseConnection,
+     sql: &str,
+     max_rows: usize,
+ ) -> Result<DatabaseQueryResult> {
++    ensure_sqlite_single_statement(sql)?;
+     let start = Instant::now();
+     let conn = sqlite_connection(connection)?;
+     let statement_type = classify_statement(sql);
+diff --git a/crates/iowb-server/src/server/preamble.rs b/crates/iowb-server/src/server/preamble.rs
+index 821975a..fe6fbcf 100644
+--- a/crates/iowb-server/src/server/preamble.rs
++++ b/crates/iowb-server/src/server/preamble.rs
+@@ -71,7 +71,18 @@ const MAX_SESSION_TITLE_LENGTH: usize = 500;
+ const MAX_UPLOAD_FILES: usize = 20;
+ const MAX_UPLOAD_FILE_BYTES: usize = 50 * 1024 * 1024;
+ const MAX_UPLOAD_IMAGES: usize = 5;
++// Android's per-app inotify and file-descriptor budgets are materially tighter
++// than a conventional desktop/server host. Termux still gets live project
++// notifications, but its native Android build avoids attempting thousands of
++// individual watches for one checkout. The normal host budget is retained for
++// Linux, macOS, and Windows builds.
++#[cfg(target_os = "android")]
++const PROJECT_WATCH_MAX_DIRECTORIES_PER_PROJECT: usize = 512;
++#[cfg(target_os = "android")]
++const PROJECT_WATCH_MAX_DIRECTORIES_TOTAL: usize = 2_048;
++#[cfg(not(target_os = "android"))]
+ const PROJECT_WATCH_MAX_DIRECTORIES_PER_PROJECT: usize = 4_096;
++#[cfg(not(target_os = "android"))]
+ const PROJECT_WATCH_MAX_DIRECTORIES_TOTAL: usize = 12_000;
+ const PROJECT_WATCH_EXCLUDED_DIRECTORIES: &[&str] = &[
+     ".git",
+diff --git a/crates/iowb-server/src/server/processes_and_websocket.rs b/crates/iowb-server/src/server/processes_and_websocket.rs
+index e516c02..7c3e39b 100644
+--- a/crates/iowb-server/src/server/processes_and_websocket.rs
++++ b/crates/iowb-server/src/server/processes_and_websocket.rs
+@@ -191,6 +191,7 @@ async fn handle_ws_command(
+         WsClientCommand::Subscribe {
+             session_ids,
+             chat_session_ids,
++            process_ids,
+             ..
+         } => {
+             *board_session_subscriptions =
+@@ -216,6 +217,35 @@ async fn handle_ws_command(
+                     }
+                 }
+             }
++            // Terminal output is transient, but a mobile Activity may be
++            // recreated while its long-lived Termux PTY survives. Replay a
++            // small bounded tail only for the explicit process ids the
++            // authenticated client says it owns. Live output still comes via
++            // the regular hub subscription below.
++            let mut replayed_processes = HashSet::new();
++            for process_id in process_ids
++                .into_iter()
++                .map(|id| id.trim().to_string())
++                .filter(|id| !id.is_empty())
++                .filter(|id| replayed_processes.insert(id.clone()))
++                .take(TERMINAL_REPLAY_MAX_PROCESSES)
++            {
++                let Ok(chunks) = state.processes.output_snapshot(&process_id).await else {
++                    continue;
++                };
++                for chunk in chunks {
++                    if direct_tx
++                        .try_send(WsServerEvent::ProcessOutput {
++                            process_id: process_id.clone(),
++                            stream: chunk.stream,
++                            data: chunk.data,
++                        })
++                        .is_err()
++                    {
++                        break;
++                    }
++                }
++            }
+         }
+         WsClientCommand::StartSession {
+             provider,
+@@ -452,3 +482,4 @@ async fn send_ws_event(
+     });
+     sender.send(Message::Text(payload.into())).await
+ }
++const TERMINAL_REPLAY_MAX_PROCESSES: usize = 4;
+diff --git a/crates/iowb-server/src/server/provider_runtime.rs b/crates/iowb-server/src/server/provider_runtime.rs
+index 786450f..e495071 100644
+--- a/crates/iowb-server/src/server/provider_runtime.rs
++++ b/crates/iowb-server/src/server/provider_runtime.rs
+@@ -135,8 +135,13 @@ fn preferred_user_command(command: &str) -> Option<String> {
+ }
+
+ async fn command_version(command: &str) -> Option<String> {
++    // Node-based provider wrappers routinely need more than two seconds on a
++    // cold Android/Termux process. Keep the status check bounded, but leave
++    // enough room for Gemini's wrapper to start before declaring an installed
++    // CLI missing.
++    const PROVIDER_VERSION_TIMEOUT: Duration = Duration::from_secs(8);
+     let result = tokio::time::timeout(
+-        Duration::from_secs(2),
++        PROVIDER_VERSION_TIMEOUT,
+         Command::new(command)
+             .arg("--version")
+             .env("PATH", augmented_user_path())
+@@ -154,33 +159,46 @@ async fn command_version(command: &str) -> Option<String> {
+
+ fn provider_auth_hint(provider: Provider) -> Option<String> {
+     let env_key = match provider {
+-        Provider::Claude => ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
+-            .into_iter()
+-            .find(|key| env_has_value(key)),
+-        Provider::Codex => ["OPENAI_API_KEY"]
+-            .into_iter()
+-            .find(|key| env_has_value(key)),
+-        Provider::Gemini => ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+-            .into_iter()
+-            .find(|key| env_has_value(key)),
++        Provider::Claude => first_present_auth_env_key(CLAUDE_AUTH_ENV_KEYS),
++        Provider::Codex => first_present_auth_env_key(&["OPENAI_API_KEY"]),
++        Provider::Gemini => first_present_auth_env_key(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+     };
+     if let Some(env_key) = env_key {
+         return Some(format!("API Key Auth ({env_key})"));
+     }
+
+     let home = home_dir()?;
+-    let configured = match provider {
+-        Provider::Claude => home.join(".claude").join(".credentials.json").is_file(),
+-        Provider::Codex => home.join(".codex").join("auth.json").is_file(),
+-        Provider::Gemini => home.join(".gemini").join("oauth_creds.json").is_file(),
+-    };
+-    configured.then(|| "Configured on disk".to_string())
++    match provider {
++        Provider::Claude => {
++            let claude_dir = home.join(".claude");
++            if claude_settings_has_auth_token(&claude_dir.join("settings.json")) {
++                Some("Configured in Claude settings".to_string())
++            } else {
++                claude_dir
++                    .join(".credentials.json")
++                    .is_file()
++                    .then(|| "Configured on disk".to_string())
++            }
++        }
++        Provider::Codex => home
++            .join(".codex")
++            .join("auth.json")
++            .is_file()
++            .then(|| "Configured on disk".to_string()),
++        Provider::Gemini => home
++            .join(".gemini")
++            .join("oauth_creds.json")
++            .is_file()
++            .then(|| "Configured on disk".to_string()),
++    }
+ }
+
+ fn auth_method(provider: Provider, auth: Option<&str>) -> Option<&'static str> {
+     auth.map(|auth| {
+         if auth.starts_with("API Key Auth") {
+             "api_key"
++        } else if auth == "Configured in Claude settings" {
++            "settings_file"
+         } else {
+             match provider {
+                 Provider::Claude | Provider::Codex | Provider::Gemini => "credentials_file",
+@@ -195,6 +213,45 @@ fn env_has_value(key: &str) -> bool {
+         .is_some_and(|value| !value.trim().is_empty())
+ }
+
++const CLAUDE_AUTH_ENV_KEYS: &[&str] = &[
++    "ANTHROPIC_AUTH_TOKEN",
++    "ANTHROPIC_API_KEY",
++    "CLAUDE_CODE_OAUTH_TOKEN",
++];
++
++fn first_present_auth_env_key<'a>(keys: &'a [&'a str]) -> Option<&'a str> {
++    first_present_auth_key(keys, env_has_value)
++}
++
++fn first_present_auth_key<'a>(
++    keys: &'a [&'a str],
++    has_value: impl Fn(&str) -> bool,
++) -> Option<&'a str> {
++    keys.iter().copied().find(|key| has_value(key))
++}
++
++/// Detects Claude's file-backed authentication without ever returning, logging,
++/// or otherwise retaining the secret. This supports both direct Anthropic keys
++/// and compatible third-party endpoints (such as MiniMax) configured through
++/// Claude Code's documented `settings.json` environment section.
++fn claude_settings_has_auth_token(settings_path: &Path) -> bool {
++    std::fs::read_to_string(settings_path)
++        .ok()
++        .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
++        .is_some_and(|settings| {
++            settings
++                .get("env")
++                .and_then(Value::as_object)
++                .is_some_and(|env| {
++                    CLAUDE_AUTH_ENV_KEYS.iter().any(|key| {
++                        env.get(*key)
++                            .and_then(Value::as_str)
++                            .is_some_and(|value| !value.trim().is_empty())
++                    })
++                })
++        })
++}
++
+ fn home_dir() -> Option<PathBuf> {
+     env::var_os("HOME").map(PathBuf::from)
+ }

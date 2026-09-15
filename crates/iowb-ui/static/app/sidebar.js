@@ -279,6 +279,9 @@ function setActiveProject(projectPath) {
   const nextProjectPath = projectPath || "";
   const projectChanged = nextProjectPath !== state.activeProjectPath;
   if (projectChanged) {
+    state.boardLoadRequestId += 1;
+    state.board = null;
+    state.boardLoading = false;
     state.fileLoadRequestId += 1;
     state.fileLoading = false;
     state.fileProjectPath = "";

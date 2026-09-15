@@ -1,0 +1,9 @@
+version=1
+generation=100001
+release_tag=v0.1.0
+aarch64_asset=io-workbench-v0.1.0-termux-aarch64
+aarch64_sha256=4b7a23509712535a656673c8441d081b9b8cd6ee4ff47ff0197d5959ad0435e4
+aarch64_size=22775816
+x86_64_asset=io-workbench-v0.1.0-termux-x86_64
+x86_64_sha256=b707e7143cccac2e54f8e7b90698ccb50e53ea6c06b3237b0e37746a28b3f9e7
+x86_64_size=25616712

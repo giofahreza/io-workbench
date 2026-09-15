@@ -46,10 +46,12 @@
                 topics,
                 session_ids,
                 chat_session_ids,
+                process_ids,
             } => {
                 assert_eq!(topics, ["sessions"]);
                 assert_eq!(session_ids, ["board-session"]);
                 assert_eq!(chat_session_ids, None);
+                assert!(process_ids.is_empty());
             }
             _ => panic!("expected subscribe"),
         }
@@ -94,6 +96,19 @@
             WsClientCommand::Subscribe {
                 chat_session_ids, ..
             } => assert_eq!(chat_session_ids, Some(Vec::new())),
+            _ => panic!("expected subscribe"),
+        }
+
+        let terminal_replay: WsClientCommand = serde_json::from_value(json!({
+            "type": "subscribe",
+            "topics": ["processes"],
+            "processIds": ["proc-terminal"]
+        }))
+        .expect("deserialize terminal replay subscription");
+        match terminal_replay {
+            WsClientCommand::Subscribe { process_ids, .. } => {
+                assert_eq!(process_ids, ["proc-terminal"]);
+            }
             _ => panic!("expected subscribe"),
         }
     }

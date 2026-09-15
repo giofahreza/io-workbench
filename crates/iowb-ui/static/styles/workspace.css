@@ -847,6 +847,11 @@ body:not(.files-editor-open) .file-editor-pane {
   display: none;
 }
 
+.file-editor-pane.file-editor-preview-mode #save-file,
+.file-editor-pane.file-editor-preview-mode .editor-save-separator {
+  display: none;
+}
+
 .editor-shell.file-editor-preview-mode {
   display: block;
 }
@@ -1105,6 +1110,10 @@ body.code-editor-active #file-editor-lines {
   font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.5;
+}
+
+.editor-shell .CodeMirror-cursor {
+  border-left-color: var(--text);
 }
 
 .editor-shell .CodeMirror-gutters {

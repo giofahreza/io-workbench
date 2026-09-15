@@ -7,18 +7,18 @@
     <meta name="theme-color" content="#080a0f" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20260910-14" />
+    <link rel="stylesheet" href="/styles.css?v=20260912-01" />
   </head>
   <body class="auth-pending">
     <div class="brand-loader" data-brand-loader role="status" aria-live="polite" aria-label="Opening io-workbench">
       <div class="brand-loader__inner">
-        <img class="brand-loader__mark" src="/brand-loader.svg?v=20260910-14" alt="" />
+        <img class="brand-loader__mark" src="/brand-loader.svg?v=20260912-01" alt="" />
         <span class="brand-loader__label">Connecting to workbench</span>
       </div>
     </div>
     <aside class="sidebar">
       <div class="brand">
-        <img class="brand-signal" src="/icon.svg?v=20260910-14" alt="" />
+          <img class="brand-signal" src="/icon.svg?v=20260912-01" alt="" />
         <span>
           <strong>io-workbench</strong>
           <small class="brand-status status" aria-label="Connection status">
@@ -58,7 +58,7 @@
     <main class="workspace">
       <section id="auth-panel" class="panel auth-panel hidden">
         <div class="auth-card">
-          <img class="auth-logo" src="/icon.svg?v=20260910-14" alt="" />
+          <img class="auth-logo" src="/icon.svg?v=20260912-01" alt="" />
           <h2 id="auth-title">Setup</h2>
           <p id="auth-description">Create or enter your io-workbench credentials.</p>
           <form id="auth-form" class="auth-form">
@@ -95,10 +95,9 @@
           </div>
         </div>
         <nav class="main-tab-switcher" aria-label="Workspace views">
-          <button data-view="board" data-symbol="nav-board" aria-label="Board" title="Board">Board</button>
           <button data-view="shell" data-symbol="nav-shell" aria-label="Shell" title="Shell">Shell</button>
           <button data-view="files" data-symbol="nav-files" aria-label="Files" title="Files">Files</button>
-          <button data-view="chat" data-symbol="nav-chat" aria-label="Chat" title="Chat">Chat</button>
+          <button data-view="board" data-symbol="nav-board" aria-label="Board" title="Board">Board</button>
           <button data-view="git" data-symbol="nav-git" aria-label="Git" title="Git">Git</button>
         </nav>
       </header>
@@ -158,8 +157,8 @@
                   <button id="file-edit-mode" class="icon-button editor-view-option active" type="button" aria-label="Edit file" title="Edit file" data-file-editor-mode="edit" data-symbol="pencil" aria-pressed="true"></button>
                   <button id="file-preview-mode" class="icon-button editor-view-option" type="button" aria-label="Preview file" title="Preview file" data-file-editor-mode="preview" data-symbol="eye" aria-pressed="false"></button>
                 </div>
-                <span class="ops-separator" aria-hidden="true"></span>
-                <button type="submit" class="primary-action icon-button" aria-label="Save file" title="Save file" data-symbol="save"></button>
+                <span class="ops-separator editor-save-separator" aria-hidden="true"></span>
+                <button id="save-file" type="submit" class="primary-action icon-button" aria-label="Save file" title="Save file" data-symbol="save"></button>
                 <button id="reload-file" class="icon-button" type="button" aria-label="Reload file" title="Reload file" data-symbol="refresh"></button>
                 <button id="editor-full-view" class="icon-button" type="button" aria-label="Full view" title="Full view" data-symbol="maximize"></button>
               </div>
@@ -329,181 +328,19 @@
                 <button id="board-pause" class="icon-button" type="button" aria-label="Pause board" title="Pause board" data-symbol="pause"></button>
                 <button id="board-abort" class="icon-button danger" type="button" aria-label="Abort board" title="Abort board" data-symbol="stop"></button>
               </div>
+              <button id="board-config-open" class="icon-button" type="button" aria-label="Configure board" title="Configure board" data-symbol="settings-2" data-board-config-open aria-haspopup="dialog" aria-controls="board-config-modal"></button>
               <button id="board-refresh" class="icon-button" type="button" aria-label="Refresh board" title="Refresh board" data-symbol="refresh"></button>
             </div>
           </header>
           <div class="board-compose-row">
             <form id="board-start-form" class="board-form">
               <label>
-                <span>Board Prompt</span>
-                <textarea id="board-start-prompt" rows="3" placeholder="Describe work to add to this board"></textarea>
+                <span>Board brief</span>
+                <textarea id="board-start-prompt" rows="3" placeholder="Describe the outcome this project board should deliver"></textarea>
               </label>
-              <div class="board-form-grid">
-                <label>
-                  <span>Provider</span>
-                  <select id="board-provider">
-                    <option value="claude">Claude</option>
-                    <option value="codex">Codex</option>
-                    <option value="gemini">Gemini</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Model</span>
-                  <input id="board-model" placeholder="Optional model" />
-                </label>
-                <label>
-                  <span>Profile</span>
-                  <select id="board-profile">
-                    <option value="minimal">Minimal</option>
-                    <option value="complete_app" selected>Complete App</option>
-                    <option value="product_ready">Product-Ready</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Strategy</span>
-                  <select id="board-model-strategy">
-                    <option value="manual">Manual</option>
-                    <option value="cheap">Cheap</option>
-                    <option value="hybrid">Hybrid</option>
-                    <option value="expensive">Expensive</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Session</span>
-                  <select id="board-session-policy">
-                    <option value="continuous" selected>Continuous</option>
-                    <option value="task-model">Per-task Model</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Git Policy</span>
-                  <select id="board-git-policy">
-                    <option value="read_only" selected>Read Only</option>
-                    <option value="managed">Managed</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Cheap Model</span>
-                  <input id="board-cheap-model" placeholder="Optional cheap model" />
-                </label>
-                <label>
-                  <span>Expensive Model</span>
-                  <input id="board-expensive-model" placeholder="Optional expensive model" />
-                </label>
-                <label>
-                  <span>TDD</span>
-                  <select id="board-tdd-enabled">
-                    <option value="true" selected>On</option>
-                    <option value="false">Off</option>
-                  </select>
-                </label>
-                <label>
-                  <span>TDD Baseline</span>
-                  <select id="board-tdd-baseline">
-                    <option value="true" selected>Require Failing</option>
-                    <option value="false">Allow Passing</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Allow No Tests</span>
-                  <select id="board-tdd-allow-no-tests">
-                    <option value="false" selected>No</option>
-                    <option value="true">Yes</option>
-                  </select>
-                </label>
-                <label>
-                  <span>TDD Fix Attempts</span>
-                  <input id="board-tdd-max-fixes" type="number" min="0" max="20" value="3" />
-                </label>
-                <label>
-                  <span>Validation</span>
-                  <select id="board-validation-enabled">
-                    <option value="true" selected>On</option>
-                    <option value="false">Off</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Validation Timeout</span>
-                  <input id="board-validation-timeout" type="number" min="5" max="3600" value="120" />
-                </label>
-                <label>
-                  <span>Feature Commands</span>
-                  <textarea id="board-validation-feature-commands" rows="2" placeholder="One command per line"></textarea>
-                </label>
-                <label>
-                  <span>Final Commands</span>
-                  <textarea id="board-validation-final-commands" rows="2" placeholder="One command per line"></textarea>
-                </label>
-                <label>
-                  <span>QA Commands</span>
-                  <textarea id="board-validation-qa-commands" rows="2" placeholder="One command per line"></textarea>
-                </label>
-                <label>
-                  <span>Feature Command Limit</span>
-                  <input id="board-validation-max-feature" type="number" min="0" max="20" value="2" />
-                </label>
-                <label>
-                  <span>Final Command Limit</span>
-                  <input id="board-validation-max-final" type="number" min="0" max="20" value="4" />
-                </label>
-                <label>
-                  <span>QA Command Limit</span>
-                  <input id="board-validation-max-qa" type="number" min="0" max="20" value="2" />
-                </label>
-                <label>
-                  <span>RAG</span>
-                  <select id="board-rag-enabled">
-                    <option value="true" selected>On</option>
-                    <option value="false">Off</option>
-                  </select>
-                </label>
-                <label>
-                  <span>RAG Context Chars</span>
-                  <input id="board-rag-context-chars" type="number" min="1000" max="80000" value="12000" />
-                </label>
-                <label>
-                  <span>QA Mode</span>
-                  <select id="board-qa-mode">
-                    <option value="high_risk" selected>High Risk</option>
-                    <option value="all">All Tasks</option>
-                    <option value="off">Off</option>
-                  </select>
-                </label>
-                <label>
-                  <span>QA Follow-ups</span>
-                  <input id="board-qa-followups" type="number" min="0" max="20" value="3" />
-                </label>
-                <label>
-                  <span>Task Attempts</span>
-                  <input id="board-qa-attempts" type="number" min="1" max="10" value="2" />
-                </label>
-                <label>
-                  <span>Tool Call Repair</span>
-                  <select id="board-tool-repair-enabled">
-                    <option value="true" selected>On</option>
-                    <option value="false">Off</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Tool Repair Retries</span>
-                  <input id="board-tool-repair-retries" type="number" min="0" max="3" value="1" />
-                </label>
-                <label>
-                  <span>Auto Retry</span>
-                  <select id="board-auto-retry-enabled">
-                    <option value="false" selected>Off</option>
-                    <option value="true">On</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Retry Delay</span>
-                  <input id="board-auto-retry-delay" type="number" min="1" max="1440" value="10" />
-                </label>
-                <label>
-                  <span>Retry Attempts</span>
-                  <input id="board-auto-retry-attempts" type="number" min="1" max="100" value="3" />
-                </label>
-                <button class="primary-action" type="submit">Add To Board</button>
+              <div class="board-form-primary-actions">
+                <button class="secondary-action" type="button" data-board-config-open aria-haspopup="dialog" aria-controls="board-config-modal">Board configuration</button>
+                <button id="board-start-submit" class="primary-action" type="submit">Create Board</button>
               </div>
             </form>
             <form id="board-task-form" class="board-form">
@@ -512,13 +349,13 @@
                 <textarea id="board-task-prompt" rows="3" placeholder="Describe a task or paste multiple lines"></textarea>
               </label>
               <div class="board-form-grid board-form-grid-single">
-                <button class="primary-action" type="submit">Add To Backlog</button>
+                <button id="board-task-submit" class="primary-action" type="submit">Add To Backlog</button>
               </div>
             </form>
           </div>
           <div id="board-status" class="board-status">Loading board...</div>
-          <div id="board-details" class="board-details"></div>
           <div id="board-columns" class="board-columns"></div>
+          <div id="board-details" class="board-details"></div>
         </div>
       </section>
 
@@ -1134,6 +971,288 @@
       </section>
     </main>
 
+    <div id="board-config-modal" class="board-config-modal hidden" aria-hidden="true">
+      <section class="board-config-dialog" role="dialog" aria-modal="true" aria-labelledby="board-config-title" aria-describedby="board-config-description">
+        <header class="board-config-header">
+          <div>
+            <p class="board-config-eyebrow">Agentic Board</p>
+            <h2 id="board-config-title" tabindex="-1">Board configuration</h2>
+            <p id="board-config-description">Choose how this project board plans, runs, validates, and recovers work.</p>
+          </div>
+          <button type="button" class="icon-button" data-board-config-close aria-label="Close board configuration" title="Close" data-symbol="close"></button>
+        </header>
+        <form id="board-config-form" class="board-config-form">
+          <div class="board-config-body">
+            <fieldset class="board-config-group">
+              <legend>Board &amp; execution</legend>
+              <p class="board-config-group-description">Set the workflow shape, source-control boundary, and optional future start time.</p>
+              <div class="board-config-grid">
+                <label>
+                  <span>Profile</span>
+                  <select id="board-profile">
+                    <option value="minimal">Minimal</option>
+                    <option value="complete_app" selected>Complete App</option>
+                    <option value="product_ready">Product-Ready</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Session policy</span>
+                  <select id="board-session-policy">
+                    <option value="continuous" selected>Continuous</option>
+                    <option value="task-model">Per-task Model</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Git policy</span>
+                  <select id="board-git-policy">
+                    <option value="read_only" selected>Read Only</option>
+                    <option value="managed">Managed</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Schedule start</span>
+                  <input id="board-scheduled-start" type="datetime-local" />
+                </label>
+              </div>
+            </fieldset>
+
+            <fieldset class="board-config-group">
+              <legend>Agent &amp; routing</legend>
+              <p class="board-config-group-description">Select the primary CLI and optional fallback for this board.</p>
+              <div class="board-config-grid">
+                <label>
+                  <span>Provider</span>
+                  <select id="board-provider">
+                    <option value="claude">Claude</option>
+                    <option value="codex">Codex</option>
+                    <option value="gemini">Gemini</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Model</span>
+                  <input id="board-model" autocomplete="off" placeholder="Provider default" />
+                </label>
+                <label>
+                  <span>Fallback provider</span>
+                  <select id="board-next-provider">
+                    <option value="" selected>None</option>
+                    <option value="claude">Claude</option>
+                    <option value="codex">Codex</option>
+                    <option value="gemini">Gemini</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Fallback model</span>
+                  <input id="board-next-model" autocomplete="off" placeholder="Provider default" />
+                </label>
+              </div>
+            </fieldset>
+
+            <fieldset class="board-config-group">
+              <legend>Model strategy</legend>
+              <p class="board-config-group-description">Control effort and model selection for the board’s execution phases.</p>
+              <div class="board-config-grid">
+                <label>
+                  <span>Strategy</span>
+                  <select id="board-model-strategy">
+                    <option value="manual" selected>Manual</option>
+                    <option value="cheap">Cheap</option>
+                    <option value="hybrid">Hybrid</option>
+                    <option value="expensive">Expensive</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Reasoning effort</span>
+                  <select id="board-reasoning-effort">
+                    <option value="" selected>Provider default</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Cheap model</span>
+                  <input id="board-cheap-model" autocomplete="off" placeholder="Optional cheap model" />
+                </label>
+                <label>
+                  <span>Expensive model</span>
+                  <input id="board-expensive-model" autocomplete="off" placeholder="Optional expensive model" />
+                </label>
+              </div>
+              <div class="board-config-checks" aria-label="Model strategy options">
+                <label><input id="board-thinking" type="checkbox" /> <span>Request extended thinking</span></label>
+                <label><input id="board-fast" type="checkbox" /> <span>Request fast priority when supported</span></label>
+              </div>
+              <div class="board-config-stage-grid">
+                <p>Per-stage model overrides <span>Leave blank to use the board or strategy model.</span></p>
+                <label><span>Breakdown</span><input id="board-task-model-breakdown" data-board-task-model-stage="breakdown" autocomplete="off" placeholder="Use board model" /></label>
+                <label><span>Implementation</span><input id="board-task-model-implementation" data-board-task-model-stage="implementation" autocomplete="off" placeholder="Use board model" /></label>
+                <label><span>QA</span><input id="board-task-model-qa" data-board-task-model-stage="qa" autocomplete="off" placeholder="Use board model" /></label>
+                <label><span>QA fix</span><input id="board-task-model-qa-fix" data-board-task-model-stage="qa_fix" autocomplete="off" placeholder="Use board model" /></label>
+                <label><span>Agents</span><input id="board-task-model-agents" data-board-task-model-stage="agents" autocomplete="off" placeholder="Use board model" /></label>
+                <label><span>Final QA</span><input id="board-task-model-final-qa" data-board-task-model-stage="final_qa" autocomplete="off" placeholder="Use board model" /></label>
+              </div>
+            </fieldset>
+
+            <fieldset class="board-config-group">
+              <legend>Quality gates</legend>
+              <p class="board-config-group-description">Keep test-driven work, validation commands, and follow-up QA explicit.</p>
+              <div class="board-config-grid">
+                <label>
+                  <span>TDD</span>
+                  <select id="board-tdd-enabled">
+                    <option value="true" selected>On</option>
+                    <option value="false">Off</option>
+                  </select>
+                </label>
+                <label>
+                  <span>TDD baseline</span>
+                  <select id="board-tdd-baseline">
+                    <option value="true" selected>Require failing</option>
+                    <option value="false">Allow passing</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Allow no tests</span>
+                  <select id="board-tdd-allow-no-tests">
+                    <option value="false" selected>No</option>
+                    <option value="true">Yes</option>
+                  </select>
+                </label>
+                <label>
+                  <span>TDD fix attempts</span>
+                  <input id="board-tdd-max-fixes" type="number" min="0" max="20" value="3" />
+                </label>
+                <label>
+                  <span>Validation</span>
+                  <select id="board-validation-enabled">
+                    <option value="true" selected>On</option>
+                    <option value="false">Off</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Validation timeout (seconds)</span>
+                  <input id="board-validation-timeout" type="number" min="5" max="3600" value="120" />
+                </label>
+                <label>
+                  <span>Feature command limit</span>
+                  <input id="board-validation-max-feature" type="number" min="0" max="20" value="2" />
+                </label>
+                <label>
+                  <span>Final command limit</span>
+                  <input id="board-validation-max-final" type="number" min="0" max="20" value="4" />
+                </label>
+                <label>
+                  <span>QA command limit</span>
+                  <input id="board-validation-max-qa" type="number" min="0" max="20" value="2" />
+                </label>
+                <label>
+                  <span>QA mode</span>
+                  <select id="board-qa-mode">
+                    <option value="high_risk" selected>High Risk</option>
+                    <option value="all">All Tasks</option>
+                    <option value="off">Off</option>
+                  </select>
+                </label>
+                <label>
+                  <span>QA follow-ups</span>
+                  <input id="board-qa-followups" type="number" min="0" max="20" value="3" />
+                </label>
+                <label>
+                  <span>Task attempts</span>
+                  <input id="board-qa-attempts" type="number" min="1" max="10" value="2" />
+                </label>
+              </div>
+              <div class="board-config-command-grid">
+                <label><span>Feature commands</span><textarea id="board-validation-feature-commands" rows="3" placeholder="One command per line"></textarea></label>
+                <label><span>Final commands</span><textarea id="board-validation-final-commands" rows="3" placeholder="One command per line"></textarea></label>
+                <label><span>QA commands</span><textarea id="board-validation-qa-commands" rows="3" placeholder="One command per line"></textarea></label>
+              </div>
+            </fieldset>
+
+            <fieldset class="board-config-group">
+              <legend>Retrieval</legend>
+              <p class="board-config-group-description">Configure the RAG context lifecycle independently from whether it is enabled.</p>
+              <div class="board-config-grid">
+                <label>
+                  <span>RAG</span>
+                  <select id="board-rag-enabled">
+                    <option value="true" selected>On</option>
+                    <option value="false">Off</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Context characters</span>
+                  <input id="board-rag-context-chars" type="number" min="1000" max="80000" value="12000" />
+                </label>
+              </div>
+              <div class="board-config-checks board-config-checks-grid" aria-label="RAG settings">
+                <label><input id="board-rag-index-on-bootstrap" type="checkbox" checked /> <span>Index project at bootstrap</span></label>
+                <label><input id="board-rag-query-enabled" type="checkbox" checked /> <span>Query context during tasks</span></label>
+                <label><input id="board-rag-ingest-task-results" type="checkbox" checked /> <span>Ingest task results</span></label>
+                <label><input id="board-rag-ingest-validation-errors" type="checkbox" checked /> <span>Ingest validation errors</span></label>
+              </div>
+              <label class="board-config-full-field"><span>RAG scopes</span><textarea id="board-rag-scopes" rows="3" spellcheck="false">global_standard
+project_specific
+validation_error</textarea><small>One scope per line.</small></label>
+            </fieldset>
+
+            <fieldset class="board-config-group">
+              <legend>Runtime &amp; recovery</legend>
+              <p class="board-config-group-description">Choose shell access, malformed tool-call repair, and automatic retry behavior.</p>
+              <div class="board-config-grid">
+                <label>
+                  <span>Tool access</span>
+                  <select id="board-tools-preset">
+                    <option value="cli-default" selected>CLI default</option>
+                    <option value="shell-enabled">Shell enabled</option>
+                    <option value="shell-disabled">Shell disabled</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Tool call repair</span>
+                  <select id="board-tool-repair-enabled">
+                    <option value="true" selected>On</option>
+                    <option value="false">Off</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Tool repair retries</span>
+                  <input id="board-tool-repair-retries" type="number" min="0" max="3" value="1" />
+                </label>
+                <label>
+                  <span>Auto retry</span>
+                  <select id="board-auto-retry-enabled">
+                    <option value="false" selected>Off</option>
+                    <option value="true">On</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Retry delay (minutes)</span>
+                  <input id="board-auto-retry-delay" type="number" min="1" max="1440" value="10" />
+                </label>
+                <label>
+                  <span>Retry attempts</span>
+                  <input id="board-auto-retry-attempts" type="number" min="1" max="100" value="3" />
+                </label>
+                <label class="board-config-inline-check">
+                  <input id="board-auto-retry-reset-attempts" type="checkbox" />
+                  <span>Reset retry counter</span>
+                  <small>Applies once when this configuration is saved.</small>
+                </label>
+              </div>
+            </fieldset>
+          </div>
+          <footer class="board-config-footer">
+            <span id="board-config-save-hint" class="meta">These options will be saved when you create the board.</span>
+            <span class="grow"></span>
+            <button type="button" data-board-config-close>Cancel</button>
+            <button id="board-config-save" type="submit" class="primary-action">Done</button>
+          </footer>
+        </form>
+      </section>
+    </div>
+
     <div id="command-palette" class="command-palette hidden" role="dialog" aria-modal="true" aria-label="Command palette">
       <div class="command-panel">
         <input id="command-search" autocomplete="off" placeholder="Search commands" />
@@ -1148,6 +1267,7 @@
             <code id="folder-browser-path">~</code>
           </div>
           <div class="folder-browser-header-actions">
+            <button id="folder-browser-create" class="icon-button hidden" type="button" aria-label="Create new folder" title="Create new folder" data-symbol="folder-plus"></button>
             <button id="folder-browser-close" class="icon-button" type="button" aria-label="Close folder picker" title="Close" data-symbol="close"></button>
           </div>
         </div>
@@ -1180,6 +1300,6 @@
     </nav>
     <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
-    <script src="/app.js?v=20260910-14" defer></script>
+    <script src="/app.js?v=20260912-01" defer></script>
   </body>
 </html>

@@ -77,6 +77,7 @@ for (const topic of [
   "settings-and-integrations",
   "troubleshooting",
   "api",
+  "keyboard-mappings",
 ]) {
   const page = "docs/" + topic + "/index.html";
   assets.set("/docs/" + topic, [page, "text/html; charset=utf-8", "no-store"]);

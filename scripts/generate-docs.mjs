@@ -6,7 +6,7 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDirectory = join(repositoryRoot, "crates", "iowb-ui", "static", "docs");
 const assetVersion = "20260910-05";
 const docsVersion = "2026.09";
-const updated = "September 1, 2026";
+const updated = "September 12, 2026";
 const generatorArguments = process.argv.slice(2);
 const checkMode = generatorArguments.includes("--check");
 const unsupportedArguments = generatorArguments.filter((argument) => argument !== "--check");
@@ -223,7 +223,7 @@ const pageDefinitions = [
       section("What runs where", cards([
         ["Host", "The source of truth", "The Rust server, project directories, configured Claude/Codex/Gemini CLIs, Git credentials, databases, and PTY processes live on this machine."],
         ["Web UI", "Your first cockpit", "Open the local URL in a browser to sign in, choose a host project, start sessions, review files and Git, query data, and run a terminal."],
-        ["Mobile", "A remote client", "Android and PWA clients call the same host over HTTP(S) and WebSocket. They do not run the agent CLI or terminal locally."],
+        ["Mobile", "A remote or local-host client", "Android and PWA clients call the same host over HTTP(S) and WebSocket. Android can optionally connect to a separately installed Termux host at localhost; the app itself never runs the agent CLI or terminal."],
       ], true)),
       section("Before you start", list([
         "<strong>Choose a release or source build</strong>: use a tagged prebuilt host when you want the supported Linux, macOS, or Windows executable; use source when you are developing io-workbench or need an unreleased change.",
@@ -283,17 +283,17 @@ const pageDefinitions = [
     title: "Install and update",
     group: "Get started",
     type: "Installation guide",
-    summary: "Install checked release builds on Linux, macOS, Windows, or Android and choose a safe local host setup.",
-    keywords: "install update release binary curl powershell windows macos linux android apk sha256 checksum github releases arm64 x86_64 systemd launchagent launchd io gateway codex claude gemini security",
+    summary: "Install checked release builds on Linux, macOS, Windows, or Android and choose a safe remote or Termux-local host setup.",
+    keywords: "install update release binary curl powershell windows macos linux android apk termux local runtime localhost sha256 checksum github releases arm64 x86_64 systemd launchagent launchd io gateway codex claude gemini security",
     body: [
-      lead("Each version tag, such as <code>v0.1.0</code>, publishes the io-workbench host binary for Linux, macOS, and Windows plus signed Android client APKs. The host executable is the self-hosted server and Web UI; Android is an authenticated remote client. Install the package that matches the device you are preparing, then deliberately start or connect it."),
+      lead("Each version tag, such as <code>v0.1.0</code>, publishes the io-workbench host binary for Linux, macOS, and Windows plus signed Android client APKs. The host executable is the self-hosted server and Web UI. Android can connect to a remote host, or its native app can manage a separately installed Termux host over authenticated localhost. Install the package that matches the device you are preparing, then deliberately start or connect it."),
       section("Choose the right release asset", table(
         ["Device", "What the release installs", "What it does"],
         [
           ["<strong>Linux</strong>", "A <code>linux-x86_64</code> or <code>linux-aarch64</code> host archive and the <code>io-workbench</code>/<code>iowb</code> commands.", "Runs the server, embedded Web UI, provider CLIs you have separately installed, projects, databases, and PTY on this machine. Both packages are built on an Ubuntu 22.04 glibc baseline for broad Linux compatibility."],
           ["<strong>macOS</strong>", "A <code>macos-x86_64</code> (Intel) or <code>macos-aarch64</code> (Apple Silicon) host archive.", "Runs the same local or remote host. It is a command-line host package, not a notarized Finder <code>.app</code>."],
           ["<strong>Windows</strong>", "A <code>windows-x86_64</code> ZIP with <code>io-workbench.exe</code> and <code>iowb.exe</code>.", "Runs the same host from PowerShell, Windows Terminal, a service manager, or another deliberate deployment boundary."],
-          ["<strong>Android</strong>", "A signed <code>android-arm64-v8a</code> APK for physical ARM phones or <code>android-x86_64</code> for a matching emulator.", "Connects to a running host. It does not run the host, provider CLIs, project files, databases, or a local Linux shell on the phone."],
+          ["<strong>Android</strong>", "A signed <code>android-arm64-v8a</code> APK for physical ARM phones or <code>android-x86_64</code> for a matching emulator.", "Connects to a running remote host by default. The native app can also manage an optional, separately installed Termux host at <code>127.0.0.1</code>; the APK does not embed that host or its CLIs."],
         ],
       )),
       section("Linux and macOS: install the current host", [
@@ -339,16 +339,23 @@ const pageDefinitions = [
         note("Noninteractive Windows install", "Without an interactive terminal, <code>auto</code> does not create a new task, gateway, provider CLI, or provider login. A task already marked as installer-managed is preserved on a normal upgrade. Use explicit switches for repeatable setup; native provider login deliberately requires a real terminal.", true),
         codeCard("curl.exe -fL -o .\\install-iowb.ps1 https://github.com/giofahreza/io-workbench/releases/latest/download/install.ps1\n.\\install-iowb.ps1 -NonInteractive -BindHost 127.0.0.1 -Port 8787 -WorkspaceRoot \"$HOME\\projects\" -AutoStart -InstallCodex -NoConfigureClis", "Repeatable Windows setup"),
       ].join("\n")),
-      section("Android: install the released remote client", [
-        paragraph("On a typical physical Android phone, open the ARM64 APK URL in the browser and install it with Android's package installer. The x86_64 APK is for a matching Android emulator; it is not the normal physical-phone choice."),
+      section("Android: connect remotely or host locally with Termux", [
+        paragraph("On a typical physical Android phone, open the ARM64 APK URL in the browser and install it with Android's package installer. The x86_64 APK is for a matching Android emulator; it is not the normal physical-phone choice. After installation, choose either a normal remote host or the optional local Termux route."),
         codeCard("https://github.com/giofahreza/io-workbench/releases/latest/download/io-workbench-android-arm64-v8a.apk", "Physical Android phone (arm64-v8a)"),
         codeCard("https://github.com/giofahreza/io-workbench/releases/latest/download/io-workbench-android-x86_64.apk", "Android emulator (x86_64)"),
         steps([
           ["Download the matching APK", "Use the GitHub Release link in a device browser, or download it on a trusted computer and transfer it with USB/ADB. Use only the release asset for this repository and architecture."],
           ["Allow that installer source", "Android may ask you to permit installs from the browser or Files app you used. Grant the permission only for that source, complete the installation prompt, and revoke it afterward if you do not normally sideload apps."],
-          ["Connect to a host", "Open the app, add the HTTPS/VPN/LAN base URL of an already-running io-workbench host, then authenticate and choose the remote project. The native terminal renders the host PTY; it is not a local Termux replacement."],
+          ["Choose a host route", "For normal use, add the HTTPS/VPN/LAN base URL of an already-running io-workbench host. For a private host on the same Android device, install Termux separately, open <strong>Choose server → Local runtime</strong> (or <strong>Add server</strong> / <strong>Settings → Server Status</strong>), and use <strong>Manage</strong> to prepare <code>http://127.0.0.1:8787</code>. In both cases, authenticate and choose the server-side project."],
         ]),
-        note("Android is a client, not the server", "Installing the APK does not install Claude, Codex, Gemini, Git credentials, a database server, project checkout, or host shell on the phone. Set those up on the Linux, macOS, or Windows machine that runs <code>io-workbench start</code>, then use the phone as its control surface.", true),
+        heading("Optional local Android host: Termux"),
+        steps([
+          ["Install official Termux", "Install Termux from its GitHub releases or F-Droid, and keep Termux plus any add-ons from the same distribution source. Do not mix sources."],
+          ["Allow the explicit companion bridge", "In io-workbench Mobile, open <strong>Choose server → Local runtime</strong> (or <strong>Add server</strong> / <strong>Settings → Server Status</strong>), choose <strong>Manage</strong>, and approve the Android Termux command permission. Then copy the displayed setup command into Termux to enable its separate <code>allow-external-apps=true</code> safety gate."],
+          ["Install the verified local host", "Choose <strong>Install verified runtime</strong>. The signed APK supplies the version-pinned runtime manifest; Termux downloads the matching Android/Bionic release, verifies its exact byte size and SHA-256 before it can run, creates <code>io-workbench-local</code>, makes it available in a normal interactive Termux shell, and starts an authenticated loopback host. Rust, Clang, Node.js, and a build toolchain are not installed on this normal path; provider CLIs remain opt-in. Fresh local hosts receive a random Termux-private bearer token so another Android app cannot claim first-user setup. The server chooser shows the current safe download/verification stage while detailed diagnostics remain in <code>~/.io-workbench/logs/termux-bootstrap.log</code>. <strong>Build from source instead</strong> remains an explicit recovery/development path if a verified release is unavailable."],
+          ["Recover a local pairing", "Choose <strong>Connect</strong> if app data was cleared or the local profile needs recovery. The native app receives the local token only through its one-shot Termux command result, keeps it out of the visible log and clipboard, and pairs automatically with <code>http://127.0.0.1:8787</code>. Projects, Git, PTYs, database tools, and optional provider CLIs remain in Termux private storage."],
+        ]),
+        note("Termux is the host boundary", "The APK does not embed a Linux environment or provider CLIs. The Android app is the control surface; Termux owns the local server and its files, processes, and credentials. Keep the listener on <code>127.0.0.1</code>, keep the generated local token private, and use Termux private storage rather than shared Android storage for the live workspace.", true),
         paragraph("Android does not include a universal <code>curl</code> command, but a computer with Android Platform Tools can download and install a repeatable APK over USB debugging. Replace the example tag and choose the matching ABI. The exact versioned names are <code>io-workbench-vX.Y.Z-android-arm64-v8a.apk</code> and <code>io-workbench-vX.Y.Z-android-x86_64.apk</code>."),
         codeCard("TAG=vX.Y.Z\nASSET=io-workbench-${TAG}-android-arm64-v8a.apk\ncurl -fL -o \"$ASSET\" \"https://github.com/giofahreza/io-workbench/releases/download/${TAG}/${ASSET}\"\nadb install -r \"$ASSET\"", "Android phone from a computer with ADB"),
       ].join("\n")),
@@ -366,7 +373,7 @@ const pageDefinitions = [
         [
           ["<strong>Linux / macOS</strong>", "Run the same installer again, then stop/restart only the host process or service you intentionally manage.", "Keep the previous archive/binary and back up <code>~/.io-workbench</code> plus projects before a production update. Use the " + docLink("deployment-and-recovery", "deployment guide") + " for a service rollback."],
           ["<strong>Windows</strong>", "Close any running host process, rerun the installer, then start the new binary when ready.", "Keep data and project directories separate from the program directory. Restore the earlier verified archive only after stopping the managed process."],
-          ["<strong>Android</strong>", "Download the next APK for the same ABI and install it over the existing app. A release signed with the same key is treated as an update and preserves app data.", "If Android reports a signature mismatch, stop and verify that the APK is the official release asset; do not uninstall by default and lose local profiles before checking provenance."],
+          ["<strong>Android</strong>", "Download the next APK for the same ABI and install it over the existing app. If using the Termux local route, update/rebuild that host separately from <strong>Local runtime</strong> or Termux. A release signed with the same key preserves Android app data.", "If Android reports a signature mismatch, stop and verify that the APK is the official release asset; do not uninstall by default and lose local profiles before checking provenance. Preserve Termux <code>~/.io-workbench</code> and projects before rebuilding a local host."],
         ],
         ),
       ].join("\n")),
@@ -436,6 +443,19 @@ const pageDefinitions = [
           ["Remote use", "Treat it as a control plane", "Use HTTPS/WSS and a narrow network boundary when this URL leaves the trusted local machine."],
         ]),
       ].join("\n")),
+      section("Keyboard mappings", [
+        paragraph("The desktop browser workspace has its own keymap. Use <code>Ctrl</code> on Windows/Linux or <code>Cmd</code> on macOS; the mobile PWA is a different surface with additional mobile-only controls. See " + docLink("keyboard-mappings", "Keyboard mappings") + " for the complete Web-versus-mobile reference."),
+        table(
+          ["Shortcut", "Desktop Web action"],
+          [
+            ["<code>Ctrl/Cmd+K</code>", "Open the Command palette."],
+            ["<code>Ctrl/Cmd+,</code> / <code>Ctrl/Cmd+.</code>", "Move backward/forward through Files, Chat, Git, and Board."],
+            ["<code>Alt+,</code> / <code>Alt+.</code>", "Move backward/forward through pinned Chat sessions."],
+            ["<code>Ctrl/Cmd+S</code> / <code>Ctrl/Cmd+F</code>", "Save the focused file / focus file search."],
+          ],
+        ),
+        note("Do not assume mobile-only bindings apply here", "The desktop Web workspace does not use <code>Alt+P</code> to focus an input, <code>Alt+M</code> to open Home, Home-card arrows, or mobile Board-column arrow navigation."),
+      ].join("\n")),
       section("Find these guides inside the app", paragraph("Open <strong>Settings → About → Product Docs</strong>, or open <strong>Sidebar → Command</strong> (or <strong>Ctrl/Cmd+K</strong>) and choose <strong>Open Product Docs</strong>.")),
       section("Next steps", paragraph("Pair the web desk with " + docLink("mobile", "mobile access") + " for a phone client, read " + docLink("agents-and-sessions", "Agents and sessions") + " for provider and recovery details, or use " + docLink("settings-and-integrations", "Settings and integrations") + " to configure the richer operational surfaces.")),
     ].join("\n"),
@@ -445,27 +465,27 @@ const pageDefinitions = [
     title: "Mobile apps",
     group: "Get started",
     type: "Tutorial",
-    summary: "Install the released Android client or build it from source, use the mobile web/PWA route, and connect it safely to a running host.",
+    summary: "Install the released Android client or build it from source, use a remote host or Termux-local host safely, and understand the PWA route.",
     keywords: "mobile android native app apk release install update adb pwa ios web harness server url emulator 10.0.2.2 lan tunnel https wss remote termux",
     body: [
-      lead("Mobile clients are remote control surfaces for a running io-workbench server. They do not run your agent CLIs, workspace processes, or PTY locally. Start the host first, then connect the phone to a reachable authenticated server URL."),
+      lead("Mobile clients are control surfaces for a running io-workbench server. Most use a remote host; Android can optionally use a separately installed Termux host on the same device. In every route, the app itself does not run agent CLIs, workspace processes, or PTYs: those remain in the connected server environment."),
       section("Choose the mobile surface", table(
         ["Surface", "Best for", "Current delivery"],
         [
-          ["<strong>Android native</strong>", "A dedicated mobile experience with native editor and terminal controls.", "Signed APKs are published with every <code>v*</code> GitHub Release for <code>arm64-v8a</code> and <code>x86_64</code>. You can also build from source for development."],
+          ["<strong>Android native</strong>", "A dedicated mobile experience with native editor and terminal controls.", "Signed APKs are published with every <code>v*</code> GitHub Release for <code>arm64-v8a</code> and <code>x86_64</code>. It can connect to a remote host or manage an optional separate Termux localhost host."],
           ["<strong>Web harness / PWA</strong>", "Fast browser-based mobile use and the supported iOS path.", "Kotlin/JS responsive UI that can be served and installed as a PWA."],
           ["<strong>Legacy PWA fallback</strong>", "Simple compatibility testing when the newer harness is not used.", "Package <code>apps/mobile/www</code> and host it over HTTPS."],
           ["<strong>iPhone / iPad</strong>", "Safari-installed web harness/PWA.", "The supported iOS route is the HTTPS browser/PWA surface. The SwiftUI shell is legacy/experimental; do not expect Android-native terminal, Database, or profile parity."],
         ],
       )),
-      section("Prepare the server before installing a client", [
+      section("Prepare a remote host or local Termux host", [
         list([
-          "<strong>Finish host setup</strong> with " + docLink("quick-start", "Quick start") + " and verify the selected project and provider CLIs on the server.",
-          "<strong>Choose a reachable address</strong>: a LAN IP on a trusted network, a VPN address, an authenticated tunnel, or an HTTPS reverse-proxy hostname.",
-          "<strong>Keep authentication enabled</strong>. Password, token, and OTP flows protect the remote client; a phone should not point at an unauthenticated public listener.",
+          "<strong>Remote route</strong>: finish host setup with " + docLink("quick-start", "Quick start") + ", verify the selected project and provider CLIs on that host, then choose a reachable LAN, VPN, tunnel, or HTTPS reverse-proxy URL.",
+          "<strong>Android local route</strong>: install official Termux separately, then let the Android app download, verify, and control the localhost host. Projects, Git, PTYs, database tools, and provider CLIs stay in Termux private storage rather than in the APK.",
+          "<strong>Keep authentication enabled</strong>. Password, token, and OTP flows protect every client route; a phone should not point at an unauthenticated public listener.",
           "<strong>Forward WebSocket traffic</strong> as well as HTTP. Live events use <code>/ws</code>, so a proxy must support HTTPS and WSS end-to-end.",
         ]),
-        note("Never confuse a phone with the host", "The phone may render a terminal or editor, but commands, files, Git operations, databases, provider CLIs, and the PTY still run on the connected server.", true),
+        note("Keep the host boundary clear", "The phone may render a terminal or editor, but commands, files, Git operations, databases, provider CLIs, and the PTY always run on the connected server. In the optional local route that server is Termux, not the io-workbench Android app.", true),
       ].join("\n")),
       section("Install the native Android app", [
         paragraph("A release tag publishes signed APKs for the two supported Android architectures. On a physical phone, use the <code>arm64-v8a</code> release; use <code>x86_64</code> only for a matching emulator. Read " + docLink("install-and-update", "Install and update") + " for the direct links, unknown-app-source permission, checksum guidance, and safe upgrade behavior."),
@@ -478,11 +498,25 @@ const pageDefinitions = [
         paragraph("Install JDK 17, an Android SDK, and Gradle on <code>PATH</code> (or add a Gradle wrapper before using these commands). This repository does not include <code>gradlew</code>. Gradle detects the SDK through <code>ANDROID_HOME</code>, <code>ANDROID_SDK_ROOT</code>, or <code>local.properties</code>. The native Android project has a minimum SDK of 26 and produces ABI-specific debug APKs for <code>arm64-v8a</code> and <code>x86_64</code>."),
         codeCard("cd apps/mobile\ngradle mobileCheck\ngradle :androidApp:assembleDebug -Piowb.android.enabled=true\nfind androidApp/build/outputs/apk/debug -name \"*.apk\" -print"),
       ].join("\n")),
+      section("Optional: run a private Android host in Termux", [
+        paragraph("Use this route when the Android device itself should own the project checkout and development environment. Termux is a separate Android application and the host boundary: the io-workbench app remains a client that talks to it only through authenticated <code>http://127.0.0.1:8787</code> HTTP and WebSocket traffic."),
+        steps([
+          ["Install Termux from one official source", "Install Termux from its GitHub releases or F-Droid. Keep Termux and any Termux add-ons from the same distribution source; do not mix F-Droid, GitHub, Play, or unrelated builds."],
+          ["Allow the explicit companion controls", "Open <strong>Choose server → Local runtime</strong> (or <strong>Add server</strong> / <strong>Settings → Server Status</strong>), then choose <strong>Manage</strong>. Approve the Android Termux command permission, then use <strong>Copy setup command</strong>, paste it into Termux, and run it. Termux intentionally requires this separate <code>allow-external-apps=true</code> opt-in before another app can ask it to run a command."],
+          ["Install the verified host", "Choose <strong>Install verified runtime</strong>. Termux installs only the runtime basics—Git, curl, OpenSSL, Python (including virtual environments for Django projects), and the native SQLite shell—then downloads the version-pinned Android/Bionic io-workbench release named by the signed APK. Termux verifies the exact byte size and SHA-256 before the binary can run, creates <code>io-workbench-local</code>, generates a random Termux-private local token, starts the loopback server, and waits for <code>/health</code>. Rust, Clang, Make, pkg-config, and Node.js are not installed on this normal path; provider CLI packages are an explicit later opt-in. The server chooser shows a live safe-stage bar rather than a made-up percentage. <strong>Build from source instead</strong> is the explicit recovery/development option when a verified release is unavailable. The app then hands the host to Termux's foreground command service and pairs/connects automatically."],
+          ["Control or recover it", "Manage checks Termux's owned host before showing controls: a stopped host shows <strong>Start</strong>; a running host shows <strong>Stop</strong> and <strong>Check runtime</strong>. <strong>Connect</strong> appears only when this app is not already connected and a pairing needs recovery. Stop keeps projects and the pairing; uninstall is a separate action that asks whether to keep or delete the Termux projects folder. The app receives the private local token only through its explicit one-shot Termux callback and never displays or copies it. Add projects under the Termux workspace root, then install and authenticate selected provider CLIs in Termux."],
+        ]),
+        codeCard("mkdir -p ~/.termux && printf '%s\\n' 'allow-external-apps=true' >> ~/.termux/termux.properties && termux-reload-settings", "Termux one-time companion opt-in (the app copies this command)"),
+        codeCard("io-workbench-local status\nio-workbench-local doctor --require-running\nio-workbench-local logs", "Termux local-host checks after installation"),
+        note("Storage and exposure", "Termux private storage is the live host workspace and also holds the generated local token with owner-only permissions. Keep projects under its private <code>~/projects</code> default rather than shared Android storage, leave the listener on <code>127.0.0.1</code>, and do not copy that token into a general clipboard or shared storage. Use a deliberate import/export or backup flow for shared files, and configure a separate authenticated remote-access boundary if the host must ever leave the device.", true),
+        note("Provider CLIs stay opt-in", "The Android handoff saves its reviewed installer at <code>~/.local/share/io-workbench/install-termux.sh</code>. Run that command directly in Termux with <code>--with-codex</code>, <code>--with-claude</code>, <code>--with-gemini</code>, or <code>--with-all-clis</code>. It never asks for provider credentials; complete Codex, Claude, or Gemini's own login flow in Termux before expecting agent sessions to work."),
+        note("Local-runtime limits", "The Termux wrapper deliberately disables RAG and FCM/push delivery. The app's <strong>Install</strong> and <strong>Start</strong> controls run the host through Termux's foreground command service while its Termux notification is present. <strong>Stop</strong> ends that host without removing the pairing or projects. A detached <code>io-workbench-local start</code> command can still be reclaimed by Android; use the app control or an active Termux terminal for longer-running work, and restart after a device restart or process stop. Use a conventional Linux, macOS, or Windows host when RAG, push delivery, or a durable service-manager lifecycle is required."),
+      ].join("\n")),
       section("Connect Android to the host", [
         steps([
-          ["Add server", "Start with <strong>Add server</strong> and optionally give the profile a name."],
-          ["Enter the API URL", "Use the exact base URL of the io-workbench host; omit a trailing slash when copying a public URL."],
-          ["Authenticate", "Enter username and password, a server token, or an OTP code according to the host authentication mode. The client probes <code>/api/auth/status</code> and follows setup, password, token, or open flow."],
+          ["Choose a server route", "For a remote host, start with <strong>Add server</strong> and optionally give the profile a name. For a prepared Termux local host, open <strong>Choose server → Local runtime → Manage</strong>. Start it if needed, then choose <strong>Connect</strong> only when the app is not already connected (the same management card is also in <strong>Settings → Server Status</strong>)."],
+          ["Enter the API URL", "Use the exact base URL of the io-workbench host; omit a trailing slash when copying a public URL. The supported local-Termux URL is <code>http://127.0.0.1:8787</code>."],
+          ["Authenticate", "For a remote host, enter username and password, a server token, or an OTP code according to the host authentication mode. For a fresh default-port Termux host, use the Local runtime <strong>Connect</strong> action; it pairs using the private token rather than exposing a first-user setup page."],
           ["Add headers only when required", "Use custom headers only when an authenticated proxy or access layer explicitly requires them."],
           ["Connect and choose a project", "After the profile connects, select the remote project, open a session, and let the client reconnect its event stream when network conditions change."],
         ]),
@@ -490,6 +524,7 @@ const pageDefinitions = [
       section("Use the right URL for the device", table(
         ["Where the client runs", "Use this server URL", "Why"],
         [
+          ["<strong>Android app with local Termux host</strong>", "<code>http://127.0.0.1:8787</code>", "The app and Termux are on the same device; the host stays loopback-only."],
           ["<strong>Android emulator</strong>", "<code>http://10.0.2.2:8787</code>", "The emulator's special host-machine address."],
           ["<strong>iPhone / iPad PWA</strong>", "<code>https://workbench.example</code>", "Install the harness over HTTPS and use an HTTPS/WSS workbench endpoint. An HTTPS PWA cannot call an HTTP host without mixed-content blocking."],
           ["<strong>Physical device on trusted LAN</strong>", "<code>http://HOST_LAN_IP:8787</code>", "Only when the host is intentionally listening on that LAN and the network is trusted."],
@@ -513,26 +548,39 @@ const pageDefinitions = [
       section("Mobile capability matrix", table(
         ["Capability", "Android native", "Web harness / PWA / iOS"],
         [
-          ["<strong>Chat, Files, Git, Board</strong>", "Available through the native mobile client against the remote host.", "Available through the shared Kotlin/JS browser surface."],
-          ["<strong>Terminal</strong>", "Native terminal renderer built with Termux components by default; it can use a web-terminal mode when needed.", "Browser-rendered remote terminal controls; do not expect Android-native terminal parity on iOS."],
+          ["<strong>Chat, Files, Git, Board</strong>", "Available against a remote host or optional local Termux host.", "Available through the shared Kotlin/JS browser surface against a remote host."],
+          ["<strong>Terminal</strong>", "Native terminal renderer built with Termux components by default; it can use a web-terminal mode when needed. It controls the connected server PTY, including one hosted in separate Termux.", "Browser-rendered remote terminal controls; do not expect Android-native terminal parity on iOS."],
           ["<strong>Database workspace</strong>", "Has a native Database surface for connections, explorer, SQL, paged rows, and Android-specific structured row clipboard actions.", "The mobile web harness currently does not expose the Database tab. Use Android native or the full web workspace for database work."],
           ["<strong>Structured row copy/paste</strong>", "Select rows and copy/paste JSON or CSV with the native Android data grid.", "No mobile-browser row clipboard controls; the full browser database grid also does not currently expose them."],
           ["<strong>Saved servers</strong>", "Choose among named server profiles stored by the Android app.", "The harness keeps the most recently used connection in browser storage; it is not a multi-profile picker."],
         ],
       )),
+      section("Keyboard mappings", [
+        paragraph("Connect a physical keyboard to use the mobile shortcut contract. Android native and the mobile web harness/PWA share the primary keymap, but it is not the same as the desktop Web workspace. See " + docLink("keyboard-mappings", "Keyboard mappings") + " for all mappings and Android Database-specific controls."),
+        table(
+          ["Shortcut", "Mobile action"],
+          [
+            ["<code>Alt+P</code>", "Focus or unfocus the active Chat prompt, editable file, or Git message. <code>Alt+I</code> is not a binding."],
+            ["<code>Alt+M</code>", "Open Home/More and focus its navigation."],
+            ["Home <code>↑</code>/<code>↓</code>", "Move between project/session cards instead of scrolling the page."],
+            ["Unfocused Chat <code>↑</code>/<code>↓</code>", "Scroll the transcript; add <code>Shift</code> for a faster scroll."],
+          ],
+        ),
+        note("Desktop Web is different", "Do not expect <code>Alt+P</code>, <code>Alt+M</code>, Home-card arrows, or mobile Board-column arrows in the desktop browser workspace."),
+      ].join("\n")),
       section("Use mobile in a real work loop", [
         cards([
           ["Chat", "Continue the remote session", "Open or pin a session, send a bounded request, and inspect the same persisted response history you see on the web."],
           ["Files and Git", "Review before approving", "Read and save host files, then inspect Git status/diff on the remote project rather than assuming the agent summary is complete."],
           ["Database", "Copy structured rows on Android", "Native Android can select rows and copy/paste structured JSON or CSV. The browser database grid does not yet expose row clipboard controls."],
-        ["Terminal", "Control the host PTY", "Android uses a native renderer built with Termux components and handy Esc, Tab, Ctrl, Alt, and arrow keys. Long-press the Terminal navigation button → <strong>Terminal renderer</strong> to switch between Native (Termux) and xterm rendering. It is not a local Termux/Linux environment."],
+        ["Terminal", "Control the host PTY", "Android uses a native renderer built with Termux components and handy Esc, Tab, Ctrl, Alt, and arrow keys. Long-press the Terminal navigation button → <strong>Terminal renderer</strong> to switch between Native (Termux) and xterm rendering. It controls the selected server PTY; with the optional local route, that separate server runs in Termux."],
         ]),
       ].join("\n")),
       section("First Android work cycle", compactSteps([
         ["Connect the saved server profile", "Choose the profile you added, confirm its URL/auth state, and wait for the project list to load from the host."],
         ["Open the project and Chat", "Select the remote project, open or create a session, choose the configured provider/model, and send a bounded request with a validation expectation."],
         ["Review Files and Git", "Read the host files changed by the task, then inspect Git status/diff before you approve or continue the request."],
-        ["Validate in Terminal", "Open the remote PTY in the selected project and run the smallest relevant test, build, migration, or inspection command."],
+        ["Validate in Terminal", "Open the selected server PTY in the project and run the smallest relevant test, build, migration, or inspection command. In the local Android route, this PTY runs in Termux."],
         ["Use Database on Android when needed", "Open <strong>Database → Explorer → Add connection</strong>, enter the connection, use <strong>Test</strong>, then <strong>Save</strong>. Use Explorer or SQL for a narrow check; select/copy/paste structured rows only after confirming the target."],
         ["Record the result", "Return to Chat or Board with the diff, command result, and any data evidence so the next decision remains reviewable."],
       ])),
@@ -541,6 +589,7 @@ const pageDefinitions = [
         "<strong>Network boundary</strong>: verify VPN/tunnel/proxy DNS, TLS, and WebSocket forwarding for <code>/ws</code>.",
         "<strong>Authentication</strong>: confirm the selected password, token, or OTP mode and re-enter credentials after a server-side change.",
         "<strong>Host service</strong>: check <code>/health</code> and the server process before rebuilding the app.",
+        "<strong>Termux local route</strong>: confirm the one-time <code>allow-external-apps=true</code> opt-in, open <code>~/.io-workbench/logs/termux-bootstrap.log</code>, then run <code>io-workbench-local status</code> and <code>io-workbench-local doctor --require-running</code> inside Termux.",
       ])),
     ].join("\n"),
   },
@@ -734,7 +783,7 @@ const pageDefinitions = [
         ["Open Database Explorer", "Open the Command palette with <strong>Command</strong> or <strong>Ctrl/Cmd+K</strong>, then choose <strong>Open Database Explorer</strong>. Database is not a permanent desktop navigation tab."],
         ["Save and test a connection", "Choose <strong>New</strong> to clear the form, enter its name/type/location details, use <strong>Test Form</strong>, then <strong>Save Connection</strong>. Saved connections belong to the signed-in account on the server, not to one selected project."],
         ["Select and explore", "Select the saved connection, then use Explorer to walk database/schema/object nodes, columns, foreign keys, details, and relationships before composing changes."],
-        ["Start with a narrow SQL query", "Use SQL → Run Query with a limited read query first, then browse paginated table data to understand the shape of the result."],
+        ["Start with a narrow SQL query", "Use SQL → Run Query with a limited read query first, then browse paginated table data to understand the shape of the result. SQLite Run Query accepts one SQL statement per action, so split a multi-statement script deliberately instead of risking a partial change."],
         ["Use jobs for JSON movement", "Use JSON import/export jobs when data must move with explicit progress, warnings, and result feedback."],
         ["Review database changes with code", "Keep the migration, related source diff, validation output, and database evidence together in the same project review loop."],
       ])),
@@ -757,10 +806,10 @@ const pageDefinitions = [
     title: "Terminal and mobile controls",
     group: "Workbench workflows",
     type: "How-to guide",
-    summary: "Operate a live server-hosted PTY from the browser or Android without mistaking it for a local device shell.",
+    summary: "Operate a live server-hosted PTY from the browser or Android, including a separately hosted local Termux server.",
     keywords: "terminal pty remote shell process resize input output abort copy paste android termux esc tab ctrl alt arrows",
     body: [
-      lead("The browser calls this surface <strong>Shell</strong>; it is a real PTY backed by the selected project on the server. It is for running host commands, watching output, resizing the terminal, and stopping processes—not an output-only command log."),
+      lead("The browser calls this surface <strong>Shell</strong>; it is a real PTY backed by the selected project on the server. It is for running host commands, watching output, resizing the terminal, and stopping processes—not an output-only command log. On Android's optional local route, the selected server is separately hosted in Termux."),
       section("Start a terminal in the correct project", steps([
         ["Select the project", "The Shell starts against the selected server-side project path, so check the project before running a migration, build, or destructive command."],
         ["Open Shell", "Select <strong>Shell</strong> in the workspace. It automatically starts or reuses a PTY for that project; wait for the connected state."],
@@ -771,9 +820,9 @@ const pageDefinitions = [
       section("Browser and Android controls", cards([
         ["Web", "Full remote Shell", "Use the browser Shell to type, resize, copy a selection or recent output, paste commands, and manage active processes."],
         ["Android", "Native terminal renderer", "Android uses a native renderer built with Termux components and includes handheld Esc, Tab, Ctrl, Alt, and arrow controls."],
-        ["Both", "Server-hosted execution", "Every command, package action, shell process, and PTY runs on the io-workbench server—not in the browser or on Android."],
+        ["Both", "Server-hosted execution", "Every command, package action, shell process, and PTY runs on the io-workbench server—not in the browser or Android app process. For the optional local route, that server runs in separate Termux private storage."],
       ], true)),
-      section("Important Android distinction", note("Not a local Termux replacement", "The Android terminal feels native on the device, but it is a remote renderer for the server PTY. Installing a mobile client does not install Linux packages, agent CLIs, or a local shell on the phone.", true)),
+      section("Important Android distinction", note("The app is not the local shell", "The Android terminal feels native on the device, but it renders the connected server PTY. Installing the APK alone does not install Linux packages, agent CLIs, or a local shell. The optional local route installs and operates those separately in Termux; the app then connects to that host over authenticated localhost.", true)),
       section("Terminal safety", list([
         "<strong>Check the working directory</strong> before every command that can mutate the project or a database.",
         "<strong>Use explicit validation</strong> rather than assuming an agent's text means a command passed.",
@@ -1020,7 +1069,7 @@ const pageDefinitions = [
     group: "Reference",
     type: "Troubleshooting",
     summary: "Diagnose host startup, authentication, provider CLI, project, WebSocket, mobile, and remote-access failures.",
-    keywords: "troubleshooting health login auth token otp cli status project websocket mobile android pwa remote proxy wss",
+    keywords: "troubleshooting health login auth token otp cli status project websocket mobile android termux local runtime pwa remote proxy wss",
     body: [
       lead("Start diagnosis at the host, then move outward through authentication, project scope, provider CLIs, and finally remote client/network details. A phone or browser error often begins with a server or proxy condition."),
       section("First checks", [
@@ -1039,7 +1088,8 @@ const pageDefinitions = [
           ["<strong>Browser receives no live output</strong>", "Check the authenticated WebSocket connection and proxy support for <code>/ws</code>."],
           ["<strong>Mobile receives a web page instead of API data</strong>", "The URL likely points to a proxy/login page or wrong hostname. Check the exact server base URL and access-layer headers."],
           ["<strong>Android cannot reach host</strong>", "Use <code>10.0.2.2</code> only in the Android emulator; use LAN/VPN/tunnel/HTTPS for a physical device."],
-          ["<strong>Terminal is not local</strong>", "Confirm the selected remote host/project and remember the PTY runs there, not on the phone."],
+          ["<strong>Termux local host will not install or start</strong>", "Confirm official Termux is installed, Android command permission is granted, and Termux has <code>allow-external-apps=true</code>. Read <code>~/.io-workbench/logs/termux-bootstrap.log</code>, then run <code>io-workbench-local status</code> and <code>io-workbench-local doctor --require-running</code> in Termux."],
+          ["<strong>Terminal is not where expected</strong>", "Confirm the selected server profile and project. The PTY runs on that server; for the optional Android-local route, it runs in separate Termux rather than in the Android app."],
           ["<strong>Database action is unexpected</strong>", "Recheck saved connection, schema/table, query scope, and transfer job feedback before retrying."],
         ],
       )),
@@ -1087,6 +1137,101 @@ const pageDefinitions = [
         ["Test WebSocket separately", "A REST request can succeed while a reverse proxy still blocks or rewrites WSS upgrades."],
       ])),
       section("Related documents", paragraph("Read " + docLink("security-and-boundaries", "Security and boundaries") + " before automating host-control endpoints, and " + docLink("remote-access", "Remote access") + " before giving an API client a public hostname.")),
+    ].join("\n"),
+  },
+  {
+    slug: "keyboard-mappings",
+    title: "Keyboard mappings",
+    group: "Reference",
+    type: "Reference",
+    summary: "Use the Web workspace and mobile keyboard shortcuts without mistaking the desktop browser map for the Android or PWA map.",
+    keywords: "keyboard mappings keyboard shortcuts keymap hotkeys web browser desktop android mobile pwa ctrl cmd alt home prompt editor git board terminal database alt+p alt+m ctrl/cmd+k ctrl/cmd+s ctrl/cmd+f ctrl/cmd+enter ctrl+tab ctrl+shift+tab ctrl/cmd+space ctrl+k cmd+k ctrl+s cmd+s ctrl+f cmd+f ctrl+enter cmd+enter ctrl+space cmd+space f5 f6 f7",
+    body: [
+      lead("io-workbench has separate keyboard maps for the desktop <strong>Web workspace</strong> and the mobile <strong>Android / web harness / PWA</strong> clients. The mobile PWA follows the mobile map, not the desktop browser map. Use a physical keyboard for mobile shortcuts."),
+      section("Read the notation", table(
+        ["Notation", "Meaning"],
+        [
+          ["<code>Ctrl/Cmd</code>", "Use <code>Ctrl</code> on Windows/Linux or <code>Cmd</code> on macOS. A mobile keyboard that sends the Meta/Command modifier follows the same command-style bindings."],
+          ["<code>+</code>", "Hold the modifier while pressing the following key. For example, <code>Ctrl/Cmd+.</code> means Ctrl or Command plus period."],
+          ["<code>↑</code>, <code>↓</code>, <code>←</code>, <code>→</code>", "Arrow keys. A mapping is contextual when its table says a prompt, editor, grip, board tabs, or Home is focused."],
+          ["<code>Esc</code>", "Dismisses the current app-owned overlay or modal when that surface offers an Escape action. Browser and operating-system reserved shortcuts can still take precedence."],
+        ],
+      )),
+      section("Everyday shortcuts shared by Web and mobile", [
+        table(
+          ["Shortcut", "Context", "Action"],
+          [
+            ["<code>Ctrl/Cmd+K</code>", "Anywhere", "Open the Command palette."],
+            ["<code>↑</code> / <code>↓</code>, <code>Enter</code>, <code>Esc</code>", "Command palette", "Select previous/next command, run it, or close the palette."],
+            ["<code>Ctrl/Cmd+,</code> / <code>Ctrl/Cmd+.</code>", "Project workspace", "Move backward/forward through <strong>Files → Chat → Git → Board</strong>, wrapping at either end."],
+            ["<code>Alt+,</code> / <code>Alt+.</code>", "Anywhere with pinned chats", "Open the previous/next pinned Chat session, wrapping at either end."],
+            ["<code>Enter</code> or <code>Ctrl/Cmd+Enter</code> / <code>Shift+Enter</code>", "Chat prompt", "Send the prompt / insert a newline."],
+            ["<code>↑</code> at the start / <code>↓</code> at the end", "Chat prompt", "Recall the previous/next prompt from that session's history."],
+            ["<code>Ctrl/Cmd+S</code>", "Editable file", "Save the current file."],
+            ["<code>Ctrl/Cmd+F</code>", "Editable file", "Focus Find in file."],
+            ["<code>Tab</code>", "Editable file", "Insert indentation."],
+            ["<code>Enter</code> / <code>Shift+Enter</code>", "Find in file", "Find next / previous match."],
+            ["<code>Ctrl/Cmd+Enter</code>", "Git commit message", "Submit the commit."],
+            ["<code>↑</code>/<code>↓</code>, <code>Enter</code>, <code>Esc</code>", "Chat Edit from here picker", "Choose an earlier prompt, apply it, or dismiss the picker."],
+            ["<code>↑</code> / <code>↓</code>", "Pinned-chat or project reorder grip", "Move that pinned chat or project one place. A project grip also accepts <code>Space</code> or <code>Enter</code> to pick it up without activating its row."],
+          ],
+        ),
+        note("Chat Escape behavior", "<code>Esc</code> first closes or cancels the active Chat transient state, such as a staged edit or running response. With a blank persisted prompt, use the offered second Escape action to open <strong>Edit from here</strong>."),
+      ].join("\n")),
+      section("Web workspace — desktop browser", [
+        paragraph("These are browser-workspace behaviors. They apply to the full desktop Web workspace, not to the mobile web harness/PWA."),
+        table(
+          ["Shortcut", "Context", "Desktop Web behavior"],
+          [
+            ["<code>Enter</code> / <code>Esc</code>", "Inline file or folder name", "Create/rename the item / cancel the inline edit."],
+            ["<code>Esc</code>", "Docs search", "Clear and blur the search field."],
+            ["<code>Tab</code> / <code>Shift+Tab</code>", "Git or Board modal", "Keep focus inside the open dialog; <code>Esc</code> closes it."],
+            ["Printable keys, <code>Ctrl</code>+letter, and terminal navigation keys", "Shell", "Send input to the server-hosted PTY. Enter, Backspace, Tab, Esc, arrows, Delete, Home, End, Page Up, and Page Down are forwarded; Alt/Meta are not sent by the Web Shell key handler."],
+          ],
+        ),
+        note("Mobile-only controls are absent", "The desktop Web workspace does <strong>not</strong> bind <code>Alt+P</code>, <code>Alt+M</code>, unfocused-Chat arrow scrolling, Home-card arrows, or Board-column arrow navigation."),
+      ].join("\n")),
+      section("Mobile apps — Android and web harness/PWA", [
+        paragraph("The Android app and mobile web harness/PWA share the following hardware-keyboard contract. The PWA is intentionally listed here because it is a mobile client, even though it runs in a browser."),
+        table(
+          ["Shortcut", "Context", "Mobile behavior"],
+          [
+            ["<code>Alt+P</code>", "Chat, editable Files, or Git", "Focus or unfocus the primary text input: the Chat prompt, active editable file, or Git commit message. <code>Alt+I</code> is no longer a shortcut."],
+            ["<code>Alt+M</code>", "Anywhere outside a blocking dialog", "Open Home/More and focus its navigation."],
+            ["<code>↑</code> / <code>↓</code>", "Chat with no text input focused", "Scroll the transcript. Use <code>Shift+↑</code> / <code>Shift+↓</code> for a larger, faster scroll."],
+            ["<code>Enter</code>", "Files → Go to line", "Move the editor cursor to the requested line."],
+            ["<code>↑</code> / <code>↓</code>", "Home/More", "Focus the previous/next project or session card. At either edge, the card remains focused; arrows do not fall through to page scrolling."],
+            ["<code>←</code> / <code>→</code>", "Home/More", "Move focus between the Home navigation controls without activating them."],
+            ["<code>←</code> / <code>→</code>, <code>Home</code> / <code>End</code>", "Focused Board column tabs", "Focus the previous/next column, or the first/last column."],
+            ["Terminal keys", "Remote terminal", "Use terminal semantics for host-PTY input. Android forwards standard control/navigation keys; the PWA uses the xterm terminal's native mappings."],
+          ],
+        ),
+        note("Reorder grips win over Home navigation", "When a project or pinned-session reorder grip has focus, its <code>↑</code>/<code>↓</code> reorder action takes precedence over Home-card navigation."),
+      ].join("\n")),
+      section("Android native Database workspace", [
+        paragraph("These controls are native-Android-only. The mobile web harness/PWA does not currently expose the Database workspace."),
+        table(
+          ["Shortcut", "Android Database action"],
+          [
+            ["<code>Ctrl/Cmd+F</code> / <code>Ctrl/Cmd+N</code>", "Focus Explorer search / create a new query."],
+            ["<code>F5</code> or <code>Ctrl/Cmd+Enter</code>", "Run the current SQL query."],
+            ["<code>Ctrl/Cmd+R</code>", "Refresh the current table, or run the current SQL query."],
+            ["<code>Ctrl/Cmd+W</code>", "Close the active Database panel."],
+            ["<code>Ctrl+Tab</code> / <code>Ctrl+Shift+Tab</code>", "Move to the next / previous Database panel."],
+            ["<code>F6</code> / <code>F7</code>", "Toggle the inspector / toggle table-card display."],
+            ["<code>Ctrl/Cmd+C</code> / <code>Ctrl/Cmd+V</code>", "Copy selected SQL rows / paste rows into the active SQL view when focus is not editing text."],
+            ["<code>Insert</code> / <code>Delete</code>", "Add a row / delete selected rows in the SQL data view."],
+            ["<code>Ctrl/Cmd+Space</code>", "Open SQL autocomplete. Use <code>↑</code>/<code>↓</code> to choose, <code>Tab</code> or D-pad center to accept, and <code>Esc</code> to dismiss."],
+            ["<code>Tab</code> / <code>Shift+Tab</code>, <code>Esc</code>", "While editing a grid cell: save and move next/previous / cancel the edit."],
+          ],
+        ),
+      ].join("\n")),
+      section("When a shortcut does not work", list([
+        "<strong>Check focus first</strong>: prompt, editor, search, drag grip, board tabs, Home, and terminal mappings apply only to their active control.",
+        "<strong>Use a physical keyboard on mobile</strong>: touch controls remain available, but they do not synthesize the hardware-keyboard shortcuts.",
+        "<strong>Expect native/browser reservations</strong>: the browser, operating system, keyboard firmware, or an accessibility service can reserve a key combination before io-workbench receives it.",
+        "<strong>Keep the surface straight</strong>: use this page's Web table for the desktop browser workspace and its Mobile table for Android or the mobile PWA.",
+      ])),
     ].join("\n"),
   },
 ];
@@ -1159,6 +1304,10 @@ const pageRelationships = {
   api: {
     topics: ["Projects and Git", "Remote access and security", "Operations and API"],
     seeAlso: ["security-and-boundaries", "remote-access", "projects-files-git", "configuration"],
+  },
+  "keyboard-mappings": {
+    topics: ["Web workspace", "Mobile clients", "Database and terminal"],
+    seeAlso: ["web-workspace", "mobile", "database-workspace", "terminal-and-mobile"],
   },
 };
 
@@ -1364,7 +1513,7 @@ function renderHome() {
     })))),
     section("Product boundaries", list([
       "<strong>Not a hosted replacement for your host environment</strong>: your configured provider CLIs and project work remain on the server you run.",
-      "<strong>Not a phone-local terminal</strong>: Android renders a remote PTY; it does not run host commands locally.",
+      "<strong>Not an in-app phone terminal</strong>: Android renders the connected server PTY. Its optional local route runs that server separately in Termux, not inside the Android app.",
       "<strong>Not a direct-public-development service</strong>: remote use should sit behind a VPN, authenticated tunnel, or HTTPS/WSS proxy with auth enabled.",
     ])),
     "</article>",
@@ -1427,7 +1576,7 @@ function buildSearchIndex() {
   }));
 
   return {
-    generatedAt: "2026-09-01",
+    generatedAt: "2026-09-12",
     docsVersion,
     pages: [
       {

@@ -292,6 +292,7 @@ const state = {
   boardChatSessionIds: new Set(),
   boardWsSessionId: "",
   boardLoading: false,
+  boardLoadRequestId: 0,
 };
 
 const qs = (selector) => document.querySelector(selector);

@@ -23,6 +23,9 @@ fn app_server_command(command: &OsString, launch_options: &CodexAppServerLaunchO
         child_command.args(&launch_options.args);
     }
     child_command.env("PATH", augmented_user_path());
+    // Do not pass the server's Termux-local loopback bearer into Codex's
+    // app-server subprocess. The parent already keeps it in AppConfig.
+    child_command.env_remove("IO_WORKBENCH_TOKEN");
     for (key, value) in &launch_options.env {
         child_command.env(key, value);
     }

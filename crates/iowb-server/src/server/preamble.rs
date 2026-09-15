@@ -71,7 +71,18 @@ const MAX_SESSION_TITLE_LENGTH: usize = 500;
 const MAX_UPLOAD_FILES: usize = 20;
 const MAX_UPLOAD_FILE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_UPLOAD_IMAGES: usize = 5;
+// Android's per-app inotify and file-descriptor budgets are materially tighter
+// than a conventional desktop/server host. Termux still gets live project
+// notifications, but its native Android build avoids attempting thousands of
+// individual watches for one checkout. The normal host budget is retained for
+// Linux, macOS, and Windows builds.
+#[cfg(target_os = "android")]
+const PROJECT_WATCH_MAX_DIRECTORIES_PER_PROJECT: usize = 512;
+#[cfg(target_os = "android")]
+const PROJECT_WATCH_MAX_DIRECTORIES_TOTAL: usize = 2_048;
+#[cfg(not(target_os = "android"))]
 const PROJECT_WATCH_MAX_DIRECTORIES_PER_PROJECT: usize = 4_096;
+#[cfg(not(target_os = "android"))]
 const PROJECT_WATCH_MAX_DIRECTORIES_TOTAL: usize = 12_000;
 const PROJECT_WATCH_EXCLUDED_DIRECTORIES: &[&str] = &[
     ".git",

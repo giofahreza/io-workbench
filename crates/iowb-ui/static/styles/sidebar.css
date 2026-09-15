@@ -131,7 +131,7 @@
 .project-sidebar-row {
   position: relative;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) 28px;
+  grid-template-columns: 22px minmax(0, 1fr) 28px 28px;
   gap: 2px;
   align-items: center;
   border-radius: 6px;
@@ -315,6 +315,25 @@ body.sidebar-pinned-dragging * {
   min-height: 28px;
   border-color: transparent;
   background: transparent;
+}
+
+.project-session-toggle {
+  width: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.project-sidebar-row:hover .project-session-toggle,
+.project-session-toggle:focus-visible,
+.project-session-toggle[aria-expanded="true"] {
+  border-color: var(--line);
+  background: var(--panel-soft);
+}
+
+.project-session-toggle[aria-expanded="true"]::before {
+  transform: rotate(180deg);
 }
 
 .project-sidebar-row:hover .project-menu-wrap > .icon-button,

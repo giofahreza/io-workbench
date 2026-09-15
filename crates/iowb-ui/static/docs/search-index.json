@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-01",
+  "generatedAt": "2026-09-12",
   "docsVersion": "2026.09",
   "pages": [
     {
@@ -29,7 +29,7 @@
         "What runs where",
         "The source of truth",
         "Your first cockpit",
-        "A remote client",
+        "A remote or local-host client",
         "Before you start",
         "Install a released host binary",
         "Install from source",
@@ -44,21 +44,22 @@
       "title": "Install and update",
       "category": "Get started",
       "type": "Installation guide",
-      "summary": "Install checked release builds on Linux, macOS, Windows, or Android and choose a safe local host setup.",
+      "summary": "Install checked release builds on Linux, macOS, Windows, or Android and choose a safe remote or Termux-local host setup.",
       "href": "/docs/install-and-update/",
-      "keywords": "install update release binary curl powershell windows macos linux android apk sha256 checksum github releases arm64 x86_64 systemd launchagent launchd io gateway codex claude gemini security Mobile clients Native desktop client Remote access and security Operations and API",
+      "keywords": "install update release binary curl powershell windows macos linux android apk termux local runtime localhost sha256 checksum github releases arm64 x86_64 systemd launchagent launchd io gateway codex claude gemini security Mobile clients Native desktop client Remote access and security Operations and API",
       "headings": [
         "Choose the right release asset",
         "Linux and macOS: install the current host",
         "Optional host tools and provider setup",
         "Windows: PowerShell installer or a downloaded script",
-        "Android: install the released remote client",
+        "Android: connect remotely or host locally with Termux",
+        "Optional local Android host: Termux",
         "Verify a manual release download",
         "Update and roll back deliberately",
         "Release security checklist",
         "Continue with"
       ],
-      "excerpt": "Each version tag, such as v0.1.0 , publishes the io-workbench host binary for Linux, macOS, and Windows plus signed Android client APKs. The host executable is the self-hosted server and Web UI; Android is an authenticated remote client. Install the package that matches the device you are preparing, then deliberately start or connect it. Choose the right release asset Device What the release installs What it does Lin"
+      "excerpt": "Each version tag, such as v0.1.0 , publishes the io-workbench host binary for Linux, macOS, and Windows plus signed Android client APKs. The host executable is the self-hosted server and Web UI. Android can connect to a remote host, or its native app can manage a separately installed Termux host over authenticated localhost. Install the package that matches the device you are preparing, then deliberately start or con"
     },
     {
       "title": "Web workspace",
@@ -77,6 +78,7 @@
         "No hosted model proxy",
         "No browser shell",
         "Treat it as a control plane",
+        "Keyboard mappings",
         "Find these guides inside the app",
         "Next steps"
       ],
@@ -86,18 +88,20 @@
       "title": "Mobile apps",
       "category": "Get started",
       "type": "Tutorial",
-      "summary": "Install the released Android client or build it from source, use the mobile web/PWA route, and connect it safely to a running host.",
+      "summary": "Install the released Android client or build it from source, use a remote host or Termux-local host safely, and understand the PWA route.",
       "href": "/docs/mobile/",
       "keywords": "mobile android native app apk release install update adb pwa ios web harness server url emulator 10.0.2.2 lan tunnel https wss remote termux Mobile clients Database and terminal Remote access and security",
       "headings": [
         "Choose the mobile surface",
-        "Prepare the server before installing a client",
+        "Prepare a remote host or local Termux host",
         "Install the native Android app",
         "Build from source when developing the Android client",
+        "Optional: run a private Android host in Termux",
         "Connect Android to the host",
         "Use the right URL for the device",
         "Use the PWA or browser harness",
         "Mobile capability matrix",
+        "Keyboard mappings",
         "Use mobile in a real work loop",
         "Continue the remote session",
         "Review before approving",
@@ -106,7 +110,7 @@
         "First Android work cycle",
         "If connection fails"
       ],
-      "excerpt": "Mobile clients are remote control surfaces for a running io-workbench server. They do not run your agent CLIs, workspace processes, or PTY locally. Start the host first, then connect the phone to a reachable authenticated server URL. Choose the mobile surface Surface Best for Current delivery Android native A dedicated mobile experience with native editor and terminal controls. Signed APKs are published with every v*"
+      "excerpt": "Mobile clients are control surfaces for a running io-workbench server. Most use a remote host; Android can optionally use a separately installed Termux host on the same device. In every route, the app itself does not run agent CLIs, workspace processes, or PTYs: those remain in the connected server environment. Choose the mobile surface Surface Best for Current delivery Android native A dedicated mobile experience wi"
     },
     {
       "title": "Native desktop client",
@@ -198,7 +202,7 @@
       "title": "Terminal and mobile controls",
       "category": "Workbench workflows",
       "type": "How-to guide",
-      "summary": "Operate a live server-hosted PTY from the browser or Android without mistaking it for a local device shell.",
+      "summary": "Operate a live server-hosted PTY from the browser or Android, including a separately hosted local Termux server.",
       "href": "/docs/terminal-and-mobile/",
       "keywords": "terminal pty remote shell process resize input output abort copy paste android termux esc tab ctrl alt arrows Web workspace Mobile clients Native desktop client Database and terminal",
       "headings": [
@@ -210,7 +214,7 @@
         "Important Android distinction",
         "Terminal safety"
       ],
-      "excerpt": "The browser calls this surface Shell ; it is a real PTY backed by the selected project on the server. It is for running host commands, watching output, resizing the terminal, and stopping processes—not an output-only command log. Start a terminal in the correct project 1 Select the project The Shell starts against the selected server-side project path, so check the project before running a migration, build, or destru"
+      "excerpt": "The browser calls this surface Shell ; it is a real PTY backed by the selected project on the server. It is for running host commands, watching output, resizing the terminal, and stopping processes—not an output-only command log. On Android's optional local route, the selected server is separately hosted in Termux. Start a terminal in the correct project 1 Select the project The Shell starts against the selected serv"
     },
     {
       "title": "Boards and tools",
@@ -303,7 +307,7 @@
       "type": "Troubleshooting",
       "summary": "Diagnose host startup, authentication, provider CLI, project, WebSocket, mobile, and remote-access failures.",
       "href": "/docs/troubleshooting/",
-      "keywords": "troubleshooting health login auth token otp cli status project websocket mobile android pwa remote proxy wss Mobile clients Native desktop client Remote access and security Operations and API",
+      "keywords": "troubleshooting health login auth token otp cli status project websocket mobile android termux local runtime pwa remote proxy wss Mobile clients Native desktop client Remote access and security Operations and API",
       "headings": [
         "First checks",
         "Common symptoms",
@@ -326,6 +330,23 @@
         "Related documents"
       ],
       "excerpt": "The browser, Android client, and PWA use the io-workbench HTTP API and WebSocket event stream. Use this page to orient yourself, then check the bundled OpenAPI document and the running server behavior before building a separate integration. Key entry points Endpoint Purpose Notes GET /health Simple host reachability check. Use it first for local and remote diagnostics. GET /ws Live events and controls. Requires the a"
+    },
+    {
+      "title": "Keyboard mappings",
+      "category": "Reference",
+      "type": "Reference",
+      "summary": "Use the Web workspace and mobile keyboard shortcuts without mistaking the desktop browser map for the Android or PWA map.",
+      "href": "/docs/keyboard-mappings/",
+      "keywords": "keyboard mappings keyboard shortcuts keymap hotkeys web browser desktop android mobile pwa ctrl cmd alt home prompt editor git board terminal database alt+p alt+m ctrl/cmd+k ctrl/cmd+s ctrl/cmd+f ctrl/cmd+enter ctrl+tab ctrl+shift+tab ctrl/cmd+space ctrl+k cmd+k ctrl+s cmd+s ctrl+f cmd+f ctrl+enter cmd+enter ctrl+space cmd+space f5 f6 f7 Web workspace Mobile clients Database and terminal",
+      "headings": [
+        "Read the notation",
+        "Everyday shortcuts shared by Web and mobile",
+        "Web workspace — desktop browser",
+        "Mobile apps — Android and web harness/PWA",
+        "Android native Database workspace",
+        "When a shortcut does not work"
+      ],
+      "excerpt": "io-workbench has separate keyboard maps for the desktop Web workspace and the mobile Android / web harness / PWA clients. The mobile PWA follows the mobile map, not the desktop browser map. Use a physical keyboard for mobile shortcuts. Read the notation Notation Meaning Ctrl/Cmd Use Ctrl on Windows/Linux or Cmd on macOS. A mobile keyboard that sends the Meta/Command modifier follows the same command-style bindings. +"
     },
     {
       "title": "Get started",

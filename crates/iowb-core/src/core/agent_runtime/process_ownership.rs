@@ -3,9 +3,10 @@ fn isolate_agent_process(command: &mut Command) {
     command.process_group(0);
 
     // A forced SIGKILL gives Rust no opportunity to run cleanup code. On
-    // Linux, ask the kernel to kill the provider CLI when its server parent
-    // disappears so startup recovery never overlaps an orphaned old turn.
-    #[cfg(target_os = "linux")]
+    // Linux and Android use the same kernel facility. Ask it to kill the
+    // provider CLI when its server parent disappears so startup recovery
+    // never overlaps an orphaned old turn.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
         command.pre_exec(|| {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
@@ -31,20 +32,20 @@ fn durable_agent_run_scope(database_path: &Path) -> String {
     ))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn process_start_time(process_id: libc::pid_t) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
     let (_, fields) = stat.rsplit_once(')')?;
     fields.split_whitespace().nth(19)?.parse().ok()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn current_process_identity() -> Option<(libc::pid_t, u64)> {
     let process_id = std::process::id() as libc::pid_t;
     process_start_time(process_id).map(|start_time| (process_id, start_time))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn process_environment_value<'a>(environment: &'a [u8], key: &str) -> Option<&'a [u8]> {
     let key = key.as_bytes();
     environment
@@ -52,7 +53,7 @@ fn process_environment_value<'a>(environment: &'a [u8], key: &str) -> Option<&'a
         .find_map(|entry| entry.strip_prefix(key)?.strip_prefix(b"="))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn marked_process_owner_is_alive(environment: &[u8]) -> bool {
     let owner_pid = process_environment_value(environment, DURABLE_AGENT_OWNER_PID_ENV)
         .and_then(|value| std::str::from_utf8(value).ok())
@@ -73,15 +74,15 @@ fn marked_process_owner_is_alive(environment: &[u8]) -> bool {
 /// Kill provider descendants left behind by a stopped server before a durable
 /// continuation is launched. A process must match both the run and canonical
 /// database path, and its recorded server owner must no longer be alive.
-/// Linux `/proc` exposes these inherited markers even when the original
-/// process-group leader has already exited.
+/// Linux and Android `/proc` expose these inherited markers even when the
+/// original process-group leader has already exited.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OrphanedAgentRunCleanup {
     pub terminated_process_groups: usize,
     pub live_owner: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn terminate_orphaned_agent_run_processes(
     run_id: &str,
     database_path: impl AsRef<Path>,
@@ -159,7 +160,7 @@ pub fn terminate_orphaned_agent_run_processes(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn terminate_orphaned_agent_run_processes(
     _run_id: &str,
     _database_path: impl AsRef<Path>,

@@ -196,11 +196,81 @@ fn sqlite_relational_schema(
     })
 }
 
+const SQLITE_SINGLE_STATEMENT_ERROR: &str = "SQLite Run Query executes one SQL statement at a time. Split a script into separate Run Query actions.";
+
+/// `rusqlite::Connection::prepare` deliberately prepares only the first SQL
+/// statement in its input. Without this guard a request such as `CREATE ...;
+/// INSERT ...;` reports success after applying only `CREATE`, which is both
+/// surprising and unsafe for the database workspace.
+///
+/// Ask SQLite where a statement is complete instead of trying to split on
+/// semicolons ourselves: quoted strings, comments, and trigger bodies may
+/// contain semicolons that are not statement boundaries.
+fn ensure_sqlite_single_statement(sql: &str) -> Result<()> {
+    for (index, byte) in sql.bytes().enumerate() {
+        if byte != b';' {
+            continue;
+        }
+        let prefix = std::ffi::CString::new(&sql[..=index]).map_err(|_| {
+            ServerError::new(StatusCode::BAD_REQUEST, "SQL must not contain a NUL byte")
+        })?;
+        // SAFETY: `CString` gives SQLite a valid, NUL-terminated SQL buffer
+        // for this read-only completeness check.
+        let complete = unsafe { rusqlite::ffi::sqlite3_complete(prefix.as_ptr()) != 0 };
+        if !complete {
+            continue;
+        }
+        if sqlite_tail_has_statement(&sql[index + 1..]) {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                SQLITE_SINGLE_STATEMENT_ERROR,
+            ));
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// A completed statement may be followed by whitespace, empty semicolons, or
+/// SQL comments. Any other token starts a second statement and must be
+/// rejected before the first statement can mutate the database.
+fn sqlite_tail_has_statement(tail: &str) -> bool {
+    let bytes = tail.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte.is_ascii_whitespace() || byte == b';' => index += 1,
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                if index + 1 >= bytes.len() {
+                    // Preserve SQLite's own syntax error for an unterminated
+                    // trailing comment instead of accepting a partial script.
+                    return true;
+                }
+                index += 2;
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
 fn execute_sqlite_query(
     connection: &StoredDatabaseConnection,
     sql: &str,
     max_rows: usize,
 ) -> Result<DatabaseQueryResult> {
+    ensure_sqlite_single_statement(sql)?;
     let start = Instant::now();
     let conn = sqlite_connection(connection)?;
     let statement_type = classify_statement(sql);

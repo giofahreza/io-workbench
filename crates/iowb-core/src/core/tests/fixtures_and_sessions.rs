@@ -581,7 +581,7 @@
         .expect("abort drain waited for an open sender");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test(flavor = "current_thread")]
     async fn startup_cleanup_is_scoped_to_database_and_dead_owner() {
         let run_id = format!("run-orphan-test-{}", Uuid::new_v4());
@@ -646,7 +646,7 @@
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test(flavor = "current_thread")]
     async fn startup_cleanup_preserves_process_with_live_owner() {
         let run_id = format!("run-live-owner-test-{}", Uuid::new_v4());

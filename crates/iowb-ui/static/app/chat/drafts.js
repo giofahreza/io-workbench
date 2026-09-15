@@ -417,13 +417,14 @@ function renderSidebarProjects() {
         <button type="button" class="project-drag-handle" data-sidebar-drag-handle="${escapeHtml(project.path)}" aria-label="Drag to reorder ${escapeHtml(displayName)}" title="Drag to reorder">
           <i></i><i></i><i></i><i></i><i></i><i></i>
         </button>
-        <button type="button" class="sidebar-item project-sidebar-item" data-sidebar-project="${escapeHtml(project.path)}" aria-label="Select ${escapeHtml(displayName)} and show sessions" aria-expanded="${expanded ? "true" : "false"}"${active ? ' aria-current="true"' : ""}>
+        <button type="button" class="sidebar-item project-sidebar-item" data-sidebar-project="${escapeHtml(project.path)}" aria-label="Open board for ${escapeHtml(displayName)}"${active ? ' aria-current="page"' : ""}>
           <span class="project-sidebar-text">
             <strong>${escapeHtml(displayName)}</strong>
             <span>${escapeHtml(project.path)}</span>
             <em>${sessionCount} sessions</em>
           </span>
         </button>
+        <button type="button" class="project-session-toggle icon-button" data-sidebar-project-sessions-toggle="${escapeHtml(project.path)}" aria-label="${expanded ? "Hide" : "Show"} chat sessions for ${escapeHtml(displayName)}" title="${expanded ? "Hide" : "Show"} chat sessions" aria-expanded="${expanded ? "true" : "false"}" data-symbol="chevron-down"></button>
         <div class="project-menu-wrap">
           <button type="button" class="icon-button${menuOpen ? " active" : ""}" data-project-menu-button="${escapeHtml(project.path)}" aria-label="Project options" title="Project options" data-symbol="dots-vertical"></button>
           <div class="project-menu${menuOpen ? "" : " hidden"}" role="menu">
@@ -436,30 +437,27 @@ function renderSidebarProjects() {
     </div>`;
   }).join("");
   target.querySelectorAll("[data-sidebar-project]").forEach((button) => {
-    button.addEventListener("click", (event) => {
+    button.addEventListener("click", async (event) => {
       if (Date.now() < state.suppressSidebarProjectClickUntil) return;
       event.preventDefault();
       event.stopPropagation();
-      const isMobile = window.matchMedia("(max-width: 760px)").matches;
       const path = button.dataset.sidebarProject;
-      const wasActive = path === activeProjectPath();
-      const wasExpanded = state.expandedProjectPaths.has(path);
       setActiveProject(path);
-      // Switching projects should reveal its sessions. Clicking the already
-      // active expanded project is the intentional collapse gesture.
-      if (wasActive && wasExpanded) {
+      await switchView("board").catch(showError);
+    });
+  });
+  target.querySelectorAll("[data-sidebar-project-sessions-toggle]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const path = button.dataset.sidebarProjectSessionsToggle;
+      if (!path) return;
+      if (state.expandedProjectPaths.has(path)) {
         state.expandedProjectPaths.delete(path);
       } else {
         state.expandedProjectPaths.add(path);
       }
       saveExpandedProjectPaths();
-      // On mobile, do NOT trigger loadView — it would auto-close the
-      // sidebar via switchView, hiding the session list the user just
-      // expanded. The full chat view will fire when the user taps a
-      // session below.
-      if (!isMobile) {
-        loadView(activeView()).catch(showError);
-      }
       renderSidebarProjects();
       renderSidebarSessions();
     });

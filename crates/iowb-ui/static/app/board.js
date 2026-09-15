@@ -6,28 +6,54 @@ const BOARD_COLUMNS = [
   { id: "done", title: "Done", description: "Completed groups" },
 ];
 
+const BOARD_TASK_MODEL_STAGES = [
+  "breakdown",
+  "implementation",
+  "qa",
+  "qa_fix",
+  "agents",
+  "final_qa",
+];
+
+let boardConfigReturnFocus = null;
+let boardConfigSaving = false;
+
 async function loadBoard() {
   const projectPath = activeProjectPath();
+  const requestId = ++state.boardLoadRequestId;
   const label = qs("#board-project-label");
   if (label) label.textContent = projectPath ? selectedProjectLabel("#active-project") : "No project selected";
   if (!projectPath) {
     state.board = null;
+    state.boardLoading = false;
     renderBoard();
     return;
   }
+  state.board = null;
   state.boardLoading = true;
   renderBoard();
   try {
     const query = new URLSearchParams({ projectPath });
     const body = await api(`/api/danger/boards?${query.toString()}`);
+    if (requestId !== state.boardLoadRequestId || projectPath !== activeProjectPath()) return;
     const boards = Array.isArray(body.boards) ? body.boards : [];
     const boardId = boards[0]?.id || "";
-    state.board = boardId ? await loadBoardDetail(boardId) : null;
+    const board = boardId ? await loadBoardDetail(boardId) : null;
+    if (requestId !== state.boardLoadRequestId || projectPath !== activeProjectPath()) return;
+    state.board = board;
     rememberBoardChatSessionIds(state.board);
     hideBoardChatSessionsFromLists();
+  } catch (error) {
+    // A request from a project that is no longer selected must not surface an
+    // error over the board that replaced it. The current request will render
+    // (or report) its own result instead.
+    if (requestId !== state.boardLoadRequestId || projectPath !== activeProjectPath()) return;
+    throw error;
   } finally {
-    state.boardLoading = false;
-    renderBoard();
+    if (requestId === state.boardLoadRequestId && projectPath === activeProjectPath()) {
+      state.boardLoading = false;
+      renderBoard();
+    }
   }
 }
 
@@ -174,14 +200,29 @@ function renderBoardDetails(run) {
 
 function renderBoardControls() {
   const run = state.board;
+  const hasProject = Boolean(activeProjectPath());
   const status = String(run?.status || "").toLowerCase();
   const hasRun = Boolean(run?.id);
   const running = hasRun && ["running", "planning", "in_progress"].includes(status);
   const terminal = hasRun && ["completed", "cancelled", "failed"].includes(status);
   const hasTodo = Array.isArray(run?.tasks) && run.tasks.some((task) => ["todo", "pending", "planned"].includes(String(task.status || "").toLowerCase()));
+  const compose = qs(".board-compose-row");
+  const startForm = qs("#board-start-form");
+  const taskForm = qs("#board-task-form");
+  const startSubmit = qs("#board-start-submit");
+  const taskSubmit = qs("#board-task-submit");
   const resume = qs("#board-resume");
   const pause = qs("#board-pause");
   const abort = qs("#board-abort");
+  compose?.classList.toggle("board-create-mode", !hasRun);
+  compose?.classList.toggle("board-active-mode", hasRun);
+  startForm?.classList.toggle("hidden", hasRun);
+  taskForm?.classList.toggle("hidden", !hasRun);
+  if (startSubmit) {
+    startSubmit.disabled = !hasProject || state.boardLoading;
+    startSubmit.textContent = "Create Board";
+  }
+  if (taskSubmit) taskSubmit.disabled = !hasRun || state.boardLoading;
   if (resume) resume.disabled = !hasRun || running || (terminal && !hasTodo);
   if (pause) pause.disabled = !hasRun || !running;
   if (abort) abort.disabled = !hasRun || terminal;
@@ -964,27 +1005,32 @@ function openBoardDiscussionModal(taskId) {
   modal?.addEventListener("click", (event) => {
     if (event.target === event.currentTarget || event.target.closest("[data-board-modal-close]")) closeBoardModal();
   });
-  qs("#board-discussion-form")?.addEventListener("submit", async (event) => {
+  qs("#board-discussion-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
     const form = event.currentTarget;
-    const action = form.elements.action.value;
-    const message = form.elements.message.value.trim();
-    if (!message && !action) throw new Error("Write a discussion message.");
-    let payload = {};
-    if (["edit", "replace"].includes(action)) payload = { details: message };
-    if (action === "reprioritize") payload = { priority: message };
-    if (action === "merge") payload = { targetId: message };
-    if (action === "split") payload = { items: message.split(/\r?\n/).map((title) => title.trim()).filter(Boolean).map((title) => ({ title, details: title })) };
-    if (action === "re_research") payload = { title: "Research revised direction", details: message };
-    if (["revision", "fix", "replacement"].includes(action)) payload = { title: `${statusLabel(action)} for completed item`, details: message, kind: action, ...(action === "replacement" ? { supersedeSource: true } : {}) };
-    const response = await api(`/api/danger/boards/${encodeURIComponent(state.board.id)}/tasks/${encodeURIComponent(taskId)}/discussion`, {
-      method: "POST",
-      body: JSON.stringify({ message, action, payload }),
-    });
-    closeBoardModal();
-    await loadBoard();
-    openBoardTaskDetails(taskId);
-    if (response?.success === false) showToast("Discussion proposal could not be prepared", "error");
+    const submit = form.querySelector('button[type="submit"]');
+    withButtonLoading(submit, async () => {
+      const action = form.elements.action.value;
+      const message = form.elements.message.value.trim();
+      if (!message && !action) throw new Error("Write a discussion message.");
+      const boardId = state.board?.id;
+      if (!boardId) throw new Error("The board is no longer available.");
+      let payload = {};
+      if (["edit", "replace"].includes(action)) payload = { details: message };
+      if (action === "reprioritize") payload = { priority: message };
+      if (action === "merge") payload = { targetId: message };
+      if (action === "split") payload = { items: message.split(/\r?\n/).map((title) => title.trim()).filter(Boolean).map((title) => ({ title, details: title })) };
+      if (action === "re_research") payload = { title: "Research revised direction", details: message };
+      if (["revision", "fix", "replacement"].includes(action)) payload = { title: `${statusLabel(action)} for completed item`, details: message, kind: action, ...(action === "replacement" ? { supersedeSource: true } : {}) };
+      const response = await api(`/api/danger/boards/${encodeURIComponent(boardId)}/tasks/${encodeURIComponent(taskId)}/discussion`, {
+        method: "POST",
+        body: JSON.stringify({ message, action, payload }),
+      });
+      closeBoardModal();
+      await loadBoard();
+      openBoardTaskDetails(taskId);
+      if (response?.success === false) showToast("Discussion proposal could not be prepared", "error");
+    }).catch(showError);
   });
 }
 
@@ -1012,92 +1058,418 @@ function multilineInputLines(selector) {
     .filter(Boolean);
 }
 
+function boardConfigValue(selector, fallback = "") {
+  return (qs(selector)?.value || fallback).trim();
+}
+
+function boardConfigBoolean(value, fallback) {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function boardConfigRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function boardConfigLines(value) {
+  return Array.isArray(value)
+    ? value.map((item) => String(item || "").trim()).filter(Boolean).join("\n")
+    : "";
+}
+
+function setBoardConfigValue(selector, value, fallback = "") {
+  const control = qs(selector);
+  if (!control) return;
+  const next = value === undefined || value === null ? fallback : String(value);
+  if (control instanceof HTMLSelectElement) {
+    const supported = [...control.options].some((option) => option.value === next);
+    control.value = supported ? next : fallback;
+    return;
+  }
+  control.value = next;
+}
+
+function setBoardConfigChecked(selector, value, fallback) {
+  const control = qs(selector);
+  if (control) control.checked = boardConfigBoolean(value, fallback);
+}
+
+function boardTaskModelOverridesFromForm() {
+  const overrides = {};
+  document.querySelectorAll("[data-board-task-model-stage]").forEach((control) => {
+    const stage = control.dataset.boardTaskModelStage || "";
+    const model = String(control.value || "").trim();
+    if (BOARD_TASK_MODEL_STAGES.includes(stage) && model) overrides[stage] = model;
+  });
+  return overrides;
+}
+
+function boardToolsPresetFromSettings(value) {
+  const settings = boardConfigRecord(value);
+  if (settings.shell === true) return "shell-enabled";
+  if (settings.shell === false) return "shell-disabled";
+  return "cli-default";
+}
+
+function boardStrategyFastSetting(value) {
+  const strategy = boardConfigRecord(value);
+  const explicit = strategy.fast ?? strategy.fastMode ?? strategy.fast_mode;
+  if (typeof explicit === "boolean") return explicit;
+  const tier = String(strategy.serviceTier ?? strategy.service_tier ?? "").trim().toLowerCase();
+  return tier === "fast" || tier === "priority";
+}
+
+function boardToolsSettingsFromForm() {
+  const preset = qs("#board-tools-preset")?.value || "cli-default";
+  if (preset === "shell-enabled") return { shell: true };
+  if (preset === "shell-disabled") return { shell: false };
+  return {};
+}
+
+function boardScheduledStartFromForm() {
+  const raw = qs("#board-scheduled-start")?.value || "";
+  if (!raw) return "";
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error("Choose a valid scheduled start time.");
+  }
+  return date.toISOString();
+}
+
+function boardScheduledStartForInput(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+    .toISOString()
+    .slice(0, 16);
+}
+
+function boardConfigurationValues() {
+  const reasoningEffort = boardConfigValue("#board-reasoning-effort");
+  const modelStrategy = {
+    mode: qs("#board-model-strategy")?.value || "manual",
+    cheapModel: boardConfigValue("#board-cheap-model"),
+    expensiveModel: boardConfigValue("#board-expensive-model"),
+    thinking: Boolean(qs("#board-thinking")?.checked),
+    fast: Boolean(qs("#board-fast")?.checked),
+  };
+  if (reasoningEffort) modelStrategy.reasoningEffort = reasoningEffort;
+
+  return {
+    provider: qs("#board-provider")?.value || "claude",
+    model: boardConfigValue("#board-model"),
+    nextProvider: qs("#board-next-provider")?.value || "",
+    nextModel: boardConfigValue("#board-next-model"),
+    boardProfile: qs("#board-profile")?.value || "complete_app",
+    sessionPolicy: qs("#board-session-policy")?.value || "continuous",
+    gitPolicy: qs("#board-git-policy")?.value || "read_only",
+    scheduledStartAt: boardScheduledStartFromForm(),
+    modelStrategy,
+    taskModelOverrides: boardTaskModelOverridesFromForm(),
+    toolsSettings: boardToolsSettingsFromForm(),
+    tddEnabled: qs("#board-tdd-enabled")?.value !== "false",
+    tddPolicy: {
+      requireFailingTestBeforeDev: qs("#board-tdd-baseline")?.value !== "false",
+      allowImplementationWithoutTests: qs("#board-tdd-allow-no-tests")?.value === "true",
+      maxFixAttempts: numericInputValue("#board-tdd-max-fixes", 3, 0, 20),
+    },
+    validationConfig: {
+      enabled: qs("#board-validation-enabled")?.value !== "false",
+      featureCommands: multilineInputLines("#board-validation-feature-commands"),
+      finalCommands: multilineInputLines("#board-validation-final-commands"),
+      qaCommands: multilineInputLines("#board-validation-qa-commands"),
+      maxFeatureCommands: numericInputValue("#board-validation-max-feature", 2, 0, 20),
+      maxFinalCommands: numericInputValue("#board-validation-max-final", 4, 0, 20),
+      maxQaCommands: numericInputValue("#board-validation-max-qa", 2, 0, 20),
+      timeoutSeconds: numericInputValue("#board-validation-timeout", 120, 5, 3600),
+    },
+    ragSettings: {
+      enabled: qs("#board-rag-enabled")?.value !== "false",
+      indexOnBootstrap: Boolean(qs("#board-rag-index-on-bootstrap")?.checked),
+      queryEnabled: Boolean(qs("#board-rag-query-enabled")?.checked),
+      ingestTaskResults: Boolean(qs("#board-rag-ingest-task-results")?.checked),
+      ingestValidationErrors: Boolean(qs("#board-rag-ingest-validation-errors")?.checked),
+      scopes: multilineInputLines("#board-rag-scopes"),
+      contextMaxChars: numericInputValue("#board-rag-context-chars", 12000, 1000, 80000),
+    },
+    qaPolicy: {
+      taskQaMode: qs("#board-qa-mode")?.value || "high_risk",
+      maxFollowupsPerGroup: numericInputValue("#board-qa-followups", 3, 0, 20),
+      maxTaskAttempts: numericInputValue("#board-qa-attempts", 2, 1, 10),
+      repairMalformedToolCalls: qs("#board-tool-repair-enabled")?.value !== "false",
+      malformedToolCallRepairRetries: numericInputValue("#board-tool-repair-retries", 1, 0, 3),
+    },
+    autoRetry: {
+      enabled: qs("#board-auto-retry-enabled")?.value === "true",
+      delayMinutes: numericInputValue("#board-auto-retry-delay", 10, 1, 1440),
+      maxAttempts: numericInputValue("#board-auto-retry-attempts", 3, 1, 100),
+      resetAttempts: Boolean(qs("#board-auto-retry-reset-attempts")?.checked),
+    },
+  };
+}
+
+function populateBoardConfiguration(run) {
+  if (!run?.id) return;
+  const modelStrategy = boardConfigRecord(run.modelStrategy);
+  const validationConfig = boardConfigRecord(run.validationConfig);
+  const ragSettings = boardConfigRecord(run.ragSettings);
+  const qaPolicy = boardConfigRecord(run.qaPolicy);
+  const tddPolicy = boardConfigRecord(run.tddPolicy);
+  const autoRetry = boardConfigRecord(run.autoRetry);
+  const taskModels = boardConfigRecord(run.taskModelOverrides);
+
+  setBoardConfigValue("#board-provider", run.provider, "claude");
+  setBoardConfigValue("#board-model", run.model);
+  setBoardConfigValue("#board-next-provider", run.nextProvider, "");
+  setBoardConfigValue("#board-next-model", run.nextModel);
+  setBoardConfigValue("#board-profile", run.boardProfile, "complete_app");
+  setBoardConfigValue("#board-session-policy", run.sessionPolicy, "continuous");
+  setBoardConfigValue("#board-git-policy", run.gitPolicy, "read_only");
+  setBoardConfigValue("#board-scheduled-start", boardScheduledStartForInput(run.scheduledStartAt));
+
+  setBoardConfigValue("#board-model-strategy", modelStrategy.mode, "manual");
+  setBoardConfigValue("#board-reasoning-effort", modelStrategy.reasoningEffort ?? modelStrategy.effort, "");
+  setBoardConfigValue("#board-cheap-model", modelStrategy.cheapModel);
+  setBoardConfigValue("#board-expensive-model", modelStrategy.expensiveModel);
+  setBoardConfigChecked("#board-thinking", modelStrategy.thinking, false);
+  setBoardConfigChecked("#board-fast", boardStrategyFastSetting(modelStrategy), false);
+  BOARD_TASK_MODEL_STAGES.forEach((stage) => {
+    setBoardConfigValue("[data-board-task-model-stage=\"" + stage + "\"]", taskModels[stage]);
+  });
+
+  setBoardConfigValue("#board-tdd-enabled", String(run.tddEnabled !== false), "true");
+  setBoardConfigValue("#board-tdd-baseline", String(tddPolicy.requireFailingTestBeforeDev !== false), "true");
+  setBoardConfigValue("#board-tdd-allow-no-tests", String(tddPolicy.allowImplementationWithoutTests === true), "false");
+  setBoardConfigValue("#board-tdd-max-fixes", tddPolicy.maxFixAttempts, "3");
+
+  setBoardConfigValue("#board-validation-enabled", String(validationConfig.enabled !== false), "true");
+  setBoardConfigValue("#board-validation-timeout", validationConfig.timeoutSeconds, "120");
+  setBoardConfigValue("#board-validation-feature-commands", boardConfigLines(validationConfig.featureCommands));
+  setBoardConfigValue("#board-validation-final-commands", boardConfigLines(validationConfig.finalCommands));
+  setBoardConfigValue("#board-validation-qa-commands", boardConfigLines(validationConfig.qaCommands));
+  setBoardConfigValue("#board-validation-max-feature", validationConfig.maxFeatureCommands, "2");
+  setBoardConfigValue("#board-validation-max-final", validationConfig.maxFinalCommands, "4");
+  setBoardConfigValue("#board-validation-max-qa", validationConfig.maxQaCommands, "2");
+
+  setBoardConfigValue("#board-rag-enabled", String(ragSettings.enabled !== false), "true");
+  setBoardConfigValue("#board-rag-context-chars", ragSettings.contextMaxChars, "12000");
+  setBoardConfigChecked("#board-rag-index-on-bootstrap", ragSettings.indexOnBootstrap, true);
+  setBoardConfigChecked("#board-rag-query-enabled", ragSettings.queryEnabled, true);
+  setBoardConfigChecked("#board-rag-ingest-task-results", ragSettings.ingestTaskResults, true);
+  setBoardConfigChecked("#board-rag-ingest-validation-errors", ragSettings.ingestValidationErrors, true);
+  setBoardConfigValue("#board-rag-scopes", boardConfigLines(ragSettings.scopes));
+
+  setBoardConfigValue("#board-qa-mode", qaPolicy.taskQaMode, "high_risk");
+  setBoardConfigValue("#board-qa-followups", qaPolicy.maxFollowupsPerGroup, "3");
+  setBoardConfigValue("#board-qa-attempts", qaPolicy.maxTaskAttempts, "2");
+  setBoardConfigValue("#board-tool-repair-enabled", String(qaPolicy.repairMalformedToolCalls !== false), "true");
+  setBoardConfigValue("#board-tool-repair-retries", qaPolicy.malformedToolCallRepairRetries, "1");
+  setBoardConfigValue("#board-tools-preset", boardToolsPresetFromSettings(run.toolsSettings), "cli-default");
+  setBoardConfigValue("#board-auto-retry-enabled", String(autoRetry.enabled === true), "false");
+  setBoardConfigValue("#board-auto-retry-delay", autoRetry.delayMinutes, "10");
+  setBoardConfigValue("#board-auto-retry-attempts", autoRetry.maxAttempts, "3");
+  setBoardConfigChecked("#board-auto-retry-reset-attempts", false, false);
+}
+
+function boardConfigFocusableElements(dialog) {
+  if (!dialog) return [];
+  return [...dialog.querySelectorAll(
+    'button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+  )].filter((element) => !element.hidden && !element.closest(".hidden"));
+}
+
+function trapBoardConfigFocus(event, dialog) {
+  if (event.key !== "Tab") return;
+  const focusable = boardConfigFocusableElements(dialog);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  const initialHeading = qs("#board-config-title");
+  if (!dialog.contains(document.activeElement)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  } else if (event.shiftKey && (document.activeElement === first || document.activeElement === initialHeading)) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function setBoardConfigModalBusy(busy) {
+  const modal = qs("#board-config-modal");
+  modal?.classList.toggle("is-busy", busy);
+  modal?.querySelectorAll("[data-board-config-close]").forEach((button) => {
+    button.disabled = busy;
+  });
+  const submit = qs("#board-config-save");
+  if (submit) submit.disabled = busy;
+}
+
+function closeBoardConfigModal({ restoreFocus = true, force = false, discardDraft = false } = {}) {
+  if (boardConfigSaving && !force) return;
+  const modal = qs("#board-config-modal");
+  if (!modal || modal.classList.contains("hidden")) return;
+  if (discardDraft && !state.board?.id) {
+    const form = qs("#board-config-form");
+    form?.reset();
+    if (form) form.dataset.projectPath = activeProjectPath();
+  }
+  modal.classList.add("hidden");
+  modal.setAttribute("aria-hidden", "true");
+  const returnFocus = boardConfigReturnFocus;
+  boardConfigReturnFocus = null;
+  if (restoreFocus && returnFocus?.isConnected && !returnFocus.disabled) {
+    window.requestAnimationFrame(() => returnFocus.focus({ preventScroll: true }));
+  }
+}
+
+function openBoardConfigModal(trigger) {
+  const modal = qs("#board-config-modal");
+  const form = qs("#board-config-form");
+  if (!modal || !form) return;
+  const run = state.board;
+  if (run?.id) {
+    populateBoardConfiguration(run);
+  } else if (form.dataset.projectPath !== activeProjectPath()) {
+    form.reset();
+    form.dataset.projectPath = activeProjectPath();
+  }
+  const existingBoard = Boolean(run?.id);
+  const save = qs("#board-config-save");
+  const hint = qs("#board-config-save-hint");
+  if (save) save.textContent = existingBoard ? "Save configuration" : "Done";
+  if (hint) {
+    hint.textContent = existingBoard
+      ? "Changes apply to this board immediately."
+      : "These options will be saved when you create the board.";
+  }
+  boardConfigReturnFocus = trigger instanceof HTMLElement ? trigger : document.activeElement;
+  modal.classList.remove("hidden");
+  modal.setAttribute("aria-hidden", "false");
+  window.requestAnimationFrame(() => qs("#board-config-title")?.focus({ preventScroll: true }));
+}
+
+async function saveBoardConfiguration() {
+  if (boardConfigSaving) return;
+  const run = state.board;
+  if (!run?.id) {
+    closeBoardConfigModal();
+    showToast("Board configuration is ready to use when you create the board.", "ok");
+    return;
+  }
+  boardConfigSaving = true;
+  setBoardConfigModalBusy(true);
+  try {
+    const configuration = boardConfigurationValues();
+    const boardUrl = "/api/danger/boards/" + encodeURIComponent(run.id);
+    await api(boardUrl + "/model-strategy", {
+      method: "PATCH",
+      body: JSON.stringify({
+        modelStrategy: configuration.modelStrategy,
+        boardProfile: configuration.boardProfile,
+        sessionPolicy: configuration.sessionPolicy,
+        gitPolicy: configuration.gitPolicy,
+        nextProvider: configuration.nextProvider,
+        nextModel: configuration.nextModel,
+        taskModelOverrides: configuration.taskModelOverrides,
+      }),
+    });
+    // The strategy endpoint derives a primary model for a non-manual preset.
+    // Apply the explicitly selected board model afterwards so saving a grouped
+    // configuration cannot replace it with the cheap or expensive strategy model.
+    await api(boardUrl + "/model", {
+      method: "PATCH",
+      body: JSON.stringify({
+        provider: configuration.provider,
+        model: configuration.model,
+        nextProvider: configuration.nextProvider,
+        nextModel: configuration.nextModel,
+      }),
+    });
+    await api(boardUrl + "/tools", {
+      method: "PATCH",
+      body: JSON.stringify({ toolsSettings: configuration.toolsSettings }),
+    });
+    await api(boardUrl + "/tdd", {
+      method: "PATCH",
+      body: JSON.stringify({
+        tddEnabled: configuration.tddEnabled,
+        tddPolicy: configuration.tddPolicy,
+      }),
+    });
+    await api(boardUrl + "/validation", {
+      method: "PATCH",
+      body: JSON.stringify({ validationConfig: configuration.validationConfig }),
+    });
+    await api(boardUrl + "/rag", {
+      method: "PATCH",
+      body: JSON.stringify({ ragSettings: configuration.ragSettings }),
+    });
+    await api(boardUrl + "/qa-policy", {
+      method: "PATCH",
+      body: JSON.stringify({ qaPolicy: configuration.qaPolicy }),
+    });
+    await api(boardUrl + "/auto-retry", {
+      method: "PATCH",
+      body: JSON.stringify(configuration.autoRetry),
+    });
+    await api(boardUrl + "/schedule", {
+      method: "POST",
+      body: JSON.stringify({ scheduledStartAt: configuration.scheduledStartAt }),
+    });
+    await loadBoard();
+  } finally {
+    boardConfigSaving = false;
+    setBoardConfigModalBusy(false);
+  }
+  closeBoardConfigModal();
+  showToast("Board configuration saved", "ok");
+}
+
+function bindBoardConfigModal() {
+  const modal = qs("#board-config-modal");
+  if (!modal || modal.dataset.bound === "true") return;
+  modal.dataset.bound = "true";
+  document.querySelectorAll("[data-board-config-open]").forEach((button) => {
+    button.addEventListener("click", (event) => openBoardConfigModal(event.currentTarget));
+  });
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) closeBoardConfigModal({ discardDraft: true });
+  });
+  modal.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeBoardConfigModal({ discardDraft: true });
+      return;
+    }
+    trapBoardConfigFocus(event, modal.querySelector(".board-config-dialog"));
+  });
+  modal.querySelectorAll("[data-board-config-close]").forEach((button) => {
+    button.addEventListener("click", () => closeBoardConfigModal({ discardDraft: true }));
+  });
+  qs("#board-config-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    withButtonLoading(event.submitter, saveBoardConfiguration).catch(showError);
+  });
+}
+
 async function createBoard(event) {
   event.preventDefault();
   const projectPath = activeProjectPath();
   if (!projectPath) throw new Error("Select a project before creating a board.");
   const prompt = qs("#board-start-prompt")?.value.trim() || "";
-  if (!prompt) throw new Error("Enter a board prompt.");
-  const provider = qs("#board-provider")?.value || "claude";
-  const model = qs("#board-model")?.value.trim() || "";
-  const boardProfile = qs("#board-profile")?.value || "complete_app";
-  const strategyMode = qs("#board-model-strategy")?.value || "manual";
-  const sessionPolicy = qs("#board-session-policy")?.value || "continuous";
-  const gitPolicy = qs("#board-git-policy")?.value || "read_only";
-  const cheapModel = qs("#board-cheap-model")?.value.trim() || "";
-  const expensiveModel = qs("#board-expensive-model")?.value.trim() || "";
-  const tddEnabled = qs("#board-tdd-enabled")?.value !== "false";
-  const tddBaseline = qs("#board-tdd-baseline")?.value !== "false";
-  const tddAllowNoTests = qs("#board-tdd-allow-no-tests")?.value === "true";
-  const tddMaxFixes = numericInputValue("#board-tdd-max-fixes", 3, 0, 20);
-  const validationEnabled = qs("#board-validation-enabled")?.value !== "false";
-  const validationTimeout = numericInputValue("#board-validation-timeout", 120, 5, 3600);
-  const validationFeatureCommands = multilineInputLines("#board-validation-feature-commands");
-  const validationFinalCommands = multilineInputLines("#board-validation-final-commands");
-  const validationQaCommands = multilineInputLines("#board-validation-qa-commands");
-  const validationMaxFeature = numericInputValue("#board-validation-max-feature", 2, 0, 20);
-  const validationMaxFinal = numericInputValue("#board-validation-max-final", 4, 0, 20);
-  const validationMaxQa = numericInputValue("#board-validation-max-qa", 2, 0, 20);
-  const ragEnabled = qs("#board-rag-enabled")?.value !== "false";
-  const ragContextChars = numericInputValue("#board-rag-context-chars", 12000, 1000, 80000);
-  const qaMode = qs("#board-qa-mode")?.value || "high_risk";
-  const qaFollowups = numericInputValue("#board-qa-followups", 3, 0, 20);
-  const qaAttempts = numericInputValue("#board-qa-attempts", 2, 1, 10);
-  const repairMalformedToolCalls = qs("#board-tool-repair-enabled")?.value !== "false";
-  const toolRepairRetries = numericInputValue("#board-tool-repair-retries", 1, 0, 3);
-  const autoRetryEnabled = qs("#board-auto-retry-enabled")?.value === "true";
-  const autoRetryDelay = numericInputValue("#board-auto-retry-delay", 10, 1, 1440);
-  const autoRetryAttempts = numericInputValue("#board-auto-retry-attempts", 3, 1, 100);
+  if (!prompt) throw new Error("Enter a board brief.");
+  const configuration = boardConfigurationValues();
   await api("/api/danger/boards", {
     method: "POST",
     body: JSON.stringify({
       command: prompt,
       projectPath,
       projectName: activeProjectName() || selectedProjectLabel("#active-project"),
-      provider,
-      model,
-      boardProfile,
-      sessionPolicy,
-      gitPolicy,
-      modelStrategy: {
-        mode: strategyMode,
-        cheapModel,
-        expensiveModel,
-      },
-      tddEnabled,
-      tddPolicy: {
-        requireFailingTestBeforeDev: tddBaseline,
-        allowImplementationWithoutTests: tddAllowNoTests,
-        maxFixAttempts: tddMaxFixes,
-      },
-      validationConfig: {
-        enabled: validationEnabled,
-        featureCommands: validationFeatureCommands,
-        finalCommands: validationFinalCommands,
-        qaCommands: validationQaCommands,
-        maxFeatureCommands: validationMaxFeature,
-        maxFinalCommands: validationMaxFinal,
-        maxQaCommands: validationMaxQa,
-        timeoutSeconds: validationTimeout,
-      },
-      ragSettings: {
-        enabled: ragEnabled,
-        queryEnabled: ragEnabled,
-        indexOnBootstrap: ragEnabled,
-        contextMaxChars: ragContextChars,
-      },
-      qaPolicy: {
-        taskQaMode: qaMode,
-        maxFollowupsPerGroup: qaFollowups,
-        maxTaskAttempts: qaAttempts,
-        repairMalformedToolCalls,
-        malformedToolCallRepairRetries: toolRepairRetries,
-      },
-      autoRetry: {
-        enabled: autoRetryEnabled,
-        delayMinutes: autoRetryDelay,
-        maxAttempts: autoRetryAttempts,
-      },
+      ...configuration,
     }),
   });
   qs("#board-start-prompt").value = "";

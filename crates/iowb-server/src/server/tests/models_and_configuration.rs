@@ -172,6 +172,48 @@
         }
     }
 
+    #[test]
+    fn detects_file_backed_claude_settings_auth_without_returning_the_secret() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-claude-settings-auth-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temporary directory");
+        let settings = root.join("settings.json");
+
+        std::fs::write(
+            &settings,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.example.test","ANTHROPIC_AUTH_TOKEN":"test-only-token"}}"#,
+        )
+        .expect("settings");
+        assert!(claude_settings_has_auth_token(&settings));
+        assert_eq!(
+            auth_method(Provider::Claude, Some("Configured in Claude settings")),
+            Some("settings_file")
+        );
+
+        std::fs::write(
+            &settings,
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"   "}}"#,
+        )
+        .expect("empty token settings");
+        assert!(!claude_settings_has_auth_token(&settings));
+
+        std::fs::write(&settings, r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.example.test"}}"#)
+            .expect("settings without auth");
+        assert!(!claude_settings_has_auth_token(&settings));
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn recognizes_anthropic_auth_token_as_a_claude_environment_credential() {
+        assert_eq!(
+            first_present_auth_key(CLAUDE_AUTH_ENV_KEYS, |key| key == "ANTHROPIC_AUTH_TOKEN"),
+            Some("ANTHROPIC_AUTH_TOKEN")
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn io_gateway_chat_models_returns_empty_success_when_catalog_unavailable() {
         let root =

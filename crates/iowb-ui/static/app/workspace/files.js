@@ -314,6 +314,12 @@ function parentFilesystemPath(path) {
   return normalized.slice(0, index);
 }
 
+function joinFilesystemPath(parentPath, folderName) {
+  const parent = String(parentPath || "~").trim().replace(/[\\/]+$/, "");
+  const separator = parent.includes("\\") && !parent.includes("/") ? "\\" : "/";
+  return parent ? `${parent}${separator}${folderName}` : `${separator}${folderName}`;
+}
+
 function filesystemDirname(path) {
   const value = String(path || "").replaceAll("\\", "/").replace(/\/+$/, "");
   const index = value.lastIndexOf("/");
@@ -348,6 +354,7 @@ function folderBrowserActionLabel() {
 
 function renderFolderBrowser() {
   const browser = state.folderBrowser;
+  const canCreateFolder = browser.action === "add-project";
   qs("#folder-browser-title").textContent = browser.action === "add-project" ? "Add Project" : "Select Folder";
   qs("#folder-browser-path").textContent = browser.path || "~";
   qs("#folder-browser-filter").value = browser.filter;
@@ -357,6 +364,11 @@ function renderFolderBrowser() {
   qs("#folder-browser-use").setAttribute("aria-label", folderBrowserActionLabel());
   qs("#folder-browser-use").title = folderBrowserActionLabel();
   qs("#folder-browser-use").dataset.symbol = browser.action === "add-project" ? "plus" : "check";
+  const createButton = qs("#folder-browser-create");
+  if (createButton) {
+    createButton.classList.toggle("hidden", !canCreateFolder);
+    createButton.disabled = browser.loading || !canCreateFolder;
+  }
   qs("#folder-browser-hidden").classList.toggle("active", browser.showHidden);
   qs("#folder-browser-hidden").setAttribute(
     "aria-label",
@@ -411,6 +423,23 @@ async function loadFolderBrowser(path = state.folderBrowser.path || "~") {
   }
   state.folderBrowser.loading = false;
   renderFolderBrowser();
+}
+
+async function createFolderInFolderBrowser() {
+  const browser = state.folderBrowser;
+  if (!browser.open || browser.action !== "add-project" || browser.loading) return;
+  const name = window.prompt(`New folder name in ${browser.path}`, "")?.trim();
+  if (!name) return;
+  if (name === "." || name === ".." || /[\\/\0]/.test(name)) {
+    throw new Error("Enter one folder name without path separators.");
+  }
+  const path = joinFilesystemPath(browser.path, name);
+  await api("/api/create-folder", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+  await loadFolderBrowser(browser.path);
+  showToast("Folder created", "ok");
 }
 
 function openFolderBrowser(targetInput = "", options = {}) {
@@ -884,7 +913,10 @@ function setFileEditorMode(mode) {
   syncFileEditorModeUi();
   updateEditorChrome();
   if (state.fileEditorMode === "edit") {
-    window.requestAnimationFrame(() => refreshEditorWidget(filePath));
+    window.requestAnimationFrame(() => {
+      refreshEditorWidget(filePath);
+      focusFileEditor();
+    });
   }
 }
 
@@ -928,6 +960,14 @@ function editorCursorIndex() {
     return state.codeEditor.indexFromPos(state.codeEditor.getCursor());
   }
   return qs("#file-editor-content").selectionStart;
+}
+
+function focusFileEditor() {
+  if (state.codeEditor) {
+    state.codeEditor.focus();
+    return;
+  }
+  qs("#file-editor-content")?.focus();
 }
 
 function setEditorSelection(start, end = start) {
@@ -1048,13 +1088,21 @@ async function loadFileContent(filePath, options = {}) {
     const body = await api(`/api/projects/${encodeURIComponent(project)}/files/content?path=${encodeURIComponent(filePath)}`);
     if (requestId !== state.fileContentRequestId || projectPath !== activeProjectPath()) return;
     qs("#file-editor-path").value = body.path;
+    state.fileEditorMode = isMarkdownFile(body.path) ? "preview" : "edit";
     state.currentFileProjectPath = projectPath;
     state.currentFileDirty = false;
     setEditorText(body.content || "");
     resetEditorSearch();
     updateEditorChrome();
     await ensureCodeEditor(body.path);
-    if (requestId === state.fileContentRequestId) refreshEditorWidget(body.path);
+    if (requestId === state.fileContentRequestId) {
+      refreshEditorWidget(body.path);
+      if (state.fileEditorMode === "edit") {
+        window.requestAnimationFrame(() => {
+          if (requestId === state.fileContentRequestId && state.fileEditorMode === "edit") focusFileEditor();
+        });
+      }
+    }
   } finally {
     if (requestId === state.fileContentRequestId) form?.setAttribute("aria-busy", "false");
   }

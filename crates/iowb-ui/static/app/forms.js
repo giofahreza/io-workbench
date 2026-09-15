@@ -144,6 +144,7 @@ function bindForms() {
   qs("#board-abort")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardAction("abort")).catch(showError));
   qs("#board-start-form")?.addEventListener("submit", (event) => withButtonLoading(event.submitter, () => createBoard(event)).catch(showError));
   qs("#board-task-form")?.addEventListener("submit", (event) => withButtonLoading(event.submitter, () => addBoardTask(event)).catch(showError));
+  bindBoardConfigModal();
   qs("#board-details")?.addEventListener("click", (event) => {
     const transcriptButton = event.target.closest("[data-board-view-transcript]");
     if (transcriptButton && transcriptButton.dataset.boardViewTranscript === "breakdown") {
@@ -209,6 +210,9 @@ function bindForms() {
   qs("#folder-browser-hidden").addEventListener("click", () => {
     state.folderBrowser.showHidden = !state.folderBrowser.showHidden;
     renderFolderBrowser();
+  });
+  qs("#folder-browser-create").addEventListener("click", (event) => {
+    withButtonLoading(event.currentTarget, createFolderInFolderBrowser).catch(showError);
   });
   qs("#folder-browser-filter").addEventListener("input", (event) => {
     state.folderBrowser.filter = event.currentTarget.value;

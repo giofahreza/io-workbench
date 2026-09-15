@@ -176,13 +176,23 @@ struct DoctorReport {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    // Capture the local bearer in AppConfig, then remove its bootstrap
+    // environment variable before tracing or Tokio can create threads. This
+    // keeps it out of every ordinary server, Git, MCP, doctor, and provider
+    // child process while the in-memory config continues to authenticate the
+    // loopback host.
+    let cli = Cli::parse();
+    let config = apply_overrides(AppConfig::from_env()?, &cli);
+    // SAFETY: this happens before tracing initialization and runtime creation,
+    // so no library worker thread can concurrently access the process
+    // environment.
+    unsafe {
+        env::remove_var("IO_WORKBENCH_TOKEN");
+    }
     init_tracing();
 
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        let cli = Cli::parse();
-        let config = apply_overrides(AppConfig::from_env()?, &cli);
-
+    runtime.block_on(async move {
         match cli.command.unwrap_or(Command::Start) {
             Command::Start => iowb_server::serve(config).await,
             Command::Status => {

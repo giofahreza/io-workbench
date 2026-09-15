@@ -1,9 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{Read, Write},
     path::PathBuf,
     process::Stdio,
-    sync::{Arc, mpsc as std_mpsc},
+    sync::{Arc, Mutex as StdMutex, mpsc as std_mpsc},
     time::Duration,
 };
 
@@ -21,6 +21,17 @@ use uuid::Uuid;
 const PROCESS_EVENT_CAPACITY: usize = 512;
 const PROCESS_INPUT_CAPACITY: usize = 256;
 const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8192;
+// Keep enough recent output for a client that reconnects to an active PTY,
+// without letting a long-running terminal consume unbounded server memory.
+const PROCESS_OUTPUT_REPLAY_BYTES: usize = 64 * 1024;
+// A shell can leave an inherited pipe open after its own process exits. Drain
+// ordinary process output briefly, then stop its readers so a terminal exit
+// cannot be delayed indefinitely or followed by stale output events.
+const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+// A background descendant can keep a slave PTY open after its shell exits.
+// Give the reader a short chance to drain, then gate further chunks so exit
+// remains prompt and can never be followed by stale terminal output.
+const PTY_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 pub enum ProcessError {
@@ -55,6 +66,15 @@ pub enum ProcessEvent {
     },
 }
 
+/// A bounded, in-memory output chunk that can be replayed to a client that
+/// reconnects to an active process. It deliberately is not persisted: a
+/// process and its terminal screen both end when the server stops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessOutputChunk {
+    pub stream: ProcessStream,
+    pub data: String,
+}
+
 #[derive(Clone)]
 pub struct ProcessManager {
     processes: Arc<RwLock<HashMap<String, Arc<ProcessRecord>>>>,
@@ -64,6 +84,30 @@ pub struct ProcessManager {
 struct ProcessRecord {
     info: ProcessInfo,
     control_tx: ProcessControlSender,
+    output: Arc<StdMutex<ProcessOutputBuffer>>,
+}
+
+#[derive(Default)]
+struct ProcessOutputBuffer {
+    chunks: VecDeque<ProcessOutputChunk>,
+    byte_len: usize,
+}
+
+impl ProcessOutputBuffer {
+    fn push(&mut self, stream: ProcessStream, data: String) {
+        self.byte_len = self.byte_len.saturating_add(data.len());
+        self.chunks.push_back(ProcessOutputChunk { stream, data });
+        while self.byte_len > PROCESS_OUTPUT_REPLAY_BYTES {
+            let Some(removed) = self.chunks.pop_front() else {
+                break;
+            };
+            self.byte_len = self.byte_len.saturating_sub(removed.data.len());
+        }
+    }
+
+    fn snapshot(&self) -> Vec<ProcessOutputChunk> {
+        self.chunks.iter().cloned().collect()
+    }
 }
 
 enum ProcessControlSender {
@@ -112,6 +156,10 @@ impl ProcessManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // The local Termux host keeps its loopback bearer in its own process
+        // environment. A user terminal (and every CLI it starts) must never
+        // inherit that host credential.
+        command.env_remove("IO_WORKBENCH_TOKEN");
 
         if let Some(cwd) = &cwd {
             command.current_dir(cwd);
@@ -133,6 +181,7 @@ impl ProcessManager {
             pty: false,
         };
 
+        let output = Arc::new(StdMutex::new(ProcessOutputBuffer::default()));
         self.processes.write().await.insert(
             id.clone(),
             Arc::new(ProcessRecord {
@@ -141,6 +190,7 @@ impl ProcessManager {
                     input_tx,
                     kill_tx: Mutex::new(Some(kill_tx)),
                 },
+                output: Arc::clone(&output),
             }),
         );
 
@@ -148,60 +198,68 @@ impl ProcessManager {
             spawn_input_writer(self.events.clone(), id.clone(), stdin, input_rx);
         }
 
-        if let Some(stdout) = stdout {
+        let stdout_reader = stdout.map(|stdout| {
             spawn_output_reader(
                 self.events.clone(),
                 id.clone(),
                 ProcessStream::Stdout,
                 stdout,
-            );
-        }
+                Arc::clone(&output),
+            )
+        });
 
-        if let Some(stderr) = stderr {
+        let stderr_reader = stderr.map(|stderr| {
             spawn_output_reader(
                 self.events.clone(),
                 id.clone(),
                 ProcessStream::Stderr,
                 stderr,
-            );
-        }
+                Arc::clone(&output),
+            )
+        });
 
         let events = self.events.clone();
         let processes = Arc::clone(&self.processes);
         let process_id = id.clone();
         tokio::spawn(async move {
-            tokio::select! {
+            let completion = tokio::select! {
                 status = child.wait() => {
                     match status {
-                        Ok(status) => {
-                            let _ = events.send(ProcessEvent::Exited {
-                                process_id: process_id.clone(),
-                                code: status.code(),
-                            });
-                        }
-                        Err(error) => {
-                            let _ = events.send(ProcessEvent::Failed {
-                                process_id: process_id.clone(),
-                                message: error.to_string(),
-                            });
-                        }
+                        Ok(status) => ProcessCompletion::Exited(status.code()),
+                        Err(error) => ProcessCompletion::Failed(error.to_string()),
                     }
                 }
                 _ = kill_rx => {
-                    let kill_result = child.kill().await;
+                    ProcessCompletion::Killed(child.kill().await.err().map(|error| error.to_string()))
+                }
+            };
+            processes.write().await.remove(&process_id);
+            drain_output_reader(stdout_reader).await;
+            drain_output_reader(stderr_reader).await;
+
+            match completion {
+                ProcessCompletion::Exited(code) => {
+                    let _ = events.send(ProcessEvent::Exited { process_id, code });
+                }
+                ProcessCompletion::Killed(error) => {
                     let _ = events.send(ProcessEvent::Exited {
                         process_id: process_id.clone(),
                         code: None,
                     });
-                    if let Err(error) = kill_result {
+                    if let Some(message) = error {
                         let _ = events.send(ProcessEvent::Failed {
-                            process_id: process_id.clone(),
-                            message: error.to_string(),
+                            process_id,
+                            message,
                         });
                     }
                 }
+                ProcessCompletion::Failed(message) => {
+                    let _ = events.send(ProcessEvent::Failed {
+                        process_id,
+                        message,
+                    });
+                }
             }
-            processes.write().await.remove(&process_id);
         });
 
         Ok(ProcessStartResponse { id, started_at })
@@ -222,6 +280,10 @@ impl ProcessManager {
 
         let mut command = CommandBuilder::new(&request.command);
         command.args(&request.args);
+        // See the matching tokio Command call above. CommandBuilder starts
+        // with the parent environment, so remove the host-only bearer before
+        // the PTY child is spawned.
+        command.env_remove("IO_WORKBENCH_TOKEN");
         configure_pty_environment(&mut command);
         if let Some(cwd) = &cwd {
             command.cwd(cwd);
@@ -244,15 +306,24 @@ impl ProcessManager {
             pty: true,
         };
 
+        let output = Arc::new(StdMutex::new(ProcessOutputBuffer::default()));
         self.processes.write().await.insert(
             id.clone(),
             Arc::new(ProcessRecord {
                 info,
                 control_tx: ProcessControlSender::Blocking(control_tx),
+                output: Arc::clone(&output),
             }),
         );
 
-        spawn_pty_reader(self.events.clone(), id.clone(), reader);
+        let output_gate = Arc::new(StdMutex::new(true));
+        let reader_done = spawn_pty_reader(
+            self.events.clone(),
+            id.clone(),
+            reader,
+            Arc::clone(&output_gate),
+            Arc::clone(&output),
+        );
         spawn_pty_control(
             self.events.clone(),
             id.clone(),
@@ -265,25 +336,39 @@ impl ProcessManager {
         let events = self.events.clone();
         let processes = Arc::clone(&self.processes);
         let process_id = id.clone();
-        tokio::task::spawn_blocking(move || {
-            match child.wait() {
-                Ok(status) => {
-                    let code = i32::try_from(status.exit_code()).ok();
-                    let _ = events.send(ProcessEvent::Exited {
-                        process_id: process_id.clone(),
-                        code,
-                    });
+        tokio::spawn(async move {
+            let completion = match tokio::task::spawn_blocking(move || child.wait()).await {
+                Ok(Ok(status)) => ProcessCompletion::Exited(i32::try_from(status.exit_code()).ok()),
+                Ok(Err(error)) => ProcessCompletion::Failed(error.to_string()),
+                Err(error) => ProcessCompletion::Failed(format!("PTY wait task failed: {error}")),
+            };
+
+            // Dropping the control sender closes the master PTY once its
+            // control thread wakes. Most readers then finish immediately,
+            // but a background descendant can retain the slave indefinitely.
+            // Bound that drain and close the output gate before publishing
+            // exit, so clients never see a final chunk after their terminal
+            // is marked closed.
+            processes.write().await.remove(&process_id);
+            let _ = tokio::time::timeout(PTY_OUTPUT_DRAIN_TIMEOUT, reader_done).await;
+
+            let mut output_open = output_gate
+                .lock()
+                .expect("PTY output gate lock must not be poisoned");
+            *output_open = false;
+            match completion {
+                ProcessCompletion::Exited(code) => {
+                    let _ = events.send(ProcessEvent::Exited { process_id, code });
                 }
-                Err(error) => {
+                ProcessCompletion::Killed(_) => unreachable!("PTY control handles termination"),
+                ProcessCompletion::Failed(message) => {
                     let _ = events.send(ProcessEvent::Failed {
-                        process_id: process_id.clone(),
-                        message: error.to_string(),
+                        process_id,
+                        message,
                     });
                 }
             }
-            tokio::runtime::Handle::current().spawn(async move {
-                processes.write().await.remove(&process_id);
-            });
+            drop(output_open);
         });
 
         Ok(ProcessStartResponse { id, started_at })
@@ -323,6 +408,23 @@ impl ProcessManager {
             .collect()
     }
 
+    /// Returns the recent output for an active process. This is used only to
+    /// restore a terminal view after a client reconnects; normal output still
+    /// flows through the live event stream.
+    pub async fn output_snapshot(&self, process_id: &str) -> Result<Vec<ProcessOutputChunk>> {
+        let output = {
+            let processes = self.processes.read().await;
+            processes
+                .get(process_id)
+                .map(|record| Arc::clone(&record.output))
+        }
+        .ok_or(ProcessError::NotFound)?;
+        Ok(output
+            .lock()
+            .expect("process output buffer lock must not be poisoned")
+            .snapshot())
+    }
+
     pub async fn abort(&self, process_id: &str) -> Result<()> {
         self.send_control(process_id, ProcessControl::Kill).await
     }
@@ -353,12 +455,33 @@ impl Default for ProcessManager {
     }
 }
 
+enum ProcessCompletion {
+    Exited(Option<i32>),
+    Killed(Option<String>),
+    Failed(String),
+}
+
+async fn drain_output_reader(reader: Option<tokio::task::JoinHandle<()>>) {
+    let Some(mut reader) = reader else {
+        return;
+    };
+    if tokio::time::timeout(PROCESS_OUTPUT_DRAIN_TIMEOUT, &mut reader)
+        .await
+        .is_err()
+    {
+        reader.abort();
+        let _ = reader.await;
+    }
+}
+
 fn spawn_output_reader<R>(
     events: broadcast::Sender<ProcessEvent>,
     process_id: String,
     stream: ProcessStream,
     reader: R,
-) where
+    output: Arc<StdMutex<ProcessOutputBuffer>>,
+) -> tokio::task::JoinHandle<()>
+where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -368,10 +491,15 @@ fn spawn_output_reader<R>(
             match reader.read(&mut buffer).await {
                 Ok(0) => break,
                 Ok(read) => {
+                    let data = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                    output
+                        .lock()
+                        .expect("process output buffer lock must not be poisoned")
+                        .push(stream, data.clone());
                     let _ = events.send(ProcessEvent::Output {
                         process_id: process_id.clone(),
                         stream,
-                        data: String::from_utf8_lossy(&buffer[..read]).into_owned(),
+                        data,
                     });
                 }
                 Err(error) => {
@@ -383,26 +511,40 @@ fn spawn_output_reader<R>(
                 }
             }
         }
-    });
+    })
 }
 
 fn spawn_pty_reader(
     events: broadcast::Sender<ProcessEvent>,
     process_id: String,
     mut reader: Box<dyn Read + Send>,
-) {
+    output_gate: Arc<StdMutex<bool>>,
+    output: Arc<StdMutex<ProcessOutputBuffer>>,
+) -> oneshot::Receiver<()> {
+    let (done_tx, done_rx) = oneshot::channel();
     std::thread::spawn(move || {
         let mut buffer = vec![0_u8; PROCESS_OUTPUT_CHUNK_BYTES];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    let _ = events.send(ProcessEvent::Output {
-                        process_id: process_id.clone(),
-                        stream: ProcessStream::Stdout,
-                        data: String::from_utf8_lossy(&buffer[..read]).into_owned(),
-                    });
+                    let output_open = output_gate
+                        .lock()
+                        .expect("PTY output gate lock must not be poisoned");
+                    if *output_open {
+                        let data = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                        output
+                            .lock()
+                            .expect("process output buffer lock must not be poisoned")
+                            .push(ProcessStream::Stdout, data.clone());
+                        let _ = events.send(ProcessEvent::Output {
+                            process_id: process_id.clone(),
+                            stream: ProcessStream::Stdout,
+                            data,
+                        });
+                    }
                 }
+                Err(error) if is_normal_pty_close(&error) => break,
                 Err(error) => {
                     let _ = events.send(ProcessEvent::Failed {
                         process_id: process_id.clone(),
@@ -412,7 +554,23 @@ fn spawn_pty_reader(
                 }
             }
         }
+        let _ = done_tx.send(());
     });
+    done_rx
+}
+
+fn is_normal_pty_close(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        // Unix PTY masters report EIO when the slave closes. It is their
+        // end-of-stream signal, not a user-visible terminal failure.
+        error.raw_os_error() == Some(5)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn configure_pty_environment(command: &mut CommandBuilder) {
@@ -499,7 +657,7 @@ fn spawn_input_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{Duration, Instant, timeout};
 
     #[tokio::test]
     async fn writes_process_input_to_child_stdin() {
@@ -596,6 +754,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pty_exit_is_published_after_final_output() {
+        let manager = ProcessManager::new();
+        let mut events = manager.subscribe();
+        let started = manager
+            .start(ProcessStartRequest {
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-lc".to_string(),
+                    "printf 'PTY_FINAL_OUTPUT\\n'".to_string(),
+                ],
+                cwd: None,
+                pty: true,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("PTY process starts");
+
+        let mut saw_final_output = false;
+        for _ in 0..12 {
+            match timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("event arrives")
+                .expect("event stream open")
+            {
+                ProcessEvent::Output {
+                    process_id, data, ..
+                } if process_id == started.id && data.contains("PTY_FINAL_OUTPUT") => {
+                    saw_final_output = true;
+                }
+                ProcessEvent::Exited { process_id, .. } if process_id == started.id => {
+                    assert!(
+                        saw_final_output,
+                        "terminal exit must not precede its final PTY output"
+                    );
+                    return;
+                }
+                ProcessEvent::Failed {
+                    process_id,
+                    message,
+                } if process_id == started.id => panic!("PTY process failed: {message}"),
+                _ => {}
+            }
+        }
+
+        panic!("did not receive terminal exit for the PTY process");
+    }
+
+    #[tokio::test]
+    async fn pty_exit_stays_prompt_when_a_background_child_keeps_the_slave_open() {
+        let manager = ProcessManager::new();
+        let mut events = manager.subscribe();
+        let started = manager
+            .start(ProcessStartRequest {
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-lc".to_string(),
+                    "(sleep 2; printf 'PTY_LATE_OUTPUT\\n') & printf 'PTY_EARLY_OUTPUT\\n'"
+                        .to_string(),
+                ],
+                cwd: None,
+                pty: true,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("PTY process starts");
+
+        let mut saw_early_output = false;
+        let exit_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = exit_deadline
+                .checked_duration_since(Instant::now())
+                .expect("PTY exit must be prompt despite its background child");
+            match timeout(remaining, events.recv())
+                .await
+                .expect("event arrives before the exit deadline")
+                .expect("event stream open")
+            {
+                ProcessEvent::Output {
+                    process_id, data, ..
+                } if process_id == started.id && data.contains("PTY_EARLY_OUTPUT") => {
+                    saw_early_output = true;
+                }
+                ProcessEvent::Exited { process_id, .. } if process_id == started.id => break,
+                ProcessEvent::Failed {
+                    process_id,
+                    message,
+                } if process_id == started.id => panic!("PTY process failed: {message}"),
+                _ => {}
+            }
+        }
+        assert!(
+            saw_early_output,
+            "terminal exit must retain already-read output"
+        );
+
+        // The child still owns the slave for roughly another second. The
+        // output gate must prevent that late data from following exit.
+        let late_output_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let Some(remaining) = late_output_deadline.checked_duration_since(Instant::now())
+            else {
+                break;
+            };
+            match timeout(remaining, events.recv()).await {
+                Err(_) => break,
+                Ok(Ok(ProcessEvent::Output {
+                    process_id, data, ..
+                })) if process_id == started.id && data.contains("PTY_LATE_OUTPUT") => {
+                    panic!("terminal output must not follow its exit event");
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("event stream failed: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pipe_exit_is_published_after_stdout_and_stderr() {
+        let manager = ProcessManager::new();
+        let mut events = manager.subscribe();
+        let started = manager
+            .start(ProcessStartRequest {
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'PIPE_STDOUT\\n'; printf 'PIPE_STDERR\\n' >&2".to_string(),
+                ],
+                cwd: None,
+                pty: false,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("pipe process starts");
+
+        let mut saw_stdout = false;
+        let mut saw_stderr = false;
+        for _ in 0..12 {
+            match timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("event arrives")
+                .expect("event stream open")
+            {
+                ProcessEvent::Output {
+                    process_id,
+                    stream: ProcessStream::Stdout,
+                    data,
+                } if process_id == started.id && data.contains("PIPE_STDOUT") => {
+                    saw_stdout = true;
+                }
+                ProcessEvent::Output {
+                    process_id,
+                    stream: ProcessStream::Stderr,
+                    data,
+                } if process_id == started.id && data.contains("PIPE_STDERR") => {
+                    saw_stderr = true;
+                }
+                ProcessEvent::Exited { process_id, .. } if process_id == started.id => {
+                    assert!(saw_stdout, "process exit must follow stdout output");
+                    assert!(saw_stderr, "process exit must follow stderr output");
+                    return;
+                }
+                ProcessEvent::Failed {
+                    process_id,
+                    message,
+                } if process_id == started.id => panic!("pipe process failed: {message}"),
+                _ => {}
+            }
+        }
+
+        panic!("did not receive process exit for the pipe process");
+    }
+
+    #[tokio::test]
     async fn pty_process_gets_browser_terminal_environment() {
         let manager = ProcessManager::new();
         let mut events = manager.subscribe();
@@ -636,5 +970,73 @@ mod tests {
         }
 
         assert!(saw_output);
+    }
+
+    #[tokio::test]
+    async fn active_pty_output_can_be_replayed_after_a_client_reconnect() {
+        let manager = ProcessManager::new();
+        let mut events = manager.subscribe();
+        let started = manager
+            .start(ProcessStartRequest {
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-lc".to_string(),
+                    "printf 'PTY_REPLAY_MARKER'; read line".to_string(),
+                ],
+                cwd: None,
+                pty: true,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("PTY starts");
+
+        for _ in 0..12 {
+            match timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("event arrives")
+                .expect("event stream open")
+            {
+                ProcessEvent::Output {
+                    process_id, data, ..
+                } if process_id == started.id && data.contains("PTY_REPLAY_MARKER") => break,
+                ProcessEvent::Failed {
+                    process_id,
+                    message,
+                } if process_id == started.id => panic!("PTY process failed: {message}"),
+                _ => continue,
+            }
+        }
+
+        let replay = manager
+            .output_snapshot(&started.id)
+            .await
+            .expect("active PTY has a replay buffer");
+        assert!(
+            replay
+                .iter()
+                .any(|chunk| chunk.data.contains("PTY_REPLAY_MARKER")),
+            "the active PTY transcript should include output produced before a client reconnects"
+        );
+
+        manager
+            .write_input(&started.id, b"\n".to_vec())
+            .await
+            .expect("PTY accepts cleanup input");
+    }
+
+    #[test]
+    fn process_output_replay_keeps_a_bounded_tail() {
+        let mut output = ProcessOutputBuffer::default();
+        output.push(
+            ProcessStream::Stdout,
+            "a".repeat(PROCESS_OUTPUT_REPLAY_BYTES),
+        );
+        output.push(ProcessStream::Stderr, "b".to_string());
+
+        let replay = output.snapshot();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].stream, ProcessStream::Stderr);
+        assert_eq!(replay[0].data, "b");
     }
 }
