@@ -968,7 +968,10 @@ mod tests {
         assert!(navigation.contains("event.code === \"Comma\" || event.key === \",\""));
         assert!(navigation.contains("event.code === \"Period\" || event.key === \".\""));
         assert!(navigation.contains("function bindWorkspaceViewShortcuts()"));
-        assert!(navigation.contains("switchView(WORKSPACE_SHORTCUT_VIEWS[nextIndex]).catch(showError);"));
+        assert!(
+            navigation
+                .contains("switchView(WORKSPACE_SHORTCUT_VIEWS[nextIndex]).catch(showError);")
+        );
         assert!(startup.contains("bindWorkspaceViewShortcuts();"));
     }
 
@@ -1027,7 +1030,9 @@ mod tests {
             save_configuration
                 .find("/model-strategy")
                 .expect("model strategy update")
-                < save_configuration.find("/model\", {").expect("model update"),
+                < save_configuration
+                    .find("/model\", {")
+                    .expect("model update"),
             "save the explicit model after the strategy-derived model"
         );
     }
