@@ -286,17 +286,20 @@ jobs:
               x86_64-linux-android) android_abi=x86_64 ;;
               *) echo "Unsupported Android target: $target" >&2; return 1 ;;
             esac
-            target_key=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
+            cargo_target_key=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
+            cc_target_key=${target//-/_}
             cc="$toolchain_bin/${target}26-clang"
             cxx="$toolchain_bin/${target}26-clang++"
             test -x "$cc"
             test -x "$cxx"
             export ANDROID_ABI="$android_abi"
-            export "CARGO_TARGET_${target_key}_LINKER=$cc"
-            export "CC_${target_key}=$cc"
-            export "CXX_${target_key}=$cxx"
-            export "AR_${target_key}=$toolchain_bin/llvm-ar"
-            export "RANLIB_${target_key}=$toolchain_bin/llvm-ranlib"
+            export "CARGO_TARGET_${cargo_target_key}_LINKER=$cc"
+            # `cc-rs` looks up target-specific tool variables using the
+            # lowercase, underscore-normalized target triple.
+            export "CC_${cc_target_key}=$cc"
+            export "CXX_${cc_target_key}=$cxx"
+            export "AR_${cc_target_key}=$toolchain_bin/llvm-ar"
+            export "RANLIB_${cc_target_key}=$toolchain_bin/llvm-ranlib"
 
             cargo build --release --locked -p iowb-cli --bin io-workbench --target "$target"
             built_binary="target/$target/release/io-workbench"
