@@ -237,6 +237,12 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          # The action's historical default includes the retired `tools`
+          # package. Modern command-line tools reject that package name.
+          packages: platform-tools
+          accept-android-sdk-licenses: "true"
+          log-accepted-android-sdk-licenses: "false"
 
       - name: Install Android NDK r27c
         shell: bash
@@ -456,6 +462,12 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          # Keep this aligned with the Termux runtime job above: `tools` is
+          # retired and makes the action fail before Gradle can run.
+          packages: platform-tools
+          accept-android-sdk-licenses: "true"
+          log-accepted-android-sdk-licenses: "false"
 
       - name: Install Android platform and build tools
         shell: bash
