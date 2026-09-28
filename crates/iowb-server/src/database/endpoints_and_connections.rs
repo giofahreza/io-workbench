@@ -192,6 +192,8 @@ async fn explorer(
             name: "main".to_string(),
             database_name: Some("main".to_string()),
             schema_name: None,
+            parent_name: None,
+            identity: None,
             has_children: true,
             description: Some("default".to_string()),
         }],
@@ -199,10 +201,12 @@ async fn explorer(
             .into_iter()
             .map(|object| DatabaseExplorerNode {
                 id: format!(
-                    "{}:{connection_id}:{}::{}",
+                    "{}:{connection_id}:{}:{}:{}:{}",
                     database_object_type_as_str(object.object_type),
                     object.database_name.as_deref().unwrap_or("main"),
-                    object.name
+                    object.parent_name.as_deref().unwrap_or(""),
+                    object.name,
+                    object.identity.as_deref().unwrap_or("")
                 ),
                 object_type: object.object_type,
                 connection_id,
@@ -212,6 +216,8 @@ async fn explorer(
                     .clone()
                     .or_else(|| Some("main".to_string())),
                 schema_name: query.schema_name.clone(),
+                parent_name: object.parent_name,
+                identity: object.identity,
                 has_children: false,
                 description: Some(database_object_type_as_str(object.object_type).to_string()),
             })
@@ -241,6 +247,9 @@ struct ObjectDetailsQuery {
     #[serde(rename = "schemaName")]
     schema_name: Option<String>,
     name: Option<String>,
+    #[serde(rename = "parentName")]
+    parent_name: Option<String>,
+    identity: Option<String>,
     #[serde(rename = "includeRelational")]
     include_relational: Option<bool>,
 }
@@ -269,11 +278,16 @@ async fn object_details(
             DatabaseObjectDetails {
                 database_name: Some(name.clone()),
                 schema_name: query.schema_name.clone(),
+                parent_name: None,
+                identity: None,
                 name,
                 object_type,
                 columns: Vec::new(),
                 primary_key: Vec::new(),
                 foreign_keys: Vec::new(),
+                definition: Some("SQLite database: main".to_string()),
+                definition_is_executable: false,
+                metadata: None,
                 relational_schema,
                 databases: vec![DatabaseNameSummary {
                     name: "main".to_string(),
@@ -283,7 +297,11 @@ async fn object_details(
                 objects,
             }
         }
-        DatabaseObjectType::Table | DatabaseObjectType::View => {
+        DatabaseObjectType::Table
+        | DatabaseObjectType::View
+        | DatabaseObjectType::Index
+        | DatabaseObjectType::Trigger
+        | DatabaseObjectType::Constraint => {
             let table_name = query
                 .name
                 .as_deref()
@@ -291,20 +309,34 @@ async fn object_details(
                 .ok_or_else(|| {
                     ServerError::new(StatusCode::BAD_REQUEST, "Object name is required")
                 })?;
-            let table = describe_sqlite_table(&connection, table_name, object_type)?;
+            let object = describe_sqlite_object(
+                &connection,
+                object_type,
+                table_name,
+                query.parent_name.as_deref(),
+                query.identity.as_deref(),
+            )?;
+            let definition_is_executable = database_definition_is_executable(
+                connection.profile.db_type,
+                object_type,
+                object.definition.as_deref(),
+            );
             DatabaseObjectDetails {
-                database_name: query.database_name.or_else(|| Some("main".to_string())),
-                schema_name: query.schema_name,
+                database_name: query
+                    .database_name
+                    .clone()
+                    .or_else(|| Some("main".to_string())),
+                schema_name: query.schema_name.clone(),
+                parent_name: object.parent_name,
+                identity: object.identity,
                 name: table_name.to_string(),
                 object_type,
-                primary_key: table
-                    .columns
-                    .iter()
-                    .filter(|column| column.is_primary_key)
-                    .map(|column| column.name.clone())
-                    .collect(),
-                foreign_keys: table.foreign_keys,
-                columns: table.columns,
+                primary_key: object.primary_key,
+                foreign_keys: object.foreign_keys,
+                columns: object.columns,
+                definition: object.definition,
+                definition_is_executable,
+                metadata: object.metadata,
                 relational_schema: None,
                 databases: Vec::new(),
                 schemas: Vec::new(),
@@ -324,6 +356,61 @@ async fn object_details(
         "session": database_session(&connection.profile),
         "details": details,
     })))
+}
+
+/// Only mark catalog output as runnable when it is already complete, standalone
+/// DDL from the database engine.  Several catalog APIs intentionally expose a
+/// source fragment (for example a view query, a routine body, or a constraint
+/// clause); putting those fragments in the SQL editor as though they were DDL
+/// is misleading and can cause accidental execution of a different statement.
+fn database_definition_is_executable(
+    db_type: SupportedDatabaseType,
+    object_type: DatabaseObjectType,
+    definition: Option<&str>,
+) -> bool {
+    let normalized_definition = definition.map(|definition| definition.trim_start().to_ascii_uppercase());
+    let has_create_statement = normalized_definition
+        .as_deref()
+        .is_some_and(|definition| definition.starts_with("CREATE "));
+    let has_create_trigger_statement = normalized_definition.as_deref().is_some_and(|definition| {
+        definition.starts_with("CREATE ")
+            && definition
+                .split_ascii_whitespace()
+                .any(|token| token == "TRIGGER")
+    });
+
+    match (db_type, object_type) {
+        // SQLite keeps the original object DDL in sqlite_master.
+        (
+            SupportedDatabaseType::Sqlite,
+            DatabaseObjectType::Table
+            | DatabaseObjectType::View
+            | DatabaseObjectType::Index
+            | DatabaseObjectType::Trigger,
+        ) => has_create_statement,
+        // PostgreSQL table DDL is reconstructed from catalog deparsers only
+        // when it is complete; index and trigger catalog functions already
+        // return complete statements. Other PostgreSQL metadata is source-only.
+        (
+            SupportedDatabaseType::Postgresql,
+            DatabaseObjectType::Table
+                | DatabaseObjectType::Index
+                | DatabaseObjectType::Trigger
+                | DatabaseObjectType::Policy,
+        ) => has_create_statement,
+        // SHOW CREATE TABLE and SHOW CREATE TRIGGER are the engine's own
+        // complete declarations. Other MySQL/MariaDB catalog values are
+        // source fragments or reconstructed metadata.
+        (
+            SupportedDatabaseType::Mysql | SupportedDatabaseType::Mariadb,
+            DatabaseObjectType::Table,
+        ) => has_create_statement,
+        (
+            SupportedDatabaseType::Mysql | SupportedDatabaseType::Mariadb,
+            DatabaseObjectType::Trigger,
+        ) => has_create_trigger_statement,
+        _ => false,
+    }
 }
 
 async fn execute_query(

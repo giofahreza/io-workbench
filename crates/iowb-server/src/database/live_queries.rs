@@ -214,6 +214,9 @@ async fn read_live_table_data(
     include_total_count: bool,
 ) -> Result<DatabaseTableData> {
     let start = Instant::now();
+    // The data grid is read-only for views, but it must be able to inspect
+    // every relation that the explorer exposes. PostgreSQL materialized views
+    // are not listed by information_schema.tables, so try them explicitly.
     let table = match describe_live_table(
         connection,
         database_name,
@@ -224,16 +227,27 @@ async fn read_live_table_data(
     .await
     {
         Ok(table) => table,
-        Err(_) => {
-            describe_live_table(
-                connection,
-                database_name,
-                schema_name,
-                table_name,
-                DatabaseObjectType::View,
-            )
-            .await?
-        }
+        Err(_) => match describe_live_table(
+            connection,
+            database_name,
+            schema_name,
+            table_name,
+            DatabaseObjectType::View,
+        )
+        .await
+        {
+            Ok(view) => view,
+            Err(_) => {
+                describe_live_table(
+                    connection,
+                    database_name,
+                    schema_name,
+                    table_name,
+                    DatabaseObjectType::MaterializedView,
+                )
+                .await?
+            }
+        },
     };
     let (_database, schema) = live_scope(connection, database_name, schema_name);
     let table_ref = live_table_ref(connection.profile.db_type, &schema, table_name);
@@ -608,7 +622,12 @@ fn mysql_value_to_json(row: &MySqlRow, index: usize) -> Value {
             .flatten()
             .map(|value| parse_mysql_vector(&value))
             .unwrap_or(Value::Null),
-        "BIT" | "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" => row
+        // MariaDB reports its JSON alias as BLOB on the wire, while retaining
+        // UTF-8 JSON bytes in the value. Preserve the portable buffer shape
+        // when decoding as JSON fails, but return structured JSON when it
+        // succeeds so JSON columns do not appear as opaque binary data.
+        "BLOB" => mysql_blob_value_to_json(row, index),
+        "BIT" | "BINARY" | "VARBINARY" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" => row
             .try_get_unchecked::<Option<Vec<u8>>, _>(index)
             .ok()
             .flatten()
@@ -632,6 +651,19 @@ fn mysql_integer_value(row: &MySqlRow, index: usize, unsigned: bool) -> Value {
         .flatten()
         .map(|value| Value::Number(value.into()))
         .unwrap_or_else(|| mysql_string_fallback(row, index))
+}
+
+fn mysql_blob_value_to_json(row: &MySqlRow, index: usize) -> Value {
+    row.try_get_unchecked::<Option<Value>, _>(index)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            row.try_get_unchecked::<Option<Vec<u8>>, _>(index)
+                .ok()
+                .flatten()
+                .map(|value| database_buffer_value(&value))
+        })
+        .unwrap_or(Value::Null)
 }
 
 fn mysql_string_fallback(row: &MySqlRow, index: usize) -> Value {

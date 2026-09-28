@@ -142,6 +142,7 @@ async fn paste_table_rows(
             column.nullable == Some(false)
                 && column.default_value.is_none()
                 && !column.is_primary_key
+                && !database_column_is_server_managed(column)
                 && !mappings.iter().any(|(target, _)| target == &column.name)
         })
         .map(|column| {
@@ -276,12 +277,6 @@ async fn add_table_row(
     Json(request): Json<DatabaseRowAddRequest>,
 ) -> Result<Json<Value>> {
     validate_table_scope(&request.scope)?;
-    if request.column_values.is_empty() {
-        return Err(ServerError::new(
-            StatusCode::BAD_REQUEST,
-            "columnValues must be a non-empty object",
-        ));
-    }
     let connection = load_connection(&state, &user.0.id, connection_id)?;
     let metadata = database_table_metadata(
         &connection,

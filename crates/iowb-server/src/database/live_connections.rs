@@ -132,22 +132,58 @@ fn database_capabilities(db_type: SupportedDatabaseType) -> DatabaseCapabilities
             supports_schemas: true,
             supports_views: true,
             supports_indexes: true,
+            supports_triggers: true,
+            supports_routines: true,
+            supports_sequences: true,
+            supports_materialized_views: true,
+            supports_events: false,
+            supports_constraints: true,
             supports_multiple_databases: true,
             supports_foreign_keys: true,
-            supports_parameterized_queries: true,
+            // The public query request currently accepts SQL text only. Do not
+            // advertise parameter binding until the protocol and execution
+            // path both support it.
+            supports_parameterized_queries: false,
             supports_offset: true,
-            supported_object_types: vec![DatabaseObjectType::Table, DatabaseObjectType::View],
+            supported_object_types: vec![
+                DatabaseObjectType::Table,
+                DatabaseObjectType::View,
+                DatabaseObjectType::MaterializedView,
+                DatabaseObjectType::Index,
+                DatabaseObjectType::Trigger,
+                DatabaseObjectType::Routine,
+                DatabaseObjectType::Sequence,
+                DatabaseObjectType::Constraint,
+                DatabaseObjectType::Policy,
+            ],
         },
         SupportedDatabaseType::Mysql | SupportedDatabaseType::Mariadb => DatabaseCapabilities {
             supports_databases: true,
             supports_schemas: false,
             supports_views: true,
             supports_indexes: true,
+            supports_triggers: true,
+            supports_routines: true,
+            supports_sequences: false,
+            supports_materialized_views: false,
+            supports_events: true,
+            supports_constraints: true,
             supports_multiple_databases: true,
             supports_foreign_keys: true,
-            supports_parameterized_queries: true,
+            // The public query request currently accepts SQL text only. Do not
+            // advertise parameter binding until the protocol and execution
+            // path both support it.
+            supports_parameterized_queries: false,
             supports_offset: true,
-            supported_object_types: vec![DatabaseObjectType::Table, DatabaseObjectType::View],
+            supported_object_types: vec![
+                DatabaseObjectType::Table,
+                DatabaseObjectType::View,
+                DatabaseObjectType::Index,
+                DatabaseObjectType::Trigger,
+                DatabaseObjectType::Routine,
+                DatabaseObjectType::Event,
+                DatabaseObjectType::Constraint,
+            ],
         },
     }
 }
@@ -158,11 +194,26 @@ fn sqlite_capabilities() -> DatabaseCapabilities {
         supports_schemas: false,
         supports_views: true,
         supports_indexes: true,
+        supports_triggers: true,
+        supports_routines: false,
+        supports_sequences: false,
+        supports_materialized_views: false,
+        supports_events: false,
+        supports_constraints: true,
         supports_multiple_databases: false,
         supports_foreign_keys: true,
-        supports_parameterized_queries: true,
+        // The public query request currently accepts SQL text only. Do not
+        // advertise parameter binding until the protocol and execution path
+        // both support it.
+        supports_parameterized_queries: false,
         supports_offset: true,
-        supported_object_types: vec![DatabaseObjectType::Table, DatabaseObjectType::View],
+        supported_object_types: vec![
+            DatabaseObjectType::Table,
+            DatabaseObjectType::View,
+            DatabaseObjectType::Index,
+            DatabaseObjectType::Trigger,
+            DatabaseObjectType::Constraint,
+        ],
     }
 }
 
@@ -274,18 +325,25 @@ async fn object_details_live(
                     .clone()
                     .or_else(|| Some(default_database_name(&connection))),
                 schema_name: resolved_schema_name.clone(),
+                parent_name: None,
+                identity: None,
                 name,
                 object_type,
                 columns: Vec::new(),
                 primary_key: Vec::new(),
                 foreign_keys: Vec::new(),
+                definition: None,
+                definition_is_executable: false,
+                metadata: None,
                 relational_schema,
                 databases: live_databases(&connection).await?,
                 schemas: live_schemas(&connection, resolved_database_name.as_deref()).await?,
                 objects,
             }
         }
-        DatabaseObjectType::Table | DatabaseObjectType::View => {
+        DatabaseObjectType::Table
+        | DatabaseObjectType::View
+        | DatabaseObjectType::MaterializedView => {
             let table_name = query
                 .name
                 .as_deref()
@@ -293,28 +351,84 @@ async fn object_details_live(
                 .ok_or_else(|| {
                     ServerError::new(StatusCode::BAD_REQUEST, "Object name is required")
                 })?;
-            let table = describe_live_table(
+            let object = describe_live_object(
                 &connection,
+                object_type,
                 resolved_database_name.as_deref(),
                 resolved_schema_name.as_deref(),
                 table_name,
-                object_type,
+                query.parent_name.as_deref(),
+                query.identity.as_deref(),
             )
             .await?;
+            let definition_is_executable = database_definition_is_executable(
+                connection.profile.db_type,
+                object_type,
+                object.definition.as_deref(),
+            );
             DatabaseObjectDetails {
                 database_name: resolved_database_name
                     .or_else(|| Some(default_database_name(&connection))),
                 schema_name: resolved_schema_name,
+                parent_name: object.parent_name,
+                identity: object.identity,
                 name: table_name.to_string(),
                 object_type,
-                primary_key: table
-                    .columns
-                    .iter()
-                    .filter(|column| column.is_primary_key)
-                    .map(|column| column.name.clone())
-                    .collect(),
-                foreign_keys: table.foreign_keys,
-                columns: table.columns,
+                primary_key: object.primary_key,
+                foreign_keys: object.foreign_keys,
+                columns: object.columns,
+                definition: object.definition,
+                definition_is_executable,
+                metadata: object.metadata,
+                relational_schema: None,
+                databases: Vec::new(),
+                schemas: Vec::new(),
+                objects: Vec::new(),
+            }
+        }
+        DatabaseObjectType::Index
+        | DatabaseObjectType::Trigger
+        | DatabaseObjectType::Routine
+        | DatabaseObjectType::Sequence
+        | DatabaseObjectType::Event
+        | DatabaseObjectType::Constraint
+        | DatabaseObjectType::Policy => {
+            let object_name = query
+                .name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    ServerError::new(StatusCode::BAD_REQUEST, "Object name is required")
+                })?;
+            let object = describe_live_object(
+                &connection,
+                object_type,
+                resolved_database_name.as_deref(),
+                resolved_schema_name.as_deref(),
+                object_name,
+                query.parent_name.as_deref(),
+                query.identity.as_deref(),
+            )
+            .await?;
+            let definition_is_executable = database_definition_is_executable(
+                connection.profile.db_type,
+                object_type,
+                object.definition.as_deref(),
+            );
+            DatabaseObjectDetails {
+                database_name: resolved_database_name
+                    .or_else(|| Some(default_database_name(&connection))),
+                schema_name: resolved_schema_name,
+                parent_name: object.parent_name,
+                identity: object.identity,
+                name: object_name.to_string(),
+                object_type,
+                primary_key: object.primary_key,
+                foreign_keys: object.foreign_keys,
+                columns: object.columns,
+                definition: object.definition,
+                definition_is_executable,
+                metadata: object.metadata,
                 relational_schema: None,
                 databases: Vec::new(),
                 schemas: Vec::new(),

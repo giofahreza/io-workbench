@@ -33,6 +33,14 @@ pub enum DatabaseObjectType {
     Schema,
     Table,
     View,
+    MaterializedView,
+    Index,
+    Trigger,
+    Routine,
+    Sequence,
+    Event,
+    Constraint,
+    Policy,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -143,6 +151,18 @@ pub struct DatabaseCapabilities {
     pub supports_views: bool,
     #[serde(rename = "supportsIndexes", default)]
     pub supports_indexes: bool,
+    #[serde(rename = "supportsTriggers", default)]
+    pub supports_triggers: bool,
+    #[serde(rename = "supportsRoutines", default)]
+    pub supports_routines: bool,
+    #[serde(rename = "supportsSequences", default)]
+    pub supports_sequences: bool,
+    #[serde(rename = "supportsMaterializedViews", default)]
+    pub supports_materialized_views: bool,
+    #[serde(rename = "supportsEvents", default)]
+    pub supports_events: bool,
+    #[serde(rename = "supportsConstraints", default)]
+    pub supports_constraints: bool,
     #[serde(rename = "supportsMultipleDatabases", default)]
     pub supports_multiple_databases: bool,
     #[serde(rename = "supportsForeignKeys", default)]
@@ -178,6 +198,10 @@ pub struct DatabaseExplorerNode {
     pub database_name: Option<String>,
     #[serde(rename = "schemaName", skip_serializing_if = "Option::is_none")]
     pub schema_name: Option<String>,
+    #[serde(rename = "parentName", skip_serializing_if = "Option::is_none")]
+    pub parent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
     #[serde(rename = "hasChildren")]
     pub has_children: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,6 +224,10 @@ pub struct DatabaseObjectSummary {
     pub database_name: Option<String>,
     #[serde(rename = "schemaName", skip_serializing_if = "Option::is_none")]
     pub schema_name: Option<String>,
+    #[serde(rename = "parentName", skip_serializing_if = "Option::is_none")]
+    pub parent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +253,11 @@ pub struct DatabaseForeignKey {
     pub name: Option<String>,
     #[serde(rename = "columnName")]
     pub column_name: String,
+    #[serde(
+        rename = "referencedDatabaseName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub referenced_database_name: Option<String>,
     #[serde(
         rename = "referencedSchemaName",
         skip_serializing_if = "Option::is_none"
@@ -297,6 +330,10 @@ pub struct DatabaseObjectDetails {
     pub database_name: Option<String>,
     #[serde(rename = "schemaName", skip_serializing_if = "Option::is_none")]
     pub schema_name: Option<String>,
+    #[serde(rename = "parentName", skip_serializing_if = "Option::is_none")]
+    pub parent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
     pub name: String,
     #[serde(rename = "type")]
     pub object_type: DatabaseObjectType,
@@ -306,6 +343,14 @@ pub struct DatabaseObjectDetails {
     pub primary_key: Vec<String>,
     #[serde(rename = "foreignKeys", default)]
     pub foreign_keys: Vec<DatabaseForeignKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+    /// Whether `definition` is complete standalone DDL that can safely be
+    /// handed to a SQL editor. Catalog source fragments remain view/copy-only.
+    #[serde(rename = "definitionIsExecutable", default)]
+    pub definition_is_executable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
     #[serde(rename = "relationalSchema", skip_serializing_if = "Option::is_none")]
     pub relational_schema: Option<DatabaseRelationalSchema>,
     #[serde(default)]

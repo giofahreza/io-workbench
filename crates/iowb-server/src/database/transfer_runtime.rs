@@ -211,6 +211,7 @@ where
             column.nullable == Some(false)
                 && column.default_value.is_none()
                 && !column.is_primary_key
+                && !database_column_is_server_managed(column)
                 && !mappings
                     .iter()
                     .any(|(target_name, _)| target_name == &column.name)
@@ -924,6 +925,14 @@ fn parse_object_type(raw: &str) -> Result<DatabaseObjectType> {
         "schema" => Ok(DatabaseObjectType::Schema),
         "table" => Ok(DatabaseObjectType::Table),
         "view" => Ok(DatabaseObjectType::View),
+        "materialized-view" | "materializedview" => Ok(DatabaseObjectType::MaterializedView),
+        "index" => Ok(DatabaseObjectType::Index),
+        "trigger" => Ok(DatabaseObjectType::Trigger),
+        "routine" | "function" | "procedure" => Ok(DatabaseObjectType::Routine),
+        "sequence" => Ok(DatabaseObjectType::Sequence),
+        "event" => Ok(DatabaseObjectType::Event),
+        "constraint" => Ok(DatabaseObjectType::Constraint),
+        "policy" => Ok(DatabaseObjectType::Policy),
         _ => Err(ServerError::new(
             StatusCode::BAD_REQUEST,
             "Unsupported database object type",
@@ -938,6 +947,14 @@ fn database_object_type_as_str(object_type: DatabaseObjectType) -> &'static str 
         DatabaseObjectType::Schema => "schema",
         DatabaseObjectType::Table => "table",
         DatabaseObjectType::View => "view",
+        DatabaseObjectType::MaterializedView => "materialized-view",
+        DatabaseObjectType::Index => "index",
+        DatabaseObjectType::Trigger => "trigger",
+        DatabaseObjectType::Routine => "routine",
+        DatabaseObjectType::Sequence => "sequence",
+        DatabaseObjectType::Event => "event",
+        DatabaseObjectType::Constraint => "constraint",
+        DatabaseObjectType::Policy => "policy",
     }
 }
 
