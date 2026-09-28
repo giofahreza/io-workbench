@@ -297,6 +297,7 @@ function connectWs() {
                 fast: prev2.fast ?? state.preferences.chatFast ?? false,
                 receivedAt: formatReceivedDateTime(receivedAt),
                 tokenUsage,
+                tokenUsageDetails: usage || null,
               };
               if (prev2.sentAt) persistedEntry.elapsed = formatElapsed(prev2.sentAt, receivedAt);
               all2[sid] = persistedEntry;
@@ -358,6 +359,7 @@ function connectWs() {
         const all = readSessionOverrides();
         const prev = all[sid] || {};
         const receivedAt = payload.receivedAt || prev.receivedAt || new Date().toISOString();
+        const tokenUsageDetails = payload.tokenUsage || prev.tokenUsageDetails || null;
         const tokenUsage = payload.tokenUsage
           ? (typeof payload.tokenUsage.used === "number"
             ? `${payload.tokenUsage.used} (in ${payload.tokenUsage.input || 0} / out ${payload.tokenUsage.output || 0})`
@@ -373,6 +375,7 @@ function connectWs() {
           fast: payload.fast ?? prev.fast ?? state.preferences.chatFast ?? false,
           receivedAt: formatReceivedDateTime(receivedAt),
           tokenUsage,
+          tokenUsageDetails,
         };
         if (prev.sentAt) entry.elapsed = formatElapsed(prev.sentAt, receivedAt);
         all[sid] = entry;
@@ -389,9 +392,14 @@ function connectWs() {
             ? {
               ...session,
               nativeSessionId: nativeId || session.nativeSessionId,
+              tokenUsage: payload.tokenUsage || session.tokenUsage,
+              token_usage: payload.tokenUsage || session.token_usage,
               lifetimeTokenUsage: payload.lifetimeTokenUsage || session.lifetimeTokenUsage,
+              lifetime_token_usage: payload.lifetimeTokenUsage || session.lifetime_token_usage,
               contextTokenUsage: payload.contextTokenUsage || session.contextTokenUsage,
+              context_token_usage: payload.contextTokenUsage || session.context_token_usage,
               spentTokenUsage: payload.spentTokenUsage || session.spentTokenUsage,
+              spent_token_usage: payload.spentTokenUsage || session.spent_token_usage,
             }
             : session;
           state.sessions = (state.sessions || []).map(patchSession);

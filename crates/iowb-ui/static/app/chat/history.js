@@ -99,6 +99,14 @@ function compactChatCacheMetadata(raw) {
     "elapsed",
     "elapsedMs",
     "tokenUsage",
+    "tokenUsageDetails",
+    "responseId",
+    "sequence",
+    "status",
+    "messageId",
+    "sessionId",
+    "timestamp",
+    "metadata",
   ].forEach((field) => {
     const value = source[field];
     if (value === undefined || value === null) return;
@@ -106,14 +114,8 @@ function compactChatCacheMetadata(raw) {
       metadata[field] = typeof value === "string"
         ? truncateChatCacheText(value, 4096)
         : value;
-    } else if (field === "tokenUsage" && typeof value === "object") {
-      const usage = {};
-      ["used", "input", "output", "total", "missingAttempts", "partialAttempts", "completeness"]
-        .forEach((usageField) => {
-          const usageValue = value[usageField];
-          if (usageValue !== undefined && usageValue !== null) usage[usageField] = usageValue;
-        });
-      if (Object.keys(usage).length) metadata[field] = usage;
+    } else if (["tokenUsage", "tokenUsageDetails", "metadata"].includes(field) && typeof value === "object") {
+      metadata[field] = value;
     }
   });
   return Object.keys(metadata).length ? metadata : null;
@@ -152,14 +154,35 @@ function compactChatCacheSession(session) {
     "mode",
     "thinking",
     "fast",
+    "firstUserAt",
+    "receivedAt",
+    "lastMessageAt",
     "lastActivity",
     "updatedAt",
     "createdAt",
+    "tokenUsage",
+    "token_usage",
+    "lifetimeTokenUsage",
+    "lifetime_token_usage",
+    "contextTokenUsage",
+    "context_token_usage",
+    "spentTokenUsage",
+    "spent_token_usage",
   ].forEach((field) => {
     const value = session[field];
     if (value === undefined || value === null) return;
     if (typeof value === "string") compact[field] = truncateChatCacheText(value, 4096);
     else if (["number", "boolean"].includes(typeof value)) compact[field] = value;
+    else if ([
+      "tokenUsage",
+      "token_usage",
+      "lifetimeTokenUsage",
+      "lifetime_token_usage",
+      "contextTokenUsage",
+      "context_token_usage",
+      "spentTokenUsage",
+      "spent_token_usage",
+    ].includes(field) && typeof value === "object") compact[field] = value;
   });
   return Object.keys(compact).length ? compact : null;
 }
@@ -684,10 +707,16 @@ function chatSessionControls(sessionId = state.chatSessionId, session = null, ov
   });
 }
 
-function chatMessageFooterMeta(message, role, controls = {}, previousPrompt = null) {
+function chatMessageFooterMeta(message, role, controls = {}, previousPrompt = null, session = null) {
   let meta = normalizedChatMessageMeta(persistedChatMessageMeta(message));
   meta = applyChatControlFallback(meta, controls);
+  meta.role = role;
+  if (!meta.id && message?.id) meta.id = message.id;
+  if (!meta.sessionId && (message?.sessionId || session?.id || state.chatSessionId)) {
+    meta.sessionId = message?.sessionId || session?.id || state.chatSessionId;
+  }
   const timestamp = chatFooterTimestamp(message?.timestamp || message?.receivedAt || "");
+  if (timestamp && !meta.timestamp) meta.timestamp = timestamp;
   if (role === "user") {
     if (!meta.sentAt && timestamp) meta.sentAt = timestamp;
   } else {
@@ -761,13 +790,13 @@ function chatResponsePresentation(messages, options = {}) {
       presentation.set(firstIndex, {
         ...first,
         showResponseHeader: true,
-        headerMeta: chatMessageFooterMeta(messages[firstIndex], "assistant", controls, previousPrompt),
+        headerMeta: chatMessageFooterMeta(messages[firstIndex], "assistant", controls, previousPrompt, session),
       });
       const last = presentation.get(lastIndex) || {};
       presentation.set(lastIndex, {
         ...last,
         showResponseFooter: true,
-        footerMeta: chatMessageFooterMeta(messages[lastIndex], "assistant", controls, previousPrompt),
+        footerMeta: chatMessageFooterMeta(messages[lastIndex], "assistant", controls, previousPrompt, session),
         copyText: chatResponseCopyText(messages, assistantIndices, previousPrompt, session),
       });
     }

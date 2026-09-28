@@ -1,3 +1,5 @@
+let chatMetadataModalReturnFocus = null;
+
 function selectedRunningChatSession() {
   const ids = chatEventSessionIds();
   for (const sessionId of ids) {
@@ -136,41 +138,477 @@ function finishChatProcessing(payload = {}, label = "") {
 
 function renderChatLineFooter(footer, meta) {
   if (!footer) return;
-  if (!meta || typeof meta !== "object") {
-    footer.innerHTML = "";
-    return;
+  const normalized = normalizedChatMessageMeta(meta || {});
+  const summary = chatLineFooterSummary(normalized);
+  footer.innerHTML = `<button type="button" class="chat-line-footer-details" data-chat-line-footer-details aria-haspopup="dialog" aria-label="Show message details" title="Show message details">` +
+    `<span class="chat-line-footer-details-label">details</span>` +
+    `<span class="chat-line-footer-details-preview">${escapeHtml(summary)}</span>` +
+    `</button>`;
+  footer.querySelector("[data-chat-line-footer-details]")?.addEventListener("click", (event) => {
+    openChatMetadataModal(normalized, event.currentTarget);
+  });
+}
+
+function chatLineFooterSummary(meta = {}) {
+  const summary = [];
+  const identity = meta.model || meta.cli || meta.provider;
+  if (identity) summary.push(identity);
+  if (meta.tokenUsage) summary.push(meta.tokenUsage);
+  if (meta.status) summary.push(meta.status);
+  if (meta.elapsed) summary.push(meta.elapsed);
+  if (!summary.length && meta.receivedAt) summary.push(meta.receivedAt);
+  return summary.join(" · ") || "Details";
+}
+
+function chatMetadataText(value) {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
   }
-  const items = [];
-  if (meta.cli) items.push(`<span>Cli: <strong>${escapeHtml(meta.cli)}</strong></span>`);
-  if (meta.model) items.push(`<span>Model: <strong>${escapeHtml(meta.model)}</strong></span>`);
-  // Mode / effort are persisted as strings (including "default"/"medium").
-  // Show them whenever the field is present and non-empty so the footer
-  // reflects what was actually sent.
-  if (meta.mode !== undefined && meta.mode !== null && meta.mode !== "") {
-    items.push(`<span>Mode: <strong>${escapeHtml(meta.mode)}</strong></span>`);
+  return String(value);
+}
+
+function chatMetadataLabel(key) {
+  return String(key || "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function chatMetadataHasValue(value) {
+  return value !== undefined && value !== null && value !== "";
+}
+
+function chatMetadataFirst(source, ...keys) {
+  if (!source || typeof source !== "object") return undefined;
+  for (const key of keys) {
+    if (chatMetadataHasValue(source[key])) return source[key];
   }
-  if (meta.effort !== undefined && meta.effort !== null && meta.effort !== "") {
-    items.push(`<span>Effort: <strong>${escapeHtml(meta.effort)}</strong></span>`);
+  return undefined;
+}
+
+function chatMetadataBoolean(value) {
+  if (value === true) return "Yes";
+  if (value === false) return "No";
+  return "—";
+}
+
+function chatMetadataTime(value) {
+  if (!chatMetadataHasValue(value)) return "—";
+  if (typeof formatReceivedDateTime === "function") {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) return formatReceivedDateTime(value);
   }
-  if (meta.status) items.push(`<span>Status: <strong>${escapeHtml(meta.status)}</strong></span>`);
-  if (meta.thinking) items.push(`<span>Thinking on</span>`);
-  if (meta.fast) items.push(`<span>Fast priority requested</span>`);
-  if (meta.tokenUsage) items.push(`<span>Tokens: <strong>${escapeHtml(meta.tokenUsage)}</strong></span>`);
-  if (meta.receivedAt) items.push(`<span>Received: <strong>${escapeHtml(meta.receivedAt)}</strong></span>`);
-  if (meta.elapsed) items.push(`<span>Elapsed: <strong>${escapeHtml(meta.elapsed)}</strong></span>`);
-  if (meta.sentAt) items.push(`<span>Sent: <strong>${escapeHtml(meta.sentAt)}</strong></span>`);
-  // Wrap the metadata in a collapsible so the chat transcript stays compact
-  // when re-opening a session. Users can click the toggle to inspect the
-  // exact CLI, model, mode, effort, token, and timestamp fields for any
-  // individual turn without having those fields crowd every reply.
-  footer.innerHTML = items.length
-    ? `<details class="chat-line-footer-details">` +
-      `<summary class="chat-line-footer-summary" aria-label="Show message metadata">` +
-      `<span class="chat-line-footer-summary-label">details</span>` +
-      `</summary>` +
-      `<div class="chat-line-footer-items">${items.join("")}</div>` +
-      `</details>`
-    : "";
+  return chatMetadataText(value);
+}
+
+function chatMetadataRuntimeLabel(value) {
+  const runtime = String(value || "").toLowerCase();
+  if (runtime === "native_cli" || runtime === "native-cli") return "Native CLI";
+  if (runtime === "io_gateway" || runtime === "io-gateway") return "IO Gateway";
+  return chatMetadataHasValue(value) ? String(value) : "—";
+}
+
+function chatMetadataSessionContext(meta = {}) {
+  const appState = typeof state !== "undefined" && state ? state : {};
+  const sessionId = String(
+    meta.sessionId
+      || appState.chatSessionId
+      || appState.pendingChatSessionId
+      || appState.currentSession?.sessionId
+      || "",
+  ).trim();
+  let liveSession = null;
+  if (sessionId && typeof findChatSession === "function") liveSession = findChatSession(sessionId);
+  let cachedSession = null;
+  if (sessionId && typeof cachedChatSession === "function") cachedSession = cachedChatSession(sessionId)?.session || null;
+  const session = liveSession || cachedSession || null;
+  const projectPath = session?.projectPath || session?.project_path || "";
+  const project = (appState.projects || []).find((candidate) => (
+    candidate?.path === projectPath
+  )) || null;
+  const live = sessionId ? appState.sessionStatusById?.[sessionId] || {} : {};
+  const response = sessionId ? appState.chatResponseStateBySession?.[sessionId] || {} : {};
+  const chatWindow = typeof chatHistoryWindow !== "undefined" && chatHistoryWindow?.sessionId === sessionId
+    ? chatHistoryWindow
+    : null;
+  const chatOpen = Boolean(sessionId && (
+    appState.chatSessionId === sessionId || appState.pendingChatSessionId === sessionId
+  ));
+  const recovery = sessionId ? appState.chatRecoveryBySession?.[sessionId] || {} : {};
+  const compaction = sessionId ? appState.chatManualCompactionBySession?.[sessionId] || {} : {};
+  let pinned = false;
+  if (session && typeof isChatSessionPinned === "function") {
+    try {
+      pinned = isChatSessionPinned(session, projectPath);
+    } catch {
+      pinned = false;
+    }
+  }
+  const rawStatus = chatMetadataFirst(live, "status")
+    || chatMetadataFirst(session, "status")
+    || (appState.currentSession?.sessionId === sessionId ? "running" : "");
+  const normalizedStatus = typeof normalizeSidebarSessionStatus === "function"
+    ? normalizeSidebarSessionStatus(rawStatus)
+    : String(rawStatus || "").toLowerCase();
+  const currentResponse = appState.currentSession?.sessionId === sessionId;
+  const processing = appState.chatProcessing?.sessionId === sessionId;
+  const running = ["starting", "running", "waiting-for-input"].includes(String(rawStatus).toLowerCase())
+    || normalizedStatus === "running"
+    || currentResponse
+    || processing;
+  const responseState = {
+    ...response,
+    activeResponseId: response.activeResponseId || live.responseId || recovery.responseId || compaction.responseId || "",
+    sequence: response.sequence ?? live.sequence ?? 0,
+  };
+  return {
+    appState,
+    sessionId,
+    session,
+    project,
+    live,
+    response: responseState,
+    chatWindow,
+    chatOpen,
+    recovery,
+    compaction,
+    pinned,
+    rawStatus,
+    normalizedStatus,
+    running,
+    processing,
+  };
+}
+
+function chatMetadataRowEntries(definitions = [], options = {}) {
+  return definitions.map((definition) => {
+    const [label, value, rowOptions = {}] = definition;
+    const present = chatMetadataHasValue(value);
+    if (!present && options.includeEmpty !== true && rowOptions.includeEmpty !== true) return null;
+    const text = present ? chatMetadataText(value) : (rowOptions.empty || options.empty || "—");
+    return {
+      label,
+      text,
+      code: rowOptions.code === true || typeof value === "object" || text.includes("\n"),
+    };
+  }).filter(Boolean);
+}
+
+function chatMetadataTokenValue(usage, key) {
+  if (!usage || typeof usage !== "object") return undefined;
+  const aliases = {
+    used: ["used", "totalUsed"],
+    total: ["total", "used"],
+    input: ["input", "inputTokens"],
+    output: ["output", "outputTokens"],
+    cacheCreation: ["cacheCreation", "cache_creation", "cacheCreate", "cacheCreationTokens"],
+    cacheRead: ["cacheRead", "cache_read", "cacheReadTokens"],
+    reasoning: ["reasoning", "reasoningTokens"],
+    costUsd: ["costUsd", "cost_usd", "cost"],
+    completeness: ["completeness"],
+    partialAttempts: ["partialAttempts", "partial_attempts"],
+    missingAttempts: ["missingAttempts", "missing_attempts"],
+    afterCompact: ["afterCompact", "after_compact"],
+    compactedAt: ["compactedAt", "compacted_at"],
+  };
+  const direct = chatMetadataFirst(usage, ...(aliases[key] || [key]));
+  if (chatMetadataHasValue(direct)) return direct;
+  const breakdown = usage.breakdown;
+  if (breakdown && typeof breakdown === "object") {
+    return chatMetadataFirst(breakdown, ...(aliases[key] || [key]));
+  }
+  return undefined;
+}
+
+function chatMetadataTokenCount(value) {
+  if (!chatMetadataHasValue(value)) return "—";
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toLocaleString() : chatMetadataText(value);
+}
+
+function chatMetadataTokenCost(value) {
+  if (!chatMetadataHasValue(value)) return "—";
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? `USD ${numeric.toFixed(6)}` : chatMetadataText(value);
+}
+
+function chatMetadataTokenRows(usage, kind = "current") {
+  if (!usage || typeof usage !== "object") return [{ label: "Usage", text: "Unavailable", code: false }];
+  const rows = [];
+  const addCount = (label, key) => rows.push({ label, text: chatMetadataTokenCount(chatMetadataTokenValue(usage, key)) });
+  const addCost = (label = "Cost") => rows.push({ label, text: chatMetadataTokenCost(chatMetadataTokenValue(usage, "costUsd")) });
+  if (kind === "current") {
+    addCount("Used", "used");
+    if (chatMetadataHasValue(chatMetadataTokenValue(usage, "total"))) addCount("Total", "total");
+  } else {
+    addCount("Total", "total");
+  }
+  addCount("Input", "input");
+  addCount("Output", "output");
+  addCount("Cache creation", "cacheCreation");
+  addCount("Cache read", "cacheRead");
+  addCount("Reasoning", "reasoning");
+  addCost();
+  if (kind !== "current") {
+    const completeness = chatMetadataTokenValue(usage, "completeness");
+    rows.push({ label: "Completeness", text: chatMetadataHasValue(completeness) ? String(completeness) : "—" });
+    rows.push({ label: "Partial attempts", text: chatMetadataTokenCount(chatMetadataTokenValue(usage, "partialAttempts")) });
+    rows.push({ label: "Missing attempts", text: chatMetadataTokenCount(chatMetadataTokenValue(usage, "missingAttempts")) });
+  }
+  return rows;
+}
+
+function chatMetadataDetailModel(meta = {}, trigger = null) {
+  const normalized = normalizedChatMessageMeta(meta || {});
+  const context = chatMetadataSessionContext(normalized);
+  const session = context.session || {};
+  const project = context.project || {};
+  const sessionProviderValue = chatMetadataFirst(session, "provider", "cli") || normalized.cli || normalized.provider;
+  const sessionProjectPath = chatMetadataFirst(session, "projectPath", "project_path") || "";
+  const projectName = chatMetadataFirst(project, "name", "repoName", "repo_name")
+    || chatMetadataFirst(session, "projectName", "project_name")
+    || sessionProjectPath.split(/[\\/]/).filter(Boolean).at(-1);
+  const sessionCurrentUsage = chatMetadataFirst(session, "tokenUsage", "token_usage") || normalized.tokenUsageDetails;
+  const lifetimeUsage = chatMetadataFirst(session, "lifetimeTokenUsage", "lifetime_token_usage");
+  const contextUsage = chatMetadataFirst(session, "contextTokenUsage", "context_token_usage");
+  const spentUsage = chatMetadataFirst(session, "spentTokenUsage", "spent_token_usage");
+  const messageRows = chatMetadataEntries(normalized, trigger);
+  const sessionRows = chatMetadataRowEntries([
+    ["Title", chatMetadataFirst(session, "title", "summary")],
+    ["Session ID", context.sessionId || normalized.sessionId],
+    ["Provider", sessionProviderValue],
+    ["Native session ID", chatMetadataFirst(session, "nativeSessionId", "native_session_id")],
+    ["Runtime", chatMetadataRuntimeLabel(chatMetadataFirst(session, "runtime"))],
+    ["Project", projectName],
+    ["Project path", sessionProjectPath],
+    ["Model", chatMetadataFirst(session, "model") || normalized.model],
+    ["Effort", chatMetadataFirst(session, "effort") || normalized.effort],
+    ["Mode", chatMetadataFirst(session, "mode") || normalized.mode],
+    ["Thinking", chatMetadataBoolean(chatMetadataFirst(session, "thinking"))],
+    ["Fast priority", chatMetadataBoolean(chatMetadataFirst(session, "fast"))],
+    ["Messages", chatMetadataFirst(session, "messageCount", "message_count")],
+    ["First user", chatMetadataTime(chatMetadataFirst(session, "firstUserAt", "first_user_at"))],
+    ["Received", chatMetadataTime(chatMetadataFirst(session, "receivedAt", "received_at"))],
+    ["Last activity", chatMetadataTime(chatMetadataFirst(session, "lastActivity", "last_activity"))],
+    ["Last message", chatMetadataTime(chatMetadataFirst(session, "lastMessageAt", "last_message_at"))],
+  ], { includeEmpty: true });
+  const stateRows = chatMetadataRowEntries([
+    ["Active", chatMetadataBoolean(chatMetadataFirst(session, "active"))],
+    ["Ongoing", context.running ? "Yes" : "No"],
+    ["Pinned", chatMetadataBoolean(context.pinned)],
+    ["External", chatMetadataBoolean(chatMetadataFirst(session, "external"))],
+    ["Board session", chatMetadataBoolean(chatMetadataFirst(session, "boardSession", "board_session"))],
+    ["Board ID", chatMetadataFirst(session, "boardId", "board_id", "boardRunId", "board_run_id")],
+    ["Board task ID", chatMetadataFirst(session, "boardTaskId", "board_task_id")],
+    ["Open in chat", context.chatOpen ? "Yes" : "No"],
+    ["Running", context.running ? "Yes" : "No"],
+    ["Starting", context.processing && !context.response.activeResponseId ? "Yes" : "No"],
+    ["Stopping", context.appState.chatStoppingSessionId === context.sessionId ? "Yes" : "No"],
+    ["Runtime status", context.rawStatus || context.normalizedStatus],
+    ["Active response ID", context.response.activeResponseId],
+    ["Completed response ID", context.response.completedResponseId],
+    ["Response sequence", context.response.sequence],
+    ["Loaded messages", context.chatWindow ? `${context.chatWindow.messages.length}/${context.chatWindow.totalCount}` : undefined],
+    ["Older messages", context.chatWindow ? (context.chatWindow.offset > 0 ? "Available" : "None") : undefined],
+    ["Recovery state", chatMetadataFirst(context.recovery, "state")],
+    ["Recovery response ID", chatMetadataFirst(context.recovery, "responseId")],
+    ["Compaction state", chatMetadataFirst(context.compaction, "state")],
+    ["Compaction response ID", chatMetadataFirst(context.compaction, "responseId")],
+  ], { includeEmpty: true });
+  const sections = [
+    { title: "Message", rows: messageRows },
+    { title: "Session", rows: sessionRows },
+    { title: "State", rows: stateRows },
+    { title: "Token usage", rows: chatMetadataTokenRows(sessionCurrentUsage, "current") },
+    { title: "Lifetime tokens", rows: chatMetadataTokenRows(lifetimeUsage, "lifetime") },
+  ];
+  if (spentUsage && typeof spentUsage === "object") {
+    const whole = chatMetadataFirst(spentUsage, "wholeSession", "whole_session");
+    const sinceCompact = chatMetadataFirst(spentUsage, "sinceCompact", "since_compact");
+    const spentRows = [];
+    if (whole) spentRows.push(...chatMetadataTokenRows(whole, "spent").map((row) => ({ ...row, label: `Whole ${row.label}` })));
+    if (sinceCompact) {
+      const compactedAt = chatMetadataFirst(spentUsage, "compactedAt", "compacted_at");
+      if (compactedAt) spentRows.push({ label: "Compacted at", text: chatMetadataTime(compactedAt) });
+      spentRows.push(...chatMetadataTokenRows(sinceCompact, "spent").map((row) => ({ ...row, label: `Since compact ${row.label}` })));
+    } else {
+      spentRows.push({ label: "Since compact", text: "Not compacted" });
+    }
+    sections.push({ title: "Tokens spent", rows: spentRows.length ? spentRows : [{ label: "Usage", text: "Unavailable" }] });
+  } else {
+    sections.push({ title: "Tokens spent", rows: [{ label: "Usage", text: "Unavailable" }] });
+  }
+  if (contextUsage && typeof contextUsage === "object") {
+    const contextRows = [
+      { label: "Scope", text: chatMetadataTokenValue(contextUsage, "afterCompact") === true ? "After compact" : "Whole session" },
+    ];
+    const compactedAt = chatMetadataTokenValue(contextUsage, "compactedAt");
+    if (compactedAt) contextRows.push({ label: "Compacted at", text: chatMetadataTime(compactedAt) });
+    contextRows.push(...chatMetadataTokenRows(contextUsage, "context"));
+    sections.push({ title: "Context tokens", rows: contextRows });
+  } else {
+    sections.push({ title: "Context tokens", rows: [{ label: "Usage", text: "Unavailable" }] });
+  }
+  const rawRows = [
+    { label: "Message metadata", text: chatMetadataText(normalized), code: true },
+  ];
+  if (context.session) rawRows.push({ label: "Session snapshot", text: chatMetadataText(context.session), code: true });
+  if (Object.keys(context.live || {}).length || Object.keys(context.response || {}).length) {
+    rawRows.push({
+      label: "Runtime snapshot",
+      text: chatMetadataText({ live: context.live, response: context.response }),
+      code: true,
+    });
+  }
+  sections.push({ title: "Raw payload", rows: rawRows });
+  return {
+    role: normalized.role || (trigger?.closest(".chat-line-user") ? "user" : "assistant"),
+    sessionId: context.sessionId,
+    sections,
+  };
+}
+
+function chatMetadataEntries(meta = {}, trigger = null) {
+  const entries = [];
+  const added = new Set();
+  const add = (label, value, options = {}) => {
+    const text = chatMetadataText(value);
+    if (!text || added.has(label)) return;
+    added.add(label);
+    entries.push({
+      label,
+      text,
+      code: options.code === true || typeof value === "object" || text.includes("\n"),
+    });
+  };
+  const role = meta.role || (trigger?.closest(".chat-line-user") ? "user" : "assistant");
+  add("Role", role);
+  add("Message ID", meta.id || meta.messageId);
+  add("Session ID", meta.sessionId);
+  add("CLI", meta.cli || meta.provider);
+  add("Model", meta.model);
+  add("Mode", meta.mode);
+  add("Effort", meta.effort);
+  if (meta.thinking !== undefined && meta.thinking !== null) add("Thinking", meta.thinking ? "on" : "off");
+  if (meta.fast !== undefined && meta.fast !== null) add("Fast priority", meta.fast ? "requested" : "not requested");
+  add("Status", meta.status);
+  add("Tokens", meta.tokenUsage);
+  add("Token breakdown", meta.tokenUsageDetails, { code: true });
+  add("Sent", meta.sentAt);
+  add("Received", meta.receivedAt);
+  add("Elapsed", meta.elapsed);
+  add("Timestamp", meta.timestamp);
+  add("Metadata", meta.metadata, { code: true });
+
+  const reserved = new Set([
+    "role", "id", "messageId", "sessionId", "cli", "provider", "model", "mode", "effort",
+    "thinking", "fast", "status", "tokenUsage", "tokenUsageDetails", "sentAt", "receivedAt",
+    "elapsed", "elapsedMs", "timestamp", "metadata", "chatCli", "chatProvider", "chatModel",
+    "chatMode", "chatEffort", "chatThinking", "chatFast", "sent_at", "received_at", "token_usage",
+  ]);
+  Object.entries(meta).forEach(([key, value]) => {
+    if (reserved.has(key)) return;
+    add(chatMetadataLabel(key), value);
+  });
+  return entries;
+}
+
+function chatMetadataModalFocusableElements(modal) {
+  if (!modal) return [];
+  return [...modal.querySelectorAll(
+    "button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex=\"-1\"])",
+  )].filter((element) => !element.hidden && !element.closest(".hidden"));
+}
+
+function trapChatMetadataModalFocus(event, dialog) {
+  if (event.key !== "Tab") return;
+  const focusable = chatMetadataModalFocusableElements(dialog);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (!dialog.contains(document.activeElement)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  } else if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function closeChatMetadataModal({ restoreFocus = true } = {}) {
+  const modal = qs("#chat-metadata-modal");
+  if (!modal) return;
+  modal.remove();
+  document.body.classList.remove("chat-metadata-modal-open");
+  const returnFocus = chatMetadataModalReturnFocus;
+  chatMetadataModalReturnFocus = null;
+  if (restoreFocus && returnFocus?.isConnected && !returnFocus.disabled) {
+    window.requestAnimationFrame(() => returnFocus.focus({ preventScroll: true }));
+  }
+}
+
+function chatMetadataModalHtml(meta, trigger) {
+  const detail = chatMetadataDetailModel(meta, trigger);
+  const title = detail.role === "user"
+    ? "User message details"
+    : "Assistant message details";
+  const sections = detail.sections.map((section) => {
+    const rows = (section.rows || []).map((entry) => `<div class="chat-metadata-modal-row">` +
+      `<dt>${escapeHtml(entry.label)}</dt>` +
+      `<dd class="${entry.code ? "is-code" : ""}">${escapeHtml(entry.text)}</dd>` +
+      `</div>`).join("");
+    return `<section class="chat-metadata-section">` +
+      `<h3 class="chat-metadata-section-title">${escapeHtml(section.title)}</h3>` +
+      `<dl class="chat-metadata-list">${rows || `<div class="chat-metadata-empty">No data available.</div>`}</dl>` +
+      `</section>`;
+  }).join("");
+  return `<div id="chat-metadata-modal" class="chat-metadata-modal" role="presentation">` +
+    `<section class="chat-metadata-dialog" role="dialog" aria-modal="true" aria-labelledby="chat-metadata-title" aria-describedby="chat-metadata-description">` +
+    `<header class="chat-metadata-header">` +
+    `<div><span class="chat-metadata-kicker">MESSAGE DETAILS</span><h2 id="chat-metadata-title">${escapeHtml(title)}</h2></div>` +
+    `<button type="button" class="icon-button" data-chat-metadata-close aria-label="Close message details" title="Close" data-symbol="close"></button>` +
+    `</header>` +
+    `<div class="chat-metadata-body">` +
+    `<p id="chat-metadata-description" class="chat-metadata-description">Complete message, session, runtime, and token details captured for this turn.</p>` +
+    sections +
+    `</div>` +
+    `<footer class="chat-metadata-footer"><button type="button" class="primary-action" data-chat-metadata-close>Close</button></footer>` +
+    `</section>` +
+    `</div>`;
+}
+
+function openChatMetadataModal(meta = {}, trigger = null) {
+  closeChatMetadataModal({ restoreFocus: false });
+  chatMetadataModalReturnFocus = trigger instanceof HTMLElement
+    ? trigger
+    : (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  document.body.insertAdjacentHTML("beforeend", chatMetadataModalHtml(meta, trigger));
+  const modal = qs("#chat-metadata-modal");
+  const dialog = modal?.querySelector(".chat-metadata-dialog");
+  if (!modal || !dialog) return;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal || event.target.closest("[data-chat-metadata-close]")) {
+      closeChatMetadataModal();
+    }
+  });
+  modal.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeChatMetadataModal();
+      return;
+    }
+    trapChatMetadataModalFocus(event, dialog);
+  });
+  document.body.classList.add("chat-metadata-modal-open");
+  window.requestAnimationFrame(() => modal.querySelector("[data-chat-metadata-close]")?.focus({ preventScroll: true }));
 }
 
 function persistedChatMessageId(message) {
@@ -375,7 +813,7 @@ function replayChatMessages(messages, options = {}) {
     const content = raw.content == null ? "" : String(raw.content);
     const persistedMeta = persistedChatMessageMeta(raw);
     if (role === "user") {
-      replayUserPromptLine(raw, chatMessageFooterMeta(raw, role, controls));
+      replayUserPromptLine(raw, chatMessageFooterMeta(raw, role, controls, null, session));
       previousPrompt = raw;
     } else if (role === "assistant") {
       if (isTerminalStatusMessageMeta(persistedMeta)) return;
@@ -389,7 +827,7 @@ function replayChatMessages(messages, options = {}) {
       replayAssistantLine(
         displayContent,
         turn.showResponseFooter
-          ? (turn.footerMeta || chatMessageFooterMeta(raw, role, controls, previousPrompt))
+          ? (turn.footerMeta || chatMessageFooterMeta(raw, role, controls, previousPrompt, session))
           : null,
         {
           showResponseHeader: turn.showResponseHeader === true,
@@ -504,6 +942,7 @@ function normalizeMessageMeta(raw) {
   // tokenUsage may be persisted as an object {used,input,output,...} on the
   // message row; flatten it to the display string the footer expects.
   if (meta.tokenUsage && typeof meta.tokenUsage === "object") {
+    meta.tokenUsageDetails = { ...meta.tokenUsage };
     meta.tokenUsage = formatTokenUsage(meta.tokenUsage);
   }
   delete meta.elapsedMs;

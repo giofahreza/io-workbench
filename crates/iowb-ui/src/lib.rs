@@ -1267,6 +1267,24 @@ mod tests {
         assert!(styles.contains(".media-viewer-video"));
         assert!(styles.contains("@media (max-width: 700px)"));
         assert!(service_worker.contains("/app/workspace/media-viewer.js?v=${APP_VERSION}"));
+
+        let chat_stream = asset_text("app/chat/stream.js");
+        assert!(chat_stream.contains("function openChatMetadataModal"));
+        assert!(chat_stream.contains("function closeChatMetadataModal"));
+        assert!(chat_stream.contains("data-chat-line-footer-details"));
+        assert!(chat_stream.contains("tokenUsageDetails"));
+        assert!(chat_stream.contains("function chatMetadataDetailModel"));
+        assert!(chat_stream.contains("function chatMetadataTokenRows"));
+        assert!(chat_stream.contains("lifetimeTokenUsage"));
+        assert!(chat_stream.contains("spentTokenUsage"));
+        assert!(chat_stream.contains("contextTokenUsage"));
+        assert!(chat_stream.contains("Active response ID"));
+        assert!(chat_stream.contains("Raw payload"));
+        assert!(chat_stream.contains("Complete message, session, runtime, and token details"));
+        assert!(styles.contains(".chat-metadata-modal"));
+        assert!(styles.contains(".chat-metadata-dialog"));
+        assert!(styles.contains(".chat-metadata-section-title"));
+        assert!(styles.contains(".chat-line-footer-details-preview"));
     }
 
     #[test]
