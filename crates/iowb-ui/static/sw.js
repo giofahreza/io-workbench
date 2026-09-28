@@ -26,6 +26,7 @@ const CORE_ASSETS = [
   `/app/chat/stream.js?v=${APP_VERSION}`,
   `/app/chat/settings.js?v=${APP_VERSION}`,
   `/app/workspace/files.js?v=${APP_VERSION}`,
+  `/app/workspace/media-viewer.js?v=${APP_VERSION}`,
   `/app/workspace/git.js?v=${APP_VERSION}`,
   `/app/workspace/git/status.js?v=${APP_VERSION}`,
   `/app/workspace/git/commit.js?v=${APP_VERSION}`,

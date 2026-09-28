@@ -372,6 +372,10 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app/workspace/files.js"),
         }),
+        "app/workspace/media-viewer.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/workspace/media-viewer.js"),
+        }),
         "app/workspace/git.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app/workspace/git.js"),
@@ -646,6 +650,7 @@ mod tests {
             "app/chat/stream.js",
             "app/chat/settings.js",
             "app/workspace/files.js",
+            "app/workspace/media-viewer.js",
             "app/workspace/git.js",
             "app/workspace/git/status.js",
             "app/workspace/git/commit.js",
@@ -1235,6 +1240,33 @@ mod tests {
             assert!(styles.contains(selector), "missing {selector}");
         }
         assert!(styles.contains("border-left-color: var(--text);"));
+    }
+
+    #[test]
+    fn files_workspace_has_an_authenticated_image_and_video_viewer() {
+        let source = app_source();
+        let viewer = asset_text("app/workspace/media-viewer.js");
+        let styles = styles_source();
+        let service_worker = asset_text("sw.js");
+
+        assert!(source.contains("/app/workspace/media-viewer.js"));
+        assert!(viewer.contains("function mediaViewerKindForPath(path)"));
+        assert!(viewer.contains("function openMediaViewer(filePath"));
+        assert!(viewer.contains("function closeMediaViewer"));
+        assert!(viewer.contains("/files/raw?"));
+        assert!(viewer.contains("params.set(\"token\", state.token)"));
+        assert!(viewer.contains("data-media-viewer-image"));
+        assert!(viewer.contains("data-media-viewer-video"));
+        assert!(viewer.contains("data-media-viewer-previous"));
+        assert!(viewer.contains("data-media-viewer-next"));
+        assert!(viewer.contains("trapMediaViewerFocus"));
+        assert!(viewer.contains("MEDIA_VIEWER_SWIPE_DISTANCE"));
+        assert!(viewer.contains("downloadMediaFile"));
+        assert!(styles.contains(".media-viewer"));
+        assert!(styles.contains(".media-viewer-image"));
+        assert!(styles.contains(".media-viewer-video"));
+        assert!(styles.contains("@media (max-width: 700px)"));
+        assert!(service_worker.contains("/app/workspace/media-viewer.js?v=${APP_VERSION}"));
     }
 
     #[test]

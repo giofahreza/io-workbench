@@ -734,7 +734,8 @@ function filePermissions(entry) {
 
 function fileIconKind(name) {
   const lower = String(name || "").toLowerCase();
-  if (/\.(png|jpe?g|gif|webp|svg|ico|avif)$/.test(lower)) return "image";
+  if (/\.(avif|bmp|gif|heic|heif|ico|jpe?g|png|svg|webp)$/.test(lower)) return "image";
+  if (/\.(3gp|3gpp|avi|m4v|mkv|mov|mp4|mpeg|mpg|ogv|webm)$/.test(lower)) return "video";
   if (/\.(json|toml|ya?ml|lock)$/.test(lower)) return "code";
   if (/\.(md|markdown|txt)$/.test(lower)) return "text";
   if (/\.(rs|js|jsx|ts|tsx|css|html|py|sh|sql)$/.test(lower)) return "code";
@@ -755,9 +756,12 @@ function fileEntryHtml(entry, depth) {
   const permissions = escapeHtml(filePermissions(entry));
   const rowMode = escapeHtml(state.fileViewMode);
   const disclosure = `<span class="file-disclosure${expanded ? " open" : ""}${loading ? " loading" : ""}${isDirectory ? "" : " file"}" aria-hidden="true"></span>`;
+  const mediaAction = !isDirectory && typeof mediaViewerActionLabel === "function"
+    ? mediaViewerActionLabel(entry.path)
+    : "";
   const displayName = renaming
     ? `<span class="file-entry-edit">${disclosure}<span class="file-icon file-icon-${iconKind}" aria-hidden="true"></span><input class="file-inline-input" data-file-rename-input="${path}" value="${name}" aria-label="Rename ${name}" /></span>`
-    : `<button type="button" class="file-entry-open" data-file-open="${path}" data-kind="${isDirectory ? "directory" : "file"}" aria-label="${isDirectory ? (expanded ? "Collapse" : "Expand") : "Open file"} ${name}"${isDirectory ? ` aria-expanded="${expanded ? "true" : "false"}"` : ""}>${disclosure}<span class="file-icon file-icon-${iconKind}" aria-hidden="true"></span><span class="file-name">${name}</span></button>`;
+    : `<button type="button" class="file-entry-open" data-file-open="${path}" data-kind="${isDirectory ? "directory" : "file"}" aria-label="${isDirectory ? (expanded ? "Collapse" : "Expand") : (mediaAction || "Open file")} ${name}"${isDirectory ? ` aria-expanded="${expanded ? "true" : "false"}"` : ""}>${disclosure}<span class="file-icon file-icon-${iconKind}" aria-hidden="true"></span><span class="file-name">${name}</span></button>`;
   return `<article class="file-tree-row${renaming ? " renaming" : ""} file-tree-row-${rowMode}" data-kind="${isDirectory ? "directory" : "file"}" data-file-row-path="${path}">
     <div class="file-tree-name" style="--file-depth:${depth}">
       <input class="file-tree-checkbox" type="checkbox" data-file-select="${path}" aria-label="Select ${name}"${checked} />
@@ -775,8 +779,11 @@ function fileEntryHtml(entry, depth) {
 function fileContextMenuHtml(entry) {
   const isDirectory = entry.type === "directory";
   const path = escapeHtml(entry.path);
+  const mediaAction = !isDirectory && typeof mediaViewerActionLabel === "function"
+    ? mediaViewerActionLabel(entry.path)
+    : "";
   return `<div id="file-context-menu" class="file-context-menu" role="menu">
-    <button type="button" data-symbol="open" data-file-context-action="open" data-file-context-path="${path}">${isDirectory ? "Expand" : "Open"}</button>
+    <button type="button" data-symbol="open" data-file-context-action="open" data-file-context-path="${path}">${isDirectory ? "Expand" : (mediaAction || "Open")}</button>
     ${isDirectory ? `<button type="button" data-symbol="file-plus" data-file-context-action="new-file" data-file-context-path="${path}">New File</button>
     <button type="button" data-symbol="folder-plus" data-file-context-action="new-folder" data-file-context-path="${path}">New Folder</button>
     <button type="button" data-symbol="upload" data-file-context-action="upload" data-file-context-path="${path}">Upload Files</button>` : ""}
@@ -1070,6 +1077,11 @@ function refreshEditorWidget(filePath = qs("#file-editor-path").value.trim()) {
 }
 
 async function openFile(filePath) {
+  const mediaKind = typeof mediaViewerKindForPath === "function" ? mediaViewerKindForPath(filePath) : null;
+  if (mediaKind && typeof openMediaViewer === "function") {
+    openMediaViewer(filePath, mediaKind);
+    return;
+  }
   await loadFileContent(filePath);
 }
 
@@ -1268,6 +1280,10 @@ function downloadCurrentFile() {
 }
 
 async function downloadFilePath(filePath) {
+  if (typeof downloadMediaFile === "function") {
+    await downloadMediaFile(filePath);
+    return;
+  }
   const project = activeProjectKey();
   if (!project || !filePath) return;
   const body = await api(`/api/projects/${encodeURIComponent(project)}/files/content?path=${encodeURIComponent(filePath)}`);
