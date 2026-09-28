@@ -968,6 +968,11 @@ mod tests {
             "const WORKSPACE_SHORTCUT_VIEWS = Object.freeze([\"files\", \"chat\", \"git\", \"board\"]);"
         ));
         assert!(navigation.contains("function workspaceShortcutDirection(event)"));
+        assert!(navigation.contains("function chatShortcutAction(event)"));
+        assert!(navigation.contains("event.code === \"KeyK\" || key === \"k\""));
+        assert!(navigation.contains("event.code === \"ArrowDown\" || event.key === \"ArrowDown\""));
+        assert!(navigation.contains("showChatSessionConfigModal()"));
+        assert!(navigation.contains("jumpToLatestChatMessage()"));
         assert!(navigation.contains("event.ctrlKey || event.metaKey"));
         assert!(navigation.contains("event.altKey || event.shiftKey"));
         assert!(navigation.contains("event.code === \"Comma\" || event.key === \",\""));

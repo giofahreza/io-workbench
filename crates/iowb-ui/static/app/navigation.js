@@ -19,8 +19,39 @@ function workspaceShortcutDirection(event) {
   return 0;
 }
 
+function chatShortcutAction(event) {
+  if (!event || !event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return "";
+  const key = typeof event.key === "string" ? event.key.toLowerCase() : "";
+  if (event.code === "KeyK" || key === "k") return "open-config";
+  if (event.code === "ArrowDown" || event.key === "ArrowDown") return "jump-latest";
+  return "";
+}
+
 function bindWorkspaceViewShortcuts() {
   document.addEventListener("keydown", (event) => {
+    const chatAction = chatShortcutAction(event);
+    if (chatAction === "open-config") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.repeat) return;
+      const openConfig = () => showChatSessionConfigModal();
+      if (activeView() === "chat") {
+        openConfig();
+      } else {
+        switchView("chat").then((opened) => {
+          if (opened) openConfig();
+        }).catch(showError);
+      }
+      return;
+    }
+    if (chatAction === "jump-latest") {
+      if (activeView() !== "chat") return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (!event.repeat) jumpToLatestChatMessage();
+      return;
+    }
+
     const direction = workspaceShortcutDirection(event);
     if (!direction) return;
     event.preventDefault();

@@ -1145,7 +1145,7 @@ const pageDefinitions = [
     group: "Reference",
     type: "Reference",
     summary: "Use the Web workspace and mobile keyboard shortcuts without mistaking the desktop browser map for the Android or PWA map.",
-    keywords: "keyboard mappings keyboard shortcuts keymap hotkeys web browser desktop android mobile pwa ctrl cmd alt home prompt editor git board terminal database alt+p alt+m ctrl/cmd+k ctrl/cmd+s ctrl/cmd+f ctrl/cmd+enter ctrl+tab ctrl+shift+tab ctrl/cmd+space ctrl+k cmd+k ctrl+s cmd+s ctrl+f cmd+f ctrl+enter cmd+enter ctrl+space cmd+space f5 f6 f7",
+    keywords: "keyboard mappings keyboard shortcuts keymap hotkeys web browser desktop android mobile pwa ctrl cmd alt home prompt editor git board terminal database alt+k alt+arrow-down alt+p alt+m ctrl/cmd+k ctrl/cmd+s ctrl/cmd+f ctrl/cmd+enter ctrl+tab ctrl+shift+tab ctrl/cmd+space ctrl+k cmd+k ctrl+s cmd+s ctrl+f cmd+f ctrl+enter cmd+enter ctrl+space cmd+space f5 f6 f7",
     body: [
       lead("io-workbench has separate keyboard maps for the desktop <strong>Web workspace</strong> and the mobile <strong>Android / web harness / PWA</strong> clients. The mobile PWA follows the mobile map, not the desktop browser map. Use a physical keyboard for mobile shortcuts."),
       section("Read the notation", table(
@@ -1165,6 +1165,8 @@ const pageDefinitions = [
             ["<code>↑</code> / <code>↓</code>, <code>Enter</code>, <code>Esc</code>", "Command palette", "Select previous/next command, run it, or close the palette."],
             ["<code>Ctrl/Cmd+,</code> / <code>Ctrl/Cmd+.</code>", "Project workspace", "Move backward/forward through <strong>Files → Chat → Git → Board</strong>, wrapping at either end."],
             ["<code>Alt+,</code> / <code>Alt+.</code>", "Anywhere with pinned chats", "Open the previous/next pinned Chat session, wrapping at either end."],
+            ["<code>Alt+K</code>", "Anywhere", "Open Chat and show Chat config."],
+            ["<code>Alt+↓</code>", "Chat transcript", "Jump directly to the latest message at the bottom of the transcript."],
             ["<code>Enter</code> or <code>Ctrl/Cmd+Enter</code> / <code>Shift+Enter</code>", "Chat prompt", "Send the prompt / insert a newline."],
             ["<code>↑</code> at the start / <code>↓</code> at the end", "Chat prompt", "Recall the previous/next prompt from that session's history."],
             ["<code>Ctrl/Cmd+S</code>", "Editable file", "Save the current file."],

@@ -337,7 +337,7 @@
       "type": "Reference",
       "summary": "Use the Web workspace and mobile keyboard shortcuts without mistaking the desktop browser map for the Android or PWA map.",
       "href": "/docs/keyboard-mappings/",
-      "keywords": "keyboard mappings keyboard shortcuts keymap hotkeys web browser desktop android mobile pwa ctrl cmd alt home prompt editor git board terminal database alt+p alt+m ctrl/cmd+k ctrl/cmd+s ctrl/cmd+f ctrl/cmd+enter ctrl+tab ctrl+shift+tab ctrl/cmd+space ctrl+k cmd+k ctrl+s cmd+s ctrl+f cmd+f ctrl+enter cmd+enter ctrl+space cmd+space f5 f6 f7 Web workspace Mobile clients Database and terminal",
+      "keywords": "keyboard mappings keyboard shortcuts keymap hotkeys web browser desktop android mobile pwa ctrl cmd alt home prompt editor git board terminal database alt+k alt+arrow-down alt+p alt+m ctrl/cmd+k ctrl/cmd+s ctrl/cmd+f ctrl/cmd+enter ctrl+tab ctrl+shift+tab ctrl/cmd+space ctrl+k cmd+k ctrl+s cmd+s ctrl+f cmd+f ctrl+enter cmd+enter ctrl+space cmd+space f5 f6 f7 Web workspace Mobile clients Database and terminal",
       "headings": [
         "Read the notation",
         "Everyday shortcuts shared by Web and mobile",
