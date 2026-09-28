@@ -26,6 +26,55 @@
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn clone_remote_validation_accepts_supported_transports_and_blocks_option_injection() {
+        for remote in [
+            "https://example.test/team/repository.git",
+            "http://example.test/team/repository.git",
+            "ssh://git@example.test/team/repository.git",
+            "git://example.test/team/repository.git",
+            "git@example.test:team/repository.git",
+        ] {
+            assert_eq!(validate_clone_remote_url(remote).unwrap(), remote, "{remote}");
+        }
+
+        for remote in [
+            "",
+            "--upload-pack=evil",
+            "https://example.test/team/repository.git\n--upload-pack=evil",
+            "https://token@example.test/team/repository.git",
+            "https://example.test/team/repository.git?access_token=secret",
+            "https://example.test/team/repository.git#secret",
+            "file:///tmp/repository",
+            "example.test/team/repository.git",
+            "ssh://example.test",
+            "git@example.test:",
+            "git://example.test/.",
+            "git@example.test:..",
+        ] {
+            assert!(validate_clone_remote_url(remote).is_err(), "{remote}");
+        }
+
+        let args = clone_command_args(
+            "--upload-pack=evil",
+            std::path::Path::new("/workspace/repository"),
+        );
+        assert_eq!(args[2], "--");
+        assert_eq!(args[3], "--upload-pack=evil");
+
+        // The actual server clone helper validates before inspecting the
+        // destination or spawning Git, so direct HTTP callers cannot bypass
+        // the same protection that the mobile form applies locally.
+        let error = clone_repository(
+            "--upload-pack=evil",
+            std::path::Path::new("/workspace/not-used"),
+            None,
+        )
+        .await
+        .expect_err("option-like clone input is rejected before Git runs");
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn streams_project_file_with_byte_ranges() {
         let root =
             std::env::temp_dir().join(format!("iowb-server-media-stream-{}", uuid::Uuid::new_v4()));

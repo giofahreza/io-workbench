@@ -175,13 +175,14 @@ async fn create_workspace(
                 "Git clone is only supported for new workspaces",
             ));
         }
+        let github_url = validate_clone_remote_url(github_url)?;
         let github_token = resolve_github_token(
             &state,
             &user.0.id,
             request.github_token_id,
             request.new_github_token.as_deref(),
         )?;
-        clone_repository(github_url, &path, github_token.as_deref()).await?
+        clone_repository(&github_url, &path, github_token.as_deref()).await?
     } else {
         path
     };
@@ -206,10 +207,34 @@ async fn clone_progress(
     Extension(user): Extension<AuthenticatedUser>,
     Query(query): Query<CloneProgressQuery>,
 ) -> Response {
+    clone_progress_response(state, user, query.into_workspace_request())
+}
+
+/**
+ * Stream a clone requested in a JSON body.
+ *
+ * Unlike the legacy GET endpoint, this keeps a one-time HTTPS access token out
+ * of the URL, browser history, proxy logs, and analytics query captures. The
+ * body deliberately reuses the normal workspace-create contract so callers
+ * get the same path and credential validation rules.
+ */
+async fn clone_progress_post(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(request): Json<CreateWorkspaceRequest>,
+) -> Response {
+    clone_progress_response(state, user, request)
+}
+
+fn clone_progress_response(
+    state: AppState,
+    user: AuthenticatedUser,
+    request: CreateWorkspaceRequest,
+) -> Response {
     let (tx, rx) = mpsc::channel::<Event>(64);
 
     tokio::spawn(async move {
-        if let Err(error) = run_clone_progress(state, user, query, tx.clone()).await {
+        if let Err(error) = run_clone_progress_request(state, user, request, tx.clone()).await {
             send_sse_json(
                 &tx,
                 serde_json::json!({
@@ -254,27 +279,48 @@ impl CloneProgressQuery {
             .map(str::trim)
             .filter(|path| !path.is_empty())
     }
+
+    fn into_workspace_request(self) -> CreateWorkspaceRequest {
+        CreateWorkspaceRequest {
+            workspace_type: WorkspaceType::New,
+            path: self.workspace_path().unwrap_or_default().to_string(),
+            github_url: self.github_url,
+            github_token_id: self.github_token_id,
+            new_github_token: self.new_github_token,
+        }
+    }
 }
 
-async fn run_clone_progress(
+async fn run_clone_progress_request(
     state: AppState,
     user: AuthenticatedUser,
-    query: CloneProgressQuery,
+    request: CreateWorkspaceRequest,
     tx: mpsc::Sender<Event>,
 ) -> Result<()> {
-    let workspace_path = query
-        .workspace_path()
-        .ok_or_else(|| ServerError::new(StatusCode::BAD_REQUEST, "workspacePath is required"))?;
-    let github_url = query
+    if request.workspace_type != WorkspaceType::New {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Git clone is only supported for new workspaces",
+        ));
+    }
+    let workspace_path = request.path.trim().to_string();
+    if workspace_path.is_empty() {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "workspacePath is required",
+        ));
+    }
+    let github_url = request
         .github_url
         .as_deref()
         .map(str::trim)
         .filter(|url| !url.is_empty())
         .ok_or_else(|| ServerError::new(StatusCode::BAD_REQUEST, "githubUrl is required"))?;
+    let github_url = validate_clone_remote_url(github_url)?;
 
     let path = state
         .path_validator
-        .validate_path(PathBuf::from(workspace_path), false)
+        .validate_path(PathBuf::from(&workspace_path), false)
         .await?;
     tokio::fs::create_dir_all(&path)
         .await
@@ -283,10 +329,10 @@ async fn run_clone_progress(
     let github_token = resolve_github_token(
         &state,
         &user.0.id,
-        query.github_token_id,
-        query.new_github_token.as_deref(),
+        request.github_token_id,
+        request.new_github_token.as_deref(),
     )?;
-    clone_repository_with_progress(github_url, &path, github_token.as_deref(), &tx, &state).await
+    clone_repository_with_progress(&github_url, &path, github_token.as_deref(), &tx, &state).await
 }
 
 async fn send_sse_json(tx: &mpsc::Sender<Event>, value: Value) {
@@ -318,18 +364,14 @@ async fn clone_repository(
     workspace_path: &Path,
     github_token: Option<&str>,
 ) -> Result<PathBuf> {
-    let repo_name = repository_name(github_url);
+    let github_url = validate_clone_remote_url(github_url)?;
+    let repo_name = repository_name(&github_url);
     let clone_path = workspace_path.join(&repo_name);
     ensure_clone_destination_available(&clone_path).await?;
 
-    let clone_url = clone_url_with_token(github_url, github_token);
+    let clone_url = clone_url_with_token(&github_url, github_token);
     let output = Command::new("git")
-        .args([
-            "clone",
-            "--progress",
-            &clone_url,
-            &clone_path.display().to_string(),
-        ])
+        .args(clone_command_args(&clone_url, &clone_path))
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .await
@@ -366,11 +408,12 @@ async fn clone_repository_with_progress(
     tx: &mpsc::Sender<Event>,
     state: &AppState,
 ) -> Result<()> {
-    let repo_name = repository_name(github_url);
+    let github_url = validate_clone_remote_url(github_url)?;
+    let repo_name = repository_name(&github_url);
     let clone_path = workspace_path.join(&repo_name);
     ensure_clone_destination_available(&clone_path).await?;
 
-    let clone_url = clone_url_with_token(github_url, github_token);
+    let clone_url = clone_url_with_token(&github_url, github_token);
     send_sse_json(
         tx,
         serde_json::json!({
@@ -381,12 +424,7 @@ async fn clone_repository_with_progress(
     .await;
 
     let mut child = Command::new("git")
-        .args([
-            "clone",
-            "--progress",
-            &clone_url,
-            &clone_path.display().to_string(),
-        ])
+        .args(clone_command_args(&clone_url, &clone_path))
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -500,6 +538,118 @@ fn repository_name(github_url: &str) -> String {
         .unwrap_or_else(|| "repository".to_string())
 }
 
+/// Accept only the transport forms the mobile clone flow presents. The
+/// validation lives on the server as well as in the client because API callers
+/// must not be able to turn the remote positional argument into a Git option.
+fn validate_clone_remote_url(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 4_096
+        || value.starts_with('-')
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Use a valid HTTPS, SSH, Git, or HTTP repository URL",
+        ));
+    }
+
+    for scheme in ["https://", "http://", "ssh://", "git://"] {
+        if value
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        {
+            let remainder = &value[scheme.len()..];
+            let Some((authority, path)) = remainder.split_once('/') else {
+                return Err(ServerError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Use a valid HTTPS, SSH, Git, or HTTP repository URL",
+                ));
+            };
+            if authority.is_empty() || path.is_empty() {
+                return Err(ServerError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Use a valid HTTPS, SSH, Git, or HTTP repository URL",
+                ));
+            }
+            if matches!(scheme, "https://" | "http://") {
+                // HTTPS credentials belong in the one-time token field.
+                // Apart from avoiding accidental secret storage, this keeps
+                // URL parsing unambiguous before Git sees it.
+                if authority.contains('@') {
+                    return Err(ServerError::new(
+                        StatusCode::BAD_REQUEST,
+                        "Put HTTPS credentials in the access-token field, not the repository URL",
+                    ));
+                }
+                // A query or fragment can carry exactly the same kind of
+                // one-time token. Git would persist it in .git/config, so
+                // never accept it as part of a clone remote.
+                if value.contains(['?', '#']) {
+                    return Err(ServerError::new(
+                        StatusCode::BAD_REQUEST,
+                        "Repository URLs cannot contain a query or fragment. Put a one-time HTTPS token in the access-token field instead",
+                    ));
+                }
+            }
+            return validate_clone_repository_name(value);
+        }
+    }
+
+    // Accept Git's common SCP-like SSH spelling, for example
+    // `git@example.test:group/repository.git`. It intentionally excludes
+    // local paths and ambiguous option-like values.
+    let Some((user_and_host, path)) = value.split_once(':') else {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Use a valid HTTPS, SSH, Git, or HTTP repository URL",
+        ));
+    };
+    let Some((user, host)) = user_and_host.split_once('@') else {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Use a valid HTTPS, SSH, Git, or HTTP repository URL",
+        ));
+    };
+    if user.is_empty()
+        || host.is_empty()
+        || path.is_empty()
+        || user.contains(['/', ':'])
+        || host.contains(['/', ':', '@'])
+    {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Use a valid HTTPS, SSH, Git, or HTTP repository URL",
+        ));
+    }
+    validate_clone_repository_name(value)
+}
+
+fn validate_clone_repository_name(value: &str) -> Result<String> {
+    if matches!(repository_name(value).as_str(), "." | "..") {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Use a valid HTTPS, SSH, Git, or HTTP repository URL",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// Build clone arguments with an explicit option boundary even after URL
+/// validation, so later changes cannot accidentally reintroduce option
+/// injection through a remote value.
+fn clone_command_args(remote: &str, destination: &Path) -> Vec<String> {
+    vec![
+        "clone".to_string(),
+        "--progress".to_string(),
+        "--".to_string(),
+        remote.to_string(),
+        destination.display().to_string(),
+    ]
+}
+
 fn sanitize_repo_name(value: &str) -> String {
     value
         .chars()
@@ -511,7 +661,14 @@ fn clone_url_with_token(github_url: &str, github_token: Option<&str>) -> String 
     let Some(token) = github_token.filter(|token| !token.is_empty()) else {
         return github_url.to_string();
     };
-    let Some(rest) = github_url.strip_prefix("https://") else {
+    let https_prefix = "https://";
+    let Some(prefix) = github_url.get(..https_prefix.len()) else {
+        return github_url.to_string();
+    };
+    if !prefix.eq_ignore_ascii_case(https_prefix) {
+        return github_url.to_string();
+    }
+    let Some(rest) = github_url.get(https_prefix.len()..) else {
         return github_url.to_string();
     };
     format!("https://{}@{}", token, rest)

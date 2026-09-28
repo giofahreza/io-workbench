@@ -206,7 +206,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/projects", get(list_projects))
         .route("/api/projects/create", post(create_project))
         .route("/api/projects/create-workspace", post(create_workspace))
-        .route("/api/projects/clone-progress", get(clone_progress))
+        .route(
+            "/api/projects/clone-progress",
+            get(clone_progress).post(clone_progress_post),
+        )
         .route(
             "/api/projects/{project_name}/sessions",
             get(project_sessions),
