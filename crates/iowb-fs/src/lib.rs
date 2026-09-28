@@ -166,10 +166,6 @@ impl FileService {
             if !metadata.is_dir() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if should_skip_name(&name) {
-                continue;
-            }
             entries.push(file_entry_from_metadata(
                 &root,
                 &entry.path(),
@@ -189,10 +185,6 @@ impl FileService {
 
         while let Some(entry) = reader.next_entry().await? {
             let metadata = entry.metadata().await?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if should_skip_name(&name) {
-                continue;
-            }
             entries.push(file_entry_from_metadata(
                 &root,
                 &entry.path(),
@@ -443,11 +435,6 @@ impl FileService {
         let mut entries = Vec::new();
 
         while let Some(entry) = reader.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if should_skip_name(&name) {
-                continue;
-            }
-
             let metadata = entry.metadata().await?;
             let is_dir = metadata.is_dir();
             let entry_path = entry.path();
@@ -691,14 +678,6 @@ fn is_forbidden_path(path: &Path, workspace_root: &Path) -> bool {
     })
 }
 
-fn should_skip_name(name: &str) -> bool {
-    matches!(
-        name,
-        ".git" | "node_modules" | "target" | "dist" | "build" | ".DS_Store"
-    ) || name.ends_with(".tmp")
-        || name.ends_with(".swp")
-}
-
 fn supports_inline_binary_preview(mime: &str) -> bool {
     mime.starts_with("image/") || mime.starts_with("video/") || mime.starts_with("audio/")
 }
@@ -789,6 +768,51 @@ mod tests {
                 .iter()
                 .any(|entry| { entry.name == "notes.txt" && entry.kind == FileKind::File })
         );
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listings_include_reserved_and_hidden_directory_names() {
+        let root = std::env::temp_dir().join(format!(
+            "iowb-fs-visible-names-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        for directory in [
+            ".git",
+            "node_modules",
+            "target",
+            "dist",
+            "build",
+            "src/target",
+            "src/.generated",
+        ] {
+            tokio::fs::create_dir_all(root.join(directory))
+                .await
+                .unwrap();
+        }
+
+        let service = FileService::new(6, 1024 * 1024);
+        let root_entries = service.list_tree_with_depth(&root, ".", 0).await.unwrap();
+        for name in [".git", "node_modules", "target", "dist", "build", "src"] {
+            assert!(
+                root_entries.iter().any(|entry| entry.name == name),
+                "root listing omitted {name}"
+            );
+        }
+
+        let src_entries = service.list_tree_with_depth(&root, "src", 0).await.unwrap();
+        for name in ["target", ".generated"] {
+            assert!(
+                src_entries.iter().any(|entry| entry.name == name),
+                "src listing omitted {name}"
+            );
+        }
+
+        let browse_entries = service.browse_entries(&root).await.unwrap();
+        assert!(browse_entries.iter().any(|entry| entry.name == "target"));
+        assert!(browse_entries.iter().any(|entry| entry.name == ".git"));
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
