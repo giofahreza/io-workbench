@@ -78,6 +78,11 @@ async fn initialize_uninitialized_submodule(
         ));
     }
 
+    // Initializing a submodule mutates the owning worktree and its Git
+    // metadata. Do not let it interrupt merge/rebase/cherry-pick/stash
+    // recovery in that parent repository.
+    ensure_no_git_workflow_in_progress(&parent.path).await?;
+
     git(
         &parent.path,
         ["submodule", "update", "--init", "--", relative_path.as_str()],

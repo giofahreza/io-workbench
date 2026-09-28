@@ -9,7 +9,10 @@ async fn branches(
         [
             "for-each-ref",
             "--sort=refname",
-            "--format=%(refname)%x1f%(symref)",
+            // `for-each-ref` treats `%x1f` as literal text (unlike
+            // `git log --format`), so put the control separator directly in
+            // the argument. Git ref names cannot contain control characters.
+            "--format=%(refname)\u{1f}%(symref)",
             "refs/heads",
             "refs/remotes",
         ],
@@ -32,9 +35,15 @@ async fn branches(
         if let Some(branch) = reference.strip_prefix("refs/heads/") {
             push_unique(&mut local_branches, branch.to_string());
         } else if let Some(remote_branch) = reference.strip_prefix("refs/remotes/")
-            && let Some((_, branch)) = remote_branch.split_once('/')
+            && let Some((remote, branch)) = remote_branch.split_once('/')
+            && !remote.is_empty()
+            && !branch.is_empty()
         {
-            push_unique(&mut remote_branches, branch.to_string());
+            // A remote branch must retain its remote identity.  Returning only
+            // `feature` would collapse `origin/feature` and
+            // `upstream/feature`, and prevents the mobile client from safely
+            // offering tracking checkout or remote deletion.
+            push_unique(&mut remote_branches, format!("{remote}/{branch}"));
         }
     }
 
@@ -55,9 +64,89 @@ async fn checkout(
     Json(body): Json<BranchBody>,
 ) -> Result<Json<GitOperationResponse>> {
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
+    validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
     validate_branch_name(&body.branch)?;
-    let output = git(&project_path, ["checkout", body.branch.trim()]).await?;
+    // Git checkout overwrites ignored files by default.  An ignored local
+    // build artifact can still be valuable user data, so make ordinary branch
+    // switching obey the same no-overwrite contract as the guarded
+    // create-and-checkout route below.
+    let output = git(
+        &project_path,
+        ["checkout", "--no-overwrite-ignore", body.branch.trim()],
+    )
+    .await?;
     Ok(Json(GitOperationResponse::success(join_output(&output))))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrackingCheckoutBody {
+    #[serde(flatten)]
+    project: ProjectBody,
+    remote: String,
+    branch: String,
+}
+
+/// Check out a local branch that tracks one explicitly selected remote ref.
+///
+/// `git checkout origin/topic` detaches HEAD, which is rarely what a touch UI
+/// means by checking out a remote branch.  This narrow operation creates the
+/// conventional local `topic` branch only when it does not exist; if it does
+/// exist we merely switch to it rather than silently replacing its upstream.
+async fn checkout_tracking_branch(
+    State(state): State<AppState>,
+    Json(body): Json<TrackingCheckoutBody>,
+) -> Result<Json<GitOperationResponse>> {
+    let project_path = resolve_git_repository_path(
+        &state,
+        body.project.project_ref()?,
+        body.project.repository_id.as_deref(),
+    )
+    .await?;
+    validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
+    let remote = validate_remote_name(&body.remote)?;
+    let branch = validate_branch_name(&body.branch)?;
+    let remote_ref = format!("{remote}/{branch}");
+    let remote_object = format!("refs/remotes/{remote}/{branch}^{{commit}}");
+    git(&project_path, ["rev-parse", "--verify", "--quiet", &remote_object])
+        .await
+        .map_err(|_| {
+            ServerError::new(
+                StatusCode::NOT_FOUND,
+                format!("Remote branch {remote_ref} was not found. Fetch {remote} and try again."),
+            )
+        })?;
+
+    let local_ref = format!("refs/heads/{branch}");
+    let local_exists = git(&project_path, ["show-ref", "--verify", "--quiet", &local_ref])
+        .await
+        .is_ok();
+    let output = if local_exists {
+        git(&project_path, ["checkout", "--no-overwrite-ignore", &branch]).await?
+    } else {
+        git(
+            &project_path,
+            [
+                "checkout",
+                "--no-overwrite-ignore",
+                "--track",
+                "-b",
+                &branch,
+                &remote_ref,
+            ],
+        )
+        .await?
+    };
+    let mut response = GitOperationResponse::success(join_output_or(
+        &output,
+        "Checked out local tracking branch successfully",
+    ));
+    response.branch = Some(branch);
+    response.remote_name = Some(remote);
+    response.remote_branch = Some(remote_ref);
+    Ok(Json(response))
 }
 
 async fn create_branch(
@@ -65,9 +154,125 @@ async fn create_branch(
     Json(body): Json<BranchBody>,
 ) -> Result<Json<GitOperationResponse>> {
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
+    validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
     validate_branch_name(&body.branch)?;
     let output = git(&project_path, ["checkout", "-b", body.branch.trim()]).await?;
     Ok(Json(GitOperationResponse::success(join_output(&output))))
+}
+
+/// The normal mobile "new branch" operation.  Unlike the legacy
+/// `/api/git/create-branch` compatibility route, this pins the checkout the
+/// user reviewed before it creates a branch and switches to it.  A branch
+/// created from another ref can change files, so it requires a clean tree;
+/// creating from the current HEAD is safe to do with ordinary local edits
+/// intact because it only changes the branch name attached to that commit.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAndCheckoutBranchBody {
+    #[serde(flatten)]
+    project: ProjectBody,
+    branch: String,
+    #[serde(default)]
+    start_point: Option<String>,
+    #[serde(default)]
+    expected_head: Option<String>,
+    #[serde(default)]
+    expected_target_ref: Option<String>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn create_and_checkout_branch(
+    State(state): State<AppState>,
+    Json(body): Json<CreateAndCheckoutBranchBody>,
+) -> Result<Json<GitOperationResponse>> {
+    advanced_require_confirmation(body.confirm, "create and check out a branch")?;
+    let project_path = resolve_git_repository_path(
+        &state,
+        body.project.project_ref()?,
+        body.project.repository_id.as_deref(),
+    )
+    .await?;
+    validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
+    let branch = validate_branch_name(&body.branch)?;
+    let has_commits = repository_has_commits(&project_path).await?;
+
+    match (
+        body.expected_head.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        body.expected_target_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (Some(expected_head), Some(expected_target_ref)) => {
+            validate_workflow_target_snapshot(
+                &project_path,
+                expected_head,
+                expected_target_ref,
+                "new-branch checkout",
+            )
+            .await?;
+        }
+        (None, None) if !has_commits => {
+            // An unborn branch has no immutable commit ID to pin. Git's
+            // checkout itself still atomically changes the symbolic HEAD.
+        }
+        (None, None) => {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "expectedHead and expectedTargetRef are required to create and check out a branch with commits",
+            ));
+        }
+        _ => {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "expectedHead and expectedTargetRef must be supplied together",
+            ));
+        }
+    }
+
+    let start_point = body
+        .start_point
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let output = if let Some(start_point) = start_point {
+        let target = resolve_commit_reference(&project_path, &start_point).await?;
+        if has_commits && target != resolve_commit_reference(&project_path, "HEAD").await? {
+            advanced_require_clean_worktree(
+                &project_path,
+                "create and check out a branch from another ref",
+            )
+            .await?;
+        }
+        // `git checkout` otherwise defaults to --overwrite-ignore and can
+        // silently replace an ignored local file with a tracked file from the
+        // selected start point. Native checkout never needs that destructive
+        // shortcut, so keep the same protection for both branch-creation
+        // forms.
+        git(
+            &project_path,
+            ["checkout", "--no-overwrite-ignore", "-b", &branch, &target],
+        )
+        .await?
+    } else {
+        git(
+            &project_path,
+            ["checkout", "--no-overwrite-ignore", "-b", &branch],
+        )
+        .await?
+    };
+
+    let mut response = GitOperationResponse::success(join_output_or(
+        &output,
+        "Created and checked out branch successfully",
+    ));
+    response.branch = Some(branch);
+    response.operation_state = Some(git_operation_state(&project_path).await?);
+    Ok(Json(response))
 }
 
 async fn delete_branch(
@@ -76,6 +281,7 @@ async fn delete_branch(
 ) -> Result<Json<GitOperationResponse>> {
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
     validate_branch_name(&body.branch)?;
     let current = current_branch(&project_path).await?;
     if current == body.branch.trim() {
@@ -102,18 +308,20 @@ async fn commits(
     }
 
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
-    let output = git(
-        &project_path,
-        [
-            "log",
-            "--pretty=format:%H|%an|%ae|%ad|%s",
-            "--date=iso-strict",
-            "-n",
-            &limit.to_string(),
-        ],
-    )
-    .await?
-    .stdout;
+    let mut args = vec![
+        "log".to_string(),
+        "--pretty=format:%H|%an|%ae|%ad|%s".to_string(),
+        "--date=iso-strict".to_string(),
+        "-n".to_string(),
+        limit.to_string(),
+    ];
+    if let Some(reference) = query.reference.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        // Resolve up front so the log is tied to an immutable commit and an
+        // invalid branch/ref is reported clearly rather than interpreted as
+        // a log pathspec.
+        args.push(resolve_commit_reference(&project_path, reference).await?);
+    }
+    let output = git(&project_path, args).await?.stdout;
     let mut commits = Vec::new();
 
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
@@ -182,7 +390,11 @@ async fn stashes(
     validate_git_repository(&project_path).await?;
     let output = git(
         &project_path,
-        ["stash", "list", "--format=%gd%x1f%H%x1f%an%x1f%aI%x1f%s"],
+        // A stash's visible name is its reflog subject (`%gs`), rather than
+        // the immutable stash commit subject (`%s`). This is what `git stash
+        // list` and LazyGit display, and it lets a later `stash store -m`
+        // rename be visible without rewriting the stash object itself.
+        ["stash", "list", "--format=%gd%x1f%H%x1f%an%x1f%aI%x1f%gs"],
     )
     .await?
     .stdout;
@@ -199,11 +411,16 @@ async fn create_stash(
 ) -> Result<Json<GitOperationResponse>> {
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
     let message = validate_optional_git_message(body.message.as_deref())?;
+    // Match Git and LazyGit's ordinary stash semantics: capture tracked
+    // changes only.  Untracked and ignored files are intentionally opt-in in
+    // the advanced stash flow, where the user can see that they will be
+    // removed from the working tree.
     let output = if let Some(message) = message {
-        git(&project_path, ["stash", "push", "-u", "-m", &message]).await?
+        git(&project_path, ["stash", "push", "-m", &message]).await?
     } else {
-        git(&project_path, ["stash", "push", "-u"]).await?
+        git(&project_path, ["stash", "push"]).await?
     };
     Ok(Json(GitOperationResponse::success(join_output_or(
         &output,
@@ -218,11 +435,16 @@ async fn apply_stash(
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let reference = validate_stash_ref(&body.reference)?;
-    let output = git(&project_path, ["stash", "apply", &reference]).await?;
-    Ok(Json(GitOperationResponse::success(join_output_or(
-        &output,
-        "Stash applied successfully",
-    ))))
+    Ok(Json(
+        management_apply_stash_with_recovery(
+            &project_path,
+            &reference,
+            false,
+            false,
+            body.expected_hash.as_deref(),
+        )
+        .await?,
+    ))
 }
 
 async fn pop_stash(
@@ -232,11 +454,16 @@ async fn pop_stash(
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
     let reference = validate_stash_ref(&body.reference)?;
-    let output = git(&project_path, ["stash", "pop", &reference]).await?;
-    Ok(Json(GitOperationResponse::success(join_output_or(
-        &output,
-        "Stash popped successfully",
-    ))))
+    Ok(Json(
+        management_apply_stash_with_recovery(
+            &project_path,
+            &reference,
+            false,
+            true,
+            body.expected_hash.as_deref(),
+        )
+        .await?,
+    ))
 }
 
 async fn drop_stash(
@@ -245,8 +472,15 @@ async fn drop_stash(
 ) -> Result<Json<GitOperationResponse>> {
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
     let reference = validate_stash_ref(&body.reference)?;
-    let output = git(&project_path, ["stash", "drop", &reference]).await?;
+    let snapshot = management_stash_snapshot_for_action(
+        &project_path,
+        &reference,
+        body.expected_hash.as_deref(),
+    )
+    .await?;
+    let output = git(&project_path, ["stash", "drop", &snapshot.reference]).await?;
     Ok(Json(GitOperationResponse::success(join_output_or(
         &output,
         "Stash dropped successfully",
@@ -265,7 +499,7 @@ async fn tags(
             "for-each-ref",
             "refs/tags",
             "--sort=-creatordate",
-            "--format=%(refname:short)%1f%(objectname)%1f%(objecttype)%1f%(creatordate:iso-strict)%1f%(subject)",
+            "--format=%(refname:short)\u{1f}%(objectname)\u{1f}%(objecttype)\u{1f}%(creatordate:iso-strict)\u{1f}%(subject)",
         ],
     )
     .await?
@@ -283,13 +517,32 @@ async fn create_tag(
 ) -> Result<Json<GitOperationResponse>> {
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
+    if body.force {
+        advanced_require_confirmation(body.confirm, "replace an existing local tag")?;
+    }
     let tag = validate_tag_name(&body.tag)?;
+    ensure_new_local_tag_or_explicit_replacement(&project_path, &tag, body.force).await?;
     let message = validate_optional_git_message(body.message.as_deref())?;
-    let output = if let Some(message) = message {
-        git(&project_path, ["tag", "-a", &tag, "-m", &message]).await?
+    let mut args = vec!["tag".to_string()];
+    if body.force {
+        args.push("--force".to_string());
+    }
+    if let Some(message) = message {
+        args.push("-a".to_string());
+        args.push(tag.clone());
+        args.push("-m".to_string());
+        args.push(message);
     } else {
-        git(&project_path, ["tag", &tag]).await?
-    };
+        // The UI promises a lightweight tag when no annotation message is
+        // supplied. Explicitly override a host/global tag.gpgSign setting so
+        // that setting cannot silently turn this into an editor-backed signed
+        // annotated tag. A signed tag necessarily has annotation content and
+        // is therefore created through the message form above.
+        args.push("--no-sign".to_string());
+        args.push(tag.clone());
+    }
+    let output = git(&project_path, args).await?;
     Ok(Json(GitOperationResponse::success(join_output_or(
         &output,
         "Tag created successfully",
@@ -302,33 +555,13 @@ async fn delete_tag(
 ) -> Result<Json<GitOperationResponse>> {
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
     let tag = validate_tag_name(&body.tag)?;
     let output = git(&project_path, ["tag", "-d", &tag]).await?;
     Ok(Json(GitOperationResponse::success(join_output_or(
         &output,
         "Tag deleted successfully",
     ))))
-}
-
-async fn push_tag(
-    State(state): State<AppState>,
-    Json(body): Json<TagBody>,
-) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
-    validate_git_repository(&project_path).await?;
-    let tag = validate_tag_name(&body.tag)?;
-    let remote_name = first_remote(&project_path).await?.ok_or_else(|| {
-        ServerError::new(
-            StatusCode::BAD_REQUEST,
-            "No remote repository configured. Add a remote first.",
-        )
-    })?;
-    validate_remote_name(&remote_name)?;
-    let output = git(&project_path, ["push", &remote_name, &tag]).await?;
-    let mut response =
-        GitOperationResponse::success(join_output_or(&output, "Tag pushed successfully"));
-    response.remote_name = Some(remote_name);
-    Ok(Json(response))
 }
 
 fn parse_stash_summary(line: &str) -> Option<GitStashSummary> {

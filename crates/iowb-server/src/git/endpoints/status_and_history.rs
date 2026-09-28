@@ -11,7 +11,17 @@ async fn status(
     let project_path = repository.path.clone();
     validate_git_repository(&project_path).await?;
     let branch = current_branch(&project_path).await.ok();
+    let target_ref = Some(checked_out_target_ref(&project_path).await?);
     let has_commits = repository_has_commits(&project_path).await?;
+    let head = if has_commits {
+        Some(resolve_commit_reference(&project_path, "HEAD").await?)
+    } else {
+        None
+    };
+    // An unresolved index cannot be written to a tree. Keep status available
+    // during conflict recovery, but omit the commit snapshot until the index
+    // is resolved and can be safely reviewed again.
+    let index_tree = index_tree_snapshot(&project_path).await.ok();
     let output = git(
         &project_path,
         [
@@ -76,7 +86,10 @@ async fn status(
         repository_name: Some(repository.name),
         repository_kind: Some(repository.kind),
         branch,
+        target_ref,
         has_commits,
+        head,
+        index_tree,
         modified,
         added,
         deleted,
@@ -85,7 +98,24 @@ async fn status(
         clean: files.is_empty(),
         files,
         raw: output.stdout,
+        operation_state: Some(git_operation_state(&project_path).await?),
     }))
+}
+
+/// Return the immutable tree object represented by the current index.
+///
+/// `git write-tree` deliberately fails for an unmerged index; callers that
+/// render status may handle that as an unavailable snapshot, while commit
+/// must require a valid tree before it can proceed.
+async fn index_tree_snapshot(repository_path: &Path) -> Result<String> {
+    let tree = git(repository_path, ["write-tree"]).await?.stdout.trim().to_string();
+    if tree.is_empty() {
+        return Err(ServerError::new(
+            StatusCode::CONFLICT,
+            "Git could not create an index snapshot. Resolve the index and refresh Git status before committing.",
+        ));
+    }
+    Ok(tree)
 }
 
 async fn git_line_change_stats(
@@ -579,6 +609,7 @@ async fn initial_commit(
 ) -> Result<Json<GitOperationResponse>> {
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
     if repository_has_commits(&project_path).await? {
         return Err(ServerError::new(
             StatusCode::BAD_REQUEST,
@@ -638,31 +669,123 @@ async fn commit(
     }
     let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
     validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
     let repository_root = repository_root(&project_path).await?;
-
-    for file in &body.files {
-        let resolved = resolve_git_file_target(&project_path, file, GitFileTargetPolicy::Commit).await?;
-        git(
-            &repository_root,
-            ["add", "--", &resolved.repository_relative_file],
-        )
-        .await?;
+    let expected_head = body
+        .expected_head
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "expectedHead is required to commit. Refresh Git status and review the staged files before committing.",
+            )
+        })?;
+    let expected_target_ref = body
+        .expected_target_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "expectedTargetRef is required to commit. Refresh Git status and review the staged files before committing.",
+            )
+        })?;
+    // A commit mutates the checked-out branch as well as consuming the
+    // reviewed index. Validate both target dimensions before checking the
+    // index snapshot so a same-OID branch switch cannot commit the staged
+    // files to a different branch.
+    validate_workflow_target_snapshot(
+        &project_path,
+        expected_head,
+        expected_target_ref,
+        "commit",
+    )
+    .await?;
+    let expected_index_tree = body
+        .expected_index_tree
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "expectedIndexTree is required to commit. Refresh Git status and review the staged files before committing.",
+            )
+        })?;
+    let current_index_tree = index_tree_snapshot(&project_path).await?;
+    if current_index_tree != expected_index_tree {
+        return Err(ServerError::new(
+            StatusCode::CONFLICT,
+            "The staged index changed after review. Refresh Git status and review the staged files before committing.",
+        ));
     }
+    validate_requested_staged_commit_files(&project_path, &body.files).await?;
 
+    // The requested files must already be in the index. Do not run git add
+    // here: doing so would silently include unstaged hunks from a partially
+    // staged file and make the native diff/review UI lie about the commit.
     let output = git(&repository_root, ["commit", "-m", body.message.trim()]).await?;
     Ok(Json(GitOperationResponse::success(join_output(&output))))
 }
 
+#[derive(Debug, Deserialize)]
+struct UndoLatestLocalCommitBody {
+    #[serde(flatten)]
+    project: ProjectBody,
+    #[serde(rename = "expectedHead")]
+    expected_head: Option<String>,
+    /// The branch (or detached HEAD) identity displayed beside expectedHead.
+    /// A full object ID alone cannot distinguish two local branches which
+    /// currently point at the same commit.
+    #[serde(rename = "expectedTargetRef")]
+    expected_target_ref: Option<String>,
+}
+
 async fn revert_local_commit(
     State(state): State<AppState>,
-    Json(body): Json<ProjectBody>,
+    Json(body): Json<UndoLatestLocalCommitBody>,
 ) -> Result<Json<GitOperationResponse>> {
-    let project_path = resolve_git_repository_path(&state, body.project_ref()?, body.repository_id.as_deref()).await?;
+    let expected_head = body.expected_head.as_deref().ok_or_else(|| {
+        ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "expectedHead is required to undo the latest local commit. Refresh Git status and confirm again.",
+        )
+    })?;
+    let expected_target_ref = body.expected_target_ref.as_deref().ok_or_else(|| {
+        ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "expectedTargetRef is required to undo the latest local commit. Refresh Git status and confirm again.",
+        )
+    })?;
+    let project_path = resolve_git_repository_path(
+        &state,
+        body.project.project_ref()?,
+        body.project.repository_id.as_deref(),
+    )
+    .await?;
     validate_git_repository(&project_path).await?;
+    ensure_no_git_workflow_in_progress(&project_path).await?;
     if !repository_has_commits(&project_path).await? {
         return Err(ServerError::new(
             StatusCode::BAD_REQUEST,
             "No local commit to revert",
+        ));
+    }
+    validate_workflow_target_snapshot(
+        &project_path,
+        expected_head,
+        expected_target_ref,
+        "undo",
+    )
+    .await?;
+    let current_head = resolve_commit_reference(&project_path, "HEAD").await?;
+    if undo_latest_commit_is_known_shared(&project_path, &current_head).await? {
+        return Err(ServerError::new(
+            StatusCode::CONFLICT,
+            "Cannot undo this commit because it is already known to an upstream or remote-tracking branch. Use Revert commit to create a safe inverse commit instead.",
         ));
     }
 
@@ -681,6 +804,89 @@ async fn revert_local_commit(
     }
 
     Ok(Json(GitOperationResponse::success(
-        "Latest local commit reverted successfully. Changes were kept staged.",
+        "Undo latest local commit completed. Changes were kept staged.",
     )))
+}
+
+/// A soft reset rewrites history, so only let it act on a commit Git can
+/// prove is local. A configured upstream catches the normal case; scanning
+/// remote-tracking refs also protects detached/no-upstream branches whose
+/// commit was fetched or pushed previously.
+async fn undo_latest_commit_is_known_shared(repository: &Path, head: &str) -> Result<bool> {
+    if let Ok(upstream) = git(
+        repository,
+        ["rev-parse", "--verify", "--end-of-options", "@{upstream}"],
+    )
+    .await
+    {
+        let upstream = upstream.stdout.trim();
+        if !upstream.is_empty()
+            && git(repository, ["merge-base", "--is-ancestor", head, upstream])
+                .await
+                .is_ok()
+        {
+            return Ok(true);
+        }
+    }
+
+    let remote_refs = git(
+        repository,
+        [
+            "for-each-ref",
+            "--contains",
+            head,
+            "--format=%(refname)",
+            "refs/remotes",
+        ],
+    )
+    .await?;
+    Ok(remote_refs.stdout.lines().any(|reference| !reference.trim().is_empty()))
+}
+
+async fn validate_requested_staged_commit_files(
+    project_path: &Path,
+    files: &[String],
+) -> Result<Vec<String>> {
+    let mut staged_paths = Vec::with_capacity(files.len());
+    let mut seen = HashSet::new();
+
+    for file in files {
+        let resolved =
+            resolve_git_file_target(project_path, file, GitFileTargetPolicy::Commit).await?;
+        let status = repository_file_status(
+            &resolved.repository_root,
+            &resolved.repository_relative_file,
+        )
+        .await?;
+        if !status
+            .as_deref()
+            .is_some_and(status_has_staged_change)
+        {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{} is not staged. Stage the exact changes you want to commit before committing.",
+                    resolved.repository_relative_file
+                ),
+            ));
+        }
+        if seen.insert(resolved.repository_relative_file.clone()) {
+            staged_paths.push(resolved.repository_relative_file);
+        }
+    }
+
+    if staged_paths.is_empty() {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "At least one staged file is required",
+        ));
+    }
+    Ok(staged_paths)
+}
+
+fn status_has_staged_change(status: &str) -> bool {
+    let Some(index_status) = status.chars().next() else {
+        return false;
+    };
+    index_status != '.' && index_status != ' ' && index_status != '?' && index_status != 'U'
 }

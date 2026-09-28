@@ -1574,6 +1574,9 @@ mod tests {
         assert!(commit_dialog.contains("Select at least one changed file before committing."));
         assert!(git_actions.contains("/api/git/generate-commit-message"));
         assert!(git_actions.contains("/api/git/commit"));
+        assert!(git_actions.contains("expectedIndexTree"));
+        assert!(git_actions.contains("expectedHead"));
+        assert!(git_actions.contains("expectedTargetRef"));
     }
 
     #[test]

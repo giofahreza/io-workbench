@@ -123,9 +123,22 @@ async function commitGitSelection() {
   const files = selectedGitFiles();
   const message = String(qs("#git-message")?.value || state.gitCommitMessage || "").trim();
   if (!project || !files.length || !message) return false;
+  const expectedIndexTree = String(state.gitStatus?.indexTree || "").trim();
+  const expectedHead = String(state.gitStatus?.head || "").trim();
+  const expectedTargetRef = String(state.gitStatus?.targetRef || "").trim();
+  if (!expectedIndexTree || !expectedHead || !expectedTargetRef) {
+    showToast("Refresh Git status before committing.", "warn");
+    return false;
+  }
   const body = await api("/api/git/commit", {
     method: "POST",
-    body: JSON.stringify(gitBody({ files, message })),
+    body: JSON.stringify(gitBody({
+      files,
+      message,
+      expectedIndexTree,
+      expectedHead,
+      expectedTargetRef,
+    })),
   });
   renderGitOperation(body);
   try {
@@ -136,12 +149,27 @@ async function commitGitSelection() {
   return true;
 }
 
+function gitWorkflowTargetSnapshot() {
+  const expectedHead = String(state.gitStatus?.head || "").trim();
+  const expectedTargetRef = String(state.gitStatus?.targetRef || "").trim();
+  if (!expectedHead || !expectedTargetRef) {
+    throw new Error("Refresh Git status before rewriting local history.");
+  }
+  return { expectedHead, expectedTargetRef };
+}
+
 async function gitOperation(path) {
   const project = activeProjectKey();
   if (!project) return;
+  // Undo is a soft history rewrite. Bind the click to both dimensions of the
+  // displayed checkout so an equal-OID branch switch cannot reset another
+  // branch while the confirmation is still visible.
+  const snapshot = path === "/api/git/revert-local-commit"
+    ? gitWorkflowTargetSnapshot()
+    : {};
   const body = await api(path, {
     method: "POST",
-    body: JSON.stringify(gitBody()),
+    body: JSON.stringify(gitBody(snapshot)),
   });
   renderGitOperation(body);
   await loadGitStatus().catch(() => {});

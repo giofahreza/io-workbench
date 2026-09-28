@@ -64,7 +64,7 @@ async fn commit_message_diff_context(
 ) -> Result<String> {
     let mut context = String::new();
     for file in files {
-        let resolved = match resolve_git_file_target(project_path, file, GitFileTargetPolicy::Inspect).await {
+        let resolved = match resolve_git_file_target(project_path, file, GitFileTargetPolicy::Commit).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 warn_git_context(&mut context, file, &error.body.error);
@@ -76,7 +76,7 @@ async fn commit_message_diff_context(
             repository_root,
             [
                 "diff",
-                "HEAD",
+                "--cached",
                 "--submodule=log",
                 "--",
                 &resolved.repository_relative_file,
@@ -94,38 +94,14 @@ async fn commit_message_diff_context(
             }
         }
 
-        let absolute_target =
-            match safe_repo_child(repository_root, &resolved.repository_relative_file) {
-                Ok(path) => path,
-                Err(error) => {
-                    warn_git_context(&mut context, file, &error.body.error);
-                    continue;
-                }
-            };
-        match fs::metadata(&absolute_target).await {
-            Ok(metadata) if metadata.is_dir() => {
-                context.push_str(&format!(
-                    "\n--- {} (new directory) ---\n",
-                    resolved.repository_relative_file
-                ));
-            }
-            Ok(_) => match fs::read_to_string(&absolute_target).await {
-                Ok(content) => {
-                    let excerpt = content.chars().take(1000).collect::<String>();
-                    context.push_str(&format!(
-                        "\n--- {} (new file) ---\n{}\n",
-                        resolved.repository_relative_file, excerpt
-                    ));
-                }
-                Err(_) => {
-                    context.push_str(&format!(
-                        "\n--- {} (binary or unreadable file) ---\n",
-                        resolved.repository_relative_file
-                    ));
-                }
-            },
-            Err(_) => warn_git_context(&mut context, file, "file not found"),
-        }
+        // The requested paths have already been verified as staged by the
+        // endpoint. If Git has no textual diff (for example a metadata-only
+        // change), do not fall back to the worktree: that could describe
+        // unstaged content that the following commit will not include.
+        context.push_str(&format!(
+            "\n--- {} (staged change with no textual diff) ---\n",
+            resolved.repository_relative_file
+        ));
     }
     Ok(context)
 }

@@ -108,13 +108,19 @@ async fn repository_has_commits(project_path: &Path) -> Result<bool> {
 
 async fn resolve_commit_reference(repository_path: &Path, value: &str) -> Result<String> {
     let reference = validate_commit_ref(value)?;
+    // A lightweight tag already names a commit, but an annotated tag names a
+    // tag object which then points at its commit.  Git's ordinary ref-aware
+    // workflows (and LazyGit's tag actions) accept both forms
+    // transparently.  Ask Git to peel only as far as a commit so tags work
+    // while trees, blobs, and other object types remain invalid inputs.
+    let commit_reference = format!("{reference}^{{commit}}");
     let output = git(
         repository_path,
         [
             "rev-parse",
             "--verify",
             "--end-of-options",
-            reference.as_str(),
+            commit_reference.as_str(),
         ],
     )
     .await?;
@@ -203,30 +209,26 @@ async fn discard_repository_path(
     }
 
     let has_tracked = entries.iter().any(|(status, _, _)| status != "??");
-    let has_commits = repository_has_commits(repository_root).await?;
-    let absolute_target = safe_repo_child(repository_root, repository_relative_file)?;
 
-    if has_commits && has_tracked {
-        let _ = git(
+    if has_tracked {
+        // Match LazyGit's "Discard unstaged changes" operation: restore the
+        // worktree from the index and leave the index untouched.  Resetting
+        // first would silently turn an `MM`/`AM` path into ` M`/`??`, losing
+        // the user's staged version even though the UI only promised to
+        // discard working-tree changes.
+        git(
             repository_root,
-            ["reset", "HEAD", "--", repository_relative_file],
+            ["restore", "--worktree", "--", repository_relative_file],
         )
-        .await;
-    } else if has_tracked {
-        let _ = git(
-            repository_root,
-            [
-                "rm",
-                "--cached",
-                "-r",
-                "--ignore-unmatch",
-                "--",
-                repository_relative_file,
-            ],
-        )
-        .await;
+        .await?;
+        return Ok(true);
     }
 
+    // The native UI sends untracked paths to the separately named delete
+    // route. Retain the historical direct-route behavior for callers that
+    // still use discard on an untracked path, but never combine it with a
+    // tracked restore above: a mixed directory must not lose staged content.
+    let absolute_target = safe_repo_child(repository_root, repository_relative_file)?;
     if absolute_target.exists() {
         if absolute_target.is_dir() {
             fs::remove_dir_all(&absolute_target)
@@ -239,8 +241,83 @@ async fn discard_repository_path(
         }
     }
 
-    if has_commits && has_tracked {
-        let _ = git(
+    Ok(true)
+}
+
+/// Reset one path back to `HEAD`, including its index entry. This is the
+/// deliberately destructive counterpart to `discard_repository_path`, which
+/// only restores the working tree from the index. Keeping the operations
+/// separate mirrors LazyGit's explicit "Discard all changes" versus
+/// "Discard unstaged changes" choices.
+async fn discard_all_repository_path(
+    repository_root: &Path,
+    repository_relative_file: &str,
+) -> Result<bool> {
+    let status_output = git(
+        repository_root,
+        [
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--",
+            repository_relative_file,
+        ],
+    )
+    .await?;
+    let entries = parse_status_entries_detailed_bytes(&status_output.stdout_bytes);
+    if entries.is_empty() {
+        return Ok(false);
+    }
+
+    let has_tracked = entries.iter().any(|(status, _, _)| status != "??");
+    let has_commits = repository_has_commits(repository_root).await?;
+    // A staged addition has no HEAD blob to restore after we remove it from
+    // the index. Avoid asking `git restore --source=HEAD` for a path that is
+    // intentionally absent from HEAD; deletion below is its full reset.
+    let has_head_backed_entry = entries
+        .iter()
+        .any(|(status, _, _)| status != "??" && !status.starts_with('A'));
+
+    if has_tracked {
+        if has_commits {
+            git(
+                repository_root,
+                ["reset", "HEAD", "--", repository_relative_file],
+            )
+            .await?;
+        } else {
+            git(
+                repository_root,
+                [
+                    "rm",
+                    "--cached",
+                    "-r",
+                    "--ignore-unmatch",
+                    "--",
+                    repository_relative_file,
+                ],
+            )
+            .await?;
+        }
+    }
+
+    let absolute_target = safe_repo_child(repository_root, repository_relative_file)?;
+    if absolute_target.exists() {
+        if absolute_target.is_dir() {
+            fs::remove_dir_all(&absolute_target)
+                .await
+                .map_err(io_server_error)?;
+        } else {
+            fs::remove_file(&absolute_target)
+                .await
+                .map_err(io_server_error)?;
+        }
+    }
+
+    if has_commits && has_head_backed_entry {
+        git(
             repository_root,
             [
                 "restore",
@@ -250,7 +327,7 @@ async fn discard_repository_path(
                 repository_relative_file,
             ],
         )
-        .await;
+        .await?;
     }
 
     Ok(true)
@@ -261,7 +338,89 @@ async fn upstream_remote_or_origin(project_path: &Path) -> Result<String> {
     Ok(upstream_remote_branch_or(project_path, &branch).await?.0)
 }
 
-async fn upstream_remote_branch_or(project_path: &Path, branch: &str) -> Result<(String, String)> {
+/// Git permits a local branch to track another local branch by configuring
+/// `branch.<name>.remote = .`. `@{upstream}` then renders only the source
+/// branch name (rather than `./source`), so it cannot be resolved by the
+/// normal remote-tracking-name parser below. LazyGit delegates this case to
+/// `git pull . refs/heads/<source>`; retain that useful native Git workflow
+/// instead of silently falling back to `origin`.
+async fn configured_local_tracking_branch(
+    project_path: &Path,
+    branch: &str,
+) -> Result<Option<String>> {
+    let branch = validate_branch_name(branch)?;
+    let remote_key = format!("branch.{branch}.remote");
+    let Some(remote) = advanced_local_config_value(project_path, &remote_key).await? else {
+        return Ok(None);
+    };
+    if remote.trim() != "." {
+        return Ok(None);
+    }
+
+    let merge_key = format!("branch.{branch}.merge");
+    let merge = advanced_local_config_value(project_path, &merge_key)
+        .await?
+        .ok_or_else(|| {
+            ServerError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Local tracking for branch {branch} is incomplete. Configure {merge_key} as refs/heads/<branch>."
+                ),
+            )
+        })?;
+    let source = merge.trim().strip_prefix("refs/heads/").ok_or_else(|| {
+        ServerError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Local tracking for branch {branch} must name a local branch as refs/heads/<branch>."
+            ),
+        )
+    })?;
+    Ok(Some(validate_branch_name(source)?))
+}
+
+async fn configured_remote_names(project_path: &Path) -> Result<Vec<String>> {
+    let output = git(project_path, ["remote"]).await?.stdout;
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(validate_remote_name)
+        .collect()
+}
+
+/// Split a remote-tracking display name using the longest configured remote
+/// prefix. A plain `split_once('/')` mistakes `team/review/feature` for the
+/// remote `team` and branch `review/feature`, even when the actual remote is
+/// named `team/review`.
+fn split_configured_remote_tracking_name(
+    tracking: &str,
+    remotes: &[String],
+) -> Option<(String, String)> {
+    remotes
+        .iter()
+        .filter_map(|remote| {
+            tracking
+                .strip_prefix(remote)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .filter(|branch| !branch.is_empty())
+                .map(|branch| (remote.clone(), branch.to_string()))
+        })
+        .max_by_key(|(remote, _)| remote.len())
+}
+
+/// Resolve the current branch's configured pull upstream without inventing a
+/// remote.  LazyGit's Pull flow prompts for an upstream when the branch is
+/// not tracking one; callers that intentionally retain the historical
+/// `origin/<branch>` fallback (such as the legacy Fetch route) use
+/// `upstream_remote_branch_or` below instead.
+async fn configured_upstream_remote_branch(
+    project_path: &Path,
+    branch: &str,
+) -> Result<Option<(String, String)>> {
+    if let Some(local_branch) = configured_local_tracking_branch(project_path, branch).await? {
+        return Ok(Some((".".to_string(), local_branch)));
+    }
     if let Ok(output) = git(
         project_path,
         [
@@ -274,26 +433,415 @@ async fn upstream_remote_branch_or(project_path: &Path, branch: &str) -> Result<
     .await
     {
         let tracking = output.stdout.trim();
-        if let Some((remote, branch)) = tracking.split_once('/') {
-            return Ok((remote.to_string(), branch.to_string()));
+        let remotes = configured_remote_names(project_path).await?;
+        if let Some((remote, branch)) = split_configured_remote_tracking_name(tracking, &remotes) {
+            return Ok(Some((remote, branch)));
         }
     }
 
-    Ok(("origin".to_string(), branch.to_string()))
+    Ok(None)
 }
 
-async fn first_remote(project_path: &Path) -> Result<Option<String>> {
+/// Compatibility resolution for callers which historically use
+/// `origin/<current-branch>` when no pull upstream exists.  Do not use this
+/// for Pull itself: unlike Fetch, a pull integrates history and must make a
+/// missing upstream explicit, matching LazyGit's upstream chooser.
+async fn upstream_remote_branch_or(project_path: &Path, branch: &str) -> Result<(String, String)> {
+    Ok(configured_upstream_remote_branch(project_path, branch)
+        .await?
+        .unwrap_or_else(|| ("origin".to_string(), branch.to_string())))
+}
+
+/// A single, explicit destination for the checked-out branch's ordinary
+/// `git push`.  Pull/upstream state and push state are deliberately separate:
+/// teams commonly fetch from `upstream` while publishing a review branch to a
+/// fork or release remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitPushTarget {
+    remote_name: String,
+    remote_branch: String,
+    /// `push.autoSetupRemote=true` makes a plain Git push establish this
+    /// branch's tracking upstream.  Keep that semantic separate from an
+    /// explicitly selected Publish action so native callers can show the
+    /// resulting configuration change before sending the push.
+    set_upstream: bool,
+}
+
+/// Git's `matching` mode can update several refs and `nothing` deliberately
+/// updates none.  The mobile UI operates on one named branch at a time, so it
+/// only receives [GitPushTarget] when Git's configuration identifies one safe
+/// branch destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitPushTargetResolution {
+    target: Option<GitPushTarget>,
+    push_mode: String,
+    message: Option<String>,
+}
+
+fn no_git_push_target(push_mode: String, message: impl Into<String>) -> GitPushTargetResolution {
+    GitPushTargetResolution {
+        target: None,
+        push_mode,
+        message: Some(message.into()),
+    }
+}
+
+fn require_configured_git_push_target(
+    resolution: GitPushTargetResolution,
+) -> Result<GitPushTarget> {
+    let GitPushTargetResolution {
+        target, message, ..
+    } = resolution;
+    target.ok_or_else(|| {
+        ServerError::new(
+            StatusCode::BAD_REQUEST,
+            message.unwrap_or_else(|| {
+                "No configured single-branch push target is available. Choose a remote branch explicitly."
+                    .to_string()
+            }),
+        )
+    })
+}
+
+async fn configured_network_tracking_target(
+    project_path: &Path,
+    branch: &str,
+) -> Result<Option<GitPushTarget>> {
+    let branch = validate_branch_name(branch)?;
+    let remote_key = format!("branch.{branch}.remote");
+    let Some(remote) = advanced_effective_config_value(project_path, &remote_key).await? else {
+        return Ok(None);
+    };
+    let remote = remote.trim();
+    // `.` is Git's useful local pull-upstream spelling, but is never a
+    // configured network push destination.
+    if remote == "." {
+        return Ok(None);
+    }
+    let remote = validate_remote_name(remote)?;
+    let merge_key = format!("branch.{branch}.merge");
+    let Some(merge) = advanced_effective_config_value(project_path, &merge_key).await? else {
+        return Ok(None);
+    };
+    let remote_branch = merge
+        .trim()
+        .strip_prefix("refs/heads/")
+        .ok_or_else(|| {
+            ServerError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "The configured upstream for branch {branch} must use refs/heads/<branch>"
+                ),
+            )
+        })?;
+    Ok(Some(GitPushTarget {
+        remote_name: remote,
+        remote_branch: validate_branch_name(remote_branch)?,
+        set_upstream: false,
+    }))
+}
+
+/// Return all effective `remote.<name>.push` refspecs for a selected remote.
+/// Git applies these before consulting `push.default`; a blank ordinary push
+/// can therefore target a differently named branch even when the default mode
+/// is `nothing`.  They are configuration values, not request input, but use
+/// NUL output so a malformed embedded newline cannot look like two rules.
+async fn configured_remote_push_refspecs(
+    project_path: &Path,
+    remote_name: &str,
+) -> Result<Vec<String>> {
+    let remote_name = validate_remote_name(remote_name)?;
+    let key = format!("remote.{remote_name}.push");
+    match git(project_path, ["config", "--null", "--get-all", key.as_str()]).await {
+        Ok(output) => Ok(output
+            .stdout_bytes
+            .split(|byte| *byte == 0)
+            .filter_map(|value| std::str::from_utf8(value).ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()),
+        // `git config --get-all` exits with 1 when a remote has no dedicated
+        // push refspec. That is the ordinary case, not a configuration error.
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Interpret the small, safe subset of a configured remote refspec that the
+/// touch client can faithfully show as one current-branch push. LazyGit hands
+/// the complete configuration to `git push`; the native UI must not quietly
+/// reduce a multi-ref, wildcard, deletion, tag, or force refspec to a
+/// different single push.
+fn configured_current_branch_push_refspec_target(
+    refspecs: &[String],
+    branch: &str,
+) -> std::result::Result<String, String> {
+    if refspecs.len() != 1 {
+        return Err(format!(
+            "The selected remote has {} configured push refspecs, which can update more than this branch",
+            refspecs.len()
+        ));
+    }
+    let refspec = refspecs[0].trim();
+    if refspec.starts_with('+') {
+        return Err(
+            "The selected remote has a force push refspec. Choose Force push explicitly instead of inheriting it silently."
+                .to_string(),
+        );
+    }
+    let Some((source, destination)) = refspec.split_once(':') else {
+        return Err(
+            "The selected remote has a configured push refspec that is not one explicit current-branch destination."
+                .to_string(),
+        );
+    };
+    let expected_source = format!("refs/heads/{branch}");
+    if source != expected_source && source != "HEAD" {
+        return Err(format!(
+            "The selected remote's configured push refspec sends {source}, not the checked-out branch {branch}"
+        ));
+    }
+    let Some(destination) = destination.strip_prefix("refs/heads/") else {
+        return Err(
+            "The selected remote's configured push refspec is not a named remote branch. Choose a remote branch explicitly."
+                .to_string(),
+        );
+    };
+    validate_branch_name(destination)
+        .map_err(|_| "The selected remote's configured push destination is not a valid branch.".to_string())
+}
+
+async fn configured_push_auto_setup_remote(project_path: &Path) -> Result<bool> {
+    let Some(value) = advanced_effective_config_value(project_path, "push.autoSetupRemote").await?
+    else {
+        return Ok(false);
+    };
+    advanced_parse_git_bool(&value).ok_or_else(|| {
+        ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "push.autoSetupRemote must be a Git boolean",
+        )
+    })
+}
+
+/// Resolve the one branch destination Git would use for an ordinary push,
+/// without performing a network call.  This follows Git's remote precedence
+/// (`branch.<name>.pushRemote`, `remote.pushDefault`, tracking remote, then
+/// `origin`) and its single-branch `push.default` modes.  A caller must ask
+/// the user for an explicit target when the saved configuration cannot name
+/// one safely.
+async fn configured_git_push_target(
+    project_path: &Path,
+    branch: &str,
+) -> Result<GitPushTargetResolution> {
+    let branch = validate_branch_name(branch)?;
+    let remotes = configured_remote_names(project_path).await?;
+    let push_mode = advanced_effective_config_value(project_path, "push.default")
+        .await?
+        .unwrap_or_else(|| "simple".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if remotes.is_empty() {
+        return Ok(no_git_push_target(
+            push_mode,
+            "No network remote is configured. Add or choose a remote before pushing.",
+        ));
+    }
+
+    let configured_tracking = configured_network_tracking_target(project_path, &branch).await?;
+    let stale_tracking_remote = configured_tracking
+        .as_ref()
+        .filter(|target| !remotes.iter().any(|remote| remote == &target.remote_name))
+        .map(|target| target.remote_name.clone());
+    let tracking = configured_tracking.filter(|target| {
+        remotes
+            .iter()
+            .any(|remote| remote == &target.remote_name)
+    });
+    let branch_push_remote_key = format!("branch.{branch}.pushRemote");
+    let configured_push_remote = match advanced_effective_config_value(project_path, &branch_push_remote_key).await? {
+        Some(remote) => Some(remote),
+        None => advanced_effective_config_value(project_path, "remote.pushDefault").await?,
+    };
+    let has_configured_push_remote = configured_push_remote.is_some();
+    let remote_name = if let Some(remote) = configured_push_remote.as_deref() {
+        let remote = remote.trim();
+        if remote == "." {
+            return Ok(no_git_push_target(
+                push_mode,
+                "The configured push remote is local (`.`). Choose a network remote and branch explicitly.",
+            ));
+        }
+        let remote = validate_remote_name(remote)?;
+        if !remotes.iter().any(|configured| configured == &remote) {
+            return Ok(no_git_push_target(
+                push_mode,
+                format!(
+                    "Configured push remote {remote} is not available. Choose a current remote and branch explicitly."
+                ),
+            ));
+        }
+        remote
+    } else if stale_tracking_remote.is_some() {
+        return Ok(no_git_push_target(
+            push_mode,
+            format!(
+                "The configured tracking remote {} is no longer available. Choose a current remote and branch explicitly.",
+                stale_tracking_remote.as_deref().unwrap_or_default(),
+            ),
+        ));
+    } else if let Some(tracking) = &tracking {
+        tracking.remote_name.clone()
+    } else if remotes.iter().any(|remote| remote == "origin") {
+        // This is Git's conventional fallback, but `simple` still refuses to
+        // invent an upstream branch below.  Do not choose a merely first
+        // remote: multi-remote repositories need an explicit destination.
+        "origin".to_string()
+    } else {
+        return Ok(no_git_push_target(
+            push_mode,
+            "No push remote is configured. Choose a remote and branch explicitly.",
+        ));
+    };
+
+    let refspecs = configured_remote_push_refspecs(project_path, &remote_name).await?;
+    if !refspecs.is_empty() {
+        return match configured_current_branch_push_refspec_target(&refspecs, &branch) {
+            Ok(remote_branch) => Ok(GitPushTargetResolution {
+                target: Some(GitPushTarget {
+                    remote_name,
+                    remote_branch,
+                    set_upstream: false,
+                }),
+                push_mode: "remote.<name>.push".to_string(),
+                message: None,
+            }),
+            Err(message) => Ok(no_git_push_target(
+                "remote.<name>.push".to_string(),
+                message,
+            )),
+        };
+    }
+
+    let auto_setup_remote = configured_push_auto_setup_remote(project_path).await?;
+    let target = match push_mode.as_str() {
+        "current" => Some(GitPushTarget {
+            remote_name,
+            remote_branch: branch,
+            set_upstream: tracking.is_none() && auto_setup_remote,
+        }),
+        "upstream" | "tracking" => match tracking {
+            Some(target) if target.remote_name == remote_name => Some(target),
+            Some(_) => {
+                return Ok(no_git_push_target(
+                    push_mode,
+                    "push.default=upstream can only push to this branch's tracking remote. Choose a target explicitly or change the push configuration.",
+                ));
+            }
+            // Git's push.autoSetupRemote applies to upstream mode as well.
+            // A branch.pushRemote or remote.pushDefault still chooses the
+            // destination before Git records it as the new tracking upstream.
+            // Do not mistake a configured push remote for an existing
+            // upstream: this is precisely the new-branch case the setting is
+            // meant to handle.
+            None if auto_setup_remote => Some(GitPushTarget {
+                remote_name,
+                remote_branch: branch,
+                set_upstream: true,
+            }),
+            None => return Ok(no_git_push_target(
+                push_mode,
+                "push.default=upstream requires a network tracking branch. Set an upstream or choose a target explicitly.",
+            )),
+        },
+        "simple" => match tracking {
+            Some(target) if target.remote_name == remote_name && target.remote_branch == branch => {
+                Some(target)
+            }
+            Some(target) if target.remote_name == remote_name => {
+                return Ok(no_git_push_target(
+                    push_mode,
+                    format!(
+                        "push.default=simple will not choose between {remote_name}/{branch} and the differently named upstream {remote_name}/{}. Choose the remote branch explicitly.",
+                        target.remote_branch,
+                    ),
+                ));
+            }
+            // An explicit pushRemote or remote.pushDefault deliberately
+            // changes the destination remote. Git's simple mode then behaves
+            // like current, so report that target instead of pretending the
+            // fetch upstream is still where this branch will be published.
+            Some(_) => Some(GitPushTarget {
+                remote_name,
+                remote_branch: branch,
+                set_upstream: false,
+            }),
+            None if has_configured_push_remote => Some(GitPushTarget {
+                remote_name,
+                remote_branch: branch,
+                // Git's push.autoSetupRemote applies to `simple` even when
+                // branch.pushRemote or remote.pushDefault selected the
+                // destination. Without it, the same ordinary push remains a
+                // current-branch push but leaves tracking unset.
+                set_upstream: auto_setup_remote,
+            }),
+            None if auto_setup_remote => Some(GitPushTarget {
+                remote_name,
+                remote_branch: branch,
+                set_upstream: true,
+            }),
+            None => return Ok(no_git_push_target(
+                push_mode,
+                "push.default=simple requires an upstream before it can choose a branch. Publish this branch to an explicit remote and branch first.",
+            )),
+        },
+        "matching" => {
+            return Ok(no_git_push_target(
+                push_mode,
+                "push.default=matching can update multiple branches. Choose one remote branch explicitly in this app.",
+            ));
+        }
+        "nothing" => {
+            return Ok(no_git_push_target(
+                push_mode,
+                "push.default=nothing disables automatic push targets. Choose one remote branch explicitly.",
+            ));
+        }
+        _ => {
+            return Ok(no_git_push_target(
+                push_mode,
+                "Git's configured push.default is not a supported single-branch mode. Choose a remote branch explicitly.",
+            ));
+        }
+    };
+
+    Ok(GitPushTargetResolution {
+        target,
+        push_mode,
+        message: None,
+    })
+}
+
+/// Return a remote only when the repository has exactly one configured
+/// destination. Workflows with no remote selector must not pick `origin` (or
+/// alphabetical first) when a project has separate upstream and release
+/// remotes.
+async fn only_configured_remote(project_path: &Path) -> Result<Option<String>> {
     let remotes = git(project_path, ["remote"]).await?.stdout;
-    let mut values = remotes
+    let values = remotes
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
-    if let Some(index) = values.iter().position(|remote| remote == "origin") {
-        return Ok(Some(values.swap_remove(index)));
+    match values.as_slice() {
+        [] => Ok(None),
+        [remote] => Ok(Some(remote.clone())),
+        _ => Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "Multiple remotes are configured. Choose an explicit remote before publishing.",
+        )),
     }
-    Ok(values.into_iter().next())
 }
 
 async fn git<I, S>(cwd: &Path, args: I) -> Result<GitOutput>
@@ -302,6 +850,21 @@ where
     S: AsRef<str>,
 {
     run_git(cwd, args, true).await
+}
+
+// Some Git workflows invoke an editor while recovering a conflict. The API
+// has no interactive terminal, so callers can provide narrowly scoped editor
+// settings without changing the server process environment.
+async fn git_with_environment<I, S>(
+    cwd: &Path,
+    args: I,
+    environment: &[(&str, &str)],
+) -> Result<GitOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    run_git_with_environment(cwd, args, true, environment).await
 }
 
 // The initial-commit path uses Git's exclude pathspec magic to keep
@@ -316,7 +879,34 @@ where
     run_git(cwd, args, false).await
 }
 
+// Most commands use literal pathspecs so request-provided file names cannot
+// gain Git pathspec meaning. `git stash push --include-untracked` is an
+// exception: its internal cleanup uses Git's default pathspec behavior, and
+// forcing GIT_LITERAL_PATHSPECS makes Git save untracked files without
+// removing them from the worktree. Call this only for commands that do not
+// forward request values as pathspecs.
+async fn git_with_default_pathspecs<I, S>(cwd: &Path, args: I) -> Result<GitOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    run_git(cwd, args, false).await
+}
+
 async fn run_git<I, S>(cwd: &Path, args: I, literal_pathspecs: bool) -> Result<GitOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    run_git_with_environment(cwd, args, literal_pathspecs, &[]).await
+}
+
+async fn run_git_with_environment<I, S>(
+    cwd: &Path,
+    args: I,
+    literal_pathspecs: bool,
+    environment: &[(&str, &str)],
+) -> Result<GitOutput>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -336,6 +926,9 @@ where
         command.env("GIT_LITERAL_PATHSPECS", "1");
     } else {
         command.env_remove("GIT_LITERAL_PATHSPECS");
+    }
+    for &(key, value) in environment {
+        command.env(key, value);
     }
     let output = command.output().await.map_err(|error| {
         ServerError::with_details(
@@ -374,25 +967,34 @@ fn redact_git_diagnostic(value: &str) -> String {
 
     while let Some(scheme_offset) = value[cursor..].find("://") {
         let authority_start = cursor + scheme_offset + 3;
-        let authority_tail = &value[authority_start..];
-        let authority_length = authority_tail
+        let url_end = value[authority_start..]
             .find(|character: char| {
                 character.is_whitespace()
-                    || matches!(character, '/' | '?' | '#' | '\'' | '"' | ')' | ']' | '}' | ',')
+                    || matches!(character, '\'' | '"' | ')' | ']' | '}' | ',')
             })
-            .unwrap_or(authority_tail.len());
-        let authority = &authority_tail[..authority_length];
-
-        let Some(user_info_end) = authority.rfind('@') else {
-            let next = authority_start + authority_length;
-            redacted.push_str(&value[cursor..next]);
-            cursor = next;
-            continue;
-        };
-
+            .map(|offset| authority_start + offset)
+            .unwrap_or(value.len());
+        // Query strings and fragments often hold one-time access tokens. They
+        // are not useful in a diagnostic, so omit them even if the URL has no
+        // user-info component to redact.
+        let display_end = value[authority_start..url_end]
+            .find(['?', '#'])
+            .map(|offset| authority_start + offset)
+            .unwrap_or(url_end);
+        let authority_end = value[authority_start..display_end]
+            .find('/')
+            .map(|offset| authority_start + offset)
+            .unwrap_or(display_end);
+        let authority = &value[authority_start..authority_end];
         redacted.push_str(&value[cursor..authority_start]);
-        redacted.push_str("<redacted>@");
-        cursor = authority_start + user_info_end + 1;
+        if let Some(user_info_end) = authority.rfind('@') {
+            redacted.push_str("<redacted>@");
+            redacted.push_str(&value[authority_start + user_info_end + 1..authority_end]);
+        } else {
+            redacted.push_str(authority);
+        }
+        redacted.push_str(&value[authority_end..display_end]);
+        cursor = url_end;
     }
 
     redacted.push_str(&value[cursor..]);
@@ -1055,6 +1657,38 @@ fn validate_tag_name(tag: &str) -> Result<String> {
     validate_git_ref_name(tag, "Invalid tag name")
 }
 
+/// A mobile tag form only opts into `git tag --force` after the user has
+/// reviewed a local tag from its loaded tag list.  Keep the server-side
+/// default just as strict: a stale client that did not know about an existing
+/// tag must never turn a normal create request into an overwrite.  Returning
+/// a focused conflict here also avoids exposing Git's raw "tag already
+/// exists" diagnostic to the UI.
+async fn ensure_new_local_tag_or_explicit_replacement(
+    repository: &Path,
+    tag: &str,
+    force: bool,
+) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    let reference = format!("refs/tags/{tag}");
+    if git(
+        repository,
+        ["show-ref", "--verify", "--quiet", reference.as_str()],
+    )
+    .await
+    .is_ok()
+    {
+        return Err(ServerError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "A local tag named {tag} already exists. Refresh the tag list and explicitly confirm replacing it."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_git_ref_name(value: &str, message: &'static str) -> Result<String> {
     let trimmed = value.trim();
     let components = trimmed.split('/').collect::<Vec<_>>();
@@ -1104,13 +1738,26 @@ fn validate_stash_ref(reference: &str) -> Result<String> {
 
 fn validate_remote_name(remote: &str) -> Result<String> {
     let remote = validate_pattern(remote, "Invalid remote name", |character| {
-        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        // Git remote names can contain path separators (for example
+        // `team/review`). They namespace remote-tracking refs just like
+        // branch names, and rejecting them makes existing repositories
+        // impossible to manage from the native client.
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '/')
     })?;
     if remote == "."
         || remote == ".."
         || remote.starts_with('.')
         || remote.ends_with('.')
+        || remote.starts_with('/')
+        || remote.ends_with('/')
+        || remote.contains("//")
         || remote.contains("..")
+        || remote.split('/').any(|component| {
+            component.is_empty()
+                || component.starts_with('.')
+                || component.ends_with('.')
+                || component.ends_with(".lock")
+        })
     {
         return Err(ServerError::new(
             StatusCode::BAD_REQUEST,
@@ -1132,7 +1779,35 @@ fn validate_remote_url(url: &str) -> Result<String> {
             "Invalid remote URL",
         ));
     }
+    if let Some(authority) = http_remote_authority(trimmed) {
+        // Never let secrets or opaque bearer tokens become durable Git config
+        // via a remote or submodule URL. SSH userinfo remains valid because
+        // this guard is intentionally scoped to HTTP(S).
+        if authority.contains('@') {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "HTTP(S) remote URLs cannot contain embedded credentials. Use SSH or a configured credential helper",
+            ));
+        }
+        if trimmed.contains(['?', '#']) {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "HTTP(S) remote URLs cannot contain a query or fragment. Use SSH or a configured credential helper",
+            ));
+        }
+    }
     Ok(trimmed.to_string())
+}
+
+fn http_remote_authority(value: &str) -> Option<&str> {
+    let scheme = ["https://", "http://"]
+        .into_iter()
+        .find(|scheme| {
+            value
+                .get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        })?;
+    Some(value[scheme.len()..].split('/').next().unwrap_or_default())
 }
 
 fn validate_optional_git_message(message: Option<&str>) -> Result<Option<String>> {
