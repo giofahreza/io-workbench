@@ -96,6 +96,7 @@ function renderIoGatewayConfig(status) {
   if (summary) {
     summary.innerHTML = [
       ioGatewaySummaryRow("Chat runtime", effective.chatRuntime === "io_gateway" ? "IO Gateway" : "Native CLI"),
+      ioGatewaySummaryRow("16 MB Codex context guard", (effective.codexContextLimitEnabled ?? config.codexContextLimitEnabled) !== false ? "enabled" : "disabled"),
       ioGatewaySummaryRow("Mode", effective.mode || "off"),
       ioGatewaySummaryRow("Gateway URL", gatewayUrl),
       ioGatewaySummaryRow("API Key", apiKeyConfigured ? "configured" : "missing", apiKeyConfigured ? "ok" : "warn"),
@@ -105,8 +106,10 @@ function renderIoGatewayConfig(status) {
     ].join("");
   }
   const enabled = qs("#io-gateway-enabled");
+  const contextLimit = qs("#io-gateway-context-limit");
   const url = qs("#io-gateway-url");
   if (enabled) enabled.checked = effective.chatRuntime === "io_gateway";
+  if (contextLimit) contextLimit.checked = (effective.codexContextLimitEnabled ?? config.codexContextLimitEnabled) !== false;
   if (url) url.value = gatewayUrl === "unset" ? "" : gatewayUrl;
   const apiKey = qs("#io-gateway-api-key");
   const otp = qs("#io-gateway-otp-secret");
@@ -194,6 +197,7 @@ async function saveIoGatewayConfig(event) {
   const payload = {
     mode: "aiproxy",
     chatRuntime: useIoGateway ? "io_gateway" : "native_cli",
+    codexContextLimitEnabled: qs("#io-gateway-context-limit")?.checked !== false,
     baseUrl: `${normalizedUrl}/claude`,
     model: storedConfig.model ?? null,
     gatewayUrl: normalizedUrl,
@@ -211,6 +215,18 @@ async function saveIoGatewayConfig(event) {
   setIoGatewaySecretVisibility("gatewayOtpSecret", false);
   state.ioGatewayStatus = null;
   await loadIoGatewayConfig({ force: true });
+  const sessionId = state.chatSessionId;
+  const previousRecovery = state.chatRecoveryBySession?.[sessionId];
+  if (sessionId && previousRecovery) {
+    try {
+      const snapshot = await api(`/api/sessions/${encodeURIComponent(sessionId)}/snapshot?limit=1`);
+      if (state.chatRecoveryBySession[sessionId] === previousRecovery) {
+        rememberChatRecovery(sessionId, snapshot.recovery || null);
+      }
+    } catch (error) {
+      showError(error);
+    }
+  }
   showToast("IO Gateway settings saved on server", "ok");
 }
 

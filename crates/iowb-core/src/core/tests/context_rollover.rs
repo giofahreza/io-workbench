@@ -1,4 +1,152 @@
     #[tokio::test(flavor = "current_thread")]
+    async fn codex_context_limit_toggle_controls_preflight_and_existing_recovery() {
+        let (mut state, root, project) = temporary_app_state("context-limit-toggle").await;
+        state.codex_app_server =
+            CodexAppServerClient::new(root.join("not-installed"), Duration::from_secs(1));
+        let session = state
+            .sessions
+            .create_or_update(
+                Provider::Codex,
+                project.display().to_string(),
+                Some("session-context-limit".to_string()),
+                false,
+                None,
+                Some(ChatRuntime::IoGateway),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("session");
+        state
+            .sessions
+            .set_native_session_id(&session.id, "native-context-limit")
+            .await
+            .expect("native session");
+        let rollout = root.join("large-rollout.jsonl");
+        std::fs::File::create(&rollout)
+            .expect("rollout")
+            .set_len(CODEX_GATEWAY_BODY_LIMIT_BYTES + 1)
+            .expect("large rollout");
+        {
+            let mut cache = state.sessions.external_cache.write().await;
+            cache.loaded_at = Some(Instant::now());
+            cache.records = vec![ExternalSessionRecord {
+                summary: SessionSummary {
+                    id: "native-context-limit".to_string(),
+                    provider: Provider::Codex,
+                    external: true,
+                    project_path: project.display().to_string(),
+                    last_activity: Utc::now(),
+                    ..Default::default()
+                },
+                file_path: rollout,
+            }];
+        }
+
+        assert!(state.codex_context_limit_enabled(Some("user-1")).unwrap());
+        let paused = state
+            .start_agent_session(
+                Provider::Codex,
+                project.display().to_string(),
+                "Continue this large chat",
+                Some(session.id.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                ChatRuntime::IoGateway,
+                None,
+                Some("user-1".to_string()),
+            )
+            .await
+            .expect("preflight pauses before starting the provider");
+        assert!(!paused.active);
+        let recovery = state.context_recovery(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            recovery.observed_bytes,
+            Some(CODEX_GATEWAY_BODY_LIMIT_BYTES + 1)
+        );
+        assert_eq!(recovery.limit_bytes, CODEX_GATEWAY_BODY_LIMIT_BYTES);
+
+        state
+            .storage
+            .set_setting(
+                "user:user-1:direct-ai",
+                &serde_json::json!({
+                    "codexContextLimitEnabled": false,
+                }),
+            )
+            .unwrap();
+        assert!(!state.codex_context_limit_enabled(Some("user-1")).unwrap());
+        assert!(
+            state
+                .codex_context_limit_enabled(Some("other-user"))
+                .unwrap()
+        );
+        assert!(state.codex_context_limit_enabled(None).unwrap());
+        assert!(state.context_recovery(&session.id).await.unwrap().is_none());
+
+        let error = state
+            .start_agent_session(
+                Provider::Codex,
+                project.display().to_string(),
+                "Try again with the guard disabled",
+                Some(session.id.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                ChatRuntime::IoGateway,
+                None,
+                Some("user-1".to_string()),
+            )
+            .await
+            .expect_err("disabled guard reaches runtime configuration validation");
+        assert_eq!(
+            error.to_string(),
+            "IO Gateway is not configured for this session"
+        );
+        assert!(state.context_recovery(&session.id).await.unwrap().is_none());
+
+        let run = state
+            .storage
+            .latest_durable_chat_run_for_session(&session.id)
+            .unwrap()
+            .unwrap();
+        state
+            .storage
+            .mark_durable_chat_run_failed(&run.id, "HTTP 413: request too large")
+            .unwrap();
+        assert!(
+            state.context_recovery(&session.id).await.unwrap().is_some(),
+            "disabling preflight must keep recovery for upstream rejections"
+        );
+        state
+            .storage
+            .mark_durable_chat_run_failed(&run.id, "unrelated failure")
+            .unwrap();
+        state
+            .storage
+            .set_setting(
+                "user:user-1:direct-ai",
+                &serde_json::json!({
+                    "codexContextLimitEnabled": true,
+                }),
+            )
+            .unwrap();
+        assert!(
+            state.context_recovery(&session.id).await.unwrap().is_some(),
+            "re-enabling the guard restores size-based recovery"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn failed_context_rollover_discards_provisional_codex_tool_rows() {
         let (state, root, project) = temporary_app_state("rollover-tool-rollback").await;
         let session = state

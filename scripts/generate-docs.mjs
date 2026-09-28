@@ -1051,6 +1051,11 @@ const pageDefinitions = [
         ["Test without broad execution", "Use Preview for notifications, a small agent task for a CLI/gateway change, and a harmless command/path for a command-backed integration."],
         ["Review the result", "Check Server Status, tool-run history, session output, Git evidence, and the remote client boundary before treating the configuration as ready."],
       ])),
+      section("Enable or disable the Codex context guard", [
+        paragraph("Open <strong>Settings → IO Gateway</strong> (or <strong>Config → IO Gateway</strong> in the PWA) and change <strong>16 MB Codex context guard</strong>. Choose <strong>Save IO Gateway</strong> on the web or Android; the PWA toggle saves automatically. The choice is saved per account and defaults to enabled."),
+        paragraph("When enabled, Workbench pauses Codex chats using IO Gateway when their native history reaches 12 MiB, leaving headroom before the gateway's 16 MiB request limit. Disabling the guard skips this local check and clears chats blocked only by it, allowing another send without forced compaction. Re-enable it whenever you want the preflight check restored."),
+        paragraph("The switch does not change the gateway's own request limit. If the gateway rejects a request as too large, the chat still offers compaction and retry. A compaction already in progress continues normally."),
+      ].join("\n")),
       section("Command-backed tools are host execution", [
         paragraph("The Tools tab can start/list/stop configured MCP servers, run MCP/utility/command/plugin/Taskmaster/notification actions, and send audio to a configured transcription command. These are deliberately command-backed integrations, not managed SaaS switches."),
         list([

@@ -296,6 +296,7 @@
       "headings": [
         "Start with the Settings map",
         "A safe configuration sequence",
+        "Enable or disable the Codex context guard",
         "Command-backed tools are host execution",
         "Continue with"
       ],

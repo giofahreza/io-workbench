@@ -30,6 +30,10 @@ impl AppState {
             ));
         }
 
+        let enforce_context_limit = provider == Provider::Codex
+            && runtime == ChatRuntime::IoGateway
+            && self.codex_context_limit_enabled(user_id.as_deref())?;
+
         // Recovery is a state transition for the current visible chat, not a
         // new turn. Reject ordinary sends before create_or_update can mark the
         // session active or append another user message to a poisoned native
@@ -103,7 +107,7 @@ impl AppState {
             None
         };
         let native_rollout_bytes =
-            if provider == Provider::Codex && native_resume_session_id.is_some() {
+            if enforce_context_limit && native_resume_session_id.is_some() {
                 if let Some(session_id) = session_id.as_deref() {
                     self.sessions.native_rollout_size(session_id).await
                 } else {
@@ -223,8 +227,7 @@ impl AppState {
             return Err(error.into());
         }
 
-        if provider == Provider::Codex
-            && runtime == ChatRuntime::IoGateway
+        if enforce_context_limit
             && native_resume_session_id.is_some()
             && native_rollout_bytes
                 .is_some_and(|bytes| bytes >= CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES)

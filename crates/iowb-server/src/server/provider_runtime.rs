@@ -1,4 +1,12 @@
 fn validate_direct_ai_config(config: &Value) -> Result<()> {
+    if let Some(enabled) = config.get("codexContextLimitEnabled")
+        && !enabled.is_boolean()
+    {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "codexContextLimitEnabled must be a boolean",
+        ));
+    }
     let allowed_modes = ["off", "proxy", "direct", "anthropic", "minimax", "aiproxy"];
     if let Some(mode) = config.get("mode").and_then(Value::as_str) {
         if !allowed_modes.contains(&mode) {

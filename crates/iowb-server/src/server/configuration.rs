@@ -110,6 +110,7 @@ fn default_direct_ai_config() -> Value {
     serde_json::json!({
         "mode": "off",
         "chatRuntime": "native_cli",
+        "codexContextLimitEnabled": true,
         "baseUrl": null,
         "apiKeyEnv": null,
         "model": null

@@ -498,6 +498,96 @@
         server.abort();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_context_limit_setting_defaults_on_and_persists_per_user() {
+        let root =
+            std::env::temp_dir().join(format!("iowb-context-limit-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        })
+        .await
+        .unwrap();
+        let user = iowb_protocol::UserProfile {
+            id: "context-limit-user".to_string(),
+            username: "context-limit-user".to_string(),
+            email: None,
+            created_at: chrono::Utc::now(),
+        };
+        let defaults = io_gateway_settings_status(&state, &user.id).unwrap();
+        assert_eq!(defaults["config"]["codexContextLimitEnabled"], true);
+        assert_eq!(defaults["effective"]["codexContextLimitEnabled"], true);
+
+        for (config, expected) in [
+            (
+                serde_json::json!({"mode": "off", "codexContextLimitEnabled": false}),
+                false,
+            ),
+            // An old client saving other settings must retain the disabled guard.
+            (
+                serde_json::json!({"mode": "off", "model": "gpt-test"}),
+                false,
+            ),
+            (
+                serde_json::json!({"mode": "off", "codexContextLimitEnabled": true}),
+                true,
+            ),
+        ] {
+            let Json(saved) = set_direct_ai(
+                State(state.clone()),
+                Extension(AuthenticatedUser(user.clone())),
+                Json(config),
+            )
+            .await
+            .unwrap();
+            assert_eq!(saved["config"]["codexContextLimitEnabled"], expected);
+            let stored = state
+                .storage
+                .get_setting(&user_setting_key(&user.id, "direct-ai"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored["codexContextLimitEnabled"], expected);
+            let status = io_gateway_settings_status(&state, &user.id).unwrap();
+            assert_eq!(status["config"]["codexContextLimitEnabled"], expected);
+            assert_eq!(status["effective"]["codexContextLimitEnabled"], expected);
+            assert_eq!(
+                io_gateway_settings_status(&state, "other-user").unwrap()["effective"]["codexContextLimitEnabled"],
+                true
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_context_limit_setting_requires_a_boolean() {
+        for invalid in [
+            Value::Null,
+            serde_json::json!("false"),
+            serde_json::json!(0),
+        ] {
+            let error = validate_direct_ai_config(&serde_json::json!({
+                "codexContextLimitEnabled": invalid,
+            }))
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+        assert!(validate_direct_ai_config(&serde_json::json!({})).is_ok());
+        assert_eq!(
+            public_direct_ai_config(&serde_json::json!({}))["codexContextLimitEnabled"],
+            true
+        );
+    }
+
     #[test]
     fn public_direct_ai_config_redacts_stored_secrets() {
         let config = serde_json::json!({
@@ -561,7 +651,7 @@
             "gatewayUrl": "https://new-gateway.example.com",
         });
 
-        preserve_direct_ai_secrets(&stored, &mut update);
+        preserve_direct_ai_settings(&stored, &mut update);
 
         assert_eq!(
             update.get("gatewayApiKey").and_then(Value::as_str),

@@ -209,6 +209,19 @@ impl AppState {
             .await
     }
 
+    /// Whether Workbench should preflight Codex context size for this user.
+    /// Gateway-side request limits still apply when the local guard is off.
+    pub fn codex_context_limit_enabled(&self, user_id: Option<&str>) -> Result<bool> {
+        let Some(user_id) = user_id else {
+            return Ok(true);
+        };
+        Ok(self
+            .storage
+            .get_setting(&format!("user:{user_id}:direct-ai"))?
+            .and_then(|config| config.get("codexContextLimitEnabled").and_then(Value::as_bool))
+            .unwrap_or(true))
+    }
+
     pub async fn context_recovery(&self, session_id: &str) -> Result<Option<ChatContextRecovery>> {
         if let Some(rollover) = self.storage.latest_context_rollover(session_id)? {
             if rollover.kind != CONTEXT_ROLLOVER_KIND_RETRY_FAILED_TURN {
@@ -250,7 +263,9 @@ impl AppState {
         };
         let observed_bytes = self.sessions.native_rollout_size(session_id).await;
         let error = run.last_error.unwrap_or_default().to_ascii_lowercase();
-        if observed_bytes.is_none_or(|bytes| bytes < CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES)
+        let local_limit_reached = self.codex_context_limit_enabled(run.user_id.as_deref())?
+            && observed_bytes.is_some_and(|bytes| bytes >= CODEX_CONTEXT_ROLLOVER_THRESHOLD_BYTES);
+        if !local_limit_reached
             && !error.contains("invalid body")
             && !error.contains("413")
             && !error.contains("too large")

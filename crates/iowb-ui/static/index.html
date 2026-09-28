@@ -7,18 +7,18 @@
     <meta name="theme-color" content="#080a0f" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20260921-03" />
+    <link rel="stylesheet" href="/styles.css?v=20260928-01" />
   </head>
   <body class="auth-pending">
     <div class="brand-loader" data-brand-loader role="status" aria-live="polite" aria-label="Opening io-workbench">
       <div class="brand-loader__inner">
-        <img class="brand-loader__mark" src="/brand-loader.svg?v=20260921-03" alt="" />
+        <img class="brand-loader__mark" src="/brand-loader.svg?v=20260928-01" alt="" />
         <span class="brand-loader__label">Connecting to workbench</span>
       </div>
     </div>
     <aside class="sidebar">
       <div class="brand">
-          <img class="brand-signal" src="/icon.svg?v=20260921-03" alt="" />
+          <img class="brand-signal" src="/icon.svg?v=20260928-01" alt="" />
         <span>
           <strong>io-workbench</strong>
           <small class="brand-status status" aria-label="Connection status">
@@ -58,7 +58,7 @@
     <main class="workspace">
       <section id="auth-panel" class="panel auth-panel hidden">
         <div class="auth-card">
-          <img class="auth-logo" src="/icon.svg?v=20260921-03" alt="" />
+          <img class="auth-logo" src="/icon.svg?v=20260928-01" alt="" />
           <h2 id="auth-title">Setup</h2>
           <p id="auth-description">Create or enter your io-workbench credentials.</p>
           <form id="auth-form" class="auth-form">
@@ -764,6 +764,7 @@
                   </header>
                   <dl id="io-gateway-summary" class="io-gateway-summary" aria-live="polite">
                     <div><dt>Chat runtime</dt><dd>Loading</dd></div>
+                    <div><dt>16 MB Codex context guard</dt><dd>Loading</dd></div>
                     <div><dt>Mode</dt><dd>Loading</dd></div>
                     <div><dt>Gateway URL</dt><dd>Loading</dd></div>
                     <div><dt>API Key</dt><dd>Loading</dd></div>
@@ -776,6 +777,11 @@
                       <input id="io-gateway-enabled" type="checkbox" />
                       <span>Use IO Gateway for chat</span>
                     </label>
+                    <label class="toolbar-check io-gateway-runtime-toggle">
+                      <input id="io-gateway-context-limit" name="codexContextLimitEnabled" type="checkbox" checked aria-describedby="io-gateway-context-limit-help" />
+                      <span>16 MB Codex context guard</span>
+                    </label>
+                    <small id="io-gateway-context-limit-help">Pause large Codex chats for compaction before the gateway limit. Turn off to attempt larger requests; the gateway may still reject them.</small>
                     <div class="io-gateway-connection">
                       <h4>Connection</h4>
                       <label>
@@ -1300,6 +1306,6 @@ validation_error</textarea><small>One scope per line.</small></label>
     </nav>
     <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
-    <script src="/app.js?v=20260921-03" defer></script>
+    <script src="/app.js?v=20260928-01" defer></script>
   </body>
 </html>

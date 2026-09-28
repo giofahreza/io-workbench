@@ -520,7 +520,7 @@ async fn set_direct_ai(
 ) -> Result<Json<Value>> {
     let key = user_setting_key(&user.0.id, "direct-ai");
     if let Some(stored) = state.storage.get_setting(&key)? {
-        preserve_direct_ai_secrets(&stored, &mut config);
+        preserve_direct_ai_settings(&stored, &mut config);
     }
     validate_direct_ai_config(&config)?;
     persist_io_gateway_secrets(&state, &user.0.id, &mut config)?;
@@ -828,6 +828,7 @@ fn io_gateway_settings_status(state: &AppState, user_id: &str) -> Result<Value> 
         "config": public_config,
         "effective": {
             "chatRuntime": configured_chat_runtime(state, user_id),
+            "codexContextLimitEnabled": state.codex_context_limit_enabled(Some(user_id))?,
             "mode": effective.get("mode").cloned().unwrap_or(Value::Null),
             "baseUrl": effective.get("baseUrl").cloned().unwrap_or(Value::Null),
             "apiKeyEnv": effective.get("apiKeyEnv").cloned().unwrap_or(Value::Null),
@@ -944,11 +945,13 @@ fn direct_ai_secret_configured(config: &Value, key: &str) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
-fn preserve_direct_ai_secrets(stored: &Value, config: &mut Value) {
+fn preserve_direct_ai_settings(stored: &Value, config: &mut Value) {
     let (Some(stored), Some(config)) = (stored.as_object(), config.as_object_mut()) else {
         return;
     };
-    for key in ["gatewayApiKey", "gatewayOtpSecret"] {
+    // Older clients do not know about the context guard. Their unrelated
+    // settings saves must not silently re-enable a user's disabled guard.
+    for key in ["gatewayApiKey", "gatewayOtpSecret", "codexContextLimitEnabled"] {
         if !config.contains_key(key) {
             if let Some(value) = stored.get(key) {
                 config.insert(key.to_string(), value.clone());
@@ -995,6 +998,8 @@ fn public_direct_ai_config(config: &Value) -> Value {
     let api_key_configured = direct_ai_secret_configured(config, "gatewayApiKey");
     let otp_configured = direct_ai_secret_configured(config, "gatewayOtpSecret");
     if let Some(obj) = public.as_object_mut() {
+        obj.entry("codexContextLimitEnabled")
+            .or_insert(Value::Bool(true));
         obj.remove("gatewayApiKey");
         obj.remove("gatewayOtpSecret");
         obj.insert(
