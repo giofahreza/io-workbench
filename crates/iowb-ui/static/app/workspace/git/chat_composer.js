@@ -145,6 +145,22 @@ function clearChatPromptInput() {
   input.style.removeProperty("transition");
 }
 
+function chatPromptFocusBlocked() {
+  return [...document.querySelectorAll('[aria-modal="true"], dialog[open]')]
+    .some((dialog) => dialog.getClientRects().length > 0
+      && getComputedStyle(dialog).visibility !== "hidden");
+}
+
+async function focusChatPrompt() {
+  if (chatPromptFocusBlocked()) return false;
+  if (activeView() !== "chat" && !await switchView("chat")) return false;
+  if (activeView() !== "chat" || chatPromptFocusBlocked()) return false;
+  const prompt = qs("#chat-prompt");
+  if (!prompt || prompt.disabled) return false;
+  prompt.focus({ preventScroll: true });
+  return document.activeElement === prompt;
+}
+
 function updateChatComposerState() {
   const input = qs("#chat-prompt");
   const clear = qs("#clear-chat");

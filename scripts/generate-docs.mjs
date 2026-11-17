@@ -1190,6 +1190,7 @@ const pageDefinitions = [
         table(
           ["Shortcut", "Context", "Desktop Web behavior"],
           [
+            ["<code>Alt+I</code>", "Outside a blocking dialog", "Open Chat and focus the prompt without clearing its draft. Also available as Focus chat prompt in the command palette."],
             ["<code>Enter</code> / <code>Esc</code>", "Inline file or folder name", "Create/rename the item / cancel the inline edit."],
             ["<code>Esc</code>", "Docs search", "Clear and blur the search field."],
             ["<code>Tab</code> / <code>Shift+Tab</code>", "Git or Board modal", "Keep focus inside the open dialog; <code>Esc</code> closes it."],

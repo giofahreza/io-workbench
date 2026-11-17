@@ -40,6 +40,13 @@ function commandPaletteCommands() {
       },
     }));
   return [
+    {
+      id: "focus-chat-prompt",
+      title: "Focus chat prompt — Alt+I",
+      section: "Chat",
+      keywords: "input composer type focus keyboard",
+      run: focusChatPrompt,
+    },
     ...viewCommands,
     ...projectCommands,
     ...sessionCommands,
