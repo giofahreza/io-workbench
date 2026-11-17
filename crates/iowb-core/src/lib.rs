@@ -21,6 +21,7 @@ include!("core/runtime_and_auth_utils.rs");
 mod tests {
     include!("core/tests/fixtures_and_sessions.rs");
     include!("core/tests/normalizers.rs");
+    include!("core/tests/canonical_final_output.rs");
     include!("core/tests/context_rollover.rs");
     include!("core/tests/session_recovery.rs");
     include!("core/tests/runtime_and_models.rs");

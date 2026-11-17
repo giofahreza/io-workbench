@@ -47,11 +47,7 @@ impl CodexAppServerLiveOutputNormalizer {
         self.streamed_agent_items.insert(item_id.clone());
         let entry = self.streamed_agent_text.entry(item_id).or_default();
         entry.push_str(delta);
-        self.final_assistant_message = Some(bound_agent_text(
-            entry.trim(),
-            AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-            "assistant response",
-        ));
+        self.final_assistant_message = Some(bound_agent_final_text(entry));
         let prefix = if self.emitted_agent_stream {
             ""
         } else if self.emitted_reasoning_stream {
@@ -223,11 +219,7 @@ impl CodexAppServerLiveOutputNormalizer {
                 .and_then(Value::as_str)
                 .filter(|review| !review.trim().is_empty())
                 .map(|review| {
-                    self.final_assistant_message = Some(bound_agent_text(
-                        review.trim(),
-                        AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                        "assistant response",
-                    ));
+                    self.final_assistant_message = Some(bound_agent_final_text(review));
                     let mut output = String::new();
                     append_live_section(&mut output, &format!("codex\n{}", review.trim()));
                     output
@@ -270,7 +262,7 @@ impl CodexAppServerLiveOutputNormalizer {
             }
             _ => {
                 let previous = self.take_pending_agent_message(true);
-                self.pending_agent_message = Some(content.trim().to_string());
+                self.pending_agent_message = Some(content);
                 previous
             }
         }
@@ -280,19 +272,14 @@ impl CodexAppServerLiveOutputNormalizer {
         let Some(text) = item
             .get("text")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
+            .filter(|text| !text.trim().is_empty())
         else {
             return;
         };
         if item.get("phase").and_then(Value::as_str) == Some("commentary") {
             return;
         }
-        self.final_assistant_message = Some(bound_agent_text(
-            text,
-            AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-            "assistant response",
-        ));
+        self.final_assistant_message = Some(bound_agent_final_text(text));
     }
 
     fn format_command_execution(&mut self, item: &Value) -> String {
@@ -433,11 +420,7 @@ impl CodexAppServerLiveOutputNormalizer {
                 if thinking {
                     format!("thinking\n{content}")
                 } else {
-                    self.final_assistant_message = Some(bound_agent_text(
-                        &content,
-                        AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                        "assistant response",
-                    ));
+                    self.final_assistant_message = Some(bound_agent_final_text(&content));
                     format!("codex\n{content}")
                 }
             })
@@ -698,18 +681,14 @@ impl CodexLiveOutputNormalizer {
                     output
                 }
                 Some("final_answer") => {
-                    self.final_assistant_message = Some(bound_agent_text(
-                        content.trim(),
-                        AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                        "assistant response",
-                    ));
+                    self.final_assistant_message = Some(bound_agent_final_text(&content));
                     let mut output = self.take_pending_agent_message(true);
                     append_live_section(&mut output, &format!("codex\n{}", content.trim()));
                     output
                 }
                 _ => {
                     let previous = self.take_pending_agent_message(true);
-                    self.pending_agent_message = Some(content.trim().to_string());
+                    self.pending_agent_message = Some(content);
                     previous
                 }
             };
@@ -768,11 +747,7 @@ impl CodexLiveOutputNormalizer {
                 if thinking {
                     format!("thinking\n{content}")
                 } else {
-                    self.final_assistant_message = Some(bound_agent_text(
-                        &content,
-                        AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                        "assistant response",
-                    ));
+                    self.final_assistant_message = Some(bound_agent_final_text(&content));
                     format!("codex\n{content}")
                 }
             })

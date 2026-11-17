@@ -944,20 +944,13 @@ impl AgentRuntimeManager {
         let mut status = status;
         let received_at = Utc::now();
         let output = assistant_output
-            .map(|output| output.trim().to_string())
-            .filter(|output| !output.is_empty())
+            .filter(|output| !output.trim().is_empty())
             .or_else(|| match status {
                 iowb_protocol::SessionRuntimeStatus::Failed => Some("Failed".to_string()),
                 iowb_protocol::SessionRuntimeStatus::Aborted => Some("Aborted".to_string()),
                 _ => None,
             })
-            .map(|output| {
-                bound_agent_text(
-                    &output,
-                    AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                    "assistant response",
-                )
-            });
+            .map(|output| bound_agent_final_text(&output));
         let mut rollover_completed_atomically = false;
         let mut rollover_follow_up = None;
         if let Some(rollover_id) = context.context_rollover_id.as_deref() {

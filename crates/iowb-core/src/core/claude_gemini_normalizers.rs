@@ -134,11 +134,8 @@ impl ClaudeLiveOutputNormalizer {
                         };
                         self.streamed_text_started = true;
                         self.emitted_content = true;
-                        self.final_assistant_message = Some(bound_agent_text(
-                            self.streamed_text.trim(),
-                            AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                            "assistant response",
-                        ));
+                        self.final_assistant_message =
+                            Some(bound_agent_final_text(&self.streamed_text));
                         format!("{prefix}{text}")
                     }
                     "input_json_delta" => {
@@ -192,11 +189,7 @@ impl ClaudeLiveOutputNormalizer {
                     if let Some(text) = extract_claude_assistant_text(message) {
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
-                            self.final_assistant_message = Some(bound_agent_text(
-                                trimmed,
-                                AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                                "assistant response",
-                            ));
+                            self.final_assistant_message = Some(bound_agent_final_text(&text));
                         }
                     }
                 }
@@ -236,11 +229,7 @@ impl ClaudeLiveOutputNormalizer {
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                 {
-                    self.final_assistant_message = Some(bound_agent_text(
-                        text.trim(),
-                        AGENT_ASSISTANT_MESSAGE_MAX_BYTES,
-                        "assistant response",
-                    ));
+                    self.final_assistant_message = Some(bound_agent_final_text(text));
                     let remaining = text.strip_prefix(&self.streamed_text).unwrap_or(text);
                     let trimmed = remaining.trim();
                     if !trimmed.is_empty()
