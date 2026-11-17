@@ -77,6 +77,21 @@ async fn create_project(
     State(state): State<AppState>,
     Json(request): Json<CreateProjectRequest>,
 ) -> Result<Json<ProjectSummary>> {
+    create_project_with_publisher(state, request, |state| async move {
+        publish_projects(&state).await;
+    })
+    .await
+}
+
+async fn create_project_with_publisher<F, P>(
+    state: AppState,
+    request: CreateProjectRequest,
+    publisher: P,
+) -> Result<Json<ProjectSummary>>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+    P: FnOnce(AppState) -> F,
+{
     let path = state
         .path_validator
         .validate_path(PathBuf::from(request.path), false)
@@ -91,7 +106,10 @@ async fn create_project(
 
     let mut project = state.projects.add_project(&path)?;
     project.repo_name = project_repository_name(&project.path).await;
-    publish_projects(&state).await;
+    // The project is persisted before we acknowledge registration. Publishing
+    // the full sidebar also discovers every project's external CLI sessions;
+    // it must not make this successful mutation look like a failed timeout.
+    tokio::spawn(publisher(state));
     Ok(Json(project))
 }
 

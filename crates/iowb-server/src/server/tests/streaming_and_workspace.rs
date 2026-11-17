@@ -165,6 +165,63 @@
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn project_registration_returns_while_session_publication_is_blocked() {
+        let (root, state) = board_scope_test_state().await;
+        let project_path = root.join("registered-with-slow-sessions");
+        std::fs::create_dir_all(&project_path).expect("project directory");
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+
+        let registration = create_project_with_publisher(
+            state.clone(),
+            CreateProjectRequest {
+                path: project_path.display().to_string(),
+            },
+            move |_| async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                let _ = finished_tx.send(());
+            },
+        );
+        let project = tokio::select! {
+            biased;
+            response = registration => response.expect("project registration succeeds").0,
+            _ = &mut started_rx => panic!("registration must return without awaiting global session publication"),
+        };
+        assert_eq!(project.name, "registered-with-slow-sessions");
+        assert_eq!(
+            state.projects.find_by_ref(&project.id).expect("durable project").path,
+            project_path.display().to_string(),
+        );
+        started_rx.await.expect("publication is scheduled after durable registration");
+        release_tx.send(()).expect("release publisher");
+        finished_rx.await.expect("publisher is not cancelled when response returns");
+        drop(state);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_project_registration_does_not_publish_or_persist() {
+        let (root, state) = board_scope_test_state().await;
+        let file = root.join("not-a-directory");
+        std::fs::write(&file, "fixture").expect("file fixture");
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let error = create_project_with_publisher(
+            state.clone(),
+            CreateProjectRequest { path: file.display().to_string() },
+            move |_| async move { let _ = started_tx.send(()); },
+        )
+        .await
+        .expect_err("files cannot be registered as projects");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(state.storage.list_projects().expect("projects").is_empty());
+        assert!(started_rx.try_recv().is_err());
+        drop(state);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn websocket_board_events_require_exact_validated_subscription() {
         let (root, state) = board_scope_test_state().await;
         let now = Utc::now();
