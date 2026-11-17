@@ -394,52 +394,98 @@ impl AppState {
                 compact_run.model.clone(),
                 None,
             ))?;
-        let start_result = self
-            .agents
-            .start(AgentStartContext {
-                provider: Provider::Codex,
-                session_id: session_id.to_string(),
-                durable_run_id: Some(compact_run_id.clone()),
-                attempt_id: Some(attempt_id),
-                response_id: compact_run_id.clone(),
-                sequence: Arc::new(AtomicU64::new(0)),
-                project_path: PathBuf::from(&session.project_path),
-                prompt: handoff,
-                model: compact_run.model.clone(),
-                runtime,
-                effort: compact_run.effort.clone(),
-                mode: compact_run.mode.clone(),
-                thinking: compact_run.thinking,
-                fast: compact_run.fast,
-                native_resume_session_id: None,
-                native_rollout_owned_by_provider: false,
-                context_rollover_id: Some(rollover_id.clone()),
-                direct_ai_config,
-                direct_ai_messages: Vec::new(),
-                sessions: self.sessions.clone(),
-                storage: self.storage.clone(),
-                hub: self.ws_hub.clone(),
-            })
-            .await;
-        if let Err(error) = start_result {
-            let message = error.to_string();
-            let _ = self.storage.fail_context_rollover(&rollover_id, &message);
-            let _ = self
-                .storage
-                .mark_durable_chat_run_failed(&compact_run_id, &message);
-            let _ = self.sessions.set_active(session_id, false).await;
-            return Err(error);
-        }
+        // Do not hold the HTTP request open while the Codex app-server is
+        // starting.  On a cold start this can exceed the reverse proxy's
+        // socket timeout even though the durable rollover is valid and the
+        // provider would eventually start successfully.
+        self.ws_hub.publish(WsServerEvent::SessionStatus {
+            provider: Provider::Codex,
+            session_id: session_id.to_string(),
+            status: iowb_protocol::SessionRuntimeStatus::Starting,
+            response_id: Some(compact_run_id.clone()),
+            sequence: None,
+            latest_user_prompt: None,
+        });
+        self.ws_hub.publish(WsServerEvent::ActiveSessions {
+            sessions: self.sessions.list_active().await,
+        });
+
+        let start_context = AgentStartContext {
+            provider: Provider::Codex,
+            session_id: session_id.to_string(),
+            durable_run_id: Some(compact_run_id.clone()),
+            attempt_id: Some(attempt_id.clone()),
+            response_id: compact_run_id.clone(),
+            sequence: Arc::new(AtomicU64::new(0)),
+            project_path: PathBuf::from(&session.project_path),
+            prompt: handoff,
+            model: compact_run.model.clone(),
+            runtime,
+            effort: compact_run.effort.clone(),
+            mode: compact_run.mode.clone(),
+            thinking: compact_run.thinking,
+            fast: compact_run.fast,
+            native_resume_session_id: None,
+            native_rollout_owned_by_provider: false,
+            context_rollover_id: Some(rollover_id.clone()),
+            direct_ai_config,
+            direct_ai_messages: Vec::new(),
+            sessions: self.sessions.clone(),
+            storage: self.storage.clone(),
+            hub: self.ws_hub.clone(),
+        };
+        let state = self.clone();
+        let rollover_id_for_task = rollover_id.clone();
+        let compact_run_id_for_task = compact_run_id.clone();
+        let session_id_for_task = session_id.to_string();
+        tokio::spawn(async move {
+            if let Err(error) = state.agents.start(start_context).await {
+                let message = error.to_string();
+                let _ = state
+                    .storage
+                    .fail_context_rollover(&rollover_id_for_task, &message);
+                let _ = state
+                    .storage
+                    .mark_durable_chat_run_failed(&compact_run_id_for_task, &message);
+                let _ = state.sessions.set_active(&session_id_for_task, false).await;
+                let _ = state.storage.finish_chat_run_attempt(
+                    &attempt_id,
+                    runtime_status_label(iowb_protocol::SessionRuntimeStatus::Failed),
+                    None,
+                    None,
+                    Some(runtime_label(runtime)),
+                    TokenUsageCompleteness::Missing,
+                );
+                state.ws_hub.publish(WsServerEvent::Error {
+                    message: "Codex retry could not be started".to_string(),
+                    details: Some(message),
+                    session_id: Some(session_id_for_task.clone()),
+                });
+                state.ws_hub.publish(WsServerEvent::SessionStatus {
+                    provider: Provider::Codex,
+                    session_id: session_id_for_task.clone(),
+                    status: iowb_protocol::SessionRuntimeStatus::Failed,
+                    response_id: Some(compact_run_id_for_task.clone()),
+                    sequence: None,
+                    latest_user_prompt: None,
+                });
+                state.ws_hub.publish(WsServerEvent::ActiveSessions {
+                    sessions: state.sessions.list_active().await,
+                });
+                warn!(
+                    error = %error,
+                    session_id = %session_id_for_task,
+                    rollover_id = %rollover_id_for_task,
+                    "Codex compact-and-retry provider startup failed"
+                );
+            }
+        });
 
         Ok(CompactSessionContextResponse {
             session_id: session_id.to_string(),
             request_id: request_id.to_string(),
             response_id: compact_run_id,
-            state: self
-                .storage
-                .context_rollover_for_retry_run(&rollover.retry_run_id)?
-                .map(|stored| stored.state)
-                .unwrap_or_else(|| "starting".to_string()),
+            state: "starting".to_string(),
         })
     }
 

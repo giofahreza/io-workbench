@@ -29,6 +29,53 @@ function chatRecoveryIsStarting(recovery) {
   return Boolean(recovery && (recovery.pending || recovery.state === "starting"));
 }
 
+async function reconcileTimedOutChatRecovery(sessionId, recovery, requestId) {
+  const sid = String(sessionId || "").trim();
+  const deadline = Date.now() + 30_000;
+  while (sid && Date.now() < deadline) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+    try {
+      const snapshot = await api(`/api/sessions/${encodeURIComponent(sid)}/snapshot?limit=1`);
+      const serverRecovery = normalizeChatRecovery(snapshot?.recovery, sid);
+      if (!serverRecovery) {
+        // The durable retry completed while the original HTTP response was
+        // lost by a proxy. WebSocket reconciliation will fill in the final
+        // assistant message; remove the stale recovery card now.
+        if (state.chatRecoveryBySession[sid] === recovery) {
+          delete state.chatRecoveryBySession[sid];
+          clearChatProcessing();
+          renderChatRecoveryCard(sid);
+          updateChatComposerState();
+          scheduleCompletedChatReconciliation(sid);
+        }
+        return true;
+      }
+      if (serverRecovery.requestId && serverRecovery.requestId !== requestId) return false;
+      if (serverRecovery.state === "failed") {
+        recovery.pending = false;
+        recovery.state = "failed";
+        recovery.message = serverRecovery.message;
+        renderChatRecoveryCard(sid);
+        updateChatComposerState();
+        return true;
+      }
+      if (serverRecovery.state === "starting") {
+        recovery.pending = false;
+        recovery.state = "starting";
+        recovery.responseId = String(serverRecovery.responseId || "").trim();
+        renderChatRecoveryCard(sid);
+        ensureChatProcessing({ provider: "codex", sessionId: sid });
+        updateProcessingLabel("Compacting context");
+        return true;
+      }
+    } catch {
+      // Keep polling transient proxy/network failures until the durable
+      // operation reaches a terminal state or the reconciliation window ends.
+    }
+  }
+  return false;
+}
+
 function rememberChatRecovery(sessionId, recovery) {
   const sid = String(sessionId || "").trim();
   if (!sid) return;
@@ -113,6 +160,9 @@ async function compactAndRetryChatContext(sessionId, button = null) {
       }),
     });
     if (!attemptIsCurrent()) return;
+    const isTransportFailure = !error?.status
+      || /socket|timeout|network|fetch failed/i.test(String(error?.message || error));
+    if (isTransportFailure && await reconcileTimedOutChatRecovery(sid, recovery, requestId)) return;
     recovery.pending = false;
     const responseState = String(response?.state || "starting").toLowerCase();
     recovery.state = responseState;
