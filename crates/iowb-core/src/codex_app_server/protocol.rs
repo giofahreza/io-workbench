@@ -1,3 +1,13 @@
+fn live_turn_setup_timeout(stage: &str, duration: Duration) -> CoreError {
+    CoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "Codex app-server live turn setup timed out during {stage} after {} ms",
+            duration.as_millis()
+        ),
+    ))
+}
+
 fn app_server_response_error(error: &Value) -> CoreError {
     let code = error.get("code").and_then(Value::as_i64);
     let message = error

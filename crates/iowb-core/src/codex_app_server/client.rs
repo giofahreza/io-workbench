@@ -196,16 +196,41 @@ impl CodexAppServerClient {
         })?;
         let mut lines = BufReader::new(stdout).lines();
 
-        let result = timeout(request_timeout, async {
-            initialize_app_server(&mut stdin, &mut lines, &events).await?;
-            let thread_id =
-                start_or_resume_thread(&mut stdin, &mut lines, &params, &events).await?;
+        let result = async {
+            timeout(
+                request_timeout,
+                initialize_app_server(&mut stdin, &mut lines, &events),
+            )
+            .await
+            .map_err(|_| live_turn_setup_timeout("initialize", request_timeout))??;
+            // Loading a large persisted rollout and starting its MCP servers
+            // can take longer than an ordinary protocol request.
+            let thread_timeout = if params
+                .thread_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
+            {
+                request_timeout.max(Duration::from_secs(120))
+            } else {
+                request_timeout
+            };
+            let thread_id = timeout(
+                thread_timeout,
+                start_or_resume_thread(&mut stdin, &mut lines, &params, &events),
+            )
+            .await
+            .map_err(|_| live_turn_setup_timeout("start or resume thread", thread_timeout))??;
             let _ = events
                 .send(CodexAppServerLiveTurnEvent::ThreadAssociated {
                     thread_id: thread_id.clone(),
                 })
                 .await;
-            let turn_id = start_turn(&mut stdin, &mut lines, &params, &thread_id, &events).await?;
+            let turn_id = timeout(
+                request_timeout,
+                start_turn(&mut stdin, &mut lines, &params, &thread_id, &events),
+            )
+            .await
+            .map_err(|_| live_turn_setup_timeout("start turn", request_timeout))??;
             if let Some(turn_id) = turn_id.as_deref() {
                 let _ = events
                     .send(CodexAppServerLiveTurnEvent::TurnAssociated {
@@ -214,26 +239,12 @@ impl CodexAppServerClient {
                     .await;
             }
             Ok::<_, CoreError>((thread_id, turn_id))
-        })
+        }
         .await;
 
         let (thread_id, mut turn_id) = match result {
-            Ok(Ok(value)) => value,
-            Ok(Err(error)) => {
-                log_captured_stderr(&stderr, "live turn setup").await;
-                let _ = stdin.shutdown().await;
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Err(error);
-            }
-            Err(_) => {
-                let error = CoreError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "Codex app-server live turn setup timed out after {} ms",
-                        request_timeout.as_millis()
-                    ),
-                ));
+            Ok(value) => value,
+            Err(error) => {
                 log_captured_stderr(&stderr, "live turn setup").await;
                 let _ = stdin.shutdown().await;
                 let _ = child.start_kill();

@@ -237,7 +237,7 @@
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runs_live_turn_resume_sequence() {
+    async fn resumes_slow_thread_without_returning_history() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!("iowb-app-server-{}", uuid::Uuid::new_v4()));
@@ -252,6 +252,7 @@
                  printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\"}}}}'\n\
                  read second\nprintf '%s\\n' \"$second\" >> '{}'\n\
                  read third\nprintf '%s\\n' \"$third\" >> '{}'\n\
+                 sleep 1\n\
                  printf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-existing\"}}}}}}'\n\
                  read fourth\nprintf '%s\\n' \"$fourth\" >> '{}'\n\
                  printf '%s\\n' '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-resume\",\"status\":\"inProgress\",\"items\":[]}}}}}}'\n\
@@ -267,7 +268,7 @@
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).expect("permissions");
 
-        let client = CodexAppServerClient::new(script.as_os_str(), Duration::from_secs(2));
+        let client = CodexAppServerClient::new(script.as_os_str(), Duration::from_millis(500));
         let (_abort_tx, abort_rx) = oneshot::channel();
         let (event_tx, _event_rx) = mpsc::channel(16);
         let outcome = client
@@ -286,6 +287,12 @@
         assert!(requests.contains("\"method\":\"thread/resume\""));
         assert!(!requests.contains("\"method\":\"thread/start\""));
         assert!(requests.contains("\"threadId\":\"thread-existing\""));
+        let resume: Value = requests
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("request JSON"))
+            .find(|request| request["method"] == "thread/resume")
+            .expect("resume request");
+        assert_eq!(resume["params"]["excludeTurns"], true);
         let _ = std::fs::remove_dir_all(root);
     }
 

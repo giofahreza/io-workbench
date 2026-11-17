@@ -50,6 +50,9 @@ async fn start_or_resume_thread(
     );
     if let Some(thread_id) = existing_thread_id {
         request_params["threadId"] = Value::String(thread_id.to_string());
+        // Live turns only need the thread id. Returning the entire saved
+        // transcript can make resuming a long-lived chat exceed setup timeouts.
+        request_params["excludeTurns"] = Value::Bool(true);
     }
     let method = if existing_thread_id.is_some() {
         "thread/resume"
