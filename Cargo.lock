@@ -4187,8 +4187,6 @@ dependencies = [
 [[package]]
 name = "sqlx-mysql"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5afe4c38a9b417b6a9a5eeffe7235d0a106716495536e7727d1c7f4b1ff3eba6"
 dependencies = [
  "atoi",
  "base64 0.22.1",

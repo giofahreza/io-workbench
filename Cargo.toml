@@ -12,6 +12,7 @@ members = [
     "rag",
 ]
 resolver = "3"
+exclude = ["vendor/sqlx-mysql"]
 
 [workspace.package]
 version = "0.1.5"
@@ -65,3 +66,8 @@ iowb-rag-plugin-api = { path = "crates/iowb-rag-plugin-api" }
 iowb-server = { path = "crates/iowb-server" }
 iowb-storage = { path = "crates/iowb-storage" }
 iowb-ui = { path = "crates/iowb-ui" }
+
+[patch.crates-io]
+# SQLx0.8 drops the charset while interpreting the overloaded MySQL BINARY
+# flag. Backport the targeted type-info correction without a driver upgrade.
+sqlx-mysql = { path = "vendor/sqlx-mysql" }
