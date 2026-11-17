@@ -1004,11 +1004,37 @@ impl AgentRuntimeManager {
             // bubble at the bottom of the reply stays populated after a
             // refresh or session switch.
             let sent_at = context
-                .storage
-                .get_session_summary(&context.session_id)
-                .ok()
-                .flatten()
-                .and_then(|s| s.first_user_at);
+                .durable_run_id
+                .as_deref()
+                .and_then(|run_id| context.storage.get_durable_chat_run(run_id).ok().flatten())
+                .map(|run| {
+                    run.user_message_id
+                        .as_deref()
+                        .and_then(|id| {
+                            context
+                                .storage
+                                .message_by_id(&context.session_id, id)
+                                .ok()
+                                .flatten()
+                        })
+                        .map(|message| message.timestamp)
+                        .unwrap_or(run.created_at)
+                })
+                .or_else(|| {
+                    context
+                        .storage
+                        .latest_user_message_id(&context.session_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|id| {
+                            context
+                                .storage
+                                .message_by_id(&context.session_id, &id)
+                                .ok()
+                                .flatten()
+                        })
+                        .map(|message| message.timestamp)
+                });
             let elapsed_ms = sent_at.map(|t| (received_at - t).num_milliseconds().max(0));
             let assistant_meta = serde_json::json!({
                 "cli": context.provider.as_str(),
@@ -1023,6 +1049,7 @@ impl AgentRuntimeManager {
                 "sentAt": sent_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
                 "elapsedMs": elapsed_ms,
                 "status": status,
+                "tokenUsage": usage.as_ref().map(|usage| &usage.usage),
             });
             if let Err(error) = context
                 .sessions
@@ -1053,6 +1080,7 @@ impl AgentRuntimeManager {
                         "sentAt": sent_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
                         "elapsedMs": elapsed_ms,
                         "status": status,
+                        "tokenUsage": usage.as_ref().map(|usage| &usage.usage),
                     });
                     let _ = context.sessions.stamp_latest_message_metadata(
                         &context.session_id,

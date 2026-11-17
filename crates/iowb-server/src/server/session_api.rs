@@ -710,13 +710,17 @@ async fn session_token_usage(
         .sessions
         .set_token_usage(&session_id, snapshot.usage.clone())
         .await?;
-    let stamp = serde_json::json!({ "tokenUsage": &snapshot.usage });
-    if let Err(error) =
-        state
-            .sessions
-            .stamp_latest_message_metadata(&session_id, MessageRole::Assistant, stamp)
+    if let Some(message_id) = state.storage.latest_assistant_message_id(&session_id)?
+        && let Some(message) = state.storage.message_by_id(&session_id, &message_id)?
+        // Durable replies carry usage for their own attempt. A rollout
+        // snapshot may still describe an earlier turn, especially after a
+        // setup failure, so only use this legacy fallback for legacy replies.
+        && message.metadata.get("durableRunId").and_then(Value::as_str).is_none()
     {
-        warn!(error = %error, session_id = %session_id, "failed to stamp token usage on assistant message");
+        let stamp = serde_json::json!({ "tokenUsage": &snapshot.usage });
+        if let Err(error) = state.storage.merge_message_metadata(&session_id, &message_id, stamp) {
+            warn!(error = %error, session_id = %session_id, "failed to stamp token usage on assistant message");
+        }
     }
 
     Ok(Json(token_usage_response(&snapshot)))

@@ -353,14 +353,14 @@
             )
             .await
             .expect("session");
-        state
+        let user_message = state
             .sessions
             .append_message(&session.id, MessageRole::User, "hello runtime")
             .await
             .expect("user message");
         let run_id = "run-app-server-live-runtime".to_string();
         let attempt_id = "attempt-app-server-live-runtime".to_string();
-        let durable_run = StoredDurableChatRun::new(
+        let mut durable_run = StoredDurableChatRun::new(
             run_id.clone(),
             None,
             session.id.clone(),
@@ -368,6 +368,7 @@
             "hello runtime",
             project.display().to_string(),
         );
+        durable_run.user_message_id = Some(user_message.id.clone());
         state
             .storage
             .create_durable_chat_run(&durable_run)
@@ -433,6 +434,23 @@
         .expect("assistant persisted");
 
         let messages = state.storage.list_messages(&session.id).expect("messages");
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("assistant message");
+        assert_eq!(
+            assistant.metadata["sentAt"],
+            user_message.timestamp.to_rfc3339()
+        );
+        assert!(
+            assistant.metadata["elapsedMs"]
+                .as_i64()
+                .is_some_and(|elapsed| elapsed < 10_000)
+        );
+        assert!(
+            assistant.metadata["tokenUsage"].is_null(),
+            "no usage was reported by this attempt"
+        );
         assert!(
             messages.iter().any(|message| {
                 message.role == MessageRole::Assistant && message.content == "runtime answer"
