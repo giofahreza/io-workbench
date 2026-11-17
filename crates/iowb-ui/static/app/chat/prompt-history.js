@@ -184,6 +184,7 @@ async function loadChatPromptHistoryPage(sessionId = state.chatSessionId, option
     mergeChatPromptHistory(body?.prompts || [], {
       hasOlder: body?.has_more === true || body?.hasMore === true,
     });
+    if (typeof updateMainHeader === "function") updateMainHeader();
     if (state.chatPromptHistoryPendingPreviousAfterLoad && state.chatPromptHistory.length) {
       state.chatPromptHistoryPendingPreviousAfterLoad = false;
       navigateChatPromptHistory(-1);

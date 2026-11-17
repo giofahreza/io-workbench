@@ -209,9 +209,7 @@ async function switchView(view) {
   panel.classList.add("active");
   panel.setAttribute("aria-hidden", "false");
   updateMainHeader(view);
-  const title = qs("#view-title");
   const subtitle = qs("#view-subtitle");
-  if (title) title.textContent = VIEW_NAMES[view] || view;
   if (subtitle) subtitle.textContent = VIEW_SUBTITLES[view] || "";
   closeMoreSheet();
   closeSidebar();

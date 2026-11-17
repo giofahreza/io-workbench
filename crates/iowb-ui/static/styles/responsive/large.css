@@ -1,5 +1,6 @@
 @media (max-width: 900px) {
-  .main-title-text span {
+  .main-title-text span,
+  .main-content-header > #view-subtitle {
     display: none;
   }
 
@@ -315,7 +316,8 @@ th {
     font-size: 14px;
   }
 
-  .main-title-text span {
+  .main-title-text span,
+  .main-content-header > #view-subtitle {
     display: none;
   }
 

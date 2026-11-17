@@ -113,15 +113,53 @@ function selectedProjectLabel(selector = "#active-project") {
   return project ? projectDisplayName(project) : "No project";
 }
 
+function workspaceViewTitle(view) {
+  if (view !== "chat") return VIEW_NAMES[view] || view;
+  const sessionId = state.chatSessionId || state.pendingChatSessionId;
+  if (!sessionId) return "New chat";
+  const session = findChatSession(sessionId);
+  const cached = cachedChatSession(sessionId);
+  const cachedSession = cached?.session;
+  const title = [session?.title, session?.summary, cachedSession?.title, cachedSession?.summary]
+    .find((value) => typeof value === "string" && value.trim())?.trim() || "Untitled chat";
+  if ((session?.titleSource ?? cachedSession?.titleSource) !== "prompt" || !title.endsWith("...")) return title;
+  const messages = typeof chatHistoryWindow !== "undefined" && chatHistoryWindow.sessionId === sessionId
+    ? chatHistoryWindow.messages : cached?.messages || [];
+  const scopedPrompts = typeof chatPromptHistoryScope === "function"
+    && state.chatPromptHistoryScope === chatPromptHistoryScope(sessionId)
+    ? state.chatPromptHistory || [] : [];
+  const prompts = [
+    scopedPrompts.at(-1)?.content,
+    messages.findLast((message) => message.role === "user")?.content,
+    cached?.messages?.findLast((message) => message.role === "user")?.content,
+  ];
+  for (const prompt of prompts) {
+    if (typeof prompt !== "string") continue;
+    const fullTitle = prompt
+      .replace(/!\[([^\]]*)\]\([^)]*\)/g, (_, alt) => alt.trim() ? `Attached image: ${alt.trim()}` : "Attached image")
+      .replace(/data:[^\s]{0,128}?;base64,[A-Za-z0-9+/_=-]+/g, "[attachment]")
+      .replace(/\s+/g, " ").trim();
+    if (fullTitle.startsWith(title.slice(0, -3))) return fullTitle;
+  }
+  return title;
+}
+
 function updateMainHeader(view = activeView()) {
   const title = qs("#view-title");
   const headerSubtitle = qs("#view-subtitle");
-  if (title) title.textContent = VIEW_NAMES[view] || view;
+  const viewTitle = workspaceViewTitle(view);
+  if (title) {
+    title.textContent = viewTitle;
+    title.title = viewTitle;
+  }
   const subtitle = selectedProjectLabel("#active-project");
   if (headerSubtitle) headerSubtitle.textContent = subtitle;
   const bottomTitle = qs("#bottom-view-title");
   const bottomMeta = qs("#bottom-view-meta");
-  if (bottomTitle) bottomTitle.textContent = VIEW_NAMES[view] || view;
+  if (bottomTitle) {
+    bottomTitle.textContent = viewTitle;
+    bottomTitle.title = viewTitle;
+  }
   if (bottomMeta) bottomMeta.textContent = subtitle;
 }
 

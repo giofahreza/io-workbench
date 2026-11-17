@@ -259,6 +259,7 @@ function clearRemoteChatPromptDraft(sessionId) {
 }
 
 function updateChatEmptyState() {
+  if (activeView() === "chat") updateMainHeader("chat");
   const emptyState = qs("#chat-empty-state");
   if (!emptyState) return;
   const shouldShow = activeView() === "chat" && chatOutputIsEmpty() && selectedChatIsFreshDraft();

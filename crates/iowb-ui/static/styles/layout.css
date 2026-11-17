@@ -26,6 +26,7 @@
 }
 
 .main-title-group {
+  grid-column: 1;
   display: flex;
   min-width: 0;
   flex: 1 1 auto;
@@ -39,6 +40,7 @@
 
 .main-title-text {
   min-width: 0;
+  flex: 1 1 0;
   display: grid;
   gap: 1px;
 }
@@ -56,6 +58,7 @@
 }
 
 .main-title-text span {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--muted);
@@ -64,7 +67,13 @@
   white-space: nowrap;
 }
 
+.main-title-text #view-subtitle {
+  display: block;
+}
+
 .main-tab-switcher {
+  grid-column: 2;
+  grid-row: 1;
   display: grid;
   grid-template-columns: repeat(4, 34px);
   min-width: max-content;

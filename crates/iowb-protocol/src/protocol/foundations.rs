@@ -433,7 +433,7 @@ pub struct SessionSummary {
     /// and Workbench's stored transcript is the user-visible source of truth.
     #[serde(skip)]
     pub native_rollout_owned_by_provider: bool,
-    #[serde(skip)]
+    #[serde(default, rename = "titleSource", skip_serializing_if = "Option::is_none")]
     pub title_source: Option<SessionTitleSource>,
     #[serde(rename = "projectPath")]
     pub project_path: String,
