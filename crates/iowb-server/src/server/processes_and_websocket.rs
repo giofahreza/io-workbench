@@ -461,7 +461,9 @@ fn resolve_session_chat_runtime(
             {
                 ChatRuntime::IoGateway
             } else {
-                ChatRuntime::NativeCli
+                // Imported and legacy chats may have no saved runtime. Use
+                // the user's selected route, just as we do for a new chat.
+                configured_chat_runtime(state, user_id)
             }
         });
     }

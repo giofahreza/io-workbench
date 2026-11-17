@@ -24,6 +24,7 @@ include!("server/tools_and_compat.rs");
 
 #[cfg(test)]
 mod tests {
+    include!("server/tests/chat_runtime_routing.rs");
     include!("server/tests/streaming_and_workspace.rs");
     include!("server/tests/models_and_configuration.rs");
     include!("server/tests/recovery.rs");
