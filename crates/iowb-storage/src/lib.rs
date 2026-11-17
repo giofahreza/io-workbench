@@ -8,6 +8,7 @@ include!("storage/durable_runs_and_usage.rs");
 include!("storage/context_rollovers.rs");
 include!("storage/durable_messages_and_forks.rs");
 include!("storage/messages_and_search.rs");
+include!("storage/history_windows.rs");
 include!("storage/settings_and_credentials.rs");
 include!("storage/database_connections_and_jobs.rs");
 include!("storage/row_mapping_and_usage.rs");
@@ -20,5 +21,6 @@ mod tests {
     include!("storage/tests/usage_and_forks.rs");
     include!("storage/tests/rollovers_and_sessions.rs");
     include!("storage/tests/credentials_and_runs.rs");
+    include!("storage/tests/history_windows.rs");
     include!("storage/tests/board_session_backfill.rs");
 }

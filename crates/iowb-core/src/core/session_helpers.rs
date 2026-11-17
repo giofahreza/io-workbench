@@ -138,8 +138,28 @@ fn estimate_json_value_bytes(value: &Value) -> usize {
 
 fn evict_external_message_cache(cache: &mut ExternalSessionCache) {
     while cache.messages.len() > EXTERNAL_MESSAGE_CACHE_MAX_ENTRIES
-        || cache.message_bytes > EXTERNAL_MESSAGE_CACHE_MAX_BYTES
+        || cache.history_windows.len() > EXTERNAL_MESSAGE_CACHE_MAX_ENTRIES
+        || cache.message_bytes
+            + cache
+                .history_windows
+                .values()
+                .map(|entry| entry.estimated_bytes)
+                .sum::<usize>()
+            > EXTERNAL_MESSAGE_CACHE_MAX_BYTES
     {
+        let oldest_history = cache
+            .history_windows
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(key, entry)| (key.clone(), entry.last_access));
+        let oldest_message = cache.messages.values().map(|entry| entry.last_access).min();
+        if let Some((key, accessed)) = oldest_history
+            && (cache.history_windows.len() > EXTERNAL_MESSAGE_CACHE_MAX_ENTRIES
+                || oldest_message.is_none_or(|message_accessed| accessed <= message_accessed))
+        {
+            cache.history_windows.remove(&key);
+            continue;
+        }
         let Some(key) = cache
             .messages
             .iter()

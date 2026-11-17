@@ -1,4 +1,4 @@
-const APP_VERSION = "20260928-01";
+const APP_VERSION = "20261005-02";
 const CACHE_NAME = `io-workbench-web-${APP_VERSION}`;
 const CORE_ASSETS = [
   "/",
@@ -22,6 +22,7 @@ const CORE_ASSETS = [
   `/app/chat/prompt-history.js?v=${APP_VERSION}`,
   `/app/chat/drafts.js?v=${APP_VERSION}`,
   `/app/chat/history.js?v=${APP_VERSION}`,
+  `/app/chat/render.js?v=${APP_VERSION}`,
   `/app/chat/recovery.js?v=${APP_VERSION}`,
   `/app/chat/stream.js?v=${APP_VERSION}`,
   `/app/chat/settings.js?v=${APP_VERSION}`,

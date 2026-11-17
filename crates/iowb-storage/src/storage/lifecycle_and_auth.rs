@@ -11,6 +11,7 @@ impl Storage {
             connection: Arc::new(Mutex::new(connection)),
         };
         storage.migrate()?;
+        storage.migrate_message_history_versions()?;
         storage.backfill_session_title_sources()?;
         Ok(storage)
     }

@@ -140,19 +140,28 @@ function renderChatLineFooter(footer, meta) {
   if (!footer) return;
   const normalized = normalizedChatMessageMeta(meta || {});
   const summary = chatLineFooterSummary(normalized);
-  footer.innerHTML = `<button type="button" class="chat-line-footer-details" data-chat-line-footer-details aria-haspopup="dialog" aria-label="Show message details" title="Show message details">` +
-    `<span class="chat-line-footer-details-label">details</span>` +
-    `<span class="chat-line-footer-details-preview">${escapeHtml(summary)}</span>` +
-    `</button>`;
-  footer.querySelector("[data-chat-line-footer-details]")?.addEventListener("click", (event) => {
-    openChatMetadataModal(normalized, event.currentTarget);
-  });
+  let button = footer.querySelector("[data-chat-line-footer-details]");
+  if (!button) {
+    footer.innerHTML = `<button type="button" class="chat-line-footer-details" data-chat-line-footer-details aria-haspopup="dialog" aria-label="Show message details" title="Show message details">` +
+      `<span class="chat-line-footer-details-label">details</span>` +
+      `<span class="chat-line-footer-details-preview"></span>` +
+      `</button>`;
+    button = footer.querySelector("[data-chat-line-footer-details]");
+    button.addEventListener("click", (event) => {
+      openChatMetadataModal(button._iowbMetadata || {}, event.currentTarget);
+    });
+  }
+  button._iowbMetadata = normalized;
+  const preview = button.querySelector(".chat-line-footer-details-preview");
+  if (preview.textContent !== summary) preview.textContent = summary;
 }
 
 function chatLineFooterSummary(meta = {}) {
   const summary = [];
   const identity = meta.model || meta.cli || meta.provider;
   if (identity) summary.push(identity);
+  if (meta.mode) summary.push(meta.mode);
+  if (meta.fast === true) summary.push("fast");
   if (meta.tokenUsage) summary.push(meta.tokenUsage);
   if (meta.status) summary.push(meta.status);
   if (meta.elapsed) summary.push(meta.elapsed);
@@ -617,46 +626,74 @@ function persistedChatMessageId(message) {
   return id;
 }
 
-function replayUserPromptLine(message, meta = null) {
-  const output = chatOutputRoot();
+function replayUserPromptLine(message, meta = null, output = chatOutputRoot(), options = {}) {
   if (!output) return;
-  const { node, text, footer } = buildChatLineNode("user");
-  text.textContent = String(message?.content || "");
+  const existing = options.existingNode;
+  const { node, text, footer } = existing ? {
+    node: existing,
+    text: existing.querySelector(":scope > .chat-line-text"),
+    footer: existing.querySelector(":scope > .chat-line-footer"),
+  } : buildChatLineNode("user");
+  const content = String(message?.content || "");
+  if (text.textContent !== content) {
+    if (text.childNodes.length === 1 && text.firstChild.nodeType === 3) patchChatRenderedText(text.firstChild, content);
+    else text.textContent = content;
+  }
   attachUserChatActions(node, message);
+  const edit = node.querySelector("[data-chat-edit-from-here]");
+  if (edit) {
+    edit.disabled = Boolean(findChatSession(state.chatSessionId)?.active || selectedRunningChatSession());
+    edit.title = edit.disabled ? "Stop the current response before editing from here" : "Edit from here";
+  }
   renderChatLineFooter(footer, meta);
-  output.appendChild(node);
+  placeChatRenderedLine(output, node, options);
+  return node;
 }
 
 function replayAssistantLine(content, meta = null, options = {}) {
-  const output = chatOutputRoot();
+  const output = options.output || chatOutputRoot();
   if (!output) return;
-  const { node, text, footer } = buildChatLineNode("assistant");
+  const existing = options.existingNode;
+  const { node, text, footer } = existing ? {
+    node: existing,
+    text: existing.querySelector(":scope > .chat-line-text"),
+    footer: existing.querySelector(":scope > .chat-line-footer"),
+  } : buildChatLineNode("assistant");
   // Agent output is untrusted. HTML/CSS/script text must never become
   // application DOM, even when a tool has returned an entire web page.
   // renderChatBubbleHtml escapes every line and only emits a whitelist
   // of block tags, so this stays safe while exec / Parameters /
   // exec / Details become collapsible blocks.
-  text.innerHTML = renderChatBubbleHtml(String(content));
+  renderChatMessageContent(text, content);
   if (options.showResponseHeader) {
     renderChatResponseHeader(node, options.headerMeta || meta || {});
+  } else {
+    node.querySelector(":scope > .chat-response-header")?.remove();
   }
   renderChatLineFooter(footer, meta);
   if (options.copyText) attachAssistantChatActions(node, options.copyText);
-  output.appendChild(node);
+  else node.querySelector("[data-chat-copy-kind='assistant']")?.remove();
+  placeChatRenderedLine(output, node, options);
+  return node;
 }
 
-function replayToolLine(content) {
-  const output = chatOutputRoot();
+function replayToolLine(content, output = chatOutputRoot(), options = {}) {
   if (!output) return;
   if (!String(content || "").trim()) return;
-  const { node, text, footer } = buildChatLineNode("assistant");
+  const existing = options.existingNode;
+  const { node, text, footer } = existing ? {
+    node: existing,
+    text: existing.querySelector(":scope > .chat-line-text"),
+    footer: existing.querySelector(":scope > .chat-line-footer"),
+  } : buildChatLineNode("assistant");
   node.classList.add("chat-line-tool-message");
   // Tool rows already contain structured `exec/tool / Parameters|Details`
   // sections. Render those directly so the UI does not create a second
   // outer "Tool output" collapsible around the real collapsibles.
-  text.innerHTML = renderChatBubbleHtml(String(content || ""));
+  renderChatMessageContent(text, content);
   renderChatLineFooter(footer, null);
-  output.appendChild(node);
+  placeChatRenderedLine(output, node, options);
+  return node;
 }
 
 function stripAnsi(value) {
@@ -781,6 +818,12 @@ function persistedChatMessageMeta(raw) {
   return {};
 }
 
+function chatTurnFast(sessionId) {
+  if (chatHistoryWindow.sessionId !== sessionId) return undefined;
+  const prompt = [...chatHistoryWindow.messages].reverse().find((message) => message.role === "user");
+  return normalizedChatMessageMeta(persistedChatMessageMeta(prompt)).fast;
+}
+
 function chatMessageProvider(raw, persistedMeta = null, session = null) {
   const meta = persistedMeta && typeof persistedMeta === "object"
     ? persistedMeta
@@ -798,6 +841,8 @@ function isTerminalStatusMessageMeta(meta) {
 }
 
 function replayChatMessages(messages, options = {}) {
+  const output = options.output || chatOutputRoot();
+  if (!output) return;
   const session = options.session || findChatSession(options.sessionId || state.chatSessionId) || null;
   const sessionId = options.sessionId || session?.id || state.chatSessionId || "";
   syncChatPromptHistoryFromMessages(messages, sessionId);
@@ -812,8 +857,14 @@ function replayChatMessages(messages, options = {}) {
     const role = String(raw.role || "").toLowerCase();
     const content = raw.content == null ? "" : String(raw.content);
     const persistedMeta = persistedChatMessageMeta(raw);
+    const key = chatRenderMessageKey(raw);
+    const candidate = options.reuseNodes?.get(key);
+    const expectedClass = role === "user" ? "chat-line-user" : role === "system" ? "chat-line-system" : "chat-line-assistant";
+    const existingNode = candidate?.classList.contains(expectedClass) ? candidate : null;
+    const placement = { inPlace: options.inPlace, renderedNodes: options.renderedNodes, existingNode };
+    let renderedNode = null;
     if (role === "user") {
-      replayUserPromptLine(raw, chatMessageFooterMeta(raw, role, controls, null, session));
+      renderedNode = replayUserPromptLine(raw, chatMessageFooterMeta(raw, role, controls, null, session), output, placement);
       previousPrompt = raw;
     } else if (role === "assistant") {
       if (isTerminalStatusMessageMeta(persistedMeta)) return;
@@ -824,29 +875,37 @@ function replayChatMessages(messages, options = {}) {
       );
       if (!displayContent) return;
       const turn = presentation.get(index) || {};
-      replayAssistantLine(
+      renderedNode = replayAssistantLine(
         displayContent,
         turn.showResponseFooter
           ? (turn.footerMeta || chatMessageFooterMeta(raw, role, controls, previousPrompt, session))
           : null,
         {
+          output,
+          ...placement,
           showResponseHeader: turn.showResponseHeader === true,
           headerMeta: turn.headerMeta,
           copyText: turn.showResponseFooter ? turn.copyText : "",
         },
       );
     } else if (role === "tool") {
-      replayToolLine(content);
+      renderedNode = replayToolLine(content, output, placement);
     } else if (role === "system") {
-      const output = chatOutputRoot();
-      if (!output) return;
-      const node = document.createElement("div");
+      const node = existingNode || document.createElement("div");
       node.className = "chat-line-system";
-      node.textContent = content;
-      output.appendChild(node);
+      if (node.textContent !== content) node.textContent = content;
+      placeChatRenderedLine(output, node, placement);
+      renderedNode = node;
     }
+    if (renderedNode && key) renderedNode.dataset.chatHistoryKey = key;
   });
-  scrollChatToBottom();
+  if (!options.output) scrollChatToBottom();
+}
+
+function prependChatHistoryPage(page, previousMessages, options = {}) {
+  // Recompute response boundaries without moving their existing DOM out of the
+  // document; moving through a fragment would discard focus and selections.
+  return reconcileChatMessages(page.concat(previousMessages), options);
 }
 
 // Normalize raw metadata stored in storage. ISO timestamps become the
@@ -949,15 +1008,124 @@ function normalizeMessageMeta(raw) {
   return meta;
 }
 
+let chatHistoryTailRequest = null;
+let chatHistoryRequestSessionId = "";
+const chatSessionEventVersions = new Map();
+
+function noteChatSessionEvent(sessionId) {
+  if (sessionId) chatSessionEventVersions.set(sessionId, chatSessionEventVersion(sessionId) + 1);
+}
+
+function chatSessionEventVersion(sessionId) {
+  return chatSessionEventVersions.get(sessionId) || 0;
+}
+
 async function loadChatHistoryForSession(sessionId, opts = {}) {
   if (!sessionId) return false;
-  if (stagedChatEdit()?.sourceSessionId === sessionId) return true;
+  if ((state.chatSessionId || state.pendingChatSessionId) !== sessionId) return false;
+  if (chatHistoryRequestSessionId !== sessionId) {
+    chatHistoryRequestSessionId = sessionId;
+    chatHistoryGeneration += 1;
+    chatHistoryTailRequest = null;
+    chatOlderHistoryRequest = null;
+    chatHistoryDemandSessionId = "";
+    state.chatOlderMessagesLoadingSessionId = "";
+  }
+  const generation = chatHistoryGeneration;
+  const older = opts.older === true;
+  if (older && (chatHistoryWindow.sessionId !== sessionId || state.chatSessionId !== sessionId)) return false;
+  const existing = older ? chatOlderHistoryRequest : chatHistoryTailRequest;
+  if (existing?.sessionId === sessionId && existing.generation === generation) {
+    if (opts.forceBottom) existing.options.forceBottom = true;
+    return existing.promise;
+  }
+  // Serialize paging and tail commits without cancelling either operation. An
+  // ordinary poll is not a session switch and must not invalidate user demand.
+  const preceding = older ? chatHistoryTailRequest : chatOlderHistoryRequest;
+  const request = { sessionId, generation, options: { ...opts }, promise: null };
+  if (older) {
+    chatOlderHistoryRequest = request;
+    state.chatOlderMessagesLoadingSessionId = sessionId;
+    showOlderMessagesLoading();
+  } else {
+    chatHistoryTailRequest = request;
+  }
+  request.promise = (async () => {
+    if (preceding?.generation === generation) await preceding.promise;
+    if (generation !== chatHistoryGeneration
+      || (state.chatSessionId || state.pendingChatSessionId) !== sessionId) return false;
+    return performChatHistoryLoad(sessionId, request.options);
+  })();
   try {
-    const preservedStream = preserveActiveChatStreamSnapshot(sessionId);
+    return await request.promise;
+  } finally {
+    if (older && chatOlderHistoryRequest === request) {
+      chatOlderHistoryRequest = null;
+      state.chatOlderMessagesLoadingSessionId = "";
+      chatHistoryDemandSessionId = "";
+      renderOlderChatMessagesControl();
+    } else if (!older && chatHistoryTailRequest === request) {
+      chatHistoryTailRequest = null;
+    }
+  }
+}
+
+function retainRicherChatMessage(previous, incoming) {
+  if (!previous || !incoming?.metadata?.contentTruncated || previous.metadata?.contentTruncated) return incoming;
+  const text = String(previous.content || "");
+  const bytes = typeof TextEncoder === "function" ? new TextEncoder().encode(text).length : text.length;
+  // A response-size budget is not a history edit. Only retain a cached body
+  // when its size and available prefix agree with the bounded representation.
+  const prefix = String(incoming.content || "").split("\n[", 1)[0].slice(0, 64);
+  if (bytes !== incoming.metadata.originalContentBytes || (prefix && !text.startsWith(prefix))) return incoming;
+  return { ...incoming, content: text, metadata: { ...incoming.metadata, contentTruncated: false } };
+}
+
+async function chatHistoryTailWindow(sessionId, page, totalCount, generation) {
+  const tailOffset = Math.max(0, totalCount - page.length);
+  const current = chatHistoryWindow;
+  if (current.sessionId !== sessionId) return { messages: page, offset: tailOffset };
+  const previous = current.messages.filter((message) => persistedChatMessageId(message));
+  if (!previous.length) return { messages: page, offset: tailOffset };
+  const byId = new Map(previous.map((message) => [persistedChatMessageId(message), message]));
+  const retain = (message) => retainRicherChatMessage(byId.get(persistedChatMessageId(message)), message);
+  const overlap = previous.findIndex((message) => persistedChatMessageId(message) === persistedChatMessageId(page[0]));
+  if (overlap >= 0 && current.offset + overlap === tailOffset
+    && previous.slice(overlap).every((message, index) => index >= page.length
+      || persistedChatMessageId(message) === persistedChatMessageId(page[index]))) {
+    return { messages: previous.slice(0, overlap).concat(page.map(retain)), offset: current.offset };
+  }
+  if (!totalCount) return { messages: [], offset: 0 };
+  // There is a gap or a changed numeric boundary. Refetch the covered range in
+  // bounded pages; never concatenate a disjoint tail as though it were adjacent.
+  const previousTotal = current.persistedTotalCount ?? (current.offset + previous.length);
+  const offset = Math.max(0, Math.min(current.offset, tailOffset) - Math.max(0, previousTotal - totalCount));
+  const messages = [];
+  for (let cursor = offset; cursor < tailOffset;) {
+    const limit = Math.min(CHAT_HISTORY_PAGE_SIZE, tailOffset - cursor);
+    const response = await api(`/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=${limit}&offset=${cursor}`);
+    if (generation !== chatHistoryGeneration || state.chatSessionId !== sessionId || stagedChatEdit()) return null;
+    const rows = Array.isArray(response) ? response : (response?.messages || []);
+    const count = Number(response?.total_count ?? response?.totalCount ?? totalCount);
+    if (count !== totalCount || rows.length !== limit) return null;
+    messages.push(...rows.map(retain));
+    cursor += limit;
+  }
+  messages.push(...page.map(retain));
+  const keys = messages.map(persistedChatMessageId);
+  if (keys.some((key) => !key) || new Set(keys).size !== keys.length) return null;
+  return { messages, offset };
+}
+
+async function performChatHistoryLoad(sessionId, opts = {}) {
+  if (!sessionId) return false;
+  if (stagedChatEdit()?.sourceSessionId === sessionId) return true;
+  const generation = chatHistoryGeneration;
+  const previousWindow = chatHistoryWindow;
+  const eventVersion = chatSessionEventVersion(sessionId);
+  const recoveryBeforeRequest = state.chatRecoveryBySession[sessionId];
+  try {
     const loadingOlder = opts.older === true && chatHistoryWindow.sessionId === sessionId;
-    const previousOutput = chatOutputRoot();
-    const previousHeight = previousOutput?.scrollHeight || 0;
-    const previousTop = previousOutput?.scrollTop || 0;
     const requestedOffset = loadingOlder
       ? Math.max(0, chatHistoryWindow.offset - CHAT_HISTORY_PAGE_SIZE)
       : 0;
@@ -996,16 +1164,44 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
         totalCount: response?.total_count ?? response?.totalCount ?? fallbackSession.messageCount ?? 0,
       };
     }
-    const page = Array.isArray(body) ? body : (body.messages || []);
-    const totalCount = Number(body?.total_count ?? body?.totalCount ?? page.length) || page.length;
-    const snapshotSession = body?.session || findChatSession(sessionId);
+    if (generation !== chatHistoryGeneration
+      || (state.chatSessionId || state.pendingChatSessionId) !== sessionId
+      || stagedChatEdit()?.sourceSessionId === sessionId
+      || (loadingOlder && (chatHistoryWindow.sessionId !== sessionId || chatHistoryWindow.offset !== previousWindow.offset))) return false;
+    const receivedPage = Array.isArray(body) ? body : (body.messages || []);
+    const existingIds = new Set(loadingOlder ? previousWindow.messages.map(persistedChatMessageId).filter(Boolean) : []);
+    const page = receivedPage.filter((message) => {
+      const id = persistedChatMessageId(message);
+      if (!id) return true;
+      if (existingIds.has(id)) return false;
+      existingIds.add(id);
+      return true;
+    });
+    const totalCount = Math.max(0, Number(body?.total_count ?? body?.totalCount ?? page.length) || 0);
+    const loadedWindow = loadingOlder ? null : await chatHistoryTailWindow(sessionId, page, totalCount, generation);
+    if (!loadingOlder && !loadedWindow) return false;
+    if (generation !== chatHistoryGeneration || (state.chatSessionId || state.pendingChatSessionId) !== sessionId
+      || stagedChatEdit()?.sourceSessionId === sessionId) return false;
+    // Capture after all I/O, but before recovery/status rendering can change
+    // the transcript. Respect any scrolling the reader did during the request.
+    const viewport = typeof captureChatViewport === "function" ? captureChatViewport() : null;
+    const anchor = !viewport ? captureChatHistoryAnchor() : null;
+    const previousOutput = chatOutputRoot();
+    const previousHeight = previousOutput?.scrollHeight || 0;
+    const previousTop = previousOutput?.scrollTop || 0;
+    const newerEvents = chatSessionEventVersion(sessionId) !== eventVersion;
+    const rawSnapshotSession = body?.session || findChatSession(sessionId);
+    const snapshotSession = newerEvents && rawSnapshotSession
+      ? { ...rawSnapshotSession, active: chatSessionIsLive(sessionId) } : rawSnapshotSession;
     const boardSession = isBoardChatSession(snapshotSession, sessionId);
     const snapshotLive = Boolean(snapshotSession?.active);
     if (boardSession) {
       state.boardChatSessionIds.add(sessionId);
       if (snapshotSession?.id) state.boardChatSessionIds.add(snapshotSession.id);
     }
-    if (!loadingOlder) rememberChatRecovery(sessionId, body?.recovery || null);
+    if (!loadingOlder && !newerEvents && state.chatRecoveryBySession[sessionId] === recoveryBeforeRequest) {
+      rememberChatRecovery(sessionId, body?.recovery || null);
+    }
     const recoveryState = state.chatRecoveryBySession[sessionId]?.state || "";
     const snapshotStatus = snapshotSession?.active || recoveryState === "starting"
       ? "running"
@@ -1021,38 +1217,63 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
         state.sessions.push(snapshotSession);
         mergeSessionIntoProjects(snapshotSession);
       }
-      rememberSidebarSessionStatus({
-        sessionId: snapshotSession.id,
-        provider: snapshotSession.provider,
-        status: snapshotStatus,
-      });
+      if (!newerEvents) {
+        rememberSidebarSessionStatus({
+          sessionId: snapshotSession.id,
+          provider: snapshotSession.provider,
+          status: snapshotStatus,
+        });
+      }
     }
-    const messages = loadingOlder
-      ? page.concat(chatHistoryWindow.messages)
-      : page;
+    const currentMessages = chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.messages : [];
+    const optimistic = currentMessages.filter((message) => !persistedChatMessageId(message));
+    // Until this turn has an authoritative inactive snapshot, keep its local
+    // presentation together. There is no safe content-based identity match
+    // between a provisional prompt and a newly persisted server message.
+    const keepOptimistic = optimistic.length > 0 && (snapshotLive || newerEvents);
+    const messages = loadingOlder ? page.concat(currentMessages)
+      : (keepOptimistic ? currentMessages : loadedWindow.messages);
     const split = splitCachedStreamingMessage(messages, sessionId);
     const replayMessages = split.messages;
-    const streamSnapshot = preservedStream || {
-      sessionId,
-      buffer: split.streamingBuffer || state.chatOutputBuffersBySession[sessionId] || "",
-      provider: sessionProvider(snapshotSession),
-    };
     const offset = loadingOlder
       ? requestedOffset
-      : Math.max(0, totalCount - page.length);
-    chatHistoryWindow = { sessionId, offset, totalCount, messages: replayMessages };
-    resetChatOutputDom();
+      : (keepOptimistic ? chatHistoryWindow.offset : loadedWindow.offset);
+    const sameSession = chatHistoryWindow.sessionId === sessionId;
+    chatHistoryWindow = { sessionId, offset, totalCount,
+      persistedTotalCount: keepOptimistic ? (previousWindow.persistedTotalCount ?? previousWindow.totalCount) : totalCount,
+      messages: replayMessages };
     const persisted = getSessionOverridesFor(sessionId) || {};
-    replayChatMessages(replayMessages, {
-      session: snapshotSession,
-      sessionId,
-      overrides: persisted,
-    });
-    renderChatRecoveryCard(sessionId);
-    renderChatManualCompactionCard(sessionId);
-    if (snapshotLive || chatSessionIsLive(sessionId)) {
-      const restored = restoreChatStreamSnapshot(sessionId, streamSnapshot);
-      if (!restored) {
+    if (loadingOlder) {
+      prependChatHistoryPage(page, currentMessages, {
+        session: snapshotSession, sessionId, overrides: persisted,
+      });
+    } else {
+      if (!sameSession) resetChatOutputDom();
+      // REST history does not own a current response. In particular it must
+      // never write back a buffer captured before awaiting its request.
+      if (!snapshotLive && !newerEvents) {
+        if (chatStream.node?.isConnected && !chatStream.node.dataset.chatHistoryKey) chatStream.node.remove();
+        chatStream = { role: null, node: null, text: null, buffer: "" };
+        state.chatBuffer = "";
+        delete state.chatOutputBuffersBySession[sessionId];
+        clearChatProcessing();
+      }
+      reconcileChatMessages(replayMessages, {
+        session: snapshotSession,
+        sessionId,
+        overrides: persisted,
+      });
+      renderChatRecoveryCard(sessionId);
+      renderChatManualCompactionCard(sessionId);
+    }
+    renderOlderChatMessagesControl();
+    if (!loadingOlder && snapshotLive) {
+      if (!chatStream.node?.isConnected && state.chatOutputBuffersBySession[sessionId]) {
+        restoreChatStreamSnapshot(sessionId, {
+          buffer: state.chatOutputBuffersBySession[sessionId], provider: sessionProvider(snapshotSession),
+        });
+      }
+      if (!chatStream.node?.isConnected) {
         ensureChatProcessing({
           provider: sessionProvider(snapshotSession),
           sessionId,
@@ -1060,8 +1281,16 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
       }
     }
     const output = chatOutputRoot();
-    if (loadingOlder && output) {
-      output.scrollTop = Math.max(0, output.scrollHeight - previousHeight + previousTop);
+    if (!sameSession && !loadingOlder) {
+      // Opening a different transcript is an intentional reset, so do not
+      // restore the prior session's viewport (or its invalidated revision).
+      scrollChatToBottom(true);
+    } else if (viewport) {
+      restoreChatViewport(viewport, { forceBottom: opts.forceBottom === true || state.chatJumpToLatestPending });
+    } else if (loadingOlder && output) {
+      if (!restoreChatHistoryAnchor(anchor)) {
+        output.scrollTop = Math.max(0, output.scrollHeight - previousHeight + previousTop);
+      }
     } else if (opts.forceBottom || state.chatJumpToLatestPending) {
       scrollChatToBottom(true);
     } else {
@@ -1070,7 +1299,7 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     maybeLoadOlderChatMessages();
     // Restore the current session controls after replaying the persisted
     // per-turn metadata in the transcript.
-    loadSessionOverridesIntoState(sessionId, snapshotSession);
+    if (!newerEvents) loadSessionOverridesIntoState(sessionId, snapshotSession);
     renderChatFooter(null);
     rememberCurrentChatSession({
       sessionId,
@@ -1084,9 +1313,12 @@ async function loadChatHistoryForSession(sessionId, opts = {}) {
     if (!boardSession) {
       persistActiveChatSelection(sessionId, snapshotSession?.projectPath || activeProjectPath());
     }
+    if (typeof updateMainHeader === "function") updateMainHeader();
     updateChatEmptyState();
     return true;
   } catch (error) {
+    if (generation !== chatHistoryGeneration
+      || (state.chatSessionId || state.pendingChatSessionId) !== sessionId) return false;
     showError(new Error(`Could not load chat history: ${error.message}`));
     return false;
   }
@@ -1140,6 +1372,7 @@ function chatRecoveryHasOptimisticTimelineState(sessionId) {
 function handleChatRecoveryRequired(payload = {}) {
   const sessionId = String(payload.sessionId || "").trim();
   if (!sessionId) return;
+  noteChatSessionEvent(sessionId);
   const selected = isActiveChatSessionEvent({ sessionId });
   const reconcileTimeline = selected && chatRecoveryHasOptimisticTimelineState(sessionId);
   const rejectedPrompt = reconcileTimeline

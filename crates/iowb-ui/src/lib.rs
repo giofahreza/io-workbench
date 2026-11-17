@@ -356,6 +356,10 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app/chat/history.js"),
         }),
+        "app/chat/render.js" => Some(UiAsset {
+            content_type: "application/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/chat/render.js"),
+        }),
         "app/chat/recovery.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app/chat/recovery.js"),
@@ -646,6 +650,7 @@ mod tests {
             "app/chat/prompt-history.js",
             "app/chat/drafts.js",
             "app/chat/history.js",
+            "app/chat/render.js",
             "app/chat/recovery.js",
             "app/chat/stream.js",
             "app/chat/settings.js",
@@ -703,8 +708,10 @@ mod tests {
     #[test]
     fn chat_history_treats_agent_content_as_sanitized_markdown_and_uses_snapshot() {
         let source = app_source();
-        assert!(source.contains("text.innerHTML = renderChatBubbleHtml(String(content));"));
-        assert!(source.contains("text.textContent = String(message?.content || \"\")"));
+        assert!(source.contains("renderChatMessageContent(text, content);"));
+        assert!(source.contains("template.innerHTML = renderChatBubbleHtml(source);"));
+        assert!(source.contains("patchChatRenderedChildren(text, template.content);"));
+        assert!(source.contains("const content = String(message?.content || \"\");"));
         assert!(!source.contains("text.innerHTML = content"));
         assert!(!source.contains("text.innerHTML = prompt"));
         assert!(source.contains("/snapshot?${query}"));
@@ -835,12 +842,13 @@ mod tests {
         );
         assert!(source.contains("delete state.chatOutputBuffersBySession[sid];"));
         assert!(session_picker.contains("preserveActiveChatStreamSnapshot();"));
-        assert!(
-            snapshot_loader
-                .contains("const preservedStream = preserveActiveChatStreamSnapshot(sessionId);")
-        );
+        // A history request must not capture and later restore an obsolete live
+        // buffer over websocket output received while it was awaiting I/O.
+        assert!(!snapshot_loader.contains("const preservedStream ="));
+        assert!(snapshot_loader.contains("chatSessionEventVersion(sessionId) !== eventVersion"));
         assert!(snapshot_loader.contains("const replayMessages = split.messages;"));
-        assert!(snapshot_loader.contains("restoreChatStreamSnapshot(sessionId, streamSnapshot);"));
+        assert!(snapshot_loader.contains("buffer: state.chatOutputBuffersBySession[sessionId]"));
+        assert!(snapshot_loader.contains("if (!snapshotLive && !newerEvents)"));
     }
 
     #[test]
@@ -1128,7 +1136,7 @@ mod tests {
         assert!(source.contains("Copy prompt"));
         assert!(source.contains("Copy response"));
         assert!(source.contains("withoutChatToolTelemetrySections(content)"));
-        assert!(source.contains("replayChatMessages(replayMessages, {"));
+        assert!(source.contains("reconcileChatMessages(replayMessages, {"));
         assert!(styles.contains(".chat-response-header"));
         assert!(styles.contains(".chat-line-assistant .chat-line-actions"));
     }

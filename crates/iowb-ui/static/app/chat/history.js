@@ -1,6 +1,7 @@
 function resetChatOutputDom() {
   const output = qs("#chat-output");
   if (output) output.innerHTML = "";
+  resetChatViewport();
   chatStream = { role: null, node: null, text: null, buffer: "" };
   state.chatProcessing = null;
   state.chatBuffer = "";
@@ -15,6 +16,10 @@ let chatStream = { role: null, node: null, text: null, buffer: "" };
 const CHAT_HISTORY_PAGE_SIZE = 30;
 const CHAT_LIVE_RENDER_MAX_CHARS = 128 * 1024;
 let chatHistoryWindow = { sessionId: "", offset: 0, totalCount: 0, messages: [] };
+let chatHistoryGeneration = 0;
+let chatHistoryDemandSessionId = "";
+let chatOlderHistoryRequest = null;
+let chatViewportState = null;
 
 function chatOutputRoot() {
   return qs("#chat-output");
@@ -127,6 +132,7 @@ function compactChatCacheSession(session) {
   [
     "id",
     "title",
+    "titleSource",
     "summary",
     "provider",
     "__provider",
@@ -461,6 +467,10 @@ function restoreChatStreamSnapshot(sessionId, snapshot = null) {
 function renderCachedChatSession(sessionId) {
   const cached = cachedChatSession(sessionId);
   if (!cached) return false;
+  chatHistoryGeneration += 1;
+  chatHistoryDemandSessionId = "";
+  chatOlderHistoryRequest = null;
+  state.chatOlderMessagesLoadingSessionId = "";
   if (isBoardChatSession(cached.session, sessionId)) {
     state.boardChatSessionIds.add(sessionId);
     hideBoardChatSessionsFromLists();
@@ -478,6 +488,7 @@ function renderCachedChatSession(sessionId) {
   };
   resetChatOutputDom();
   replayChatMessages(messages);
+  renderOlderChatMessagesControl();
   scrollChatToBottom(true);
   if (cached.live || chatSessionIsLive(sessionId)) {
     const restored = restoreChatStreamSnapshot(sessionId, {
@@ -493,6 +504,7 @@ function renderCachedChatSession(sessionId) {
   }
   loadSessionOverridesIntoState(sessionId, cached.session);
   renderChatFooter(null);
+  if (typeof updateMainHeader === "function") updateMainHeader();
   updateChatEmptyState();
   return true;
 }
@@ -587,16 +599,187 @@ function isChatNearBottom() {
   return output.scrollHeight - output.clientHeight - output.scrollTop <= CHAT_AUTOSCROLL_THRESHOLD_PX;
 }
 
+// Following is user intent, not a consequence of the latest response height.
+// Keep native scroll anchoring; compensate only its measured residual movement.
+function chatViewportController() {
+  const output = chatOutputRoot();
+  if (!output) return null;
+  if (!chatViewportState || chatViewportState.output !== output) {
+    chatViewportState?.observer?.disconnect();
+    chatViewportState = {
+      output, sessionId: null, revision: 0, following: false, expectedTop: null,
+      frame: 0, baseline: null, inputPending: false, inputDirection: 0, inputTop: 0, observed: new Set(),
+    };
+  }
+  const controller = chatViewportState;
+  if (controller.sessionId !== (state.chatSessionId || "")) {
+    controller.sessionId = state.chatSessionId || "";
+    controller.revision += 1;
+    controller.following = isChatNearBottom();
+    controller.expectedTop = null;
+    controller.baseline = null;
+    controller.inputPending = false;
+  }
+  return controller;
+}
+
+function resetChatViewport() {
+  const controller = chatViewportState;
+  if (!controller) return;
+  controller.revision += 1;
+  if (controller.frame) cancelAnimationFrame(controller.frame);
+  controller.frame = 0;
+  controller.baseline = null;
+  controller.expectedTop = null;
+  controller.following = true;
+  controller.inputPending = false;
+  controller.inputDirection = 0;
+}
+
+function setChatViewportTop(controller, top) {
+  const output = controller.output;
+  const nextTop = Math.max(0, Math.min(top, output.scrollHeight - output.clientHeight));
+  if (Math.abs(output.scrollTop - nextTop) < 0.5) return;
+  output.scrollTop = nextTop;
+  // Scroll events are asynchronous. Ignore the resulting position, not all
+  // events in a time window (which could swallow a real wheel/scrollbar move).
+  controller.expectedTop = output.scrollTop;
+}
+
+function chatViewportAnchor(output) {
+  const bounds = output.getBoundingClientRect();
+  const top = bounds.top + output.clientTop;
+  const row = Array.from(output.children).find((child) =>
+    !child.hasAttribute("data-chat-load-older") && child.getBoundingClientRect().bottom > top
+    && child.getBoundingClientRect().top < bounds.bottom);
+  if (!row) return null;
+  const anchor = { node: row, offset: row.getBoundingClientRect().top - top };
+  // A text offset preserves the visible words when a long paragraph reflows;
+  // anchoring only the message/paragraph's top cannot do that.
+  for (const insetY of [2, 12, 24]) {
+    for (const ratioX of [0.15, 0.5, 0.85]) {
+      const x = bounds.left + output.clientLeft + output.clientWidth * ratioX;
+      const y = top + insetY;
+      let textNode;
+      let offset;
+      if (document.caretPositionFromPoint) {
+        const caret = document.caretPositionFromPoint(x, y);
+        textNode = caret?.offsetNode;
+        offset = caret?.offset;
+      } else if (document.caretRangeFromPoint) {
+        const caret = document.caretRangeFromPoint(x, y);
+        textNode = caret?.startContainer;
+        offset = caret?.startOffset;
+      }
+      if (textNode?.nodeType !== 3 || !row.contains(textNode) || !textNode.length
+        || textNode.parentElement?.closest("button, summary, .chat-line-actions")) continue;
+      const textOffset = Math.min(offset, textNode.length - 1);
+      const range = document.createRange();
+      range.setStart(textNode, textOffset);
+      range.setEnd(textNode, textOffset + 1);
+      const rect = range.getBoundingClientRect();
+      if (rect.height > 0 && rect.bottom > top && rect.top < top + 48) {
+        anchor.textNode = textNode;
+        anchor.textOffset = textOffset;
+        anchor.textTop = rect.top - top;
+        return anchor;
+      }
+    }
+  }
+  return anchor;
+}
+
+function chatViewportAnchorDelta(output, anchor) {
+  if (!anchor?.node?.isConnected || !output.contains(anchor.node)) return null;
+  const top = output.getBoundingClientRect().top + output.clientTop;
+  if (anchor.textNode?.isConnected && anchor.node.contains(anchor.textNode)
+    && anchor.textOffset < anchor.textNode.length) {
+    const range = document.createRange();
+    range.setStart(anchor.textNode, anchor.textOffset);
+    range.setEnd(anchor.textNode, anchor.textOffset + 1);
+    const rect = range.getBoundingClientRect();
+    if (rect.height > 0) return rect.top - top - anchor.textTop;
+  }
+  return anchor.node.getBoundingClientRect().top - top - anchor.offset;
+}
+
+function captureChatViewport() {
+  const controller = chatViewportController();
+  if (!controller) return null;
+  const output = controller.output;
+  return {
+    output, sessionId: controller.sessionId, revision: controller.revision,
+    following: controller.following && chatDisplaySettings().autoScrollToBottom,
+    anchor: chatViewportAnchor(output), scrollTop: output.scrollTop,
+    scrollHeight: output.scrollHeight, width: output.clientWidth, height: output.clientHeight,
+  };
+}
+
+function observeChatViewportRows(controller) {
+  if (!controller.observer) return;
+  const nodes = new Set([controller.output, ...controller.output.children]);
+  for (const node of controller.observed) {
+    if (!nodes.has(node)) controller.observer.unobserve(node);
+  }
+  for (const node of nodes) {
+    if (!controller.observed.has(node)) controller.observer.observe(node);
+  }
+  controller.observed = nodes;
+}
+
+function restoreChatViewport(snapshot, options = {}) {
+  const controller = chatViewportController();
+  if (!controller || !snapshot || snapshot.output !== controller.output
+    || snapshot.sessionId !== controller.sessionId || snapshot.revision !== controller.revision) return;
+  const forceBottom = options.forceBottom || state.chatJumpToLatestPending;
+  if (forceBottom) controller.following = true;
+  const apply = () => {
+    if (controller !== chatViewportState || snapshot.sessionId !== controller.sessionId
+      || snapshot.sessionId !== (state.chatSessionId || "")
+      || snapshot.revision !== controller.revision || !controller.output.clientHeight) return;
+    if (forceBottom || (snapshot.following && controller.following && chatDisplaySettings().autoScrollToBottom)) {
+      setChatViewportTop(controller, controller.output.scrollHeight);
+      state.chatJumpToLatestPending = false;
+    } else {
+      const delta = chatViewportAnchorDelta(controller.output, snapshot.anchor);
+      if (delta !== null) setChatViewportTop(controller, controller.output.scrollTop + delta);
+      // If the anchored content was deleted/compacted, retain the offset where
+      // possible instead of forcing the reader to either edge of the history.
+      else setChatViewportTop(controller, snapshot.scrollTop);
+    }
+  };
+  apply();
+  observeChatViewportRows(controller);
+  if (controller.frame) cancelAnimationFrame(controller.frame);
+  controller.frame = requestAnimationFrame(() => {
+    controller.frame = 0;
+    apply();
+    if (controller === chatViewportState && controller.sessionId === (state.chatSessionId || "")) {
+      controller.baseline = captureChatViewport();
+      updateChatJumpToLatestButton();
+    }
+  });
+}
+
 function scrollChatToBottom(force = false) {
-  const shouldScroll = force || state.chatJumpToLatestPending || chatDisplaySettings().autoScrollToBottom;
+  const controller = chatViewportController();
+  if (controller) observeChatViewportRows(controller);
+  const shouldScroll = force || state.chatJumpToLatestPending
+    || (controller?.following && chatDisplaySettings().autoScrollToBottom);
   if (!shouldScroll) {
     updateChatJumpToLatestButton();
     return;
   }
-  const output = chatOutputRoot();
-  if (!output) return;
-  output.scrollTop = output.scrollHeight;
+  if (!controller) return;
+  if (force || state.chatJumpToLatestPending) {
+    controller.following = true;
+    controller.revision += 1;
+    if (controller.frame) cancelAnimationFrame(controller.frame);
+    controller.frame = 0;
+  }
+  setChatViewportTop(controller, controller.output.scrollHeight);
   state.chatJumpToLatestPending = false;
+  controller.baseline = captureChatViewport();
   updateChatJumpToLatestButton();
 }
 
@@ -615,12 +798,170 @@ function jumpToLatestChatMessage() {
 }
 
 function showOlderMessagesLoading() {
+  renderOlderChatMessagesControl();
+}
+
+function renderOlderChatMessagesControl() {
   const output = chatOutputRoot();
-  if (!output || output.querySelector(".chat-history-loading")) return;
-  const row = document.createElement("div");
-  row.className = "chat-history-loading";
-  row.textContent = "Loading older messages";
-  output.prepend(row);
+  if (!output) return;
+  let row = output.querySelector("[data-chat-load-older]");
+  if (chatHistoryWindow.sessionId !== state.chatSessionId || chatHistoryWindow.offset <= 0) {
+    row?.remove();
+    return;
+  }
+  if (!row) {
+    row = document.createElement("button");
+    row.type = "button";
+    row.className = "chat-history-older";
+    row.dataset.chatLoadOlder = "true";
+    row.addEventListener("click", () => {
+      chatHistoryDemandSessionId = state.chatSessionId;
+      maybeLoadOlderChatMessages();
+    });
+    output.prepend(row);
+  }
+  const loading = state.chatOlderMessagesLoadingSessionId === state.chatSessionId;
+  row.disabled = loading;
+  row.classList.toggle("chat-history-loading", loading);
+  row.textContent = loading ? "Loading older messages" : "Load older messages";
+  if (output.firstElementChild !== row) output.prepend(row);
+}
+
+function requestOlderChatMessagesDemand() {
+  if (state.chatOlderMessagesLoadingSessionId) return;
+  chatHistoryDemandSessionId = state.chatSessionId || "";
+  maybeLoadOlderChatMessages();
+}
+
+function bindChatHistoryLoading(output) {
+  if (!output || output.dataset.chatViewportBound) return;
+  output.dataset.chatViewportBound = "true";
+  const controller = chatViewportController();
+  const input = (direction = 0) => {
+    const current = chatViewportController();
+    current.revision += 1;
+    current.expectedTop = null;
+    current.inputPending = true;
+    current.inputDirection = direction;
+    current.inputTop = output.scrollTop;
+    if (direction < 0) current.following = false;
+    current.baseline = null;
+    requestAnimationFrame(() => {
+      if (current === chatViewportState) current.baseline = captureChatViewport();
+    });
+  };
+  const nestedScrollerConsumes = (target, direction) => {
+    for (let node = target?.nodeType === 1 ? target : target?.parentElement;
+      node && node !== output; node = node.parentElement) {
+      if (node.scrollHeight <= node.clientHeight + 1) continue;
+      if (!/(auto|scroll)/.test(getComputedStyle(node).overflowY)) continue;
+      if (direction < 0 ? node.scrollTop > 0 : node.scrollTop + node.clientHeight < node.scrollHeight - 1) return true;
+    }
+    return false;
+  };
+  let touchY = null;
+  let touchTarget = null;
+  output.addEventListener("wheel", (event) => {
+    if (event.ctrlKey || event.defaultPrevented || !event.deltaY || Math.abs(event.deltaX) > Math.abs(event.deltaY)
+      || nestedScrollerConsumes(event.target, event.deltaY)) return;
+    input(event.deltaY);
+    if (event.deltaY > 0) chatHistoryDemandSessionId = "";
+    if (event.deltaY < 0 && output.scrollTop + event.deltaY <= CHAT_HISTORY_LOAD_THRESHOLD_PX) {
+      requestOlderChatMessagesDemand();
+    }
+  }, { passive: true });
+  output.addEventListener("touchstart", (event) => {
+    touchY = event.touches[0]?.clientY ?? null;
+    touchTarget = event.target;
+  }, { passive: true });
+  output.addEventListener("touchmove", (event) => {
+    const nextY = event.touches[0]?.clientY ?? null;
+    if (nextY !== null && touchY !== null) {
+      const direction = touchY - nextY;
+      if (direction && !nestedScrollerConsumes(touchTarget, direction)) {
+        input(direction);
+        if (direction < 0 && output.scrollTop + direction <= CHAT_HISTORY_LOAD_THRESHOLD_PX) {
+          requestOlderChatMessagesDemand();
+        } else if (direction > 0) chatHistoryDemandSessionId = "";
+      }
+    }
+    touchY = nextY;
+  }, { passive: true });
+  output.addEventListener("keydown", (event) => {
+    if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.target.closest("input, textarea, select, [contenteditable='true']")) return;
+    const up = ["ArrowUp", "PageUp", "Home"].includes(event.key) || (event.key === " " && event.shiftKey);
+    const down = ["ArrowDown", "PageDown", "End", " "].includes(event.key);
+    if ((!up && !down) || nestedScrollerConsumes(event.target, up ? -1 : 1)) return;
+    input(up ? -1 : 1);
+    if (up) {
+      requestOlderChatMessagesDemand();
+    } else chatHistoryDemandSessionId = "";
+  });
+  output.addEventListener("pointerdown", () => { input(); }, { passive: true });
+  output.addEventListener("scroll", () => {
+    const current = chatViewportController();
+    if (current.expectedTop !== null && Math.abs(output.scrollTop - current.expectedTop) < 1) {
+      current.expectedTop = null;
+      return;
+    }
+    const baseline = current.baseline;
+    const unchangedLayout = baseline && baseline.scrollHeight === output.scrollHeight
+      && baseline.width === output.clientWidth && baseline.height === output.clientHeight;
+    if (current.inputPending || unchangedLayout) {
+      const previousTop = current.inputPending ? current.inputTop : baseline.scrollTop;
+      const movingUp = current.inputDirection < 0 || output.scrollTop < previousTop - 1;
+      if (movingUp) current.following = false;
+      else if (isChatNearBottom()) current.following = true;
+      current.revision += 1;
+      current.inputPending = false;
+      current.inputDirection = 0;
+      current.expectedTop = null;
+      current.baseline = captureChatViewport();
+    }
+    updateChatJumpToLatestButton();
+  }, { passive: true });
+  output.addEventListener("keyup", () => { chatHistoryDemandSessionId = ""; });
+  for (const eventName of ["touchend", "touchcancel"]) {
+    output.addEventListener(eventName, () => {
+      touchY = null;
+      touchTarget = null;
+      chatHistoryDemandSessionId = "";
+    }, { passive: true });
+  }
+  if (!output.hasAttribute("tabindex")) output.tabIndex = 0;
+  const resized = () => {
+    const current = chatViewportController();
+    if (activeView() !== "chat" || current.frame || !output.clientHeight) return;
+    const baseline = current.baseline;
+    if (baseline) restoreChatViewport(baseline);
+    else current.baseline = captureChatViewport();
+    observeChatViewportRows(current);
+  };
+  if (typeof ResizeObserver !== "undefined") {
+    controller.observer = new ResizeObserver(resized);
+    observeChatViewportRows(controller);
+  }
+  window.visualViewport?.addEventListener("resize", resized);
+  controller.baseline = captureChatViewport();
+}
+
+function captureChatHistoryAnchor() {
+  const output = chatOutputRoot();
+  if (!output) return null;
+  const top = output.getBoundingClientRect().top;
+  const node = Array.from(output.children).find((child) => child.dataset.chatHistoryKey
+    && child.getBoundingClientRect().bottom > top);
+  return node ? { node, offset: node.getBoundingClientRect().top - top } : null;
+}
+
+function restoreChatHistoryAnchor(anchor) {
+  const output = chatOutputRoot();
+  if (!output || !anchor?.node?.isConnected) return false;
+  const controller = chatViewportState?.output === output ? chatViewportState : { output };
+  setChatViewportTop(controller, output.scrollTop + anchor.node.getBoundingClientRect().top
+    - output.getBoundingClientRect().top - anchor.offset);
+  return true;
 }
 
 function maybeLoadOlderChatMessages() {
@@ -629,6 +970,7 @@ function maybeLoadOlderChatMessages() {
   if (
     activeView() !== "chat" ||
     !sessionId ||
+    chatHistoryDemandSessionId !== sessionId ||
     state.chatOlderMessagesLoadingSessionId ||
     chatHistoryWindow.sessionId !== sessionId ||
     chatHistoryWindow.offset <= 0 ||
@@ -637,13 +979,8 @@ function maybeLoadOlderChatMessages() {
   ) {
     return;
   }
-  state.chatOlderMessagesLoadingSessionId = sessionId;
-  showOlderMessagesLoading();
-  loadChatHistoryForSession(sessionId, { older: true }).finally(() => {
-    if (state.chatOlderMessagesLoadingSessionId === sessionId) {
-      state.chatOlderMessagesLoadingSessionId = "";
-    }
-  });
+  chatHistoryDemandSessionId = "";
+  loadChatHistoryForSession(sessionId, { older: true });
 }
 
 function buildChatLineNode(role) {
@@ -681,12 +1018,18 @@ function normalizedChatMessageMeta(raw = {}) {
   };
   if (meta.sentAt) meta.sentAt = chatFooterTimestamp(meta.sentAt);
   if (meta.receivedAt) meta.receivedAt = chatFooterTimestamp(meta.receivedAt);
+  if (meta.fast !== undefined && meta.fast !== null) {
+    const fast = String(meta.fast).trim().toLowerCase();
+    meta.fast = ["true", "yes", "on", "1", "fast", "priority"].includes(fast)
+      ? true
+      : ["false", "no", "off", "0", "", "default", "standard"].includes(fast) ? false : undefined;
+  }
   return normalizeMessageMeta(meta);
 }
 
 function applyChatControlFallback(meta, fallback = {}) {
   const next = { ...meta };
-  ["cli", "model", "effort", "mode", "thinking", "fast"].forEach((field) => {
+  ["cli", "model", "effort", "mode", "thinking"].forEach((field) => {
     if (next[field] === undefined || next[field] === null || next[field] === "") {
       const value = fallback[field];
       if (value !== undefined && value !== null && value !== "") next[field] = value;
@@ -709,6 +1052,9 @@ function chatSessionControls(sessionId = state.chatSessionId, session = null, ov
 
 function chatMessageFooterMeta(message, role, controls = {}, previousPrompt = null, session = null) {
   let meta = normalizedChatMessageMeta(persistedChatMessageMeta(message));
+  if (role === "assistant" && meta.fast == null && previousPrompt) {
+    meta.fast = normalizedChatMessageMeta(persistedChatMessageMeta(previousPrompt)).fast;
+  }
   meta = applyChatControlFallback(meta, controls);
   meta.role = role;
   if (!meta.id && message?.id) meta.id = message.id;

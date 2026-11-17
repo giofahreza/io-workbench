@@ -15,6 +15,22 @@ struct ExternalSessionCache {
     records: Vec<ExternalSessionRecord>,
     message_bytes: usize,
     messages: HashMap<String, CachedExternalMessages>,
+    history_windows: HashMap<String, CachedHistoryWindow>,
+}
+
+#[derive(Clone)]
+struct CachedHistoryWindow {
+    version: Option<MessageHistoryVersion>,
+    fingerprint: Option<ExternalFileFingerprint>,
+    last_access: Instant,
+    estimated_bytes: usize,
+    value: HistoryWindowValue,
+}
+
+#[derive(Clone)]
+enum HistoryWindowValue {
+    Descriptors(Arc<Vec<ActiveContextMessageDescriptor>>),
+    Messages(Arc<Vec<ChatMessage>>),
 }
 
 #[derive(Clone)]

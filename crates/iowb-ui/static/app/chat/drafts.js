@@ -52,12 +52,24 @@ function showChatSessionConfigModal() {
   });
   modal?.querySelectorAll("[data-chat-display-setting]").forEach((input) => {
     input.addEventListener("change", () => {
-      saveChatDisplaySettings({
+      const viewport = captureChatViewport();
+      const settings = {
         expandThinking: modal.querySelector('[data-chat-display-setting="expandThinking"]')?.checked !== false,
         expandParameters: modal.querySelector('[data-chat-display-setting="expandParameters"]')?.checked !== false,
         autoScrollToBottom: modal.querySelector('[data-chat-display-setting="autoScrollToBottom"]')?.checked === true,
+      };
+      saveChatDisplaySettings(settings);
+      // Ordinary reconciliation preserves each disclosure's manual state.
+      // An explicit preference change applies locally to its own section kind,
+      // including live output, without replacing history or fetching a snapshot.
+      const setting = input.dataset.chatDisplaySetting;
+      const selector = setting === "expandThinking" ? "details.thinking-section"
+        : setting === "expandParameters" ? "details.exec-parameters" : "";
+      if (selector) chatOutputRoot()?.querySelectorAll(selector).forEach((section) => {
+        section.open = settings[setting];
       });
-      if (state.chatSessionId) loadChatHistoryForSession(state.chatSessionId).catch(showError);
+      if (setting === "autoScrollToBottom" && settings.autoScrollToBottom) scrollChatToBottom(true);
+      else restoreChatViewport(viewport);
       updateChatJumpToLatestButton();
     });
   });

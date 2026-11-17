@@ -1,6 +1,13 @@
 impl SessionManager {
     pub async fn get(&self, session_id: &str) -> Result<SessionSummary> {
-        if let Some(mut session) = self.sessions.read().await.get(session_id).cloned() {
+        // Refresh can await external discovery and read the session map again.
+        // Drop this guard before that await: a queued writer otherwise makes
+        // the recursive read deadlock on Tokio's write-preferring RwLock.
+        let cached_session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).cloned()
+        };
+        if let Some(mut session) = cached_session {
             self.refresh_summary_message_count(&mut session).await?;
             return Ok(session);
         }
@@ -340,36 +347,16 @@ impl SessionManager {
             .context_compaction_marker_timestamp(session_id, &rollover.id)?
             .or(rollover.activated_at);
 
-        let mut hidden_stored_message_ids = HashSet::new();
-        self.storage
-            .visit_assistant_messages_ordered(session_id, |message| {
-                if is_persisted_codex_live_transcript_message(&message) {
-                    hidden_stored_message_ids.insert(message.id);
-                }
-            })?;
-
-        let mut stored = Vec::new();
-        self.storage.visit_message_references_ordered(
-            session_id,
-            compacted_at,
-            |reference| {
-                if !hidden_stored_message_ids.contains(&reference.id) {
-                    stored.push(ActiveContextMessageDescriptor::from_stored_reference(reference));
-                }
-            },
-        )?;
-        if let Some(compacted_at) = compacted_at {
-            self.storage.visit_messages_after(session_id, compacted_at, |message| {
-                if !is_persisted_codex_live_transcript_message(&message) {
-                    stored.push(ActiveContextMessageDescriptor::from_message(
-                        ActiveContextMessageSource::Stored(message.id.clone()),
-                        &message,
-                    ));
-                }
-            })?;
-        }
+        let version = self.storage.message_history_version(session_id)?;
+        let Some(stored) = self
+            .stored_context_history(session_id, compacted_at, &version)
+            .await?
+        else {
+            return Ok(None);
+        };
 
         let mut external = Vec::new();
+        let mut external_descriptors = None;
         let mut external_record = None;
         let mut external_fingerprint = None;
         let mut parsed_external = None;
@@ -380,7 +367,19 @@ impl SessionManager {
         {
             let file_path = record.file_path.display().to_string();
             let fingerprint = external_file_fingerprint(&record.file_path);
-            if let Some(fingerprint) = fingerprint.as_ref() {
+            let descriptor_key = format!(
+                "external-descriptors:{}",
+                external_session_cache_key(&record)
+            );
+            if fingerprint.is_some()
+                && let Some(cached) = self.cached_history_window(&descriptor_key).await
+                && cached.fingerprint == fingerprint
+                && let HistoryWindowValue::Descriptors(descriptors) = cached.value
+            {
+                external_descriptors = Some(descriptors);
+                used_persisted_external = true;
+            }
+            if !used_persisted_external && let Some(fingerprint) = fingerprint.as_ref() {
                 let storage_fingerprint = ExternalHistoryFingerprint {
                     file_identity: fingerprint.file_identity.as_deref(),
                     file_size: fingerprint.file_size,
@@ -415,11 +414,50 @@ impl SessionManager {
                 }
                 parsed_external = Some(messages);
             }
+            if external_descriptors.is_none() {
+                let descriptors = Arc::new(external);
+                if fingerprint.is_some()
+                    && external_file_fingerprint(&record.file_path) == fingerprint
+                {
+                    self.remember_history_window(
+                        descriptor_key,
+                        None,
+                        fingerprint.clone(),
+                        HistoryWindowValue::Descriptors(descriptors.clone()),
+                    )
+                    .await;
+                }
+                external_descriptors = Some(descriptors);
+            }
             external_record = Some((record, file_path));
             external_fingerprint = fingerprint;
         }
 
-        let merged = merge_active_context_message_descriptors(stored, external, compacted_at);
+        let window_key = format!(
+            "context:{session_id}:{}:{compacted_at:?}:{}",
+            rollover.id,
+            external_record
+                .as_ref()
+                .map(|(record, _)| external_session_cache_key(record))
+                .unwrap_or_default()
+        );
+        let cached_window = self.cached_history_window(&window_key).await;
+        let merged = if let Some(cached) = cached_window
+            && cached.version.as_ref() == Some(&version)
+            && cached.fingerprint == external_fingerprint
+            && (external_record.is_none() || external_fingerprint.is_some())
+            && let HistoryWindowValue::Descriptors(descriptors) = cached.value
+        {
+            descriptors
+        } else {
+            Arc::new(merge_active_context_message_descriptors(
+                stored.as_ref().clone(),
+                external_descriptors
+                    .map(|descriptors| descriptors.as_ref().clone())
+                    .unwrap_or_default(),
+                compacted_at,
+            ))
+        };
         let total = merged.len();
         let start = offset
             .map(|offset| offset.min(total))
@@ -496,39 +534,27 @@ impl SessionManager {
             };
             messages.push(message);
         }
+        if self.storage.message_history_version(session_id)? != version
+            || self
+                .storage
+                .latest_active_context_rollover(session_id)?
+                .is_none_or(|current| current.id != rollover.id)
+            || external_record.as_ref().is_some_and(|(record, _)| {
+                external_file_fingerprint(&record.file_path) != external_fingerprint
+            })
+        {
+            return Ok(None);
+        }
+        if external_record.is_none() || external_fingerprint.is_some() {
+            self.remember_history_window(
+                window_key,
+                Some(version),
+                external_fingerprint,
+                HistoryWindowValue::Descriptors(merged),
+            )
+            .await;
+        }
         Ok(Some((messages, total)))
-    }
-
-    async fn external_messages_tail_for_session(
-        &self,
-        session_id: &str,
-        limit: usize,
-    ) -> Result<Option<(Vec<ChatMessage>, usize)>> {
-        if self.has_provider_owned_native_rollout(session_id).await? {
-            return Ok(None);
-        }
-        let Some(record) = self.external_record_for_messages(session_id).await else {
-            return Ok(None);
-        };
-        let (external, external_total) = self.external_messages_tail(&record, limit).await;
-        if external.is_empty() {
-            return Ok(None);
-        }
-        if record.summary.id == session_id {
-            return Ok(Some((external, external_total)));
-        }
-
-        let stored = self.messages(session_id)?;
-        let stored_system_count = stored
-            .iter()
-            .filter(|message| message.role == MessageRole::System)
-            .count();
-        let merged = merge_mapped_external_messages(stored, external);
-        let start = merged.len().saturating_sub(limit);
-        Ok(Some((
-            merged[start..].to_vec(),
-            external_total.saturating_add(stored_system_count),
-        )))
     }
 
     async fn external_messages_tail(

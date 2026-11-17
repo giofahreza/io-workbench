@@ -14,6 +14,7 @@ function bindForms() {
   chatBody?.addEventListener("touchend", handleChatTouchEnd, { passive: true });
   chatBody?.addEventListener("touchcancel", resetChatSwipe, { passive: true });
   const chatOutput = qs("#chat-output");
+  bindChatHistoryLoading(chatOutput);
   chatOutput?.addEventListener("scroll", () => {
     maybeLoadOlderChatMessages();
     updateChatJumpToLatestButton();
@@ -678,12 +679,14 @@ function bindForms() {
 
     // Show the user prompt in the chat with right-aligned styling, plus the
     // current overrides footer so the data below the prompt is visible.
+    const optimisticMessageId = `local-user-${Date.now()}`;
+    noteChatSessionEvent(sessionId);
     appendUserPromptToChat(prompt, {
-      cli, model, effort, mode, thinking, fast, sentAt: startedAt,
+      id: optimisticMessageId, cli, model, effort, mode, thinking, fast, sentAt: startedAt,
     });
     const currentMessages = chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.messages : [];
     const nextMessages = currentMessages.concat({
-      id: `local-user-${Date.now()}`,
+      id: optimisticMessageId,
       role: "user",
       content: prompt,
       timestamp: startedAt,
@@ -691,6 +694,8 @@ function bindForms() {
     });
     chatHistoryWindow = {
       sessionId,
+      persistedTotalCount: chatHistoryWindow.sessionId === sessionId
+        ? (chatHistoryWindow.persistedTotalCount ?? chatHistoryWindow.totalCount) : 0,
       offset: chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.offset : 0,
       totalCount: Math.max(
         chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.totalCount + 1 : nextMessages.length,

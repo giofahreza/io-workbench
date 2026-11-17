@@ -814,6 +814,73 @@
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_session_get_does_not_deadlock_with_queued_session_writer() {
+        use std::task::Poll;
+
+        let root = env::temp_dir().join(format!("iowb-session-get-lock-{}", Uuid::new_v4()));
+        let storage = Storage::open(root.join("test.db")).expect("storage");
+        let session = SessionSummary {
+            id: "external-lock-session".to_string(),
+            provider: Provider::Codex,
+            external: true,
+            project_path: root.display().to_string(),
+            active: true,
+            ..Default::default()
+        };
+        storage.upsert_session(&session).expect("stored session");
+        let sessions = SessionManager::load(storage.clone(), 10).expect("sessions");
+        let mut cache_guard = sessions.external_cache.write().await;
+        cache_guard.loaded_at = Some(Instant::now());
+        cache_guard.records = vec![ExternalSessionRecord {
+            summary: SessionSummary {
+                message_count: 7,
+                ..session.clone()
+            },
+            file_path: root.join("missing-rollout.jsonl"),
+        }];
+
+        // Stop get() at its external-cache await, after the in-memory lookup.
+        // Polling directly makes the lock ordering deterministic, without sleeps.
+        let mut lookup = Box::pin(sessions.get(&session.id));
+        assert!(
+            std::future::poll_fn(|cx| {
+                Poll::Ready(lookup.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+
+        // With the old read-guard lifetime this writer queues behind get().
+        // External refresh then tries a second read, which Tokio queues behind
+        // the writer, so neither operation can finish.
+        let mut writer = Box::pin(sessions.set_active(&session.id, false));
+        let writer_result = std::future::poll_fn(|cx| {
+            Poll::Ready(match writer.as_mut().poll(cx) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+        drop(cache_guard);
+
+        let result = timeout(Duration::from_secs(1), async {
+            let refreshed = lookup.await.expect("refreshed external session");
+            let updated = match writer_result {
+                Some(result) => result,
+                None => writer.await,
+            }
+            .expect("session writer");
+            assert_eq!(refreshed.message_count, 7);
+            assert!(!updated.active);
+        })
+        .await;
+
+        drop(sessions);
+        drop(storage);
+        std::fs::remove_dir_all(root).expect("cleanup");
+        result.expect("session lookup and queued writer must both complete");
+    }
+
     #[test]
     fn direct_ai_history_filters_and_normalizes_stored_messages() {
         let now = Utc::now();

@@ -103,14 +103,35 @@ function rememberChatRecovery(sessionId, recovery) {
   }
 }
 
+function patchChatStatusCard(output, className, sessionId, html) {
+  let card = output.querySelector(`.${className}`);
+  if (card && card.dataset.chatStatusSessionId !== sessionId) {
+    card.remove();
+    card = null;
+  }
+  if (!card) {
+    card = document.createElement("section");
+    card.className = `${className} chat-line-system`;
+    card.dataset.chatStatusSessionId = sessionId;
+  }
+  if (card._iowbStatusHtml === html) return { card, changed: false };
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  patchChatRenderedChildren(card, template.content);
+  card._iowbStatusHtml = html;
+  if (card.parentNode !== output) output.appendChild(card);
+  return { card, changed: true };
+}
+
 function renderChatRecoveryCard(sessionId = state.chatSessionId) {
   const output = chatOutputRoot();
   if (!output) return;
-  output.querySelectorAll(".chat-context-recovery").forEach((node) => node.remove());
-  const recovery = state.chatRecoveryBySession[String(sessionId || "").trim()];
-  if (!recovery || !isActiveChatSessionEvent({ sessionId })) return;
-  const card = document.createElement("section");
-  card.className = "chat-context-recovery chat-line-system";
+  const sid = String(sessionId || "").trim();
+  const recovery = state.chatRecoveryBySession[sid];
+  if (!recovery || !isActiveChatSessionEvent({ sessionId: sid })) {
+    output.querySelector(".chat-context-recovery")?.remove();
+    return;
+  }
   const busy = chatRecoveryIsStarting(recovery);
   const title = busy
     ? "Compacting context"
@@ -123,16 +144,21 @@ function renderChatRecoveryCard(sessionId = state.chatSessionId) {
   const detail = recovery.observedBytes
     ? ` Current native context: ${formatBytes(recovery.observedBytes)}; gateway limit: ${formatBytes(recovery.limitBytes || 0)}.`
     : "";
-  card.innerHTML = `<div class="chat-context-recovery-copy">
+  const html = `<div class="chat-context-recovery-copy">
       <strong>${title}</strong>
       <span>${escapeHtml(recovery.message || "The native Codex context is too large to continue safely.")}${escapeHtml(detail)}</span>
       <span>${escapeHtml(continuity)}</span>
     </div>
-    <button type="button" class="primary-action" data-chat-compact-retry${busy ? " disabled" : ""}>${busy ? "Compacting…" : "Compact & retry"}</button>`;
-  output.appendChild(card);
-  card.querySelector("[data-chat-compact-retry]")?.addEventListener("click", (event) => {
-    compactAndRetryChatContext(sessionId, event.currentTarget).catch(showError);
-  });
+    <button type="button" class="primary-action" data-chat-render-key="retry" data-chat-compact-retry${busy ? " disabled" : ""}>${busy ? "Compacting…" : "Compact & retry"}</button>`;
+  const { card, changed } = patchChatStatusCard(output, "chat-context-recovery", sid, html);
+  if (!changed) return;
+  const retry = card.querySelector("[data-chat-compact-retry]");
+  if (retry && !retry._iowbCompactBound) {
+    retry._iowbCompactBound = true;
+    retry.addEventListener("click", (event) => {
+      compactAndRetryChatContext(sid, event.currentTarget).catch(showError);
+    });
+  }
   scrollChatToBottom();
 }
 
@@ -160,9 +186,6 @@ async function compactAndRetryChatContext(sessionId, button = null) {
       }),
     });
     if (!attemptIsCurrent()) return;
-    const isTransportFailure = !error?.status
-      || /socket|timeout|network|fetch failed/i.test(String(error?.message || error));
-    if (isTransportFailure && await reconcileTimedOutChatRecovery(sid, recovery, requestId)) return;
     recovery.pending = false;
     const responseState = String(response?.state || "starting").toLowerCase();
     recovery.state = responseState;
@@ -188,6 +211,9 @@ async function compactAndRetryChatContext(sessionId, button = null) {
     updateProcessingLabel("Compacting context");
   } catch (error) {
     if (!attemptIsCurrent()) return;
+    const isTransportFailure = !error?.status
+      || /socket|timeout|network|fetch failed/i.test(String(error?.message || error));
+    if (isTransportFailure && await reconcileTimedOutChatRecovery(sid, recovery, requestId)) return;
     recovery.pending = false;
     recovery.state = "failed";
     recovery.message = error?.message || String(error);
@@ -200,35 +226,44 @@ async function compactAndRetryChatContext(sessionId, button = null) {
 function renderChatManualCompactionCard(sessionId = state.chatSessionId) {
   const output = chatOutputRoot();
   if (!output) return;
-  output.querySelectorAll(".chat-manual-compaction").forEach((node) => node.remove());
   const sid = String(sessionId || "").trim();
   const compaction = state.chatManualCompactionBySession[sid];
-  if (!compaction || !isActiveChatSessionEvent({ sessionId: sid })) return;
+  if (!compaction || !isActiveChatSessionEvent({ sessionId: sid })) {
+    output.querySelector(".chat-manual-compaction")?.remove();
+    return;
+  }
   const busy = chatManualCompactionIsStarting(compaction);
-  const card = document.createElement("section");
-  card.className = "chat-manual-compaction chat-line-system";
   const title = busy ? "Compacting context" : "Manual compaction failed";
   const message = busy
     ? "Preparing a clean Codex context for future turns."
     : (compaction.message || "The clean-context compaction failed. Your original context mapping was kept; you can try again.");
-  card.innerHTML = `<div class="chat-manual-compaction-copy">
+  const html = `<div class="chat-manual-compaction-copy">
       <strong>${escapeHtml(title)}</strong>
       <span>${escapeHtml(message)}</span>
       <span>Your chat, URL, title, settings, draft, project, and visible messages stay unchanged.</span>
     </div>
     <div class="chat-manual-compaction-actions">
-      ${busy ? "" : `<button type="button" class="secondary-action" data-chat-manual-compact-dismiss>Dismiss</button>`}
-      <button type="button" class="primary-action" data-chat-manual-compact-retry${busy ? " disabled" : ""}>${busy ? "Compacting…" : "Try again"}</button>
+      ${busy ? "" : `<button type="button" class="secondary-action" data-chat-render-key="dismiss" data-chat-manual-compact-dismiss>Dismiss</button>`}
+      <button type="button" class="primary-action" data-chat-render-key="retry" data-chat-manual-compact-retry${busy ? " disabled" : ""}>${busy ? "Compacting…" : "Try again"}</button>
     </div>`;
-  output.appendChild(card);
-  card.querySelector("[data-chat-manual-compact-retry]")?.addEventListener("click", (event) => {
-    compactChatSessionContext(sid, event.currentTarget, { skipConfirm: true }).catch(showError);
-  });
-  card.querySelector("[data-chat-manual-compact-dismiss]")?.addEventListener("click", () => {
-    delete state.chatManualCompactionBySession[sid];
-    renderChatManualCompactionCard(sid);
-    updateChatComposerState();
-  });
+  const { card, changed } = patchChatStatusCard(output, "chat-manual-compaction", sid, html);
+  if (!changed) return;
+  const retry = card.querySelector("[data-chat-manual-compact-retry]");
+  if (retry && !retry._iowbCompactBound) {
+    retry._iowbCompactBound = true;
+    retry.addEventListener("click", (event) => {
+      compactChatSessionContext(sid, event.currentTarget, { skipConfirm: true }).catch(showError);
+    });
+  }
+  const dismiss = card.querySelector("[data-chat-manual-compact-dismiss]");
+  if (dismiss && !dismiss._iowbCompactBound) {
+    dismiss._iowbCompactBound = true;
+    dismiss.addEventListener("click", () => {
+      delete state.chatManualCompactionBySession[sid];
+      renderChatManualCompactionCard(sid);
+      updateChatComposerState();
+    });
+  }
   scrollChatToBottom();
 }
 
@@ -416,6 +451,7 @@ function acceptsOrderedChatResponseEvent(payload = {}, options = {}) {
 
 function rememberOrderedChatResponseEvent(payload = {}, options = {}) {
   const sessionId = String(payload.sessionId || "").trim();
+  if (sessionId) noteChatSessionEvent(sessionId);
   const responseId = chatEventResponseId(payload);
   const sequence = chatEventSequence(payload);
   if (!sessionId || !responseId || sequence == null) return;

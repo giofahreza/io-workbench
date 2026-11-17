@@ -457,6 +457,7 @@
   font-size: 12px;
 }
 
+#chat-output .chat-history-older,
 #chat-output .chat-history-loading {
   align-self: center;
   display: inline-flex;
@@ -473,6 +474,7 @@
 
 #chat-output .chat-history-loading::before {
   content: "";
+  box-sizing: border-box;
   width: 14px;
   height: 14px;
   border-radius: 999px;

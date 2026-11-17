@@ -1,13 +1,14 @@
 "use strict";
 
 const TOKEN_STORAGE_KEY = "iowb.token";
-const APP_VERSION = "20260928-01";
+const APP_VERSION = "20261005-02";
 const APP_MODULES = Object.freeze([
   "/app/core.js",
   "/app/sidebar.js",
   "/app/chat/prompt-history.js",
   "/app/chat/drafts.js",
   "/app/chat/history.js",
+  "/app/chat/render.js",
   "/app/chat/recovery.js",
   "/app/chat/stream.js",
   "/app/chat/settings.js",

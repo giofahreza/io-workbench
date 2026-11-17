@@ -23,6 +23,7 @@ mod tests {
     include!("core/tests/normalizers.rs");
     include!("core/tests/canonical_final_output.rs");
     include!("core/tests/context_rollover.rs");
+    include!("core/tests/history_windows.rs");
     include!("core/tests/session_recovery.rs");
     include!("core/tests/runtime_and_models.rs");
 }

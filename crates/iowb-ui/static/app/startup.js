@@ -102,6 +102,7 @@ function appendUserPromptToChat(prompt, meta) {
     chatStream.buffer = "";
   }
   const { node, text, footer } = buildChatLineNode("user");
+  if (meta?.id) node.dataset.chatHistoryKey = String(meta.id);
   text.textContent = prompt;
   attachUserChatActions(node, { content: prompt });
   renderChatLineFooter(footer, meta);
@@ -155,6 +156,7 @@ function lastChatUserPromptContent() {
 function appendChat(value, opts = {}) {
   const output = chatOutputRoot();
   if (!output) return;
+  const viewport = captureChatViewport();
   if (typeof value !== "string") value = String(value);
   state.chatBuffer = `${state.chatBuffer}${value}`.slice(-CHAT_LIVE_RENDER_MAX_CHARS);
   const sessionId = opts.sessionId || state.chatSessionId || state.pendingChatSessionId || state.currentSession?.sessionId || "";
@@ -181,8 +183,8 @@ function appendChat(value, opts = {}) {
     opts.provider || state.currentSession?.provider || chatCliValue(),
     lastChatUserPromptContent(),
   );
-  chatStream.text.innerHTML = renderChatBubbleHtml(displayContent);
-  scrollChatToBottom();
+  renderChatMessageContent(chatStream.text, displayContent);
+  restoreChatViewport(viewport);
   updateChatEmptyState();
 }
 

@@ -30,7 +30,7 @@ use iowb_protocol::{
     new_id, session_title_from_prompt,
 };
 use iowb_storage::{
-    CreateSessionForkOutcome, ExternalHistoryFingerprint, Storage, StoredChatRunAttempt,
+    CreateSessionForkOutcome, ExternalHistoryFingerprint, MessageHistoryVersion, Storage, StoredChatRunAttempt,
     StoredDurableChatRun, StoredMessageReference, StoredSessionContextRollover,
 };
 use serde_json::Value;
@@ -51,7 +51,7 @@ use codex_app_server::{
     CodexThreadSnapshot,
 };
 use external_sessions::{
-    EXTERNAL_MESSAGE_PARSER_VERSION, ExternalSessionRecord, external_file_fingerprint,
+    EXTERNAL_MESSAGE_PARSER_VERSION, ExternalFileFingerprint, ExternalSessionRecord, external_file_fingerprint,
     load_external_messages, looks_like_codex_live_transcript, same_project_path,
     sync_external_sessions, visible_user_text,
 };

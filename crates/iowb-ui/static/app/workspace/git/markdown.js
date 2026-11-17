@@ -321,6 +321,14 @@ function renderMarkdownLiteWithSections(value, options = {}) {
     ? formatAssistantMarkdownForWeb(value)
     : String(value || "").replace(/\r\n?/g, "\n");
   const lines = source.split("\n");
+  // The source start, not a changing title/body or the section's list index,
+  // identifies a disclosure while more text is streamed into it.
+  const sourceOffsets = [];
+  let sourceOffset = 0;
+  for (const line of lines) {
+    sourceOffsets.push(sourceOffset);
+    sourceOffset += line.length + 1;
+  }
   const sections = [];
   let buffer = [];
   let currentSection = null;
@@ -559,7 +567,7 @@ function renderMarkdownLiteWithSections(value, options = {}) {
     const header = fenceTicks == null ? toolSectionHeader(line) : null;
     if (header) {
       flushBuffer();
-      currentSection = { ...header, lines: [] };
+      currentSection = { ...header, sourceOffset: sourceOffsets[i], lines: [] };
       sections.push(currentSection);
       continue;
     }
@@ -569,7 +577,7 @@ function renderMarkdownLiteWithSections(value, options = {}) {
       // until the next blank line that precedes a non-thinking segment
       // (or the next structured header) belongs to the block.
       flushBuffer();
-      currentSection = { kind: "thinking", variant: "block", title: thinkingTitle, lines: [] };
+      currentSection = { kind: "thinking", variant: "block", title: thinkingTitle, sourceOffset: sourceOffsets[i], lines: [] };
       sections.push(currentSection);
       continue;
     }
@@ -594,7 +602,7 @@ function renderMarkdownLiteWithSections(value, options = {}) {
     } else if (section.kind === "thinking") {
       const body = section.lines.join("\n").trim();
       html.push(
-        `<details class="thinking-section"${chatDisplaySettingsForRender().expandThinking ? " open" : ""}>` +
+        `<details class="thinking-section" data-chat-section-key="thinking:${section.sourceOffset}"${chatDisplaySettingsForRender().expandThinking ? " open" : ""}>` +
           `<summary><span class="thinking-title">${escapeHtml(section.title || "Thinking")}</span></summary>` +
           `<div class="thinking-body">${renderMarkdownSegment(
             body || "*No reasoning captured.*"
@@ -607,7 +615,7 @@ function renderMarkdownLiteWithSections(value, options = {}) {
       const body = formatSectionBody(section);
       const open = variant === "parameters" && chatDisplaySettingsForRender().expandParameters;
       html.push(
-        `<details class="exec-section exec-${variant}"${open ? " open" : ""}>` +
+        `<details class="exec-section exec-${variant}" data-chat-section-key="${section.kind}:${section.sourceOffset}"${open ? " open" : ""}>` +
           `<summary><span class="exec-title">${escapeHtml(label)}</span></summary>` +
           `<div class="exec-body">${renderMarkdownSegment(
             body || "*No data captured.*"

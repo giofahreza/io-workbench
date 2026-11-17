@@ -255,11 +255,11 @@ impl SessionManager {
             let end = start.saturating_add(limit.clamp(1, 500)).min(total);
             return Ok((messages[start..end].to_vec(), total));
         }
-        if let Some(messages) = self.external_messages_for_session(session_id).await? {
-            let total = messages.len();
-            let start = offset.min(total);
-            let end = start.saturating_add(limit.clamp(1, 500)).min(total);
-            return Ok((messages[start..end].to_vec(), total));
+        if let Some(page) = self
+            .external_messages_window_for_session(session_id, limit.clamp(1, 500), Some(offset))
+            .await?
+        {
+            return Ok(page);
         }
         self.messages_page(session_id, limit, offset)
     }
@@ -289,7 +289,7 @@ impl SessionManager {
             return Ok((messages[start..].to_vec(), total));
         }
         if let Some((messages, total)) = self
-            .external_messages_tail_for_session(session_id, limit)
+            .external_messages_window_for_session(session_id, limit, None)
             .await?
         {
             return Ok((messages, total));

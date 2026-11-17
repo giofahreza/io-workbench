@@ -239,26 +239,33 @@ function connectWs() {
         const receivedAt = new Date().toISOString();
         const sid = payload.sessionId;
         const proj = state.preferences.chatCli || state.preferences.chatProvider || "codex";
+        // Usage may arrive after another prompt starts. Bind every message
+        // update to this completion, never to the mutable active stream.
+        const completedNode = chatStream.role === "assistant" ? chatStream.node : null;
+        const completedBuffer = state.chatBuffer;
+        const completedPrompt = lastChatUserPromptContent();
+        const completedResponseId = chatEventResponseId(payload);
+        const assistantMessageId = `local-assistant-${Date.now()}`;
         let assistantMeta = {
           cli: proj,
           model: state.preferences.chatModel || "",
           effort: state.preferences.chatEffort || "",
           mode: state.preferences.chatMode || "",
-          fast: state.preferences.chatFast ?? false,
+          fast: chatTurnFast(sid),
           receivedAt: formatReceivedDateTime(receivedAt),
         };
         const finalizeBubble = (entry) => {
-          if (chatStream.node && chatStream.role === "assistant") {
-            renderChatResponseHeader(chatStream.node, entry);
-            renderChatLineFooter(chatStream.node.querySelector(".chat-line-footer"), entry);
+          if (completedNode?.isConnected) {
+            renderChatResponseHeader(completedNode, entry);
+            renderChatLineFooter(completedNode.querySelector(".chat-line-footer"), entry);
             const copyContent = withoutChatToolTelemetrySections(
               assistantResponseContent(
-                state.chatBuffer,
+                completedBuffer,
                 entry.cli || payload.provider || chatCliValue(),
-                lastChatUserPromptContent(),
+                completedPrompt,
               ),
             );
-            attachAssistantChatActions(chatStream.node, copyContent);
+            attachAssistantChatActions(completedNode, copyContent);
           }
         };
         if (sid) {
@@ -272,7 +279,7 @@ function connectWs() {
             model: prev.model || state.preferences.chatModel || "",
             effort: prev.effort || state.preferences.chatEffort || "",
             mode: prev.mode || state.preferences.chatMode || "",
-            fast: prev.fast ?? state.preferences.chatFast ?? false,
+            fast: chatTurnFast(sid),
             receivedAt: formatReceivedDateTime(receivedAt),
           };
           if (prev.sentAt) provisional.elapsed = formatElapsed(prev.sentAt, receivedAt);
@@ -289,46 +296,51 @@ function connectWs() {
               const all2 = readSessionOverrides();
               const prev2 = all2[sid] || {};
               const persistedEntry = {
-                ...prev2,
-                cli: proj,
-                model: prev2.model || state.preferences.chatModel || "",
-                effort: prev2.effort || state.preferences.chatEffort || "",
-                mode: prev2.mode || state.preferences.chatMode || "",
-                fast: prev2.fast ?? state.preferences.chatFast ?? false,
-                receivedAt: formatReceivedDateTime(receivedAt),
+                ...provisional,
                 tokenUsage,
                 tokenUsageDetails: usage || null,
               };
-              if (prev2.sentAt) persistedEntry.elapsed = formatElapsed(prev2.sentAt, receivedAt);
-              all2[sid] = persistedEntry;
-              writeSessionOverrides(all2);
-              if (state.chatSessionId === sid || state.pendingChatSessionId === sid) {
-                finalizeBubble(persistedEntry);
+              const response = chatResponseState(sid);
+              const latestResponseId = response.activeResponseId || response.completedResponseId;
+              if (!chatSessionIsLive(sid)
+                && prev2.sentAt === provisional.sentAt
+                && (!completedResponseId || latestResponseId === completedResponseId)) {
+                all2[sid] = persistedEntry;
+                writeSessionOverrides(all2);
               }
+              finalizeBubble(persistedEntry);
+              const updateMessages = (messages) => messages.map((message) => (
+                message.id === assistantMessageId ? { ...message, metadata: persistedEntry } : message
+              ));
               if (chatHistoryWindow.sessionId === sid) {
-                const messages = chatHistoryWindow.messages.map((message) => {
-                  if (message.id !== assistantMeta.id) return message;
-                  return { ...message, metadata: persistedEntry };
-                });
-                chatHistoryWindow = { ...chatHistoryWindow, messages };
-                rememberCurrentChatSession({ sessionId: sid, messages, live: false, status: "completed" });
+                chatHistoryWindow = { ...chatHistoryWindow, messages: updateMessages(chatHistoryWindow.messages) };
+              }
+              const cached = cachedChatSession(sid);
+              if (cached) {
+                // Metadata belongs to the old message; live/status/streaming
+                // state belongs to whichever turn is current when this resolves.
+                rememberCurrentChatSession({ ...cached, messages: updateMessages(cached.messages) });
               }
             }).catch(() => {});
           }
         }
         if (sid) {
           const assistantMessage = {
-            id: `local-assistant-${Date.now()}`,
+            id: assistantMessageId,
             role: "assistant",
-            content: state.chatBuffer,
+            content: completedBuffer,
             timestamp: receivedAt,
             metadata: assistantMeta,
           };
-          assistantMeta.id = assistantMessage.id;
+          if (completedNode?.isConnected) {
+            completedNode.dataset.chatHistoryKey = assistantMessage.id;
+          }
           const currentMessages = chatHistoryWindow.sessionId === sid ? chatHistoryWindow.messages : [];
           const messages = currentMessages.concat(assistantMessage);
           chatHistoryWindow = {
             sessionId: sid,
+            persistedTotalCount: chatHistoryWindow.sessionId === sid
+              ? (chatHistoryWindow.persistedTotalCount ?? chatHistoryWindow.totalCount) : 0,
             offset: chatHistoryWindow.sessionId === sid ? chatHistoryWindow.offset : 0,
             totalCount: Math.max(
               chatHistoryWindow.sessionId === sid ? chatHistoryWindow.totalCount + 1 : messages.length,
@@ -372,7 +384,7 @@ function connectWs() {
           effort: payload.effort ?? prev.effort ?? state.preferences.chatEffort ?? "",
           mode: payload.mode ?? prev.mode ?? state.preferences.chatMode ?? "",
           thinking: payload.thinking ?? prev.thinking ?? state.preferences.chatThinking ?? false,
-          fast: payload.fast ?? prev.fast ?? state.preferences.chatFast ?? false,
+          fast: payload.fast ?? chatTurnFast(sid),
           receivedAt: formatReceivedDateTime(receivedAt),
           tokenUsage,
           tokenUsageDetails,
