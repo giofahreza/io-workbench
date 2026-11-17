@@ -3,6 +3,100 @@ struct TransferSourceSnapshot {
     rows: Vec<Map<String, Value>>,
 }
 
+const PORTABLE_SCHEMA_LIMITATIONS: &str = "Portable schema copies preserve basic column types, nullability, and primary keys only. Defaults, generated/identity behavior, secondary indexes, foreign keys, triggers, and comments are not preserved.";
+
+// A transfer must not page a changing source between target writes. Spooling a
+// single SELECT keeps the database's statement snapshot without retaining the
+// whole table in memory or holding its transaction open during a slow import.
+struct TransferSourceSpool {
+    file: Option<std::io::BufReader<std::fs::File>>,
+    path: PathBuf,
+    row_count: usize,
+}
+
+impl Drop for TransferSourceSpool {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+impl TransferSourceSpool {
+    fn read_batch(&mut self) -> Result<Vec<Map<String, Value>>> {
+        use std::io::BufRead;
+        let mut rows = Vec::with_capacity(TRANSFER_ROW_BATCH_SIZE);
+        for _ in 0..TRANSFER_ROW_BATCH_SIZE {
+            let mut line = String::new();
+            if self.file.as_mut().expect("open transfer snapshot").read_line(&mut line).map_err(io_server_error)? == 0 {
+                break;
+            }
+            rows.push(serde_json::from_str(&line).map_err(|error| {
+                ServerError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot read transfer snapshot: {error}"))
+            })?);
+        }
+        Ok(rows)
+    }
+}
+
+async fn spool_transfer_source(
+    connection: &StoredDatabaseConnection,
+    endpoint: &DatabaseTransferEndpoint,
+) -> Result<TransferSourceSpool> {
+    use std::io::{Seek, Write};
+    let path = std::env::temp_dir().join(format!("{}.jsonl", new_id("iowb-transfer")));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).map_err(io_server_error)?;
+    let mut spool = TransferSourceSpool { file: Some(std::io::BufReader::new(file)), path, row_count: 0 };
+    // Keep only an open descriptor on Unix, including if the process crashes.
+    #[cfg(unix)]
+    std::fs::remove_file(&spool.path).map_err(io_server_error)?;
+    {
+        let mut writer = std::io::BufWriter::new(spool.file.as_mut().expect("open transfer snapshot").get_mut());
+        let mut write_row = |row: Map<String, Value>| -> Result<()> {
+            serde_json::to_writer(&mut writer, &row).map_err(|error| {
+                ServerError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("Cannot stage transfer row: {error}"))
+            })?;
+            writer.write_all(b"\n").map_err(io_server_error)?;
+            spool.row_count += 1;
+            Ok(())
+        };
+        if connection.profile.db_type == SupportedDatabaseType::Sqlite {
+            let conn = sqlite_connection(connection)?;
+            let mut stmt = conn.prepare(&format!("SELECT * FROM {}", quote_identifier(&endpoint.table_name))).map_err(sqlite_server_error)?;
+            let columns = stmt.column_names().into_iter().map(str::to_string).collect::<Vec<_>>();
+            let mut rows = stmt.query([]).map_err(sqlite_server_error)?;
+            while let Some(row) = rows.next().map_err(sqlite_server_error)? {
+                write_row(row_to_json_map(row, &columns)?)?;
+            }
+        } else {
+            let sql = format!("SELECT * FROM {}", transfer_table_ref(connection.profile.db_type, endpoint));
+            match typed_live_pool_for_database(connection, endpoint.database_name.as_deref()).await? {
+                TypedLivePool::Postgresql(pool) => {
+                    let mut rows = sqlx::raw_sql(&sql).fetch(&pool);
+                    while let Some(row) = rows.next().await {
+                        write_row(postgres_row_to_json_map(&row.map_err(sqlx_server_error)?))?;
+                    }
+                }
+                TypedLivePool::Mysql(pool) => {
+                    let mut rows = sqlx::raw_sql(&sql).fetch(&pool);
+                    while let Some(row) = rows.next().await {
+                        write_row(mysql_row_to_json_map(&row.map_err(sqlx_server_error)?))?;
+                    }
+                }
+            }
+        }
+        writer.flush().map_err(io_server_error)?;
+    }
+    spool.file.as_mut().expect("open transfer snapshot").rewind().map_err(io_server_error)?;
+    Ok(spool)
+}
+
 fn append_transfer_job_log<F>(
     job: &mut DatabaseTransferJob,
     level: &str,
@@ -23,18 +117,94 @@ fn append_transfer_job_log<F>(
     persist_job(job);
 }
 
-fn set_transfer_job_progress<F>(
+fn set_transfer_job_phase<F>(
     job: &mut DatabaseTransferJob,
-    current: usize,
-    total: usize,
     message: impl AsRef<str>,
     persist_job: &mut F,
 ) where
     F: FnMut(&DatabaseTransferJob),
 {
-    job.progress = progress(current, total, message.as_ref());
+    // Setup steps have no meaningful row denominator. Do not mix their step
+    // count with the later row percentage (for example, 75% -> 200/401=50%).
+    job.progress = serde_json::json!({"message": message.as_ref()});
     job.updated_at = Utc::now();
     persist_job(job);
+}
+
+fn transfer_copy_progress(current: usize, total: usize, copied: usize, failed: usize) -> Value {
+    let percentage = if total == 0 {
+        0
+    } else {
+        let rounded = ((current as f64 / total as f64) * 100.0).round() as usize;
+        // Rounding 400/401 to 100 must not imply that the last row is done.
+        rounded.min(if current < total { 99 } else { 100 })
+    };
+    serde_json::json!({
+        "current": current,
+        "total": total,
+        "percentage": percentage,
+        "message": format!("Copying row data: {current} of {total} row(s) processed; {copied} copied, {failed} failed"),
+    })
+}
+
+fn transfer_copy_checkpoint_due(
+    processed: usize,
+    batch_finished: bool,
+    elapsed: std::time::Duration,
+) -> bool {
+    processed == 1 || batch_finished || elapsed >= std::time::Duration::from_millis(500)
+}
+
+fn transfer_value_for_target_column(column: &DatabaseObjectColumn, value: Value) -> Value {
+    let is_boolean = column.native_type.as_deref().or(column.data_type.as_deref())
+        .is_some_and(|kind| matches!(kind.to_ascii_lowercase().as_str(), "bool" | "boolean"));
+    if is_boolean {
+        // SQLite and MySQL expose Boolean storage as numeric0/1. PostgreSQL
+        // accepts TRUE/FALSE, not an integer assignment to BOOLEAN. Normalize
+        // only these exact values; 2/-1/fractions must still fail validation,
+        // and SQL NULL, strings, arrays and unrelated columns retain their type.
+        match value.as_i64() {
+            Some(0) => return Value::Bool(false),
+            Some(1) => return Value::Bool(true),
+            _ => {}
+        }
+    }
+    value
+}
+
+fn transfer_value_for_column_mapping(
+    source: Option<&DatabaseObjectColumn>,
+    target: &DatabaseObjectColumn,
+    value: Value,
+) -> Value {
+    let source_is_json = source.and_then(|column| column.native_type.as_deref().or(column.data_type.as_deref()))
+        .is_some_and(|kind| matches!(kind.to_ascii_lowercase().as_str(), "json" | "jsonb"));
+    let target_is_text = target.native_type.as_deref().or(target.data_type.as_deref())
+        .is_some_and(|kind| {
+            let kind = kind.to_ascii_lowercase();
+            matches!(kind.as_str(), "text" | "tinytext" | "mediumtext" | "longtext" | "char" | "varchar" | "character" | "character varying")
+                || kind.starts_with("varchar(") || kind.starts_with("char(")
+                || kind.starts_with("character varying(") || kind.starts_with("character(")
+        });
+    if target_is_text && source.is_some_and(|column| transfer_unsigned_integer_width(column) == Some(64)) {
+        // SQLite parses unquoted integers above i64::MAX through REAL before
+        // applying TEXT affinity, losing digits. Quote the exact decimal token.
+        // This also preserves u64 values copied into existing text columns.
+        if let Value::Number(number) = &value {
+            return Value::String(number.to_string());
+        }
+    }
+    if source_is_json && target_is_text {
+        // JSON true inserted as SQL TRUE into SQLite TEXT becomes "1", which
+        // is a JSON number, not a Boolean. Preserve the source JSON document.
+        // Strings from the database decoder are already encoded JSON text
+        // (including JSON null and string scalars); never double-encode them.
+        return match value {
+            Value::Null | Value::String(_) => value,
+            _ => Value::String(value.to_string()),
+        };
+    }
+    transfer_value_for_target_column(target, value)
 }
 
 fn add_transfer_job_warning<F>(
@@ -67,6 +237,12 @@ where
     let source = job.source.clone();
     let target = job.target.clone();
     let mode = job.mode;
+    set_transfer_job_phase(job, "Opening connections", persist_job);
+
+    if mode != DatabaseTransferMode::TableCopy {
+        add_transfer_job_warning(job, PORTABLE_SCHEMA_LIMITATIONS, None,
+            Some("SCHEMA_PORTABILITY_LIMITATIONS".to_string()), persist_job);
+    }
 
     append_transfer_job_log(
         job,
@@ -75,7 +251,6 @@ where
         None,
         persist_job,
     );
-    set_transfer_job_progress(job, 0, 4, "Opening connections", persist_job);
     append_transfer_job_log(
         job,
         "info",
@@ -87,7 +262,7 @@ where
         )),
         persist_job,
     );
-    set_transfer_job_progress(job, 1, 4, "Inspecting source table", persist_job);
+    set_transfer_job_phase(job, "Inspecting source table", persist_job);
 
     let source_metadata = database_table_metadata(
         source_connection,
@@ -118,18 +293,33 @@ where
         persist_job,
     );
 
-    for column in &source_metadata.columns {
-        if column.default_value.is_some() {
-            add_transfer_job_warning(
-                job,
-                format!("Skipped default value mapping for column {}", column.name),
-                Some(column.name.clone()),
-                Some("DEFAULT_SKIPPED".to_string()),
-                persist_job,
-            );
+    // Row-only copies retain the existing target schema and defaults. Only
+    // portable schema creation can omit a source default definition.
+    if mode != DatabaseTransferMode::TableCopy {
+        for column in &source_metadata.columns {
+            if column.default_value.is_some() {
+                add_transfer_job_warning(
+                    job,
+                    format!("Skipped default value mapping for column {}", column.name),
+                    Some(column.name.clone()),
+                    Some("DEFAULT_SKIPPED".to_string()),
+                    persist_job,
+                );
+            }
         }
     }
 
+    // Capture one read snapshot before any target writes. OFFSET reads taken
+    // between inserts can consume their own output through a connection alias,
+    // or skip/duplicate rows when another client changes the source.
+    let source_snapshot = if mode != DatabaseTransferMode::SchemaOnly {
+        set_transfer_job_phase(job, "Reading source snapshot", persist_job);
+        Some(spool_transfer_source(source_connection, &source).await?)
+    } else {
+        None
+    };
+
+    set_transfer_job_phase(job, "Checking target table", persist_job);
     let target_exists = transfer_target_exists(target_connection, &target).await?;
     let mut created_table = false;
     match mode {
@@ -154,7 +344,7 @@ where
             ));
         }
         DatabaseTransferMode::SchemaOnly | DatabaseTransferMode::SchemaAndData => {
-            set_transfer_job_progress(job, 2, 4, "Preparing target table", persist_job);
+            set_transfer_job_phase(job, "Preparing target table", persist_job);
             create_transfer_target_table(target_connection, &target, &source_metadata.columns)
                 .await?;
             created_table = true;
@@ -169,6 +359,14 @@ where
         DatabaseTransferMode::TableCopy => {}
     }
 
+    // Persist the surviving table even if later mapping or insertion fails.
+    job.result = Some(DatabaseTransferJobResult {
+        created_table, copied_row_count: 0, failed_row_count: 0,
+        ignored_source_columns: Vec::new(), mapped_column_count: 0,
+        column_failures: Vec::new(), row_failures: Vec::new(),
+    });
+    persist_job(job);
+
     if mode == DatabaseTransferMode::SchemaOnly {
         return Ok(DatabaseTransferJobResult {
             created_table,
@@ -181,7 +379,7 @@ where
         });
     }
 
-    set_transfer_job_progress(job, 3, 4, "Loading target table metadata", persist_job);
+    set_transfer_job_phase(job, "Loading target table metadata", persist_job);
     let target_metadata = database_table_metadata(
         target_connection,
         target.database_name.as_deref(),
@@ -194,7 +392,7 @@ where
         .iter()
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
-    let mappings = build_column_mappings(&source_column_names, &target_metadata.columns);
+    let mappings = build_column_mappings(&source_column_names, &target_metadata.columns)?;
     let used_source_columns = mappings
         .iter()
         .map(|(_, source_name)| source_name.clone())
@@ -274,43 +472,52 @@ where
                 .cloned()
         })
         .collect::<Vec<_>>();
+    let mapped_source_columns = mappings.iter().map(|(_, name)| {
+        source_metadata.columns.iter().find(|column| column.name == *name)
+    }).collect::<Vec<_>>();
     let mut copied_row_count = 0usize;
     let mut failed_row_count = 0usize;
     let mut row_failures = Vec::new();
     let mut processed_row_count = 0usize;
-    let mut total_row_count = 0usize;
+    let mut source_rows = source_snapshot.expect("data transfer snapshot");
+    let total_row_count = source_rows.row_count;
     let mut offset = 0usize;
+    job.result = Some(DatabaseTransferJobResult {
+        created_table, copied_row_count, failed_row_count,
+        ignored_source_columns: ignored_source_columns.clone(), mapped_column_count: mappings.len(),
+        column_failures: Vec::new(), row_failures: Vec::new(),
+    });
+    job.progress = transfer_copy_progress(0, total_row_count, 0, 0);
+    job.updated_at = Utc::now();
+    persist_job(job);
+    let mut last_checkpoint = std::time::Instant::now();
 
     loop {
-        let page = read_transfer_source_page(
-            source_connection,
-            &source,
-            TRANSFER_ROW_BATCH_SIZE,
-            offset,
-            offset == 0,
-        )
-        .await?;
-        if let Some(total) = page.total_row_count {
-            total_row_count = total;
-        }
-        let page_row_count = page.rows.len();
-        if page_row_count == 0 {
-            break;
-        }
-
-        for (page_row_index, source_row) in page.rows.iter().enumerate() {
-            let mapped_row = mappings
-                .iter()
-                .map(|(target_name, source_name)| {
+        let page = source_rows.read_batch()?;
+        if page.is_empty() { break; }
+        let page_row_count = page.len();
+        for (page_row_index, source_row) in page.iter().enumerate() {
+            let mapped_row = mapped_columns.iter().zip(&mappings).zip(&mapped_source_columns)
+                .map(|((column, (target_name, source_name)), source_column)| {
                     (
                         target_name.clone(),
-                        source_row.get(source_name).cloned().unwrap_or(Value::Null),
+                        transfer_value_for_column_mapping(*source_column, column,
+                            source_row.get(source_name).cloned().unwrap_or(Value::Null)),
                     )
                 })
                 .collect::<Map<_, _>>();
             match insert_transfer_rows(target_connection, &target, &mapped_columns, &[mapped_row])
                 .await
             {
+                Ok(0) => {
+                    failed_row_count += 1;
+                    if row_failures.len() < MAX_ROW_FAILURE_DETAILS {
+                        row_failures.push(serde_json::json!({
+                            "rowIndex": offset + page_row_index,
+                            "message": database_error_message(&database_insert_suppressed()),
+                        }));
+                    }
+                }
                 Ok(count) => copied_row_count += count,
                 Err(error) => {
                     failed_row_count += 1;
@@ -323,30 +530,36 @@ where
                     }
                 }
             }
+            // Advance only after an acknowledged outcome. A slow first batch
+            // must not leave the job claiming it is still loading metadata.
+            // Persist result + progress together, bounded by time/batch size;
+            // crash recovery still warns about writes after the last checkpoint.
+            processed_row_count += 1;
+            if transfer_copy_checkpoint_due(
+                processed_row_count,
+                page_row_index + 1 == page_row_count,
+                last_checkpoint.elapsed(),
+            ) {
+                job.result = Some(DatabaseTransferJobResult {
+                    created_table, copied_row_count, failed_row_count,
+                    ignored_source_columns: ignored_source_columns.clone(), mapped_column_count: mappings.len(),
+                    column_failures: Vec::new(), row_failures: row_failures.clone(),
+                });
+                job.progress = transfer_copy_progress(
+                    processed_row_count, total_row_count, copied_row_count, failed_row_count,
+                );
+                job.updated_at = Utc::now();
+                persist_job(job);
+                last_checkpoint = std::time::Instant::now();
+            }
         }
 
-        processed_row_count = processed_row_count.saturating_add(page_row_count);
         offset = offset.checked_add(page_row_count).ok_or_else(|| {
             ServerError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "table row offset overflow",
             )
         })?;
-        let progress_total = total_row_count.max(processed_row_count).max(1);
-        set_transfer_job_progress(
-            job,
-            processed_row_count,
-            progress_total,
-            format!(
-                "Copied {} of {} row(s)",
-                processed_row_count, progress_total
-            ),
-            persist_job,
-        );
-
-        if !page.has_more {
-            break;
-        }
     }
 
     if failed_row_count > 0 {
@@ -433,31 +646,11 @@ async fn read_transfer_source(
         DatabaseObjectType::Table,
     )
     .await?;
-    let mut rows = Vec::new();
-    let mut offset = 0usize;
-    loop {
-        let page = read_live_table_data(
-            connection,
-            endpoint.database_name.as_deref(),
-            endpoint.schema_name.as_deref(),
-            &endpoint.table_name,
-            TRANSFER_ROW_BATCH_SIZE,
-            offset,
-            false,
-        )
-        .await?;
-        let page_row_count = page.rows.len();
-        rows.extend(page.rows);
-        if !page.has_more || page_row_count == 0 {
-            break;
-        }
-        offset = offset.checked_add(page_row_count).ok_or_else(|| {
-            ServerError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "table row offset overflow",
-            )
-        })?;
-    }
+    let rows = fetch_live_row_maps(
+        connection,
+        endpoint.database_name.as_deref(),
+        &format!("SELECT * FROM {}", transfer_table_ref(connection.profile.db_type, endpoint)),
+    ).await?;
     Ok(TransferSourceSnapshot {
         columns: table.columns,
         rows,
@@ -517,6 +710,7 @@ async fn ensure_transfer_target_schema(
         "CREATE SCHEMA IF NOT EXISTS {}",
         quote_identifier(schema_name)
     );
+    validate_database_mutation_text(connection.profile.db_type, &sql)?;
     pool.execute(sql.as_str())
         .await
         .map_err(sqlx_server_error)?;
@@ -529,6 +723,7 @@ async fn create_transfer_target_table(
     columns: &[DatabaseObjectColumn],
 ) -> Result<()> {
     let sql = build_transfer_create_table_sql(connection.profile.db_type, endpoint, columns);
+    validate_database_mutation_text(connection.profile.db_type, &sql)?;
     if connection.profile.db_type == SupportedDatabaseType::Sqlite {
         let conn = sqlite_transfer_target_connection(connection)?;
         conn.execute_batch(&sql).map_err(sqlite_server_error)?;
@@ -553,25 +748,36 @@ async fn insert_transfer_rows(
         return Ok(0);
     }
 
+    for row in rows {
+        for column in columns {
+            if let Some(value) = row.get(&column.name) {
+                validate_database_binary_value(column, value)?;
+            }
+        }
+    }
+
     if connection.profile.db_type == SupportedDatabaseType::Sqlite {
         let mut conn = sqlite_transfer_target_connection(connection)?;
         let tx = conn.transaction().map_err(sqlite_server_error)?;
+        let mut inserted = 0usize;
         for row in rows {
             let sql = build_transfer_insert_sql(connection.profile.db_type, endpoint, columns, row);
-            tx.execute(&sql, []).map_err(sqlite_server_error)?;
+            inserted += tx.execute(&sql, []).map_err(sqlite_server_error)?;
         }
         tx.commit().map_err(sqlite_server_error)?;
-        return Ok(rows.len());
+        return Ok(inserted);
     }
 
     let pool = live_pool_for_database(connection, endpoint.database_name.as_deref()).await?;
+    let mut inserted = 0usize;
     for row in rows {
         let sql = build_transfer_insert_sql(connection.profile.db_type, endpoint, columns, row);
-        pool.execute(sql.as_str())
+        validate_database_mutation_text(connection.profile.db_type, &sql)?;
+        inserted += pool.execute(sql.as_str())
             .await
-            .map_err(sqlx_server_error)?;
+            .map_err(sqlx_server_error)?.rows_affected() as usize;
     }
-    Ok(rows.len())
+    Ok(inserted)
 }
 
 fn build_transfer_create_table_sql(
@@ -595,7 +801,9 @@ fn build_transfer_create_table_sql(
         if single_primary_key && column.is_primary_key {
             definition.push_str(" PRIMARY KEY");
         }
-        if column.nullable == Some(false) && !(single_primary_key && column.is_primary_key) {
+        // A SQLite text PRIMARY KEY does not imply NOT NULL. Preserve the
+        // source constraint explicitly, including on single-column keys.
+        if column.nullable == Some(false) {
             definition.push_str(" NOT NULL");
         }
         definitions.push(definition);
@@ -624,6 +832,10 @@ fn build_transfer_insert_sql(
     columns: &[DatabaseObjectColumn],
     row: &Map<String, Value>,
 ) -> String {
+    let metadata = DatabaseTableMetadata {
+        columns: columns.to_vec(),
+        primary_key: Vec::new(),
+    };
     let column_names = columns
         .iter()
         .map(|column| quote_transfer_identifier(db_type, &column.name))
@@ -633,7 +845,7 @@ fn build_transfer_insert_sql(
         .iter()
         .map(|column| {
             row.get(&column.name)
-                .map(|value| transfer_value_literal(db_type, value))
+                .map(|value| database_row_value_literal(db_type, &metadata, &column.name, value))
                 .unwrap_or_else(|| "NULL".to_string())
         })
         .collect::<Vec<_>>()
@@ -684,6 +896,23 @@ fn transfer_column_type(
     db_type: SupportedDatabaseType,
     column: &DatabaseObjectColumn,
 ) -> &'static str {
+    if let Some(width) = transfer_unsigned_integer_width(column) {
+        return match db_type {
+            SupportedDatabaseType::Mysql | SupportedDatabaseType::Mariadb => match width {
+                8 => "TINYINT UNSIGNED",
+                16 => "SMALLINT UNSIGNED",
+                24 => "MEDIUMINT UNSIGNED",
+                32 => "INT UNSIGNED",
+                _ => "BIGINT UNSIGNED",
+            },
+            SupportedDatabaseType::Postgresql => match width {
+                64 => "NUMERIC(20, 0)",
+                32 => "BIGINT",
+                _ => "INTEGER",
+            },
+            SupportedDatabaseType::Sqlite => if width == 64 { "TEXT" } else { "INTEGER" },
+        };
+    }
     let native = column
         .native_type
         .as_deref()
@@ -780,14 +1009,30 @@ fn transfer_column_type(
     }
 }
 
+fn transfer_unsigned_integer_width(column: &DatabaseObjectColumn) -> Option<u8> {
+    let native = column.native_type.as_deref().or(column.data_type.as_deref())?.to_ascii_lowercase();
+    let tokens = native.split(|character: char| !character.is_ascii_alphanumeric()).collect::<Vec<_>>();
+    if !tokens.contains(&"unsigned") && !tokens.contains(&"zerofill") {
+        return None;
+    }
+    match tokens.first().copied() {
+        Some("tinyint") => Some(8),
+        Some("smallint") => Some(16),
+        Some("mediumint") => Some(24),
+        Some("int" | "integer") => Some(32),
+        Some("bigint") => Some(64),
+        _ => None,
+    }
+}
+
 fn transfer_value_literal(db_type: SupportedDatabaseType, value: &Value) -> String {
     if let Some(encoded) = database_buffer_base64(value) {
         return match db_type {
             SupportedDatabaseType::Postgresql => {
-                format!("decode('{encoded}', 'base64')")
+                format!("decode({}, 'base64')", database_text_literal(db_type, encoded))
             }
             SupportedDatabaseType::Mysql | SupportedDatabaseType::Mariadb => {
-                format!("FROM_BASE64('{encoded}')")
+                format!("FROM_BASE64({})", database_text_literal(db_type, encoded))
             }
             SupportedDatabaseType::Sqlite => BASE64_STANDARD
                 .decode(encoded)
@@ -1094,11 +1339,15 @@ fn sqlite_server_error(error: rusqlite::Error) -> ServerError {
 fn sqlx_server_error(error: sqlx::Error) -> ServerError {
     let vendor_code = match &error {
         sqlx::Error::Database(database_error) => database_error
-            .code()
-            .map(|code| normalize_sqlx_vendor_code(code.as_ref()).to_string()),
+            .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+            .map(|error| normalize_sqlx_vendor_code(&error.number().to_string()).to_string())
+            .or_else(|| database_error.code().map(|code| normalize_sqlx_vendor_code(code.as_ref()).to_string())),
         _ => None,
     };
-    let message = error.to_string();
+    let mut message = error.to_string();
+    if vendor_code.as_deref() == Some("ER_DUP_ENTRY") {
+        message = redact_duplicate_entry_value(&message);
+    }
     let normalized = message.to_ascii_lowercase();
     let code = vendor_code.unwrap_or_else(|| {
         if normalized.contains("connection refused") {
@@ -1145,6 +1394,14 @@ fn sqlx_server_error(error: sqlx::Error) -> ServerError {
         category,
         retryable,
     )
+}
+
+fn redact_duplicate_entry_value(message: &str) -> String {
+    let constraint = message.rsplit_once(" for key ").map(|(_, key)| key);
+    match constraint {
+        Some(key) => format!("Duplicate key violates unique constraint {key}"),
+        None => "Duplicate key violates a unique constraint".to_string(),
+    }
 }
 
 fn normalize_sqlx_vendor_code(code: &str) -> &str {

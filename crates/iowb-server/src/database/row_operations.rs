@@ -55,11 +55,67 @@ async fn database_table_metadata(
     })
 }
 
+async fn ensure_postgres_mutation_privilege_when_primary_key_hidden(
+    connection: &StoredDatabaseConnection,
+    scope: &DatabaseTableScopeRequest,
+    update: bool,
+) -> Result<()> {
+    if connection.profile.db_type != SupportedDatabaseType::Postgresql {
+        return Ok(());
+    }
+    // PostgreSQL's information_schema constraint views can hide the real PK
+    // after UPDATE/DELETE grants are revoked. Keep normal metadata/read-only UI
+    // semantics, but do not misdiagnose denied writes as a table without a PK.
+    let (database, schema) = live_scope(
+        connection,
+        scope.database_name.as_deref(),
+        scope.schema_name.as_deref(),
+    );
+    let TypedLivePool::Postgresql(pool) =
+        typed_live_pool_for_database(connection, Some(&database)).await?
+    else {
+        unreachable!("PostgreSQL connection requires PostgreSQL pool")
+    };
+    let permitted: Option<bool> = sqlx::query_scalar(
+        "SELECT CASE WHEN $3 THEN \
+           has_table_privilege(relation.oid, 'UPDATE') OR \
+           has_any_column_privilege(relation.oid, 'UPDATE') \
+         ELSE has_table_privilege(relation.oid, 'DELETE') END \
+         FROM pg_catalog.pg_class relation \
+         JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace \
+         WHERE namespace.nspname=$1 AND relation.relname=$2",
+    )
+    .bind(schema)
+    .bind(&scope.table_name)
+    .bind(update)
+    .fetch_optional(&pool)
+    .await
+    .map_err(sqlx_server_error)?;
+    let permitted = permitted
+        .ok_or_else(|| ServerError::new(StatusCode::NOT_FOUND, "Table not found"))?;
+    if !permitted {
+        return Err(ServerError::database(
+            StatusCode::FORBIDDEN,
+            if update {
+                "Permission denied: UPDATE privileges are required to edit rows."
+            } else {
+                "Permission denied: DELETE privileges are required to delete rows."
+            },
+            None,
+            "42501",
+            "permission",
+            false,
+        ));
+    }
+    Ok(())
+}
+
 fn build_column_mappings(
     source_columns: &[String],
     target_columns: &[DatabaseObjectColumn],
-) -> Vec<(String, String)> {
-    target_columns
+) -> Result<Vec<(String, String)>> {
+    let mut mappings = Vec::new();
+    for target in target_columns
         .iter()
         // Generated, identity, and auto-increment columns are selected by the
         // database.  Never map imported values into them: the row operation
@@ -67,19 +123,32 @@ fn build_column_mappings(
         // imports from failing just because their source includes a derived
         // value.
         .filter(|target| !database_column_is_server_managed(target))
-        .filter_map(|target| {
-            source_columns
-                .iter()
-                .find(|source| *source == &target.name)
-                .or_else(|| {
-                    let target_key = normalize_database_column_key(&target.name);
-                    source_columns
-                        .iter()
-                        .find(|source| normalize_database_column_key(source) == target_key)
-                })
-                .map(|source| (target.name.clone(), source.clone()))
-        })
-        .collect()
+    {
+        let exact = source_columns.iter().find(|source| *source == &target.name);
+        let key = normalize_database_column_key(&target.name);
+        let candidates = source_columns.iter().filter(|source| {
+            !key.is_empty() && normalize_database_column_key(source) == key
+                // An exact source/target pair owns that source regardless of
+                // target order; do not reuse it for a case/normalized alias.
+                && !target_columns.iter().any(|other| other.name == **source)
+        }).collect::<Vec<_>>();
+        let source = if let Some(exact) = exact {
+            Some(exact)
+        } else if candidates.len() > 1 {
+            return Err(ServerError::new(StatusCode::BAD_REQUEST,
+                format!("Ambiguous source columns match target column {}", target.name)));
+        } else {
+            candidates.first().copied()
+        };
+        if let Some(source) = source {
+            if mappings.iter().any(|(_, used)| used == source) {
+                return Err(ServerError::new(StatusCode::BAD_REQUEST,
+                    format!("Source column {source} matches multiple target columns")));
+            }
+            mappings.push((target.name.clone(), source.clone()));
+        }
+    }
+    Ok(mappings)
 }
 
 fn database_column_is_generated(column: &DatabaseObjectColumn) -> bool {
@@ -103,7 +172,7 @@ fn database_column_is_server_managed(column: &DatabaseObjectColumn) -> bool {
 fn normalize_database_column_key(value: &str) -> String {
     value
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(|character| character.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -191,6 +260,9 @@ fn parse_portable_table_payload(payload: &Value) -> Result<PortableTablePayload>
         .unwrap_or("")
         .trim()
         .to_string();
+    if table_name.is_empty() {
+        return Err(ServerError::new(StatusCode::BAD_REQUEST, "Portable table name is missing"));
+    }
     let columns = table
         .get("columns")
         .and_then(Value::as_array)
@@ -201,11 +273,17 @@ fn parse_portable_table_payload(payload: &Value) -> Result<PortableTablePayload>
             )
         })?
         .iter()
-        .filter_map(|entry| {
-            let entry = entry.as_object()?;
-            let name = entry.get("name")?.as_str()?.trim().to_string();
+        .map(|entry| {
+            let malformed = || ServerError::new(StatusCode::BAD_REQUEST, "Malformed portable column entry");
+            let entry = entry.as_object().ok_or_else(malformed)?;
+            let name = entry.get("name").and_then(Value::as_str).ok_or_else(malformed)?.trim().to_string();
             if name.is_empty() {
-                return None;
+                return Err(malformed());
+            }
+            for key in ["nullable", "isPrimaryKey"] {
+                if entry.get(key).is_some_and(|value| !value.is_boolean()) {
+                    return Err(malformed());
+                }
             }
             let type_family = entry
                 .get("typeFamily")
@@ -221,7 +299,7 @@ fn parse_portable_table_payload(payload: &Value) -> Result<PortableTablePayload>
                         .map(portable_type_family_name)
                         .map(str::to_string)
                 });
-            Some(DatabaseObjectColumn {
+            Ok(DatabaseObjectColumn {
                 name,
                 data_type,
                 native_type: entry
@@ -240,24 +318,45 @@ fn parse_portable_table_payload(payload: &Value) -> Result<PortableTablePayload>
                     .unwrap_or(false),
             })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     if columns.is_empty() {
         return Err(ServerError::new(
             StatusCode::BAD_REQUEST,
             "Portable table has no columns",
         ));
     }
+    for (index, column) in columns.iter().enumerate() {
+        if columns[..index].iter().any(|other| other.name == column.name) {
+            return Err(ServerError::new(StatusCode::BAD_REQUEST, "Duplicate portable column name"));
+        }
+    }
+    if let Some(primary_key) = table.get("primaryKey") {
+        let names = primary_key.as_array().ok_or_else(|| ServerError::new(StatusCode::BAD_REQUEST, "Malformed portable primary key"))?;
+        let declared = names.iter().map(|name| name.as_str()).collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ServerError::new(StatusCode::BAD_REQUEST, "Malformed portable primary key"))?;
+        let actual = columns.iter().filter(|column| column.is_primary_key).map(|column| column.name.as_str()).collect::<Vec<_>>();
+        if declared.len() != actual.len()
+            || declared.iter().any(|name| !actual.contains(name))
+            || declared.iter().enumerate().any(|(index, name)| declared[..index].contains(name))
+        {
+            return Err(ServerError::new(StatusCode::BAD_REQUEST, "Conflicting portable primary-key metadata"));
+        }
+    }
     let rows = if include_data {
-        object
-            .get("rows")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|row| row.as_object().cloned())
-            .collect()
+        object.get("rows").and_then(Value::as_array)
+            .ok_or_else(|| ServerError::new(StatusCode::BAD_REQUEST, "Portable data rows are missing"))?
+            .iter().map(|row| row.as_object().cloned().ok_or_else(|| ServerError::new(StatusCode::BAD_REQUEST, "Malformed portable row entry")))
+            .collect::<Result<Vec<_>>>()?
     } else {
         Vec::new()
     };
+    for row in &rows {
+        for column in &columns {
+            if let Some(value) = row.get(&column.name) {
+                validate_database_binary_value(column, value)?;
+            }
+        }
+    }
     Ok(PortableTablePayload {
         table_name,
         columns,
@@ -298,16 +397,13 @@ async fn update_database_row(
     )
     .await?;
     if metadata.primary_key.is_empty() {
+        ensure_postgres_mutation_privilege_when_primary_key_hidden(connection, scope, true).await?;
         return Err(ServerError::new(
             StatusCode::BAD_REQUEST,
             "Table has no primary key. Row editing is not supported.",
         ));
     }
     let primary_keys = canonical_primary_key_values(&metadata, primary_key_values)?;
-    let current = select_database_row(connection, scope, &primary_keys)
-        .await?
-        .ok_or_else(|| ServerError::new(StatusCode::NOT_FOUND, "Row not found"))?;
-    ensure_row_is_current(&current, original_values)?;
     let updates = canonical_column_values(&metadata, column_values, false)?;
     if updates.is_empty() {
         return Err(ServerError::new(
@@ -322,7 +418,7 @@ async fn update_database_row(
             format!(
                 "{} = {}",
                 quote_transfer_identifier(connection.profile.db_type, column),
-                transfer_value_literal(connection.profile.db_type, value)
+                database_row_value_literal(connection.profile.db_type, &metadata, column, value)
             )
         })
         .collect::<Vec<_>>()
@@ -332,8 +428,7 @@ async fn update_database_row(
         "UPDATE {} SET {set_sql} WHERE {where_sql}",
         transfer_table_ref(connection.profile.db_type, &endpoint)
     );
-    execute_database_mutation(connection, scope.database_name.as_deref(), &sql).await?;
-    select_database_row(connection, scope, &primary_keys).await
+    mutate_database_row_atomically(connection, scope, &primary_keys, original_values, &sql, true).await
 }
 
 async fn insert_database_row(
@@ -367,12 +462,17 @@ async fn insert_database_row(
             .join(", ");
         let sql_values = values
             .iter()
-            .map(|(_, value)| transfer_value_literal(connection.profile.db_type, value))
+            .map(|(column, value)| {
+                database_row_value_literal(connection.profile.db_type, metadata, column, value)
+            })
             .collect::<Vec<_>>()
             .join(", ");
         format!("INSERT INTO {table_ref} ({columns}) VALUES ({sql_values})")
     };
-    execute_database_mutation(connection, database_name, &sql).await?;
+    let affected = execute_database_mutation(connection, database_name, &sql).await?;
+    if affected == 0 {
+        return Err(database_insert_suppressed());
+    }
 
     let provided = values.into_iter().collect::<Map<_, _>>();
     let primary_keys = metadata
@@ -386,6 +486,13 @@ async fn insert_database_row(
         return select_database_row(connection, &scope, &primary_keys).await;
     }
     Ok(None)
+}
+
+fn database_insert_suppressed() -> ServerError {
+    ServerError::new(
+        StatusCode::CONFLICT,
+        "The database did not insert this row (a trigger or rule may have suppressed it)",
+    )
 }
 
 async fn delete_database_row(
@@ -402,23 +509,20 @@ async fn delete_database_row(
     )
     .await?;
     if metadata.primary_key.is_empty() {
+        ensure_postgres_mutation_privilege_when_primary_key_hidden(connection, scope, false).await?;
         return Err(ServerError::new(
             StatusCode::BAD_REQUEST,
             "Table has no primary key. Row deletion is not supported.",
         ));
     }
     let primary_keys = canonical_primary_key_values(&metadata, primary_key_values)?;
-    let current = select_database_row(connection, scope, &primary_keys)
-        .await?
-        .ok_or_else(|| ServerError::new(StatusCode::NOT_FOUND, "Row not found"))?;
-    ensure_row_is_current(&current, original_values)?;
     let endpoint = database_scope_endpoint(connection, scope);
     let sql = format!(
         "DELETE FROM {} WHERE {}",
         transfer_table_ref(connection.profile.db_type, &endpoint),
         build_database_where_clause(connection.profile.db_type, &primary_keys),
     );
-    execute_database_mutation(connection, scope.database_name.as_deref(), &sql).await?;
+    mutate_database_row_atomically(connection, scope, &primary_keys, original_values, &sql, false).await?;
     Ok(())
 }
 
@@ -443,6 +547,39 @@ fn canonical_primary_key_values(
         .collect()
 }
 
+fn database_column_is_bytea_array(column: &DatabaseObjectColumn) -> bool {
+    let kind = column.native_type.as_deref().or(column.data_type.as_deref())
+        .unwrap_or("").trim().to_ascii_lowercase();
+    kind == "_bytea" || (kind.ends_with("[]") && kind.trim_end_matches("[]") == "bytea")
+}
+
+fn validate_database_binary_value(column: &DatabaseObjectColumn, value: &Value) -> Result<()> {
+    if database_column_is_bytea_array(column) {
+        if let Value::Array(values) = value {
+            for element in values {
+                validate_database_binary_value(column, element)?;
+            }
+            return Ok(());
+        }
+        if !value.is_null() && !value.is_string() && !value.is_object() {
+            return Err(ServerError::new(StatusCode::BAD_REQUEST,
+                format!("Column \"{}\" has an invalid binary array element", column.name)));
+        }
+    }
+    let family = portable_type_family(column);
+    if (family == "binary" && value.is_object())
+        || (family != "json" && database_buffer_base64(value).is_some())
+    {
+        let encoded = database_buffer_base64(value).ok_or_else(|| ServerError::new(
+            StatusCode::BAD_REQUEST, format!("Column \"{}\" has an invalid binary buffer marker", column.name),
+        ))?;
+        BASE64_STANDARD.decode(encoded).map_err(|_| ServerError::new(
+            StatusCode::BAD_REQUEST, format!("Column \"{}\" has invalid base64 binary data", column.name),
+        ))?;
+    }
+    Ok(())
+}
+
 fn canonical_column_values(
     metadata: &DatabaseTableMetadata,
     values: &Map<String, Value>,
@@ -453,13 +590,15 @@ fn canonical_column_values(
         let Some(column) = metadata
             .columns
             .iter()
-            .find(|column| column.name.eq_ignore_ascii_case(requested_name))
+            .find(|column| column.name == *requested_name)
+            .or_else(|| metadata.columns.iter().find(|column| column.name.eq_ignore_ascii_case(requested_name)))
         else {
             return Err(ServerError::new(
                 StatusCode::BAD_REQUEST,
                 format!("Unknown table column: {requested_name}"),
             ));
         };
+        validate_database_binary_value(column, value)?;
         if include_primary_keys && database_column_is_generated(column) {
             return Err(ServerError::new(
                 StatusCode::BAD_REQUEST,
@@ -474,13 +613,115 @@ fn canonical_column_values(
         }
         if output
             .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case(&column.name))
+            .any(|(name, _)| name == &column.name)
         {
             continue;
         }
         output.push((column.name.clone(), value.clone()));
     }
     Ok(output)
+}
+
+// JSON arrays returned by PostgreSQL must be encoded using PostgreSQL's array
+// input grammar, not JSON syntax. Keep JSON/JSONB columns on their usual path.
+fn database_column_is_json(metadata: &DatabaseTableMetadata, column_name: &str) -> bool {
+    metadata.columns.iter().any(|column| {
+        column.name == column_name
+            && column.native_type.as_deref().or(column.data_type.as_deref())
+                .is_some_and(|data_type| matches!(data_type.to_ascii_lowercase().as_str(), "json" | "jsonb"))
+    })
+}
+
+fn database_paste_value(
+    metadata: &DatabaseTableMetadata,
+    column_name: &str,
+    value: Value,
+    format: &DatabaseRowValueFormat,
+) -> Value {
+    if *format == DatabaseRowValueFormat::NativeJson
+        && !value.is_null()
+        && database_column_is_json(metadata, column_name)
+    {
+        Value::String(value.to_string())
+    } else {
+        value
+    }
+}
+
+fn database_row_value_literal(
+    db_type: SupportedDatabaseType,
+    metadata: &DatabaseTableMetadata,
+    column_name: &str,
+    value: &Value,
+) -> String {
+    if database_column_is_json(metadata, column_name) && !value.is_null() {
+        // Editors/CSV may supply already-encoded JSON text, whereas row
+        // snapshots supply native JSON scalars. Serialize non-string scalars
+        // and plain strings, while retaining the existing encoded-text path.
+        let encoded = match value {
+            Value::String(text) if serde_json::from_str::<Value>(text).is_ok() => text.clone(),
+            _ => value.to_string(),
+        };
+        return database_text_literal(db_type, &encoded);
+    }
+    if db_type == SupportedDatabaseType::Postgresql
+        && metadata.columns.iter().any(|column| {
+            column.name == column_name
+                && column.native_type.as_deref().or(column.data_type.as_deref())
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("point"))
+        })
+    {
+        if let Some(point) = value.as_object() {
+            if let (Some(Value::Number(x)), Some(Value::Number(y))) = (point.get("x"), point.get("y")) {
+                return database_text_literal(db_type, &format!("({x},{y})"));
+            }
+        }
+    }
+    let is_postgres_array = db_type == SupportedDatabaseType::Postgresql
+        && metadata.columns.iter().any(|column| {
+            column.name == column_name
+                && column.data_type.as_deref().is_some_and(|data_type| {
+                    data_type.eq_ignore_ascii_case("array") || data_type.ends_with("[]")
+                })
+        });
+    if is_postgres_array && value.is_array() {
+        if metadata.columns.iter().any(|column| column.name == column_name && database_column_is_bytea_array(column)) {
+            postgres_binary_array_literal(value)
+        } else {
+            database_text_literal(db_type, &postgres_array_input(value))
+        }
+    } else {
+        transfer_value_literal(db_type, value)
+    }
+}
+
+fn postgres_binary_array_literal(value: &Value) -> String {
+    match value {
+        Value::Array(values) => format!(
+            "ARRAY[{}]::bytea[]",
+            values.iter().map(postgres_binary_array_literal).collect::<Vec<_>>().join(", "),
+        ),
+        // Buffers have already been validated recursively. Reuse the scalar
+        // byte decoder rather than storing each marker's JSON as bytea text.
+        _ => format!("{}::bytea", transfer_value_literal(SupportedDatabaseType::Postgresql, value)),
+    }
+}
+
+fn postgres_array_input(value: &Value) -> String {
+    match value {
+        Value::Array(values) => format!(
+            "{{{}}}",
+            values.iter().map(postgres_array_input).collect::<Vec<_>>().join(",")
+        ),
+        Value::Null => "NULL".to_string(),
+        _ => {
+            let text = match value {
+                Value::String(text) => text.clone(),
+                _ => value.to_string(),
+            };
+            format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+        }
+    }
 }
 
 fn default_row_insert_sql(db_type: SupportedDatabaseType, table_ref: &str) -> String {
@@ -596,6 +837,7 @@ async fn execute_database_mutation(
     database_name: Option<&str>,
     sql: &str,
 ) -> Result<u64> {
+    validate_database_mutation_text(connection.profile.db_type, sql)?;
     if connection.profile.db_type == SupportedDatabaseType::Sqlite {
         let conn = sqlite_connection(connection)?;
         let affected = conn.execute(sql, []).map_err(sqlite_server_error)?;
@@ -604,6 +846,19 @@ async fn execute_database_mutation(
     let pool = live_pool_for_database(connection, database_name).await?;
     let result = pool.execute(sql).await.map_err(sqlx_server_error)?;
     Ok(result.rows_affected())
+}
+
+fn validate_database_mutation_text(db_type: SupportedDatabaseType, sql: &str) -> Result<()> {
+    // PostgreSQL's text protocol cannot carry an embedded zero byte. Reject it
+    // before sending the statement, rather than exposing an opaque protocol
+    // error. Binary values are encoded literals and do not contain raw NULs.
+    if db_type == SupportedDatabaseType::Postgresql && sql.contains('\0') {
+        return Err(ServerError::new(
+            StatusCode::BAD_REQUEST,
+            "PostgreSQL text values cannot contain U+0000 (NUL). Use a binary column to store zero bytes.",
+        ));
+    }
+    Ok(())
 }
 
 async fn normalize_connection_input(

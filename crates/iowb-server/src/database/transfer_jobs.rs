@@ -1,3 +1,42 @@
+static ACTIVE_TRANSFER_JOBS: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+struct ActiveTransferJob(String);
+
+impl ActiveTransferJob {
+    fn register(id: &str) -> Self {
+        ACTIVE_TRANSFER_JOBS.get_or_init(Default::default).lock().unwrap_or_else(|error| error.into_inner()).insert(id.to_string());
+        Self(id.to_string())
+    }
+}
+
+impl Drop for ActiveTransferJob {
+    fn drop(&mut self) {
+        ACTIVE_TRANSFER_JOBS.get_or_init(Default::default).lock().unwrap_or_else(|error| error.into_inner()).remove(&self.0);
+    }
+}
+
+fn recover_interrupted_transfer_job(state: &AppState, user_id: &str, mut job: DatabaseTransferJob) -> Result<DatabaseTransferJob> {
+    let active = ACTIVE_TRANSFER_JOBS.get_or_init(Default::default).lock().unwrap_or_else(|error| error.into_inner()).contains(&job.id);
+    if job.status == DatabaseTransferJobStatus::Running && !active {
+        // The worker can finish between the initial storage read and the
+        // registry check. Do not overwrite its newer terminal result with a
+        // failure based on the older running snapshot.
+        if let Some(current) = state.storage.get_database_transfer_job(user_id, &job.id)? {
+            if current.status != DatabaseTransferJobStatus::Running {
+                return Ok(current);
+            }
+            job = current;
+        }
+        fail_database_job(&mut job, ServerError::database(
+            StatusCode::CONFLICT,
+            "Transfer was interrupted. Destination writes may already be committed; verify the destination before retrying. Saved counts are the last checkpoint, not a guarantee of zero additional writes.",
+            None, "TRANSFER_INTERRUPTED", "execution", false,
+        ));
+        state.storage.upsert_database_transfer_job(user_id, &job)?;
+    }
+    Ok(job)
+}
+
 async fn create_transfer(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -31,7 +70,7 @@ async fn create_transfer(
         status: DatabaseTransferJobStatus::Running,
         source: enrich_transfer_endpoint(request.source, &source_connection.profile),
         target: enrich_transfer_endpoint(request.target, &target_connection.profile),
-        progress: progress(0, 1, "Queued"),
+        progress: serde_json::json!({"message": "Queued"}),
         logs: vec![DatabaseTransferJobLogEntry {
             timestamp: now,
             level: "info".to_string(),
@@ -47,6 +86,7 @@ async fn create_transfer(
         finished_at: None,
     };
 
+    let active_job = ActiveTransferJob::register(&job.id);
     state
         .storage
         .upsert_database_transfer_job(&user.0.id, &job)?;
@@ -55,6 +95,7 @@ async fn create_transfer(
     let task_state = state.clone();
     let user_id = user.0.id.clone();
     tokio::spawn(async move {
+        let _active_job = active_job;
         let mut job = job;
         let started_at = Utc::now();
         job.started_at = Some(started_at);
@@ -76,6 +117,15 @@ async fn create_transfer(
 
         match transfer_result {
             Ok(result) => {
+                if result.failed_row_count > 0 && result.copied_row_count == 0 {
+                    job.result = Some(result);
+                    fail_database_job(&mut job, ServerError::database(
+                        StatusCode::BAD_REQUEST, "All source rows failed to copy; the destination table may still exist", None,
+                        "ALL_ROWS_FAILED", "execution", false,
+                    ));
+                    let _ = task_state.storage.upsert_database_transfer_job(&user_id, &job);
+                    return;
+                }
                 let finished_at = Utc::now();
                 let completion_message = match job.mode {
                     DatabaseTransferMode::TableCopy => "Table copy completed",
@@ -114,9 +164,11 @@ async fn list_jobs(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<Value>> {
+    let jobs = state.storage.list_database_transfer_jobs(&user.0.id)?.into_iter()
+        .map(|job| recover_interrupted_transfer_job(&state, &user.0.id, job)).collect::<Result<Vec<_>>>()?;
     Ok(Json(serde_json::json!({
         "success": true,
-        "jobs": state.storage.list_database_transfer_jobs(&user.0.id)?,
+        "jobs": jobs,
     })))
 }
 
@@ -129,6 +181,7 @@ async fn get_job(
         .storage
         .get_database_transfer_job(&user.0.id, &job_id)?
         .ok_or_else(|| ServerError::new(StatusCode::NOT_FOUND, "Transfer job not found"))?;
+    let job = recover_interrupted_transfer_job(&state, &user.0.id, job)?;
     Ok(Json(serde_json::json!({
         "success": true,
         "job": job,
@@ -270,14 +323,19 @@ async fn import_table(
             match result {
                 Ok((target_exists, copied)) => {
                     let finished_at = Utc::now();
-                    job.status = DatabaseTransferJobStatus::Succeeded;
-                    job.progress = progress(1, 1, "Import completed");
+                    let suppressed = rows.len().saturating_sub(copied);
+                    job.status = if suppressed == 0 {
+                        DatabaseTransferJobStatus::Succeeded
+                    } else {
+                        DatabaseTransferJobStatus::Failed
+                    };
+                    job.progress = progress(1, 1, if suppressed == 0 { "Import completed" } else { "Import completed with suppressed rows" });
                     job.updated_at = finished_at;
                     job.finished_at = Some(finished_at);
                     job.result = Some(DatabaseTransferJobResult {
                         created_table: !target_exists,
                         copied_row_count: copied,
-                        failed_row_count: 0,
+                        failed_row_count: suppressed,
                         ignored_source_columns: Vec::new(),
                         mapped_column_count: columns.len(),
                         column_failures: Vec::new(),
@@ -285,8 +343,8 @@ async fn import_table(
                     });
                     job.logs.push(DatabaseTransferJobLogEntry {
                         timestamp: finished_at,
-                        level: "info".to_string(),
-                        message: format!("Imported rows from {}", input_path.display()),
+                        level: if suppressed == 0 { "info" } else { "warning" }.to_string(),
+                        message: format!("Imported {copied} row(s) from {}; {suppressed} row(s) were suppressed by the database", input_path.display()),
                         details: None,
                     });
                 }

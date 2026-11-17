@@ -5,6 +5,7 @@ include!("database/endpoints_and_connections.rs");
 include!("database/table_operations.rs");
 include!("database/transfer_jobs.rs");
 include!("database/row_operations.rs");
+include!("database/atomic_row_mutations.rs");
 include!("database/live_connections.rs");
 include!("database/live_schema.rs");
 include!("database/live_queries.rs");
@@ -18,4 +19,11 @@ mod tests {
     include!("database/tests/live_and_contracts.rs");
     include!("database/tests/sqlite_transfers.rs");
     include!("database/tests/errors_and_progress.rs");
+    include!("database/tests/transfer_safety.rs");
+    include!("database/tests/transfer_progress.rs");
+    include!("database/tests/data_integrity.rs");
+    include!("database/tests/concurrent_row_mutations.rs");
+    include!("database/tests/mysql_value_integrity.rs");
+    include!("database/tests/mutation_permissions.rs");
+    include!("database/tests/unsigned_schema_transfer.rs");
 }

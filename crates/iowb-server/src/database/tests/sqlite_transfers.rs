@@ -19,11 +19,11 @@
         assert_eq!(binary["value"], Value::String("AAEC/w==".to_string()));
         assert_eq!(
             transfer_value_literal(SupportedDatabaseType::Postgresql, &binary),
-            "decode('AAEC/w==', 'base64')"
+            "decode($iowb$AAEC/w==$iowb$, 'base64')"
         );
         assert_eq!(
             transfer_value_literal(SupportedDatabaseType::Mysql, &binary),
-            "FROM_BASE64('AAEC/w==')"
+            "FROM_BASE64(CONVERT(X'414145432f773d3d' USING utf8mb4))"
         );
         assert_eq!(
             transfer_value_literal(SupportedDatabaseType::Sqlite, &binary),
@@ -243,6 +243,17 @@
         assert!(result.created_table);
         assert_eq!(result.copied_row_count, 450);
         assert_eq!(result.failed_row_count, 0);
+        let percentages = progress_updates.iter()
+            .filter_map(|update| update["percentage"].as_u64())
+            .collect::<Vec<_>>();
+        assert!(percentages.windows(2).all(|pair| pair[0] <= pair[1]),
+            "transfer percentage regressed: {percentages:?}");
+        assert!(progress_updates.iter().any(|update| {
+            update["current"] == 0 && update["total"] == 450
+        }), "copy phase must start before the first insert");
+        assert!(progress_updates.iter().any(|update| {
+            update["current"] == 1 && update["total"] == 450
+        }), "the first committed row must not wait for the 200-row batch");
         assert!(progress_updates.iter().any(|update| {
             update["current"] == Value::from(200) && update["total"] == Value::from(450)
         }));
@@ -350,4 +361,244 @@
 
         let _ = std::fs::remove_file(source_path);
         let _ = std::fs::remove_file(target_path);
+    }
+
+    struct TransferDefaultWarningFixture {
+        source_path: std::path::PathBuf,
+        target_path: std::path::PathBuf,
+    }
+
+    impl Drop for TransferDefaultWarningFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.source_path);
+            let _ = std::fs::remove_file(&self.target_path);
+        }
+    }
+
+    async fn assert_transfer_default_warning_scope(mode: DatabaseTransferMode) {
+        let fixture = TransferDefaultWarningFixture {
+            source_path: env::temp_dir().join(format!("{}.sqlite", new_id("default-warning-source"))),
+            target_path: env::temp_dir().join(format!("{}.sqlite", new_id("default-warning-target"))),
+        };
+        for path in [&fixture.source_path, &fixture.target_path] {
+            std::fs::OpenOptions::new().write(true).create_new(true).open(path)
+                .expect("reserve private default-warning fixture");
+        }
+        let source_native = Connection::open(&fixture.source_path).unwrap();
+        source_native.execute_batch(
+            "CREATE TABLE records (id TEXT PRIMARY KEY, value TEXT DEFAULT 'source-default'); \
+             INSERT INTO records (id) VALUES ('copied');"
+        ).unwrap();
+        let target_native = Connection::open(&fixture.target_path).unwrap();
+        let existing_target = mode == DatabaseTransferMode::TableCopy;
+        let original_target_ddl: Option<String> = if existing_target {
+            target_native.execute_batch(
+                "CREATE TABLE records_copy (id TEXT PRIMARY KEY, value TEXT DEFAULT 'target-default', \
+                 target_only TEXT DEFAULT 'kept-default'); \
+                 INSERT INTO records_copy (id, value, target_only) VALUES ('existing', 'untouched', 'original');"
+            ).unwrap();
+            Some(target_native.query_row(
+                "SELECT sql FROM sqlite_master WHERE name='records_copy'", [], |row| row.get(0),
+            ).unwrap())
+        } else {
+            None
+        };
+        let source = sqlite_test_connection(&fixture.source_path);
+        let mut target = sqlite_test_connection(&fixture.target_path);
+        target.profile.id = 2;
+        let endpoint = |connection_id, table_name: &str| DatabaseTransferEndpoint {
+            connection_id,
+            connection_name: None,
+            connection_type: Some(SupportedDatabaseType::Sqlite),
+            database_name: None,
+            schema_name: None,
+            table_name: table_name.to_string(),
+        };
+        let mut job = test_transfer_job(endpoint(1, "records"), endpoint(2, "records_copy"), mode);
+        let result = run_database_transfer(&source, &target, &mut job, &mut |_| {}).await.unwrap();
+        assert_eq!(result.created_table, !existing_target);
+        assert_eq!(result.failed_row_count, 0);
+        assert_eq!(result.copied_row_count, usize::from(mode != DatabaseTransferMode::SchemaOnly));
+        let source_row: (String, String) = source_native.query_row(
+            "SELECT id, value FROM records", [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(source_row, ("copied".into(), "source-default".into()));
+        let source_default: Option<String> = source_native.query_row(
+            "SELECT dflt_value FROM pragma_table_info('records') WHERE name='value'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(source_default.as_deref(), Some("'source-default'"));
+
+        if existing_target {
+            let after_ddl: String = target_native.query_row(
+                "SELECT sql FROM sqlite_master WHERE name='records_copy'", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(Some(after_ddl), original_target_ddl, "row copying must not rewrite target defaults/schema");
+            let rows = target_native.prepare("SELECT id, value, target_only FROM records_copy ORDER BY id")
+                .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+                .unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap();
+            assert_eq!(rows, vec![
+                ("copied".into(), "source-default".into(), "kept-default".into()),
+                ("existing".into(), "untouched".into(), "original".into()),
+            ]);
+            assert!(job.warnings.is_empty(), "existing-table copy has no schema-loss warning: {:?}", job.warnings);
+            assert!(!job.logs.iter().any(|entry| entry.level == "warning"));
+        } else {
+            let default: Option<String> = target_native.query_row(
+                "SELECT dflt_value FROM pragma_table_info('records_copy') WHERE name='value'", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(default, None, "portable schema really omits the source default");
+            let count: usize = target_native.query_row("SELECT COUNT(*) FROM records_copy", [], |row| row.get(0)).unwrap();
+            assert_eq!(count, result.copied_row_count);
+            if mode == DatabaseTransferMode::SchemaAndData {
+                let copied: (String, String) = target_native.query_row(
+                    "SELECT id, value FROM records_copy", [], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                assert_eq!(copied, source_row);
+            }
+            assert_eq!(job.warnings.len(), 2);
+            assert!(job.warnings.iter().any(|warning| warning.code.as_deref() == Some("SCHEMA_PORTABILITY_LIMITATIONS")));
+            assert!(job.warnings.iter().any(|warning| {
+                warning.code.as_deref() == Some("DEFAULT_SKIPPED")
+                    && warning.scope.as_deref() == Some("value")
+                    && warning.message == "Skipped default value mapping for column value"
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_default_warning_existing_table_preserves_target_defaults_without_schema_loss_warning() {
+        assert_transfer_default_warning_scope(DatabaseTransferMode::TableCopy).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_default_warning_schema_only_reports_actual_default_loss() {
+        assert_transfer_default_warning_scope(DatabaseTransferMode::SchemaOnly).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_default_warning_schema_and_data_reports_actual_default_loss() {
+        assert_transfer_default_warning_scope(DatabaseTransferMode::SchemaAndData).await;
+    }
+
+    async fn assert_transfer_explicit_not_null_text_primary_key(mode: DatabaseTransferMode) {
+        let fixture = TransferDefaultWarningFixture {
+            source_path: env::temp_dir().join(format!("{}.sqlite", new_id("not-null-source"))),
+            target_path: env::temp_dir().join(format!("{}.sqlite", new_id("not-null-target"))),
+        };
+        for path in [&fixture.source_path, &fixture.target_path] {
+            std::fs::OpenOptions::new().write(true).create_new(true).open(path)
+                .expect("reserve private nullability fixture");
+        }
+        let source_native = Connection::open(&fixture.source_path).unwrap();
+        source_native.execute_batch(
+            "CREATE TABLE records (row_key TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL DEFAULT 'fixture-default'); \
+             INSERT INTO records (row_key) VALUES ('source-row');"
+        ).unwrap();
+        let read_flags = |native: &Connection, table: &str| {
+            native.prepare(&format!("SELECT name, \"notnull\", pk FROM pragma_table_info('{table}') ORDER BY cid"))
+                .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, i64>(2)?)))
+                .unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap()
+        };
+        let expected_flags = vec![("row_key".to_string(), true, 1), ("title".to_string(), true, 0)];
+        assert_eq!(read_flags(&source_native, "records"), expected_flags);
+        assert!(source_native.execute("INSERT INTO records VALUES (NULL, 'probe')", []).is_err());
+        assert!(source_native.execute("INSERT INTO records VALUES ('null-title', NULL)", []).is_err());
+
+        let source = sqlite_test_connection(&fixture.source_path);
+        let mut target = sqlite_test_connection(&fixture.target_path);
+        target.profile.id = 2;
+        let metadata = database_table_metadata(&source, None, None, "records").await.unwrap();
+        assert!(metadata.columns.iter().all(|column| column.nullable == Some(false)));
+        let endpoint = |connection_id, table_name: &str| DatabaseTransferEndpoint {
+            connection_id,
+            connection_name: None,
+            connection_type: Some(SupportedDatabaseType::Sqlite),
+            database_name: None,
+            schema_name: None,
+            table_name: table_name.to_string(),
+        };
+        let mut job = test_transfer_job(endpoint(1, "records"), endpoint(2, "records_copy"), mode);
+        let result = run_database_transfer(&source, &target, &mut job, &mut |_| {}).await.unwrap();
+        assert!(result.created_table);
+        assert_eq!(result.failed_row_count, 0);
+        assert_eq!(result.copied_row_count, usize::from(mode == DatabaseTransferMode::SchemaAndData));
+
+        let target_native = Connection::open(&fixture.target_path).unwrap();
+        let target_flags = read_flags(&target_native, "records_copy");
+        let target_ddl: String = target_native.query_row(
+            "SELECT sql FROM sqlite_master WHERE name='records_copy'", [], |row| row.get(0),
+        ).unwrap();
+        // Exercise actual SQLite constraints, not just the generated SQL text.
+        // Both probes are rolled back even if a broken schema accepts one.
+        target_native.execute_batch("SAVEPOINT nullability_probe").unwrap();
+        let null_key_rejected = target_native.execute(
+            "INSERT INTO records_copy VALUES (NULL, 'null-key-probe')", [],
+        ).is_err();
+        let null_title_rejected = target_native.execute(
+            "INSERT INTO records_copy VALUES ('null-title-probe', NULL)", [],
+        ).is_err();
+        target_native.execute_batch("ROLLBACK TO nullability_probe; RELEASE nullability_probe").unwrap();
+        let copied_rows = target_native.prepare("SELECT row_key, title FROM records_copy ORDER BY row_key")
+            .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        let expected_rows = if mode == DatabaseTransferMode::SchemaAndData {
+            vec![("source-row".to_string(), "fixture-default".to_string())]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(copied_rows, expected_rows);
+        assert_eq!(source_native.query_row("SELECT COUNT(*) FROM records", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            (target_flags, null_key_rejected, null_title_rejected),
+            (expected_flags, true, true),
+            "explicit source NOT NULL must remain enforced on the text PK and ordinary column; target DDL: {target_ddl}",
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_not_null_schema_only_preserves_explicit_text_primary_key_constraint() {
+        assert_transfer_explicit_not_null_text_primary_key(DatabaseTransferMode::SchemaOnly).await;
+    }
+
+    #[tokio::test]
+    async fn transfer_not_null_schema_and_data_preserves_explicit_text_primary_key_constraint() {
+        assert_transfer_explicit_not_null_text_primary_key(DatabaseTransferMode::SchemaAndData).await;
+    }
+
+    #[test]
+    fn transfer_not_null_portable_schema_builder_preserves_only_explicit_constraints() {
+        let payload = serde_json::json!({
+            "format": "web-ai-cli/database-portable-v1",
+            "type": "table-schema",
+            "table": {"name": "portable_records", "columns": [
+                {"name": "row_key", "dataType": "text", "nativeType": "TEXT", "nullable": false, "isPrimaryKey": true},
+                {"name": "title", "dataType": "text", "nativeType": "TEXT", "nullable": false}
+            ]}
+        });
+        let portable = parse_portable_table_payload(&payload).unwrap();
+        let endpoint = DatabaseTransferEndpoint {
+            connection_id: 1,
+            connection_name: None,
+            connection_type: None,
+            database_name: None,
+            schema_name: None,
+            table_name: portable.table_name,
+        };
+        for nullable in [Some(false), Some(true), None] {
+            let mut columns = portable.columns.clone();
+            columns[0].nullable = nullable;
+            for db_type in [SupportedDatabaseType::Sqlite, SupportedDatabaseType::Postgresql,
+                SupportedDatabaseType::Mysql, SupportedDatabaseType::Mariadb] {
+                let sql = build_transfer_create_table_sql(db_type, &endpoint, &columns);
+                assert_eq!(sql.matches("NOT NULL").count(), 1 + usize::from(nullable == Some(false)),
+                    "shared portable-import builder must preserve explicit constraints: {sql}");
+            }
+            let native = Connection::open_in_memory().unwrap();
+            native.execute_batch(&build_transfer_create_table_sql(SupportedDatabaseType::Sqlite, &endpoint, &columns)).unwrap();
+            let null_pk = native.execute("INSERT INTO portable_records VALUES (NULL, 'provided')", []);
+            assert_eq!(null_pk.is_err(), nullable == Some(false),
+                "do not remove explicit NOT NULL or invent it for nullable/unknown text primary keys");
+            assert!(native.execute("INSERT INTO portable_records VALUES ('null-title', NULL)", []).is_err());
+            assert_eq!(native.execute("INSERT INTO portable_records VALUES ('valid', 'retained')", []).unwrap(), 1);
+        }
     }

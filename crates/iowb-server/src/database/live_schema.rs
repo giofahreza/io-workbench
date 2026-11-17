@@ -923,12 +923,56 @@ async fn describe_live_table(
         live_primary_keys(&pool, connection.profile.db_type, &schema, table_name).await?;
     let foreign_keys =
         live_foreign_keys(&pool, connection.profile.db_type, &schema, table_name).await?;
+    // MariaDB's JSON alias is stored as LONGTEXT plus an exact JSON_VALID
+    // check. Retain its semantic type for JSON editors and paste conversion;
+    // ordinary LONGTEXT and unrelated/compound checks are not JSON aliases.
+    let maria_json_checks = if connection.profile.db_type == SupportedDatabaseType::Mariadb {
+        // MySQL-compatible profiles may point to either backend. MariaDB
+        // adds TABLE_NAME to this catalog; MySQL exposes only the standard
+        // constraint identity. Keep MariaDB's exact table qualification
+        // (including same-named checks on different tables) when available.
+        let has_table_name = sqlx::query(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'information_schema' AND table_name = 'CHECK_CONSTRAINTS' AND column_name = 'TABLE_NAME'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .map_err(sqlx_server_error)?
+        .is_some();
+        let checks_sql = if has_table_name {
+            "SELECT check_clause FROM information_schema.check_constraints WHERE constraint_schema = ? AND table_name = ?"
+        } else {
+            "SELECT cc.check_clause FROM information_schema.check_constraints AS cc \
+             JOIN information_schema.table_constraints AS tc \
+               ON tc.constraint_catalog = cc.constraint_catalog \
+              AND tc.constraint_schema = cc.constraint_schema \
+              AND tc.constraint_name = cc.constraint_name \
+             WHERE tc.table_schema = ? AND tc.table_name = ? \
+               AND tc.constraint_type = 'CHECK'"
+        };
+        sqlx::query(checks_sql)
+        .bind(&schema)
+        .bind(table_name)
+        .fetch_all(&pool)
+        .await
+        .map_err(sqlx_server_error)?
+        .into_iter()
+        .filter_map(|row| any_string(&row, 0))
+        .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let columns = columns_rows
         .into_iter()
         .filter_map(|row| {
             let name = any_string(&row, 0)?;
-            let data_type = any_string(&row, 1);
-            let native_type = any_string(&row, 2).or_else(|| data_type.clone());
+            let mut data_type = any_string(&row, 1);
+            let mut native_type = any_string(&row, 2).or_else(|| data_type.clone());
+            if data_type.as_deref().is_some_and(|kind| kind.eq_ignore_ascii_case("longtext"))
+                && maria_json_checks.iter().any(|check| mariadb_check_is_json_column(check, &name))
+            {
+                data_type = Some("json".to_string());
+                native_type = Some("json".to_string());
+            }
             let nullable = any_string(&row, 3).map(|value| value.eq_ignore_ascii_case("yes"));
             let default_value = any_string(&row, 4);
             let extra = match connection.profile.db_type {
@@ -980,6 +1024,11 @@ async fn describe_live_table(
         columns,
         foreign_keys,
     })
+}
+
+fn mariadb_check_is_json_column(check: &str, column_name: &str) -> bool {
+    let quoted = format!("`{}`", column_name.replace('`', "``"));
+    check.trim().eq_ignore_ascii_case(&format!("json_valid({quoted})"))
 }
 
 fn postgresql_column_extra(
@@ -1458,7 +1507,15 @@ async fn describe_live_object(
                 // TRIGGER is the engine's complete declaration on both
                 // MySQL and MariaDB. Keep the information_schema body as a
                 // graceful fallback for servers that return no CREATE row.
-                let definition = mysql_trigger_definition(&pool, &database, name)
+                // SHOW CREATE TRIGGER also returns a Created timestamp.
+                // AnyPool cannot decode that MySQL/MariaDB temporal column,
+                // even though only the declaration itself is needed here.
+                let TypedLivePool::Mysql(trigger_pool) =
+                    typed_live_pool_for_database(connection, Some(&database)).await?
+                else {
+                    unreachable!("MySQL trigger requires the typed MySQL pool");
+                };
+                let definition = mysql_trigger_definition(&trigger_pool, &database, name)
                     .await?
                     .or(action.clone())
                     .or_else(|| {
@@ -2658,7 +2715,7 @@ async fn mysql_table_definition(
 /// TRIGGER. `information_schema.triggers.action_statement` contains only the
 /// body, so it must not be used as the primary SQL-editor handoff.
 async fn mysql_trigger_definition(
-    pool: &AnyPool,
+    pool: &MySqlPool,
     database: &str,
     trigger_name: &str,
 ) -> Result<Option<String>> {
@@ -2673,7 +2730,10 @@ async fn mysql_trigger_definition(
         .map_err(sqlx_server_error)?;
     // The SQL Original Statement is column 2 for both MySQL and MariaDB:
     // trigger name, SQL mode, then the complete CREATE TRIGGER declaration.
-    Ok(row.and_then(|row| any_string(&row, 2)))
+    row.map(|row| row.try_get::<Option<String>, _>(2))
+        .transpose()
+        .map(Option::flatten)
+        .map_err(sqlx_server_error)
 }
 
 async fn live_relational_schema(

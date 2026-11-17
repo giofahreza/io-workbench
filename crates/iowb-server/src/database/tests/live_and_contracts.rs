@@ -1,3 +1,50 @@
+    #[test]
+    fn postgres_cell_array_literal_preserves_shape_nulls_and_escaping() {
+        assert_eq!(postgres_array_input(&serde_json::json!([])), "{}");
+        assert_eq!(
+            postgres_array_input(&serde_json::json!([[true, null], [false, true]])),
+            "{{\"true\",NULL},{\"false\",\"true\"}}"
+        );
+        assert_eq!(
+            postgres_array_input(&serde_json::json!(["NULL", "", "a,b", "a\"b", "a\\b"])),
+            "{\"NULL\",\"\",\"a,b\",\"a\\\"b\",\"a\\\\b\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_cell_array_edit_roundtrips_and_checks_original_values() {
+        let Some(connection) = postgres_test_connection() else { return; };
+        let database_name = connection.profile.database_name.clone().unwrap_or_else(|| "postgres".into());
+        let url = connection_url_for_database(&connection, Some(&database_name)).unwrap();
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        let table_name = new_id("iowb_cell_array").replace('-', "_");
+        let table_ref = quote_identifier(&table_name);
+        sqlx::raw_sql(&format!(
+            "CREATE TABLE {table_ref} (id integer PRIMARY KEY, flags boolean[], counts integer[], labels text[], payload jsonb); \
+             INSERT INTO {table_ref} VALUES (1, ARRAY[true,false], ARRAY[1,2], ARRAY['old'], '[1,2]')"
+        )).execute(&pool).await.unwrap();
+        let scope = DatabaseTableScopeRequest {
+            database_name: Some(database_name), schema_name: Some("public".into()), table_name,
+        };
+        let keys = serde_json::json!({"id": 1}).as_object().unwrap().clone();
+        let original = select_database_row(&connection, &scope, &keys).await.unwrap().unwrap();
+        let updates = serde_json::json!({
+            "flags": [false, null, true], "counts": [],
+            "labels": ["NULL", "", "a,b", "a\"b", "a\\b", "$iowb$'; DROP TABLE no; --"],
+            "payload": [3,4]
+        }).as_object().unwrap().clone();
+        let result = update_database_row(&connection, &scope, &keys, &updates, &original).await;
+        let stale_result = if result.is_ok() {
+            Some(update_database_row(&connection, &scope, &keys, &updates, &original).await)
+        } else { None };
+        sqlx::raw_sql(&format!("DROP TABLE {table_ref}")).execute(&pool).await.unwrap();
+        let row = result.expect("typed array update").unwrap();
+        for (column, expected) in &updates {
+            assert_eq!(row.get(column), Some(expected), "{column}");
+        }
+        assert!(stale_result.unwrap().is_err(), "old array snapshot must be rejected");
+    }
+
     #[tokio::test]
     async fn postgres_live_queries_preserve_returning_rows_and_empty_columns() {
         let Some(connection) = postgres_test_connection() else {
@@ -997,10 +1044,20 @@
                 "123456789012345678901.123456789".to_string(),
             )),
         );
-        assert_eq!(
-            row.get("payload"),
-            Some(&serde_json::json!({"ok": true, "nested": [1, 2]}))
-        );
+        let payload = row.get("payload").expect("JSON payload");
+        let payload_type = select.columns.iter().find(|column| column.name == "payload")
+            .and_then(|column| column.native_type.as_deref());
+        let expected_payload = serde_json::json!({"ok": true, "nested": [1, 2]});
+        if payload_type == Some("JSON") {
+            assert_eq!(payload, &expected_payload);
+        } else {
+            // MariaDB aliases JSON to text. Its wire metadata does not identify
+            // the JSON_VALID constraint, so retain encoded JSON instead of
+            // guessing from the contents of arbitrary binary-collated TEXT.
+            assert!(matches!(payload_type, Some("TEXT" | "LONGTEXT")));
+            assert_eq!(serde_json::from_str::<Value>(payload.as_str().expect("encoded MariaDB JSON"))
+                .expect("valid alias JSON"), expected_payload);
+        }
         assert_eq!(
             row.get("bytes"),
             Some(&serde_json::json!({
@@ -1074,6 +1131,8 @@
                 id bigint NOT NULL AUTO_INCREMENT,
                 parent_id integer NOT NULL,
                 label varchar(64) NOT NULL DEFAULT 'new',
+                notes longtext,
+                payload JSON,
                 PRIMARY KEY (id),
                 UNIQUE KEY {unique_ref} (label),
                 CONSTRAINT {foreign_key_ref} FOREIGN KEY (parent_id)
@@ -1100,6 +1159,22 @@
                     Some(&child_table_name),
                 )
                 .await?;
+                assert_eq!(
+                    details.columns.iter()
+                        .find(|column| column.name == "notes")
+                        .and_then(|column| column.data_type.as_deref()),
+                    Some("longtext"),
+                );
+                if db_type == SupportedDatabaseType::Mariadb {
+                    // Real MariaDB's LONGTEXT+JSON_VALID alias and MySQL's
+                    // native JSON must both survive their catalog variants.
+                    assert_eq!(
+                        details.columns.iter()
+                            .find(|column| column.name == "payload")
+                            .and_then(|column| column.data_type.as_deref()),
+                        Some("json"),
+                    );
+                }
                 let current_definition = details
                     .definition
                     .expect("engine-provided SHOW CREATE TABLE definition");
@@ -1190,6 +1265,17 @@
         .expect("create MySQL trigger-DDL fixture");
 
         let verification = async {
+            // Typed rows can retain SHOW CREATE's otherwise-unused Created
+            // TIMESTAMP (MySQL) / DATETIME (MariaDB) while reading exact SQL.
+            let expected_definition: String = sqlx::query(&format!(
+                "SHOW CREATE TRIGGER {}.{trigger_ref}",
+                quote_mysql_identifier(&database_name),
+            ))
+            .fetch_one(&pool)
+            .await
+            .map_err(sqlx_server_error)?
+            .try_get(2)
+            .map_err(sqlx_server_error)?;
             let mut definition = None;
             for db_type in [SupportedDatabaseType::Mysql, SupportedDatabaseType::Mariadb] {
                 let mut scoped_connection = connection.clone();
@@ -1208,6 +1294,7 @@
                 let current_definition = details
                     .definition
                     .expect("engine-provided SHOW CREATE TRIGGER definition");
+                assert_eq!(current_definition, expected_definition);
                 let normalized = current_definition.to_ascii_uppercase();
                 assert!(normalized.starts_with("CREATE "));
                 assert!(normalized.contains("TRIGGER"));
@@ -1291,8 +1378,8 @@
             r#"
             CREATE TABLE {first_table_ref} (
                 id integer NOT NULL,
-                first_value integer,
-                KEY {index_ref} (first_value)
+                `first_value` integer,
+                KEY {index_ref} (`first_value`)
             );
             CREATE TABLE {second_table_ref} (
                 id integer NOT NULL,
@@ -1974,7 +2061,7 @@
         let mappings = build_column_mappings(
             &["User ID".to_string(), "DISPLAY-NAME".to_string()],
             &portable.columns,
-        );
+        ).expect("unambiguous column mapping");
         assert_eq!(
             mappings,
             vec![
@@ -1992,11 +2079,11 @@
         );
         assert_eq!(
             parse_postgres_array("{{1.25,2.5},{3.75,4}}", "NUMERIC"),
-            serde_json::json!([[1.25, 2.5], [3.75, 4.0]]),
+            serde_json::json!([["1.25", "2.5"], ["3.75", "4"]]),
         );
         assert_eq!(
             parse_postgres_array("{\"{\\\"ok\\\":true}\",NULL}", "JSONB"),
-            serde_json::json!([{"ok": true}, null]),
+            serde_json::json!(["{\"ok\":true}", null]),
         );
         assert_eq!(
             parse_postgres_point("(1.5,-2.25)"),
@@ -2307,6 +2394,78 @@
         assert_eq!(foreign_key.column_name, "parent_id");
         assert_eq!(foreign_key.referenced_table_name, "parents");
         assert_eq!(foreign_key.referenced_column_name, "");
+    }
+
+    #[test]
+    fn sqlite_related_record_preserves_explicit_and_shorthand_composite_keys() {
+        let path = env::temp_dir().join(format!("{}.sqlite", new_id("sqlite-related-record")));
+        let sqlite = Connection::open(&path).expect("open relationship fixture");
+        sqlite.execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE people (
+                id INTEGER,
+                tenant INTEGER,
+                name TEXT,
+                email TEXT,
+                PRIMARY KEY (tenant, id)
+            );
+            CREATE TABLE workflows (
+                id INTEGER PRIMARY KEY,
+                created_id INTEGER,
+                created_tenant INTEGER,
+                updated_id INTEGER,
+                updated_tenant INTEGER,
+                FOREIGN KEY (created_tenant, created_id) REFERENCES people (tenant, id),
+                FOREIGN KEY (updated_tenant, updated_id) REFERENCES people
+            );
+            INSERT INTO people VALUES
+                (7, 1, 'Creator', 'creator@example.test'),
+                (7, 2, 'Updater', 'updater@example.test');
+            INSERT INTO workflows VALUES (1, 7, 1, 7, 2);
+            "#,
+        ).expect("create relationship fixture");
+        let table = describe_sqlite_table_inner(&sqlite, "workflows", DatabaseObjectType::Table)
+            .expect("describe composite relationships");
+        let primary_key = describe_sqlite_object_inner(
+            &sqlite, DatabaseObjectType::Table, "people", None, None,
+        ).expect("target object details").primary_key;
+        assert_eq!(primary_key, vec!["tenant", "id"]);
+        assert_eq!(table.foreign_keys.len(), 4);
+        let mut groups: HashMap<String, Vec<&DatabaseForeignKey>> = HashMap::new();
+        for key in &table.foreign_keys {
+            groups.entry(key.name.clone().expect("relationship identity")).or_default().push(key);
+        }
+        assert_eq!(groups.len(), 2, "independent references must stay separate");
+        drop(sqlite);
+        let connection = sqlite_test_connection(&path);
+        let source = read_sqlite_table_data(&connection, "workflows", 1, 0, false)
+            .expect("load workflow row");
+        for (focused_column, expected_name, expected_email, implicit) in [
+            ("created_id", "Creator", "creator@example.test", false),
+            ("updated_id", "Updater", "updater@example.test", true),
+        ] {
+            let keys = groups.values().find(|keys| keys.iter().any(|key| key.column_name == focused_column))
+                .expect("focused relationship");
+            assert_eq!(keys.len(), 2, "both composite parts must remain grouped");
+            assert!(keys[0].column_name.ends_with("tenant"));
+            assert!(keys[1].column_name.ends_with("id"));
+            assert_eq!(keys.iter().all(|key| key.referenced_column_name.is_empty()), implicit);
+            let filters = keys.iter().enumerate().map(|(index, key)| DatabaseTableFilter {
+                column: if implicit { primary_key[index].clone() } else { key.referenced_column_name.clone() },
+                operator: "eq".into(),
+                value: source.rows[0][&key.column_name].clone(),
+            }).collect();
+            let options = DatabaseTableQueryOptions::new(filters, Vec::new()).expect("typed relationship filters");
+            let related = read_sqlite_table_data_with_options(&connection, "people", 2, 0, false, &options)
+                .expect("read complete related row");
+            assert_eq!(related.rows.len(), 1);
+            assert!(!related.has_more);
+            assert_eq!(related.rows[0].len(), 4, "return every destination field");
+            assert_eq!(related.rows[0]["name"], expected_name);
+            assert_eq!(related.rows[0]["email"], expected_email);
+        }
+        std::fs::remove_file(path).expect("remove disposable relationship fixture");
     }
 
     #[test]

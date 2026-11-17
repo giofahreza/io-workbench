@@ -731,35 +731,18 @@ fn describe_sqlite_table_inner(
         }
     }
 
-    let mut fk_stmt = conn
-        .prepare(&format!(
-            "PRAGMA foreign_key_list({})",
-            quote_identifier(table_name)
-        ))
-        .map_err(sqlite_server_error)?;
-    let fk_rows = fk_stmt
-        .query_map([], |row| {
-            Ok(DatabaseForeignKey {
-                name: None,
-                column_name: row.get(3)?,
-                referenced_database_name: None,
-                referenced_schema_name: None,
-                referenced_table_name: row.get(2)?,
-                // SQLite reports NULL for the target column when a foreign
-                // key uses the valid `REFERENCES parent_table` shorthand.
-                // Preserve that as an empty field because the shared protocol
-                // represents column names as strings.
-                referenced_column_name: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                on_update: row.get(5)?,
-                on_delete: row.get(6)?,
-            })
+    let mut fk_rows = sqlite_foreign_key_rows(conn, table_name)?;
+    fk_rows.sort_by_key(|row| (row.id, row.sequence));
+    let foreign_keys = fk_rows
+        .into_iter()
+        .map(|mut row| {
+            // PRAGMA omits constraint names but identifies each relationship
+            // by id. Keep composite parts together and separate distinct
+            // relationships to the same table in the shared client protocol.
+            row.key.name = Some(format!("sqlite_fk_{}", row.id));
+            row.key
         })
-        .map_err(sqlite_server_error)?;
-
-    let mut foreign_keys = Vec::new();
-    for row in fk_rows {
-        foreign_keys.push(row.map_err(sqlite_server_error)?);
-    }
+        .collect();
 
     let mut metadata = serde_json::Map::new();
     metadata.insert(
@@ -841,12 +824,7 @@ fn describe_sqlite_object_inner(
             .flatten()
             .ok_or_else(|| ServerError::new(StatusCode::NOT_FOUND, "Database object not found"))?;
         let table = describe_sqlite_table_inner(conn, name, object_type)?;
-        let primary_key = table
-            .columns
-            .iter()
-            .filter(|column| column.is_primary_key)
-            .map(|column| column.name.clone())
-            .collect();
+        let primary_key = sqlite_primary_key_columns(conn, name)?;
         return Ok(SqliteObjectDescription {
             parent_name: None,
             identity: Some(identity.unwrap_or(name).to_string()),
@@ -1419,19 +1397,44 @@ fn read_sqlite_table_data(
     offset: usize,
     include_total_count: bool,
 ) -> Result<DatabaseTableData> {
+    read_sqlite_table_data_with_options(
+        connection,
+        table_name,
+        limit,
+        offset,
+        include_total_count,
+        &DatabaseTableQueryOptions::default(),
+    )
+}
+
+fn read_sqlite_table_data_with_options(
+    connection: &StoredDatabaseConnection,
+    table_name: &str,
+    limit: usize,
+    offset: usize,
+    include_total_count: bool,
+    options: &DatabaseTableQueryOptions,
+) -> Result<DatabaseTableData> {
     let start = Instant::now();
     let conn = sqlite_connection(connection)?;
     let table = describe_sqlite_table_inner(&conn, table_name, DatabaseObjectType::Table)
         .or_else(|_| describe_sqlite_table_inner(&conn, table_name, DatabaseObjectType::View))?;
+    let (where_clause, order_clause) =
+        database_table_query_clauses(SupportedDatabaseType::Sqlite, &table.columns, options)?;
+    let table_ref = quote_identifier(table_name);
     let total_row_count = if include_total_count {
-        Some(count_sqlite_rows(&conn, table_name)?)
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table_ref}{where_clause}"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_server_error)?;
+        Some(count.max(0) as usize)
     } else {
         None
     };
-    let sql = format!(
-        "SELECT * FROM {} LIMIT ?1 OFFSET ?2",
-        quote_identifier(table_name)
-    );
+    let sql = format!("SELECT * FROM {table_ref}{where_clause}{order_clause} LIMIT ?1 OFFSET ?2");
     let mut stmt = conn.prepare(&sql).map_err(sqlite_server_error)?;
     let column_names = stmt
         .column_names()

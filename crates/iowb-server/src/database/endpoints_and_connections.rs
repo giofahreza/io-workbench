@@ -508,6 +508,83 @@ struct TableDataQuery {
     offset: Option<usize>,
     #[serde(rename = "includeTotalCount")]
     include_total_count: Option<bool>,
+    filters: Option<String>,
+    sort: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TableDataQueryBody {
+    database_name: Option<String>,
+    schema_name: Option<String>,
+    table_name: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    include_total_count: Option<bool>,
+    #[serde(default)]
+    filters: Vec<DatabaseTableFilter>,
+    #[serde(default)]
+    sort: Vec<DatabaseTableSort>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatabaseTableFilter {
+    #[serde(rename = "columnName", alias = "column")]
+    column: String,
+    operator: String,
+    #[serde(default)]
+    value: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatabaseTableSort {
+    #[serde(rename = "columnName", alias = "column")]
+    column: String,
+    direction: String,
+}
+
+#[derive(Debug, Default)]
+struct DatabaseTableQueryOptions {
+    filters: Vec<DatabaseTableFilter>,
+    sort: Vec<DatabaseTableSort>,
+}
+
+impl DatabaseTableQueryOptions {
+    fn parse(filters: Option<&str>, sort: Option<&str>) -> Result<Self> {
+        let filters = filters
+            .map(serde_json::from_str::<Vec<DatabaseTableFilter>>)
+            .transpose()
+            .map_err(|_| {
+                ServerError::new(
+                    StatusCode::BAD_REQUEST,
+                    "filters must be a JSON array of column/operator/value objects",
+                )
+            })?
+            .unwrap_or_default();
+        let sort = sort
+            .map(serde_json::from_str::<Vec<DatabaseTableSort>>)
+            .transpose()
+            .map_err(|_| {
+                ServerError::new(
+                    StatusCode::BAD_REQUEST,
+                    "sort must be a JSON array of column/direction objects",
+                )
+            })?
+            .unwrap_or_default();
+        Self::new(filters, sort)
+    }
+
+    fn new(filters: Vec<DatabaseTableFilter>, sort: Vec<DatabaseTableSort>) -> Result<Self> {
+        if filters.len() > 32 || sort.len() > 32 {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "At most 32 filters and sort columns are supported",
+            ));
+        }
+        Ok(Self { filters, sort })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -570,6 +647,10 @@ struct DatabaseRowsDeleteRequest {
     scope: DatabaseTableScopeRequest,
     #[serde(rename = "primaryKeyRows", default)]
     primary_key_rows: Vec<Map<String, Value>>,
+    // Optional for legacy clients; native clients send the displayed snapshots
+    // in exactly the same order as primaryKeyRows.
+    #[serde(rename = "originalRows", default)]
+    original_rows: Option<Vec<Map<String, Value>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,6 +662,8 @@ struct DatabasePasteColumn {
 struct DatabaseClipboardPayload {
     #[serde(rename = "type")]
     clipboard_type: String,
+    #[serde(rename = "valueFormat", default)]
+    value_format: Option<DatabaseRowValueFormat>,
     #[serde(rename = "createdAt")]
     _created_at: Option<String>,
     #[serde(rename = "sourceConnectionId")]
@@ -603,10 +686,20 @@ struct DatabasePasteRequest {
     scope: DatabaseTableScopeRequest,
     #[serde(default)]
     clipboard: Option<DatabaseClipboardPayload>,
+    #[serde(rename = "valueFormat", default)]
+    value_format: Option<DatabaseRowValueFormat>,
     #[serde(rename = "sourceColumns", default)]
     source_columns: Vec<DatabasePasteColumn>,
     #[serde(rename = "sourceRows", default)]
     source_rows: Vec<Map<String, Value>>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum DatabaseRowValueFormat {
+    #[default]
+    EncodedText,
+    NativeJson,
 }
 
 #[derive(Debug, Deserialize)]

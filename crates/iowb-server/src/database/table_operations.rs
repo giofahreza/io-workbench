@@ -4,6 +4,37 @@ async fn table_data(
     AxumPath(connection_id): AxumPath<i64>,
     Query(query): Query<TableDataQuery>,
 ) -> Result<Json<Value>> {
+    let options = DatabaseTableQueryOptions::parse(query.filters.as_deref(), query.sort.as_deref())?;
+    table_data_with_options(state, user, connection_id, query, options).await
+}
+
+async fn table_data_query(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(connection_id): AxumPath<i64>,
+    Json(body): Json<TableDataQueryBody>,
+) -> Result<Json<Value>> {
+    let options = DatabaseTableQueryOptions::new(body.filters, body.sort)?;
+    let query = TableDataQuery {
+        database_name: body.database_name,
+        schema_name: body.schema_name,
+        table_name: body.table_name,
+        limit: body.limit,
+        offset: body.offset,
+        include_total_count: body.include_total_count,
+        filters: None,
+        sort: None,
+    };
+    table_data_with_options(state, user, connection_id, query, options).await
+}
+
+async fn table_data_with_options(
+    state: AppState,
+    user: AuthenticatedUser,
+    connection_id: i64,
+    query: TableDataQuery,
+    options: DatabaseTableQueryOptions,
+) -> Result<Json<Value>> {
     if query.table_name.trim().is_empty() {
         return Err(ServerError::new(
             StatusCode::BAD_REQUEST,
@@ -19,15 +50,16 @@ async fn table_data(
         .unwrap_or(DEFAULT_TABLE_PAGE_SIZE);
     let offset = query.offset.unwrap_or(0);
     let mut data = if connection.profile.db_type == SupportedDatabaseType::Sqlite {
-        read_sqlite_table_data(
+        read_sqlite_table_data_with_options(
             &connection,
             &query.table_name,
             limit,
             offset,
             query.include_total_count.unwrap_or(false),
+            &options,
         )?
     } else {
-        read_live_table_data(
+        read_live_table_data_with_options(
             &connection,
             query.database_name.as_deref(),
             query.schema_name.as_deref(),
@@ -35,6 +67,7 @@ async fn table_data(
             limit,
             offset,
             query.include_total_count.unwrap_or(false),
+            &options,
         )
         .await?
     };
@@ -50,6 +83,36 @@ async fn table_data(
     })))
 }
 
+fn database_paste_source_column_names(request: &DatabasePasteRequest) -> Vec<String> {
+    // Column names are identifiers and row-object keys, not display labels.
+    // Trimming here collapses distinct quoted identifiers (including NBSP)
+    // and makes subsequent exact row lookups silently lose their values.
+    if let Some(clipboard) = &request.clipboard {
+        clipboard
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()
+    } else if !request.source_columns.is_empty() {
+        request
+            .source_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()
+    } else {
+        request
+            .source_rows
+            .iter()
+            .flat_map(|row| row.keys().cloned())
+            .fold(Vec::<String>::new(), |mut names, name| {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+                names
+            })
+    }
+}
+
 async fn paste_table_rows(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -57,7 +120,8 @@ async fn paste_table_rows(
     Json(request): Json<DatabasePasteRequest>,
 ) -> Result<Response> {
     validate_table_scope(&request.scope)?;
-    let (source_column_names, source_rows) = if let Some(clipboard) = request.clipboard {
+    let source_column_names = database_paste_source_column_names(&request);
+    let (source_rows, source_value_format) = if let Some(clipboard) = request.clipboard {
         if clipboard.clipboard_type != "rows"
             || clipboard.columns.is_empty()
             || clipboard.rows.is_empty()
@@ -74,13 +138,8 @@ async fn paste_table_rows(
                 .into_response());
         }
         (
-            clipboard
-                .columns
-                .into_iter()
-                .map(|column| column.name.trim().to_string())
-                .filter(|name| !name.is_empty())
-                .collect::<Vec<_>>(),
             clipboard.rows,
+            clipboard.value_format.unwrap_or_default(),
         )
     } else {
         if request.source_rows.is_empty() {
@@ -95,26 +154,7 @@ async fn paste_table_rows(
             )
                 .into_response());
         }
-        let names = if request.source_columns.is_empty() {
-            request
-                .source_rows
-                .iter()
-                .flat_map(|row| row.keys().cloned())
-                .fold(Vec::<String>::new(), |mut names, name| {
-                    if !names.iter().any(|candidate| candidate == &name) {
-                        names.push(name);
-                    }
-                    names
-                })
-        } else {
-            request
-                .source_columns
-                .into_iter()
-                .map(|column| column.name.trim().to_string())
-                .filter(|name| !name.is_empty())
-                .collect()
-        };
-        (names, request.source_rows)
+        (request.source_rows, request.value_format.unwrap_or_default())
     };
 
     let connection = load_connection(&state, &user.0.id, connection_id)?;
@@ -125,7 +165,7 @@ async fn paste_table_rows(
         &request.scope.table_name,
     )
     .await?;
-    let mappings = build_column_mappings(&source_column_names, &metadata.columns);
+    let mappings = build_column_mappings(&source_column_names, &metadata.columns)?;
     let used_source_columns = mappings
         .iter()
         .map(|(_, source)| source.clone())
@@ -194,7 +234,12 @@ async fn paste_table_rows(
             .map(|(target, source)| {
                 (
                     target.clone(),
-                    source_row.get(source).cloned().unwrap_or(Value::Null),
+                    database_paste_value(
+                        &metadata,
+                        target,
+                        source_row.get(source).cloned().unwrap_or(Value::Null),
+                        &source_value_format,
+                    ),
                 )
             })
             .collect::<Map<_, _>>();
@@ -343,11 +388,38 @@ async fn delete_table_rows(
         ));
     }
     let connection = load_connection(&state, &user.0.id, connection_id)?;
+    let (deleted_row_count, row_failures) =
+        delete_database_rows_with_snapshots(&connection, &request).await?;
+    Ok(Json(serde_json::json!({
+        "success": row_failures.is_empty(),
+        "session": database_session(&connection.profile),
+        "deletedRowCount": deleted_row_count,
+        "failedRowCount": row_failures.len(),
+        "rowFailures": row_failures,
+    })))
+}
+
+async fn delete_database_rows_with_snapshots(
+    connection: &StoredDatabaseConnection,
+    request: &DatabaseRowsDeleteRequest,
+) -> Result<(usize, Vec<Value>)> {
+    if let Some(original_rows) = &request.original_rows {
+        if original_rows.len() != request.primary_key_rows.len()
+            || original_rows.iter().any(Map::is_empty)
+        {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "originalRows must contain one nonempty snapshot for every primaryKeyRows entry, in the same order",
+            ));
+        }
+    }
     let mut deleted_row_count = 0usize;
     let mut row_failures = Vec::new();
+    let legacy_no_snapshot = Map::new();
     for (row_index, primary_key_values) in request.primary_key_rows.iter().enumerate() {
-        match delete_database_row(&connection, &request.scope, primary_key_values, &Map::new())
-            .await
+        let original = request.original_rows.as_ref()
+            .map(|rows| &rows[row_index]).unwrap_or(&legacy_no_snapshot);
+        match delete_database_row(connection, &request.scope, primary_key_values, original).await
         {
             Ok(_) => deleted_row_count += 1,
             Err(error) => row_failures.push(serde_json::json!({
@@ -356,13 +428,7 @@ async fn delete_table_rows(
             })),
         }
     }
-    Ok(Json(serde_json::json!({
-        "success": row_failures.is_empty(),
-        "session": database_session(&connection.profile),
-        "deletedRowCount": deleted_row_count,
-        "failedRowCount": row_failures.len(),
-        "rowFailures": row_failures,
-    })))
+    Ok((deleted_row_count, row_failures))
 }
 
 async fn export_portable_table(
@@ -401,6 +467,7 @@ async fn export_portable_table(
         "format": "web-ai-cli/database-portable-v1",
         "type": if request.include_data { "table-schema-and-data" } else { "table-schema" },
         "exportedAt": Utc::now(),
+        "warnings": [{"code": "SCHEMA_PORTABILITY_LIMITATIONS", "message": PORTABLE_SCHEMA_LIMITATIONS}],
         "source": {
             "connectionType": connection.profile.db_type,
             "databaseName": endpoint.database_name,
@@ -482,6 +549,15 @@ async fn import_portable_table(
             )
             .await
             {
+                Ok(0) => {
+                    failed_row_count += 1;
+                    if row_failures.len() < MAX_ROW_FAILURE_DETAILS {
+                        row_failures.push(serde_json::json!({
+                            "rowIndex": row_index,
+                            "message": database_error_message(&database_insert_suppressed()),
+                        }));
+                    }
+                }
                 Ok(count) => imported_row_count += count,
                 Err(error) => {
                     failed_row_count += 1;
@@ -501,6 +577,7 @@ async fn import_portable_table(
         "schemaName": endpoint.schema_name,
         "tableName": endpoint.table_name,
         "createdTable": true,
+        "warnings": [{"code": "SCHEMA_PORTABILITY_LIMITATIONS", "message": PORTABLE_SCHEMA_LIMITATIONS}],
         "importedRowCount": imported_row_count,
         "failedRowCount": failed_row_count,
         "ignoredSourceColumns": [],

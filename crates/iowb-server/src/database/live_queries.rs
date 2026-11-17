@@ -36,7 +36,7 @@ async fn execute_postgres_query(
     let described_columns = (&mut *database)
         .describe(sql)
         .await
-        .map(|description| postgres_columns(description.columns()))
+        .map(|description| description.columns().to_vec())
         .unwrap_or_default();
     let mut rows = Vec::new();
     let mut observed_rows = 0usize;
@@ -63,9 +63,21 @@ async fn execute_postgres_query(
 
     let columns = rows
         .first()
-        .map(|row| postgres_columns(row.columns()))
+        .map(|row| {
+            // Raw/simple-query rows may retain only a custom type's OID. Use
+            // described names only when ordinal, name and OID identify the
+            // same result column; never borrow metadata from a different set.
+            let resolved = row.columns().iter().enumerate().map(|(index, column)| {
+                described_columns.get(index).filter(|known| {
+                    known.name() == column.name()
+                        && column.type_info().oid().is_some()
+                        && known.type_info().oid() == column.type_info().oid()
+                }).unwrap_or(column).clone()
+            }).collect::<Vec<_>>();
+            postgres_columns(&resolved)
+        })
         .filter(|columns| !columns.is_empty())
-        .unwrap_or(described_columns);
+        .unwrap_or_else(|| postgres_columns(&described_columns));
     let row_count = if columns.is_empty() {
         usize::try_from(affected_rows).unwrap_or(usize::MAX)
     } else {
@@ -213,6 +225,29 @@ async fn read_live_table_data(
     offset: usize,
     include_total_count: bool,
 ) -> Result<DatabaseTableData> {
+    read_live_table_data_with_options(
+        connection,
+        database_name,
+        schema_name,
+        table_name,
+        limit,
+        offset,
+        include_total_count,
+        &DatabaseTableQueryOptions::default(),
+    )
+    .await
+}
+
+async fn read_live_table_data_with_options(
+    connection: &StoredDatabaseConnection,
+    database_name: Option<&str>,
+    schema_name: Option<&str>,
+    table_name: &str,
+    limit: usize,
+    offset: usize,
+    include_total_count: bool,
+    options: &DatabaseTableQueryOptions,
+) -> Result<DatabaseTableData> {
     let start = Instant::now();
     // The data grid is read-only for views, but it must be able to inspect
     // every relation that the explorer exposes. PostgreSQL materialized views
@@ -252,17 +287,19 @@ async fn read_live_table_data(
     let (_database, schema) = live_scope(connection, database_name, schema_name);
     let table_ref = live_table_ref(connection.profile.db_type, &schema, table_name);
     let fetch_limit = limit.saturating_add(1);
+    let (where_clause, order_clause) =
+        database_table_query_clauses(connection.profile.db_type, &table.columns, options)?;
     let rows = fetch_live_row_maps(
         connection,
         database_name,
-        &format!("SELECT * FROM {table_ref} LIMIT {fetch_limit} OFFSET {offset}"),
+        &format!("SELECT * FROM {table_ref}{where_clause}{order_clause} LIMIT {fetch_limit} OFFSET {offset}"),
     )
     .await?;
     let total_row_count = if include_total_count {
         fetch_live_count(
             connection,
             database_name,
-            &format!("SELECT COUNT(*) AS __iowb_count FROM {table_ref}"),
+            &format!("SELECT COUNT(*) AS __iowb_count FROM {table_ref}{where_clause}"),
         )
         .await?
     } else {
@@ -289,6 +326,143 @@ async fn read_live_table_data(
         rows: output,
         duration_ms: start.elapsed().as_millis(),
     })
+}
+
+fn database_table_query_clauses(
+    db_type: SupportedDatabaseType,
+    columns: &[DatabaseObjectColumn],
+    options: &DatabaseTableQueryOptions,
+) -> Result<(String, String)> {
+    let quote_column = |name: &str| match db_type {
+        SupportedDatabaseType::Mysql | SupportedDatabaseType::Mariadb => {
+            quote_mysql_identifier(name)
+        }
+        _ => quote_identifier(name),
+    };
+    let find_column = |name: &str| {
+        columns
+            .iter()
+            .find(|column| column.name == name)
+            .ok_or_else(|| {
+                ServerError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("Unknown table column: {name}"),
+                )
+            })
+    };
+    let mut predicates = Vec::new();
+    for filter in &options.filters {
+        let column = find_column(&filter.column)?;
+        let identifier = quote_column(&column.name);
+        let predicate = match filter.operator.as_str() {
+            "isNull" => format!("{identifier} IS NULL"),
+            "isNotNull" => format!("{identifier} IS NOT NULL"),
+            "eq" | "ne" if filter.value.is_null() => {
+                format!(
+                    "{identifier} IS {}NULL",
+                    if filter.operator == "ne" { "NOT " } else { "" }
+                )
+            }
+            "eq" | "ne" => {
+                let operator = if filter.operator == "eq" { "=" } else { "<>" };
+                let is_json = column
+                    .data_type
+                    .as_deref()
+                    .into_iter()
+                    .chain(column.native_type.as_deref())
+                    .any(|kind| matches!(kind.to_ascii_lowercase().as_str(), "json" | "jsonb"));
+                if is_json && db_type == SupportedDatabaseType::Postgresql {
+                    let literal = database_text_literal(db_type, &filter.value.to_string());
+                    format!("{identifier}::jsonb {operator} {literal}::jsonb")
+                } else {
+                    let literal = if is_json {
+                        database_text_literal(db_type, &filter.value.to_string())
+                    } else {
+                        match &filter.value {
+                            Value::String(value) => database_text_literal(db_type, value),
+                            Value::Number(value) => value.to_string(),
+                            Value::Bool(value) => if *value { "TRUE" } else { "FALSE" }.to_string(),
+                            _ => {
+                                return Err(ServerError::new(
+                                    StatusCode::BAD_REQUEST,
+                                    "Objects and arrays may only filter JSON columns",
+                                ));
+                            }
+                        }
+                    };
+                    format!("{identifier} {operator} {literal}")
+                }
+            }
+            _ => {
+                return Err(ServerError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Supported filter operators: eq, ne, isNull, isNotNull",
+                ));
+            }
+        };
+        predicates.push(predicate);
+    }
+    let mut ordered_columns = Vec::new();
+    let mut ordering = Vec::new();
+    for sort in &options.sort {
+        let column = find_column(&sort.column)?;
+        let direction = match sort.direction.as_str() {
+            "asc" => "ASC",
+            "desc" => "DESC",
+            _ => {
+                return Err(ServerError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Sort direction must be asc or desc",
+                ));
+            }
+        };
+        if !ordered_columns.contains(&column.name.as_str()) {
+            ordering.push(format!("{} {direction}", quote_column(&column.name)));
+            ordered_columns.push(column.name.as_str());
+        }
+    }
+    for column in columns.iter().filter(|column| column.is_primary_key) {
+        if !ordered_columns.contains(&column.name.as_str()) {
+            ordering.push(quote_column(&column.name));
+        }
+    }
+    let where_clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", predicates.join(" AND "))
+    };
+    let order_clause = if ordering.is_empty() {
+        String::new()
+    } else {
+        format!(" ORDER BY {}", ordering.join(", "))
+    };
+    Ok((where_clause, order_clause))
+}
+
+#[cfg(test)]
+fn live_table_page_sql(
+    db_type: SupportedDatabaseType,
+    table_ref: &str,
+    primary_key: &[String],
+    limit: usize,
+    offset: usize,
+) -> String {
+    let order_by = if primary_key.is_empty() {
+        String::new()
+    } else {
+        let columns = primary_key
+            .iter()
+            .map(|column| match db_type {
+                SupportedDatabaseType::Mysql | SupportedDatabaseType::Mariadb => {
+                    quote_mysql_identifier(column)
+                }
+                _ => quote_identifier(column),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" ORDER BY {columns}")
+    };
+    format!("SELECT * FROM {table_ref}{order_by} LIMIT {limit} OFFSET {offset}")
 }
 
 fn live_scope(
@@ -391,11 +565,7 @@ fn postgres_columns(columns: &[sqlx::postgres::PgColumn]) -> Vec<DatabaseObjectC
         .map(|column| DatabaseObjectColumn {
             name: column.name().to_string(),
             data_type: None,
-            native_type: column
-                .type_info()
-                .oid()
-                .map(|oid| oid.0.to_string())
-                .or_else(|| Some(column.type_info().name().to_string())),
+            native_type: Some(column.type_info().name().to_string()),
             nullable: None,
             default_value: None,
             extra: None,
@@ -432,6 +602,13 @@ fn postgres_row_to_json_map(row: &PgRow) -> Map<String, Value> {
 
 fn postgres_value_to_json(row: &PgRow, index: usize) -> Value {
     let type_info = row.columns()[index].type_info();
+    // Simple-query/raw_sql rows can expose custom enum/domain OIDs without
+    // resolving their catalog metadata. SQLx names those declarations "?";
+    // calling kind() on one panics, including during post-insert readback.
+    // The simple-query wire value is text and remains safe to preserve.
+    if type_info.name() == "?" {
+        return postgres_string_fallback(row, index);
+    }
     if let PgTypeKind::Array(element_type) = type_info.kind() {
         return postgres_raw_string(row, index)
             .map(|value| {
@@ -480,19 +657,20 @@ fn postgres_value_to_json(row: &PgRow, index: usize) -> Value {
             .try_get_unchecked::<Option<Value>, _>(index)
             .ok()
             .flatten()
+            .map(database_json_wire_value)
             .unwrap_or(Value::Null),
         "DATE" => row
             .try_get_unchecked::<Option<NaiveDate>, _>(index)
             .ok()
             .flatten()
-            .map(|value| local_naive_to_iso(value.and_hms_opt(0, 0, 0).expect("midnight")))
+            .map(|value| value.to_string())
             .map(Value::String)
             .unwrap_or(Value::Null),
         "TIMESTAMP" => row
             .try_get_unchecked::<Option<NaiveDateTime>, _>(index)
             .ok()
             .flatten()
-            .map(local_naive_to_iso)
+            .map(|value| value.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
             .map(Value::String)
             .unwrap_or(Value::Null),
         "TIMESTAMPTZ" => row
@@ -595,19 +773,20 @@ fn mysql_value_to_json(row: &MySqlRow, index: usize) -> Value {
             .try_get_unchecked::<Option<Value>, _>(index)
             .ok()
             .flatten()
+            .map(database_json_wire_value)
             .unwrap_or(Value::Null),
         "DATE" => row
             .try_get_unchecked::<Option<NaiveDate>, _>(index)
             .ok()
             .flatten()
-            .map(|value| local_naive_to_iso(value.and_hms_opt(0, 0, 0).expect("midnight")))
+            .map(|value| value.to_string())
             .map(Value::String)
             .unwrap_or(Value::Null),
         "DATETIME" | "TIMESTAMP" => row
             .try_get_unchecked::<Option<NaiveDateTime>, _>(index)
             .ok()
             .flatten()
-            .map(local_naive_to_iso)
+            .map(|value| value.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
             .map(Value::String)
             .unwrap_or(Value::Null),
         "GEOMETRY" => row
@@ -622,12 +801,11 @@ fn mysql_value_to_json(row: &MySqlRow, index: usize) -> Value {
             .flatten()
             .map(|value| parse_mysql_vector(&value))
             .unwrap_or(Value::Null),
-        // MariaDB reports its JSON alias as BLOB on the wire, while retaining
-        // UTF-8 JSON bytes in the value. Preserve the portable buffer shape
-        // when decoding as JSON fails, but return structured JSON when it
-        // succeeds so JSON columns do not appear as opaque binary data.
-        "BLOB" => mysql_blob_value_to_json(row, index),
-        "BIT" | "BINARY" | "VARBINARY" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" => row
+        // MariaDB's JSON alias is textual and takes the string fallback,
+        // preserving encoded JSON (including null/string scalar provenance).
+        // Native MySQL JSON keeps its dedicated decoder. Actual binary data
+        // must remain bytes even when its UTF-8 happens to be valid JSON.
+        "BIT" | "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" => row
             .try_get_unchecked::<Option<Vec<u8>>, _>(index)
             .ok()
             .flatten()
@@ -653,19 +831,6 @@ fn mysql_integer_value(row: &MySqlRow, index: usize, unsigned: bool) -> Value {
         .unwrap_or_else(|| mysql_string_fallback(row, index))
 }
 
-fn mysql_blob_value_to_json(row: &MySqlRow, index: usize) -> Value {
-    row.try_get_unchecked::<Option<Value>, _>(index)
-        .ok()
-        .flatten()
-        .or_else(|| {
-            row.try_get_unchecked::<Option<Vec<u8>>, _>(index)
-                .ok()
-                .flatten()
-                .map(|value| database_buffer_value(&value))
-        })
-        .unwrap_or(Value::Null)
-}
-
 fn mysql_string_fallback(row: &MySqlRow, index: usize) -> Value {
     row.try_get_unchecked::<Option<String>, _>(index)
         .ok()
@@ -683,7 +848,23 @@ fn mysql_string_fallback(row: &MySqlRow, index: usize) -> Value {
 fn json_float_value(value: f64) -> Value {
     serde_json::Number::from_f64(value)
         .map(Value::Number)
-        .unwrap_or(Value::Null)
+        .unwrap_or_else(|| Value::String(if value.is_nan() {
+            "NaN".to_string()
+        } else if value.is_sign_negative() {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        }))
+}
+
+// Preserve the difference between SQL NULL and JSON null, and between JSON
+// strings such as "true" and their boolean/number lookalikes. Editors already
+// submit encoded JSON text; objects and arrays remain structured for viewers.
+fn database_json_wire_value(value: Value) -> Value {
+    match value {
+        Value::Null | Value::String(_) => Value::String(value.to_string()),
+        _ => value,
+    }
 }
 
 fn local_naive_to_iso(value: NaiveDateTime) -> String {
@@ -696,5 +877,5 @@ fn local_naive_to_iso(value: NaiveDateTime) -> String {
 }
 
 fn utc_datetime_to_iso(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+    value.to_rfc3339_opts(SecondsFormat::AutoSi, true)
 }

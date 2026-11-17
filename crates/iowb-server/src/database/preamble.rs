@@ -118,6 +118,10 @@ pub fn router() -> Router<AppState> {
             get(table_data),
         )
         .route(
+            "/api/database/connections/{connection_id}/table-data/query",
+            post(table_data_query),
+        )
+        .route(
             "/api/database/connections/{connection_id}/table-data/paste",
             post(paste_table_rows),
         )

@@ -130,25 +130,26 @@ fn postgres_array_scalar_to_json(value: &str, element_type: &str) -> Value {
             .parse::<i64>()
             .map(|value| Value::Number(value.into()))
             .unwrap_or_else(|_| Value::String(value.to_string())),
-        "INT8" => Value::String(value.to_string()),
-        "FLOAT4" | "FLOAT8" | "NUMERIC" => value
+        "INT8" | "NUMERIC" | "DECIMAL" => Value::String(value.to_string()),
+        "FLOAT4" | "FLOAT8" => value
             .parse::<f64>()
             .map(json_float_value)
             .unwrap_or(Value::Null),
         "BYTEA" => decode_postgres_bytea(value)
             .map(|value| database_buffer_value(&value))
             .unwrap_or(Value::Null),
-        "JSON" | "JSONB" => {
-            serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
-        }
+        // Array dimensions belong to PostgreSQL, not to JSON documents inside
+        // an element. Keep every JSON element encoded, including objects/arrays,
+        // so its strings and JSON null cannot become scalars or SQL array NULL
+        // when an editor, clipboard, or portable export replays the snapshot.
+        "JSON" | "JSONB" => Value::String(value.to_string()),
         "DATE" => NaiveDate::parse_from_str(value, "%Y-%m-%d")
             .ok()
-            .and_then(|value| value.and_hms_opt(0, 0, 0))
-            .map(local_naive_to_iso)
+            .map(|value| value.to_string())
             .map(Value::String)
             .unwrap_or(Value::Null),
         "TIMESTAMP" => NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
-            .map(local_naive_to_iso)
+            .map(|value| value.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
             .map(Value::String)
             .unwrap_or(Value::Null),
         "TIMESTAMPTZ" => DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f%#z")
@@ -396,7 +397,18 @@ fn parse_mysql_vector(value: &[u8]) -> Value {
 }
 
 fn any_string(row: &AnyRow, index: usize) -> Option<String> {
-    row.try_get::<Option<String>, _>(index).ok().flatten()
+    row.try_get::<Option<String>, _>(index)
+        .ok()
+        .flatten()
+        // MySQL 8 catalog DATA_TYPE/COLUMN_TYPE and MariaDB CHECK_CLAUSE
+        // can be reported as binary strings by the generic driver. They
+        // are UTF-8 metadata, not absent values or user BLOB cell contents.
+        .or_else(|| {
+            row.try_get::<Option<Vec<u8>>, _>(index)
+                .ok()
+                .flatten()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+        })
 }
 
 fn sqlite_connection(connection: &StoredDatabaseConnection) -> Result<Connection> {
