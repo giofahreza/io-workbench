@@ -242,6 +242,107 @@
     }
 
     #[test]
+    fn manual_kind_inference_keeps_app_build_with_manual_acceptance_as_implementation() {
+        let prompt = r#"Build “Pocket Notes” — a tiny local web app for my daily notes 📝.
+Bahasa Indonesia: tambah catatan, tandai selesai, lalu hapus. 日本語: メモを保存。 العربية: ملاحظاتي.
+Use plain HTML, CSS, and JavaScript. No backend, accounts, paid services, deployment, or network dependencies.
+
+The screen should have one title field, an optional multiline note, an Add button, and filters for All / Active / Done. Show accurate total, active, and done counts. Keep notes in localStorage across reloads. A user must be able to toggle completion in both directions and delete just the selected note without deleting its neighbours.
+Treat titles and notes as text: preserve "double quotes", 'single quotes', ampersands & angle brackets <example>, without executing HTML or JavaScript. Reject an empty or whitespace-only title. Do not reject non-Latin names or emoji. Preserve intentional newlines in the note body, and keep long unbroken words inside the card without covering buttons.
+Example note title: Café ☕ — 买牛奶 — مرحباً. Example detail: Remember the "blue" notebook; don't forget the pencil.
+Use accessible labels, keyboard navigation, and a comfortable phone layout. Include explicit empty and filtered-empty states. After adding three notes and completing one, the counters must show 3 total, 2 active, and 1 done; after reload, the same notes and statuses should remain.
+
+Keep implementation scope small. Plan dependencies explicitly: implement the static shell before interactions, implement state before persistence checks, then manually verify the complete workflow. Write short local run instructions. Do not invent analytics, sharing, login, cloud sync, subscriptions, databases, or unrelated features.
+Final acceptance marker: 完了 ✅ END-OF-PROMPT-1002."#;
+        let mut run = board_fixture(json!({
+            "command": prompt,
+            "projectPath": "/tmp/project"
+        }));
+
+        // Creation stores an implementation Story; persistence/load normalization
+        // must not turn its downstream verification acceptance into its purpose.
+        for _ in 0..2 {
+            normalize_board_model(&mut run);
+            assert_eq!(run.tasks[0].task_type, TASK_KIND_IMPLEMENTATION);
+            assert_eq!(task_level(&run.tasks[0]), TASK_LEVEL_STORY);
+            assert!(!task_is_executable(&run.tasks[0]));
+            assert_eq!(run.tasks[0].prompt, prompt);
+        }
+    }
+
+    #[test]
+    fn manual_kind_inference_preserves_primary_implementation_scope_in_drafts() {
+        for title in [
+            "Build Pocket Notes",
+            "Please implement note persistence",
+            "Create the notes UI and manually verify the complete workflow",
+            "Fix note deletion; run a manual smoke test afterwards",
+            "Add task counts then manually verify them",
+        ] {
+            let criteria = vec!["Manually verify the workflow on a phone.".to_string()];
+            assert_eq!(
+                prompt_task_kind_from_value(
+                    &json!({}),
+                    title,
+                    "Implement the requested behavior and then run a manual smoke pass.",
+                    &criteria,
+                ),
+                TASK_KIND_IMPLEMENTATION,
+                "manual acceptance must not reclassify the implementation scope: {title}"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_kind_inference_preserves_verification_and_explicit_kinds() {
+        for (title, details) in [
+            ("Run mobile functional verification", "Verify the app locally."),
+            ("Budget alerts", "Run an Android emulator smoke test."),
+            ("Add manual verification evidence", "Record observed outcomes and screenshots."),
+            ("Create manual smoke report", "Document the verification observations."),
+        ] {
+            assert_eq!(
+                prompt_task_kind_from_value(&json!({}), title, details, &[]),
+                TASK_KIND_MANUAL_TEST,
+                "verification-only inference must remain supported: {title}"
+            );
+        }
+        assert_eq!(
+            prompt_task_kind_from_value(
+                &json!({"kind": "manual_test"}),
+                "Build Pocket Notes",
+                "User explicitly selected manual verification.",
+                &[],
+            ),
+            TASK_KIND_MANUAL_TEST,
+        );
+        assert_eq!(
+            prompt_task_kind_from_value(
+                &json!({"kind": "implementation"}),
+                "Run manual smoke test",
+                "Explicit task kind remains authoritative.",
+                &[],
+            ),
+            TASK_KIND_IMPLEMENTATION,
+        );
+    }
+
+    #[test]
+    fn manual_kind_inference_does_not_demote_a_stored_manual_task() {
+        let mut run = board_fixture(json!({
+            "command": "Build Pocket Notes, then manually verify the complete workflow.",
+            "projectPath": "/tmp/project"
+        }));
+        // An existing value might be the user's explicit choice. Fix future
+        // inference without guessing whether to migrate historical cards.
+        run.tasks[0].task_type = TASK_KIND_MANUAL_TEST.to_string();
+        for _ in 0..2 {
+            normalize_board_model(&mut run);
+            assert_eq!(run.tasks[0].task_type, TASK_KIND_MANUAL_TEST);
+        }
+    }
+
+    #[test]
     fn prompt_task_draft_infers_manual_test_kind_for_functional_verification() {
         let mut run = board_fixture(json!({
             "command": "Add budget alerts",
@@ -476,7 +577,9 @@
             agents.hierarchy.parent_id.as_deref(),
             Some(parent_id.as_str())
         );
-        assert!(task_is_runnable_in_board(&run, &agents));
+        assert_eq!(agents.status, TASK_STATUS_BACKLOG);
+        assert!(!agents.hierarchy.required);
+        assert!(!task_is_runnable_in_board(&run, &agents));
 
         run.tasks.push(qa.clone());
         assert!(queue_qa_verdict_retry(

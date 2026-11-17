@@ -74,10 +74,39 @@ fn release_project_execution(project_path: &str, board_id: &str) {
     }
 }
 
+fn preflight_task_may_start(
+    current: &AgenticBoard,
+    task_id: &str,
+    project_path: &str,
+    control_revision: u64,
+    scope_version: u64,
+) -> bool {
+    current.status == "running"
+        && current.active
+        && !current.pause_requested
+        && current.control_revision == control_revision
+        && current.project_path == project_path
+        && current.current_task_id.as_deref() == Some(task_id)
+        && current
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .is_some_and(|task| {
+                task_status_is_active(&task.status)
+                    && (!uses_hierarchical_orchestration(current) || task_is_executable(task))
+                    && task.hierarchy.scope_version == scope_version
+                    && task.superseded_by.is_none()
+                    && task_ancestors_are_approved(current, task)
+                    && task_side_effects_are_approved(task)
+                    && unmet_task_dependencies(current, task).is_empty()
+            })
+}
+
 fn start_board_execution(state: &AppState, user_id: &str, id: &str) -> Result<StoredBoard> {
     let (should_spawn, stored) = {
         let _guard = board_mutation_lock();
         let mut stored = load_user_board(state, user_id, id)?;
+        ensure_restart_recovery_finished(id)?;
         if let Some(task_id) = unapproved_side_effect_task_ids(&stored.board).first() {
             return Err(ServerError::new(
                 StatusCode::CONFLICT,
@@ -135,281 +164,353 @@ async fn execute_board_loop(state: AppState, user_id: String, board_id: String) 
     result
 }
 
+enum BoardExecutionPreparation {
+    Stop,
+    Continue,
+    Bootstrap,
+    Breakdown(String),
+    Execute {
+        stored: StoredBoard,
+        task_index: usize,
+        task_id: String,
+        started_at: DateTime<Utc>,
+    },
+}
+
+fn prepare_board_execution_step(
+    state: &AppState,
+    user_id: &str,
+    board_id: &str,
+) -> Result<BoardExecutionPreparation> {
+    prepare_board_execution_step_observed(state, user_id, board_id, || {})
+}
+
+fn prepare_board_execution_step_observed(
+    state: &AppState,
+    user_id: &str,
+    board_id: &str,
+    after_load: impl FnOnce(),
+) -> Result<BoardExecutionPreparation> {
+    // A native bulk move sends parent-first promotion requests. Each request
+    // can start this scheduler, so an idle worker must not overwrite the next
+    // acknowledged approval with the older snapshot it used for its decision.
+    // Keep load, reconciliation and decision/claim persistence atomic with UI
+    // mutations. This synchronous function releases the guard before callers
+    // await bootstrap, hierarchy planning, validation or a provider.
+    let _guard = board_mutation_lock();
+    let mut stored = load_user_board(state, user_id, board_id)?;
+    after_load();
+    if matches!(
+        stored.board.status.as_str(),
+        "cancelled" | "failed" | "blocked" | "completed"
+    ) {
+        if matches!(stored.board.status.as_str(), "failed" | "blocked") {
+            let status_for_retry = stored.board.status.clone();
+            schedule_auto_retry_if_eligible(&mut stored.board, &status_for_retry);
+        }
+        stored.board.active = false;
+        stored.board.loop_started = false;
+        save_board(state, &stored.board)?;
+        return Ok(BoardExecutionPreparation::Stop);
+    }
+    if stored.board.status == "paused" || stored.board.pause_requested {
+        settle_board_pause(&mut stored.board);
+        stored.board.touch();
+        save_board(state, &stored.board)?;
+        return Ok(BoardExecutionPreparation::Stop);
+    }
+
+    if !stored.board.bootstrap_complete {
+        return Ok(BoardExecutionPreparation::Bootstrap);
+    }
+
+    if let Some(issue) = hierarchy_validation_issues(&stored.board)
+        .into_iter()
+        .next()
+    {
+        let affected = planning_error_task_ids(&stored.board, &issue);
+        mark_planning_error(&mut stored.board, &affected, "hierarchy", &issue);
+        stored.board.touch();
+        save_board(state, &stored.board)?;
+        return Ok(BoardExecutionPreparation::Stop);
+    }
+    if let Some(issue) = dependency_validation_issues(&stored.board)
+        .into_iter()
+        .next()
+    {
+        let affected = planning_error_task_ids(&stored.board, &issue);
+        mark_planning_error(&mut stored.board, &affected, "dependency", &issue);
+        stored.board.touch();
+        save_board(state, &stored.board)?;
+        return Ok(BoardExecutionPreparation::Stop);
+    }
+    if let Some(cycle) = dependency_cycle(&stored.board) {
+        let issue = format!("Dependency cycle detected: {}", cycle.join(" -> "));
+        mark_planning_error(&mut stored.board, &cycle, "dependency", &issue);
+        stored.board.touch();
+        save_board(state, &stored.board)?;
+        return Ok(BoardExecutionPreparation::Stop);
+    }
+    refresh_hierarchy_rollups(&mut stored.board);
+    if let Some(parent) = next_hierarchy_parent(&stored.board) {
+        if parent.hierarchy.manual_verification.is_some()
+            && let Some(issue) = manual_task_contract_issue(&parent)
+        {
+            mark_planning_error(&mut stored.board, &[parent.id], "manual_verification", issue);
+            stored.board.touch();
+            save_board(state, &stored.board)?;
+            return Ok(BoardExecutionPreparation::Stop);
+        }
+        stored.board.current_phase = Some("hierarchy_breakdown".to_string());
+        stored.board.phase_started_at = Some(Utc::now());
+        stored.board.phase_details = Some(json!({
+            "parentId": parent.id,
+            "parentLevel": task_level(&parent),
+            "nextLevel": next_hierarchy_level(task_level(&parent)),
+        }));
+        stored.board.append_log(format!(
+            "Breaking down {} {} into its next hierarchy level",
+            task_level(&parent),
+            parent.id
+        ));
+        stored.board.touch();
+        save_board(state, &stored.board)?;
+        return Ok(BoardExecutionPreparation::Breakdown(parent.id));
+    }
+
+    reconcile_dependency_statuses(&mut stored.board);
+    refresh_hierarchy_rollups(&mut stored.board);
+    stored.board.touch();
+    save_board(state, &stored.board)?;
+
+    let Some(task_index) = pick_next_task_index(&stored.board) else {
+        if uses_hierarchical_orchestration(&stored.board) {
+            reconcile_dependency_statuses(&mut stored.board);
+            let waiting_tasks = dependency_waiting_tasks(&stored.board);
+            let side_effect_tasks = unapproved_side_effect_task_ids(&stored.board);
+            let pending_research = pending_research_acceptance_ids(&stored.board);
+            if !side_effect_tasks.is_empty() {
+                mark_side_effect_blockers(&mut stored.board);
+                stored.board.status = TASK_STATUS_BLOCKED.to_string();
+                stored.board.active = false;
+                stored.board.loop_started = false;
+                stored.board.current_phase =
+                    Some("waiting_for_side_effect_approval".to_string());
+                stored.board.pause_reason = Some(
+                    "Approve declared external side effects before resuming execution."
+                        .to_string(),
+                );
+                stored.board.append_log(format!(
+                    "No runnable subtasks: {} require external side-effect approval ({})",
+                    side_effect_tasks.len(),
+                    side_effect_tasks.join(", ")
+                ));
+            } else if !pending_research.is_empty() {
+                stored.board.status = "paused".to_string();
+                stored.board.active = false;
+                stored.board.loop_started = false;
+                stored.board.current_phase = Some("waiting_for_research_approval".to_string());
+                stored.board.pause_reason = Some(
+                    "Accept completed research output before implementation can continue."
+                        .to_string(),
+                );
+                stored.board.phase_details = Some(json!({
+                    "researchTaskIds": pending_research,
+                }));
+                stored.board.append_log(
+                    "Execution paused because completed research awaits user acceptance",
+                );
+            } else if !waiting_tasks.is_empty() {
+                mark_dependency_blockers(&mut stored.board);
+                stored.board.status = TASK_STATUS_BLOCKED.to_string();
+                stored.board.active = false;
+                stored.board.loop_started = false;
+                stored.board.current_phase = Some("blocked".to_string());
+                stored.board.append_log(format!(
+                    "No runnable subtasks: {} waiting on dependencies ({})",
+                    waiting_tasks.len(),
+                    waiting_tasks.join(", ")
+                ));
+            } else if has_dependency_blocked_tasks(&stored.board) {
+                stored.board.status = TASK_STATUS_BLOCKED.to_string();
+                stored.board.active = false;
+                stored.board.loop_started = false;
+                stored.board.current_phase = Some("blocked".to_string());
+                stored.board.append_log(
+                   "Hierarchy execution stopped on a dependency blocker; resolve the dependency before resuming",
+                );
+            } else if has_hierarchical_attention_tasks(&stored.board) {
+                stored.board.status = TASK_STATUS_BLOCKED.to_string();
+                stored.board.active = false;
+                stored.board.loop_started = false;
+                stored.board.current_phase = Some("blocked".to_string());
+                stored.board.append_log(
+                   "Hierarchy execution stopped at a failed or blocked subtask; retry it or approve a fix subtask",
+                );
+            } else if hierarchical_work_is_complete(&stored.board)
+                && !has_backlog_planning_work(&stored.board)
+            {
+                stored.board.status = "completed".to_string();
+                stored.board.active = false;
+                stored.board.loop_started = false;
+                stored.board.current_task_id = None;
+                stored.board.current_task_title.clear();
+                stored.board.current_task_status.clear();
+                stored.board.current_phase = Some("completed".to_string());
+                stored.board.phase_details = Some(json!({
+                    "taskCount": stored.board.tasks.len(),
+                    "execution": "subtasks_only",
+                }));
+                stored.board.final_review = Some(json!({
+                    "complete": true,
+                    "summary": "All approved executable subtasks completed.",
+                }));
+                stored.board.append_log(
+                    "Hierarchy execution completed: all approved executable subtasks are done",
+                );
+            } else {
+                stored.board.status = "paused".to_string();
+                stored.board.active = false;
+                stored.board.loop_started = false;
+                stored.board.current_phase = Some("waiting_for_approval".to_string());
+                stored.board.pause_reason = Some(
+                   "No approved executable subtasks remain; move the next planning item to Todo."
+                       .to_string(),
+               );
+                stored.board.append_log(
+                    "Hierarchy execution paused because no approved executable subtasks remain",
+                );
+            }
+            stored.board.touch();
+            save_board(state, &stored.board)?;
+            return Ok(BoardExecutionPreparation::Stop);
+        }
+        if !stored.board.agents_knowledge_updated
+            && append_agents_knowledge_task(
+                &mut stored.board,
+                "Implementation work completed before final QA",
+                None,
+            )
+        {
+            stored.board.current_phase = Some("agents_update".to_string());
+            stored.board.phase_started_at = Some(Utc::now());
+            stored
+                .board
+                .append_log("Appended AGENTS.md knowledge update task");
+            stored.board.touch();
+            save_board(state, &stored.board)?;
+            return Ok(BoardExecutionPreparation::Continue);
+        }
+        if append_promotion_review_task(&mut stored.board, "Final promotion review") {
+            stored.board.current_phase = Some("promotion_review".to_string());
+            stored.board.phase_started_at = Some(Utc::now());
+            stored
+                .board
+                .append_log("Appended RAG promotion review task");
+            stored.board.touch();
+            save_board(state, &stored.board)?;
+            return Ok(BoardExecutionPreparation::Continue);
+        }
+        stored.board.status = "completed".to_string();
+        stored.board.active = false;
+        stored.board.loop_started = false;
+        stored.board.current_task_id = None;
+        stored.board.current_task_title.clear();
+        stored.board.current_task_status.clear();
+        stored.board.current_phase = Some("completed".to_string());
+        stored.board.phase_details = Some(json!({ "taskCount": stored.board.tasks.len() }));
+        stored.board.final_qa_complete = true;
+        stored.board.final_review = Some(json!({
+            "complete": true,
+            "summary": "All runnable board tasks completed.",
+        }));
+        stored.board.append_log("Agentic board execution completed");
+        stored.board.touch();
+        save_board(state, &stored.board)?;
+        return Ok(BoardExecutionPreparation::Stop);
+    };
+
+    let task_id = stored.board.tasks[task_index].id.clone();
+    if let Some(issue) = manual_task_contract_issue(&stored.board.tasks[task_index]) {
+        mark_planning_error(&mut stored.board, &[task_id], "manual_verification", issue);
+        stored.board.touch();
+        save_board(state, &stored.board)?;
+        return Ok(BoardExecutionPreparation::Stop);
+    }
+    let task_title = stored.board.tasks[task_index].title.clone();
+    let started_at = Utc::now();
+    stored.board.status = "running".to_string();
+    stored.board.current_task_id = Some(task_id.clone());
+    stored.board.current_task_title = task_title.clone();
+    stored.board.current_task_status = "in_progress".to_string();
+    let task_phase = stored
+        .board
+        .tasks
+        .get(task_index)
+        .map(|task| {
+            if is_qa_task(task) {
+                "qa_task"
+            } else if is_promotion_review_task(task) {
+                "promotion_review"
+            } else if task.agents_knowledge_task || task.id == AGENTS_KNOWLEDGE_TASK_ID {
+                "agents_update"
+            } else {
+                "task_execution"
+            }
+        })
+        .unwrap_or("task_execution");
+    stored.board.current_phase = Some(task_phase.to_string());
+    stored.board.phase_started_at = Some(started_at);
+    stored.board.phase_details = Some(json!({ "taskId": task_id, "taskTitle": task_title }));
+    apply_task_model_routing(&mut stored.board, task_index);
+    if let Some(task) = stored.board.tasks.get_mut(task_index) {
+        task.status = "in_progress".to_string();
+        task.attempt_count = task.attempt_count.saturating_add(1);
+        task.started_at = Some(started_at);
+        task.completed_at = None;
+        task.error = None;
+        task.transcript.push(json!({
+            "timestamp": started_at,
+            "kind": "status",
+            "status": "running",
+            "content": "Task execution started",
+        }));
+        task.transcript_updated_at = Some(started_at);
+    }
+    stored.board.append_log(format!("Executing task {task_id}"));
+    stored.board.touch();
+    save_board(state, &stored.board)?;
+
+    Ok(BoardExecutionPreparation::Execute {
+        stored,
+        task_index,
+        task_id,
+        started_at,
+    })
+}
+
 async fn execute_board_loop_inner(
     state: AppState,
     user_id: String,
     board_id: String,
 ) -> Result<()> {
     loop {
-        let mut stored = load_user_board(&state, &user_id, &board_id)?;
-        if matches!(
-            stored.board.status.as_str(),
-            "cancelled" | "failed" | "blocked" | "completed"
-        ) {
-            if matches!(stored.board.status.as_str(), "failed" | "blocked") {
-                let status_for_retry = stored.board.status.clone();
-                schedule_auto_retry_if_eligible(&mut stored.board, &status_for_retry);
-            }
-            stored.board.active = false;
-            stored.board.loop_started = false;
-            save_board(&state, &stored.board)?;
-            return Ok(());
-        }
-        if stored.board.status == "paused" || stored.board.pause_requested {
-            settle_board_pause(&mut stored.board);
-            stored.board.touch();
-            save_board(&state, &stored.board)?;
-            return Ok(());
-        }
-
-        if !stored.board.bootstrap_complete {
-            bootstrap_agentic_board(&state, &user_id, &board_id).await?;
-            continue;
-        }
-
-        if let Some(issue) = hierarchy_validation_issues(&stored.board)
-            .into_iter()
-            .next()
-        {
-            let affected = planning_error_task_ids(&stored.board, &issue);
-            mark_planning_error(&mut stored.board, &affected, "hierarchy", &issue);
-            stored.board.touch();
-            save_board(&state, &stored.board)?;
-            return Ok(());
-        }
-        if let Some(issue) = dependency_validation_issues(&stored.board)
-            .into_iter()
-            .next()
-        {
-            let affected = planning_error_task_ids(&stored.board, &issue);
-            mark_planning_error(&mut stored.board, &affected, "dependency", &issue);
-            stored.board.touch();
-            save_board(&state, &stored.board)?;
-            return Ok(());
-        }
-        if let Some(cycle) = dependency_cycle(&stored.board) {
-            let issue = format!("Dependency cycle detected: {}", cycle.join(" -> "));
-            mark_planning_error(&mut stored.board, &cycle, "dependency", &issue);
-            stored.board.touch();
-            save_board(&state, &stored.board)?;
-            return Ok(());
-        }
-        refresh_hierarchy_rollups(&mut stored.board);
-        if let Some(parent) = next_hierarchy_parent(&stored.board) {
-            stored.board.current_phase = Some("hierarchy_breakdown".to_string());
-            stored.board.phase_started_at = Some(Utc::now());
-            stored.board.phase_details = Some(json!({
-                "parentId": parent.id,
-                "parentLevel": task_level(&parent),
-                "nextLevel": next_hierarchy_level(task_level(&parent)),
-            }));
-            stored.board.append_log(format!(
-                "Breaking down {} {} into its next hierarchy level",
-                task_level(&parent),
-                parent.id
-            ));
-            stored.board.touch();
-            save_board(&state, &stored.board)?;
-            plan_hierarchy_children(&state, &user_id, &board_id, &parent.id, false).await?;
-            continue;
-        }
-
-        reconcile_dependency_statuses(&mut stored.board);
-        refresh_hierarchy_rollups(&mut stored.board);
-        stored.board.touch();
-        save_board(&state, &stored.board)?;
-
-        let Some(task_index) = pick_next_task_index(&stored.board) else {
-            if uses_hierarchical_orchestration(&stored.board) {
-                reconcile_dependency_statuses(&mut stored.board);
-                let waiting_tasks = dependency_waiting_tasks(&stored.board);
-                let side_effect_tasks = unapproved_side_effect_task_ids(&stored.board);
-                let pending_research = pending_research_acceptance_ids(&stored.board);
-                if !side_effect_tasks.is_empty() {
-                    mark_side_effect_blockers(&mut stored.board);
-                    stored.board.status = TASK_STATUS_BLOCKED.to_string();
-                    stored.board.active = false;
-                    stored.board.loop_started = false;
-                    stored.board.current_phase =
-                        Some("waiting_for_side_effect_approval".to_string());
-                    stored.board.pause_reason = Some(
-                        "Approve declared external side effects before resuming execution."
-                            .to_string(),
-                    );
-                    stored.board.append_log(format!(
-                        "No runnable subtasks: {} require external side-effect approval ({})",
-                        side_effect_tasks.len(),
-                        side_effect_tasks.join(", ")
-                    ));
-                } else if !pending_research.is_empty() {
-                    stored.board.status = "paused".to_string();
-                    stored.board.active = false;
-                    stored.board.loop_started = false;
-                    stored.board.current_phase = Some("waiting_for_research_approval".to_string());
-                    stored.board.pause_reason = Some(
-                        "Accept completed research output before implementation can continue."
-                            .to_string(),
-                    );
-                    stored.board.phase_details = Some(json!({
-                        "researchTaskIds": pending_research,
-                    }));
-                    stored.board.append_log(
-                        "Execution paused because completed research awaits user acceptance",
-                    );
-                } else if !waiting_tasks.is_empty() {
-                    mark_dependency_blockers(&mut stored.board);
-                    stored.board.status = TASK_STATUS_BLOCKED.to_string();
-                    stored.board.active = false;
-                    stored.board.loop_started = false;
-                    stored.board.current_phase = Some("blocked".to_string());
-                    stored.board.append_log(format!(
-                        "No runnable subtasks: {} waiting on dependencies ({})",
-                        waiting_tasks.len(),
-                        waiting_tasks.join(", ")
-                    ));
-                } else if has_dependency_blocked_tasks(&stored.board) {
-                    stored.board.status = TASK_STATUS_BLOCKED.to_string();
-                    stored.board.active = false;
-                    stored.board.loop_started = false;
-                    stored.board.current_phase = Some("blocked".to_string());
-                    stored.board.append_log(
-                       "Hierarchy execution stopped on a dependency blocker; resolve the dependency before resuming",
-                    );
-                } else if has_hierarchical_attention_tasks(&stored.board) {
-                    stored.board.status = TASK_STATUS_BLOCKED.to_string();
-                    stored.board.active = false;
-                    stored.board.loop_started = false;
-                    stored.board.current_phase = Some("blocked".to_string());
-                    stored.board.append_log(
-                       "Hierarchy execution stopped at a failed or blocked subtask; retry it or approve a fix subtask",
-                    );
-                } else if hierarchical_work_is_complete(&stored.board)
-                    && !has_backlog_planning_work(&stored.board)
-                {
-                    stored.board.status = "completed".to_string();
-                    stored.board.active = false;
-                    stored.board.loop_started = false;
-                    stored.board.current_task_id = None;
-                    stored.board.current_task_title.clear();
-                    stored.board.current_task_status.clear();
-                    stored.board.current_phase = Some("completed".to_string());
-                    stored.board.phase_details = Some(json!({
-                        "taskCount": stored.board.tasks.len(),
-                        "execution": "subtasks_only",
-                    }));
-                    stored.board.final_review = Some(json!({
-                        "complete": true,
-                        "summary": "All approved executable subtasks completed.",
-                    }));
-                    stored.board.append_log(
-                        "Hierarchy execution completed: all approved executable subtasks are done",
-                    );
-                } else {
-                    stored.board.status = "paused".to_string();
-                    stored.board.active = false;
-                    stored.board.loop_started = false;
-                    stored.board.current_phase = Some("waiting_for_approval".to_string());
-                    stored.board.pause_reason = Some(
-                       "No approved executable subtasks remain; move the next planning item to Todo."
-                           .to_string(),
-                   );
-                    stored.board.append_log(
-                        "Hierarchy execution paused because no approved executable subtasks remain",
-                    );
+        let (mut stored, task_index, task_id, started_at) =
+            match prepare_board_execution_step(&state, &user_id, &board_id)? {
+                BoardExecutionPreparation::Stop => return Ok(()),
+                BoardExecutionPreparation::Continue => continue,
+                BoardExecutionPreparation::Bootstrap => {
+                    bootstrap_agentic_board(&state, &user_id, &board_id).await?;
+                    continue;
                 }
-                stored.board.touch();
-                save_board(&state, &stored.board)?;
-                return Ok(());
-            }
-            if !stored.board.agents_knowledge_updated
-                && append_agents_knowledge_task(
-                    &mut stored.board,
-                    "Implementation work completed before final QA",
-                    None,
-                )
-            {
-                stored.board.current_phase = Some("agents_update".to_string());
-                stored.board.phase_started_at = Some(Utc::now());
-                stored
-                    .board
-                    .append_log("Appended AGENTS.md knowledge update task");
-                stored.board.touch();
-                save_board(&state, &stored.board)?;
-                continue;
-            }
-            if append_promotion_review_task(&mut stored.board, "Final promotion review") {
-                stored.board.current_phase = Some("promotion_review".to_string());
-                stored.board.phase_started_at = Some(Utc::now());
-                stored
-                    .board
-                    .append_log("Appended RAG promotion review task");
-                stored.board.touch();
-                save_board(&state, &stored.board)?;
-                continue;
-            }
-            stored.board.status = "completed".to_string();
-            stored.board.active = false;
-            stored.board.loop_started = false;
-            stored.board.current_task_id = None;
-            stored.board.current_task_title.clear();
-            stored.board.current_task_status.clear();
-            stored.board.current_phase = Some("completed".to_string());
-            stored.board.phase_details = Some(json!({ "taskCount": stored.board.tasks.len() }));
-            stored.board.final_qa_complete = true;
-            stored.board.final_review = Some(json!({
-                "complete": true,
-                "summary": "All runnable board tasks completed.",
-            }));
-            stored.board.append_log("Agentic board execution completed");
-            stored.board.touch();
-            save_board(&state, &stored.board)?;
-            return Ok(());
-        };
-
-        let task_id = stored.board.tasks[task_index].id.clone();
-        let task_title = stored.board.tasks[task_index].title.clone();
-        let started_at = Utc::now();
-        stored.board.status = "running".to_string();
-        stored.board.current_task_id = Some(task_id.clone());
-        stored.board.current_task_title = task_title.clone();
-        stored.board.current_task_status = "in_progress".to_string();
-        let task_phase = stored
-            .board
-            .tasks
-            .get(task_index)
-            .map(|task| {
-                if is_qa_task(task) {
-                    "qa_task"
-                } else if is_promotion_review_task(task) {
-                    "promotion_review"
-                } else if task.agents_knowledge_task || task.id == AGENTS_KNOWLEDGE_TASK_ID {
-                    "agents_update"
-                } else {
-                    "task_execution"
+                BoardExecutionPreparation::Breakdown(parent_id) => {
+                    plan_hierarchy_children(&state, &user_id, &board_id, &parent_id, false).await?;
+                    continue;
                 }
-            })
-            .unwrap_or("task_execution");
-        stored.board.current_phase = Some(task_phase.to_string());
-        stored.board.phase_started_at = Some(started_at);
-        stored.board.phase_details = Some(json!({ "taskId": task_id, "taskTitle": task_title }));
-        apply_task_model_routing(&mut stored.board, task_index);
-        if let Some(task) = stored.board.tasks.get_mut(task_index) {
-            task.status = "in_progress".to_string();
-            task.attempt_count = task.attempt_count.saturating_add(1);
-            task.started_at = Some(started_at);
-            task.completed_at = None;
-            task.error = None;
-            task.transcript.push(json!({
-                "timestamp": started_at,
-                "kind": "status",
-                "status": "running",
-                "content": "Task execution started",
-            }));
-            task.transcript_updated_at = Some(started_at);
-        }
-        stored.board.append_log(format!("Executing task {task_id}"));
-        stored.board.touch();
-        save_board(&state, &stored.board)?;
+                BoardExecutionPreparation::Execute {
+                    stored, task_index, task_id, started_at,
+                } => (stored, task_index, task_id, started_at),
+            };
 
         if stored
             .board
@@ -452,6 +553,7 @@ async fn execute_board_loop_inner(
                     &attempt_id,
                     TASK_STATUS_FAILED,
                     now,
+                    None,
                 );
                 stored.board.touch();
                 save_board(&state, &stored.board)?;
@@ -469,6 +571,7 @@ async fn execute_board_loop_inner(
                 &attempt_id,
                 attempt_status,
                 Utc::now(),
+                None,
             );
             stored.board.current_task_id = None;
             stored.board.current_task_title.clear();
@@ -556,16 +659,74 @@ async fn execute_board_loop_inner(
             continue;
         };
 
-        let before_workspace = capture_workspace_snapshot(&stored.board.project_path);
-        stored.board.provider_call_started_at = Some(Utc::now());
-        stored.board.provider_call_label = Some(format!("task execution for {task_id}"));
+        let preflight_control_revision = stored.board.control_revision;
+        let preflight_project_path = stored.board.project_path.clone();
+        let preflight_scope_version = stored.board.tasks[task_index].hierarchy.scope_version;
+        let mut before_workspace = capture_workspace_snapshot(&stored.board.project_path);
+        if let Some(task) = stored.board.tasks.get(task_index) {
+            before_workspace["scopeVersion"] = json!(task.hierarchy.scope_version);
+            bind_manual_runtime_snapshot(&mut before_workspace, task);
+        }
+        stored.board.latest_workspace_snapshot = Some(before_workspace.clone());
+        let pre_execution_validation =
+            if stored.board.tasks.get(task_index).is_some_and(|task| {
+                hierarchical_intermediate_qa_barrier(&stored.board, task).is_some()
+            }) {
+                Some(
+                    run_deterministic_validation_with_output_limit(
+                        &stored.board,
+                        &task_id,
+                        "test_preflight",
+                        65536,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+        let test_suite_fingerprint = hierarchical_validation_test_fingerprint(&stored.board);
+        if pre_execution_validation.is_some() {
+            // Tests may create local artifacts. Attribute only changes after
+            // the provider's real start, not the older pre-test snapshot.
+            before_workspace = capture_workspace_snapshot(&preflight_project_path);
+            before_workspace["scopeVersion"] = json!(preflight_scope_version);
+            bind_manual_runtime_snapshot(&mut before_workspace, &stored.board.tasks[task_index]);
+        }
         let attempt_id = format!("attempt-{}", Uuid::new_v4());
-        if let Some(task) = stored
-            .board
-            .tasks
-            .iter_mut()
-            .find(|task| task.id == task_id)
-        {
+        let (stored, task_index) = {
+            // A pause, abort, scope revision, or model edit may have arrived
+            // during preflight. Merge no stale task/scope state into the board.
+            // The synchronous guard is released before the provider await.
+            let _guard = board_mutation_lock();
+            let mut fresh = load_user_board(&state, &user_id, &board_id)?;
+            if fresh.board.status == "paused" || fresh.board.pause_requested {
+                settle_board_pause(&mut fresh.board);
+                fresh.board.touch();
+                save_board(&state, &fresh.board)?;
+                return Ok(());
+            }
+            if !fresh.board.active || fresh.board.status != "running" {
+                return Ok(());
+            }
+            if !preflight_task_may_start(
+                &fresh.board,
+                &task_id,
+                &preflight_project_path,
+                preflight_control_revision,
+                preflight_scope_version,
+            ) {
+                continue;
+            }
+            let task_index = fresh
+                .board
+                .tasks
+                .iter()
+                .position(|task| task.id == task_id)
+                .unwrap();
+            fresh.board.latest_workspace_snapshot = Some(before_workspace.clone());
+            fresh.board.provider_call_started_at = Some(Utc::now());
+            fresh.board.provider_call_label = Some(format!("task execution for {task_id}"));
+            let task = &mut fresh.board.tasks[task_index];
             let transcript_start_index = task.transcript.len().saturating_sub(1);
             task.hierarchy.attempts.push(json!({
                 "attemptId": attempt_id,
@@ -573,10 +734,14 @@ async fn execute_board_loop_inner(
                 "startedAt": started_at,
                 "status": "running",
                 "transcriptStartIndex": transcript_start_index,
+                "scopeVersion": task.hierarchy.scope_version,
+                "preExecutionValidation": pre_execution_validation,
+                "testSuiteFingerprint": test_suite_fingerprint,
             }));
-        }
-        stored.board.touch();
-        save_board(&state, &stored.board)?;
+            fresh.board.touch();
+            save_board(&state, &fresh.board)?;
+            (fresh, task_index)
+        };
         let provider_attempt =
             execute_provider_task_with_fallback(&state, &stored.board, task_index).await;
         let mut stored = load_user_board(&state, &user_id, &board_id)?;
@@ -741,18 +906,28 @@ async fn execute_board_loop_inner(
                     } else {
                         run_deterministic_validation(&stored.board, &task_id, "feature").await
                     };
-                    parsed = apply_deterministic_validation_result(parsed, &validation);
+                    parsed = apply_task_validation_result(parsed, &validation);
                     stored.board.validation_runs.push(validation.clone());
                     if let Some(index) = task_position {
                         if let Some(task) = stored.board.tasks.get_mut(index) {
+                            if validation
+                                .get("expectedRedAccepted")
+                                .and_then(Value::as_bool)
+                                == Some(true)
+                            {
+                                task.qa_baseline_validation = Some(validation.clone());
+                                task.coverage_evidence.push(json!({
+                                    "kind": "hierarchical_red_baseline",
+                                    "validation": validation,
+                                    "recordedAt": Utc::now(),
+                                }));
+                            }
                             task.deterministic_validation = Some(validation);
                             if task.tdd_phase != "disabled" && !is_qa_task(task) {
                                 if task
                                     .deterministic_validation
                                     .as_ref()
-                                    .and_then(|value| value.get("passed"))
-                                    .and_then(Value::as_bool)
-                                    == Some(true)
+                                    .is_some_and(validation_gate_passed)
                                 {
                                     task.tdd_phase = "evidence_review".to_string();
                                 } else {
@@ -949,6 +1124,7 @@ async fn execute_board_loop_inner(
                     &attempt_id,
                     attempt_status,
                     now,
+                    Some(&change_summary),
                 );
                 if let Some(session_id) = result.session_id.clone() {
                     stored.board.current_provider_session_id = Some(session_id.clone());
@@ -1005,9 +1181,6 @@ async fn execute_board_loop_inner(
                 } else {
                     append_followup_task_if_needed(&mut stored.board, &task_id, &parsed)
                 };
-                if uses_hierarchical_orchestration(&stored.board) {
-                    refresh_hierarchy_rollups(&mut stored.board);
-                }
                 let post_qa_added =
                     if failed_with_provider_error || qa_followup_added || followup_added {
                         false
@@ -1063,6 +1236,12 @@ async fn execute_board_loop_inner(
                         })
                         .unwrap_or(false)
                 };
+                // Include required post-task work before deriving parent
+                // completion. A prematurely Done parent is an approval
+                // boundary and would prevent its new QA child from running.
+                if uses_hierarchical_orchestration(&stored.board) {
+                    refresh_hierarchy_rollups(&mut stored.board);
+                }
                 if !qa_followup_added && !followup_added {
                     if let Some(entry) =
                         compact_provider_session_after_task_group(&state, &stored.board, &task_id)
@@ -1123,6 +1302,8 @@ async fn execute_board_loop_inner(
                 ));
             }
             Err(error) => {
+                let change_summary =
+                    record_task_workspace_changes(&mut stored.board, &task_id, before_workspace);
                 let message = server_error_message(&error);
                 if let Some(index) = task_position {
                     let task = &mut stored.board.tasks[index];
@@ -1144,6 +1325,7 @@ async fn execute_board_loop_inner(
                     &attempt_id,
                     TASK_STATUS_FAILED,
                     now,
+                    Some(&change_summary),
                 );
                 stored.board.append_log(format!(
                     "Task {task_id} failed: {}",

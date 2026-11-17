@@ -500,7 +500,8 @@ fn reconcile_dependency_statuses(run: &mut AgenticBoard) {
         let Some(task) = run.tasks.iter().find(|task| task.id == task_id).cloned() else {
             continue;
         };
-        if unmet_task_dependencies(run, &task).is_empty()
+        let unmet = unmet_task_dependencies(run, &task);
+        if unmet.is_empty()
             && let Some(task) = run.tasks.iter_mut().find(|task| task.id == task_id)
         {
             task.status = TASK_STATUS_TODO.to_string();
@@ -509,6 +510,14 @@ fn reconcile_dependency_statuses(run: &mut AgenticBoard) {
             run.append_log(format!(
                 "Unblocked subtask {task_id}; all dependencies are complete"
             ));
+        } else if !unmet.is_empty() {
+            // A completed dependency must not remain advertised as a current
+            // blocker while other dependencies are still unfinished. Refresh
+            // only the reason; this is not approval, retry, or execution.
+            let reason = dependency_block_reason(run, &unmet);
+            if let Some(task) = run.tasks.iter_mut().find(|task| task.id == task_id) {
+                task.error = Some(reason);
+            }
         }
     }
 }

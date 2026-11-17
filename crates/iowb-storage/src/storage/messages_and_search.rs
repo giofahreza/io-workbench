@@ -41,6 +41,36 @@ impl Storage {
         })
     }
 
+    /// The same first User entry as list_messages().find(User), without loading the transcript.
+    /// Empty user content is intentional evidence and must not be skipped.
+    /// Match parse_role: unknown legacy roles also map to User.
+    pub fn first_user_message(&self, session_id: &str) -> Result<Option<ChatMessage>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT id, role, content, timestamp, metadata
+                FROM messages
+                WHERE session_id = ?1 AND role NOT IN ('system', 'assistant', 'tool')
+                ORDER BY timestamp ASC, id ASC
+                LIMIT 1
+                "#,
+                params![session_id],
+                |row| {
+                    let metadata_raw: String = row.get(4)?;
+                    Ok(ChatMessage {
+                        id: row.get(0)?,
+                        role: parse_role(&row.get::<_, String>(1)?),
+                        content: row.get(2)?,
+                        timestamp: parse_time_sql(row.get::<_, String>(3)?)?,
+                        metadata: serde_json::from_str::<Value>(&metadata_raw).unwrap_or(Value::Null),
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
     pub fn visit_messages_ordered(
         &self,
         session_id: &str,

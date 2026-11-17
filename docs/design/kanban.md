@@ -198,6 +198,23 @@ Add Room entity BudgetLimit
 
 `test_implementation` can edit test files.
 
+For non-Git workspaces, explicitly planned test tooling is also allowed when
+complete before/after filesystem evidence verifies its scope: root `package.json`
+may change local Node/Playwright `test` or `test:*` scripts and versioned
+Playwright devDependencies, while existing production fields, unrelated
+dependencies, and lifecycle scripts remain unchanged. A new manifest is limited
+to basic metadata and that test tooling. Explicitly planned root Playwright
+configuration files and a consistent npm v3 lockfile are supported; changed lock
+packages must be dev-only and reachable from the test tooling. This is not a
+general permission to edit configuration or production code.
+
+Conventional Playwright `test-results/` and `playwright-report/` directories are
+generated evidence, not source changes. QA and manual-test cards remain read-only.
+An unchanged retry can reuse server-recorded file evidence only for the same task
+and scope version with matching before/after hashes. Reused evidence stays
+separate from newly changed files; legacy evidence without a scope version cannot
+be reused this way.
+
 Example:
 
 ```text
@@ -221,6 +238,32 @@ Run budget repository tests
 `manual_test` validates the app manually, such as using an Android emulator.
 
 It should not edit source files.
+
+Hierarchical manual execution uses an approved `manualVerification` scope:
+`{"version":1,"mode":"ui","viewports":[{"width":360,"height":800}]}`.
+Other modes are `cli`, `api`, and `inspection`; they do not require a GUI.
+Split mixed UI and CLI/source-inspection acceptance into separate coherent
+manual tickets. A UI parent contract cannot be weakened by a generated child.
+
+Completion requires versioned `manualEvidence` tied to the current scope version,
+with environment/build identifiers and criterion-indexed expected/observed
+outcomes. UI checks require actual interaction actions in every planned viewport
+and screenshots under project-local `test-results/manual-evidence/`. Passing an
+automated suite, fetching HTML, or inspecting CSS does not prove manual UI
+acceptance. Missing, failed, or blocked checks prevent completion. Subsequent QA
+also audits relevant manual source/prerequisite leaves; it cannot override a
+missing evidence contract.
+
+The server checks artifact path boundaries, image headers, bounded size, and
+content hashes. This is structural evidence validation, not a claim that it can
+prove a model's observations are truthful or automatically judge screenshot
+contents. The verifying agent must inspect the images and disclose limitations.
+An unavailable device/browser is a blocker, not a successful manual test.
+
+Existing Done records are not rewritten. To resume an unfinished legacy manual
+card with no contract, move its scope to Backlog, set `manualVerification` via
+task edit/discussion, and re-approve. Changing it is a scope edit, not a status
+override; old evidence cannot satisfy a newly versioned scope.
 
 Example:
 
@@ -1109,9 +1152,9 @@ Examples:
 
 ```text
 implementation -> changed production files
-test_implementation -> changed test files
+test_implementation -> changed test files or verified in-scope test tooling
 qa -> command results
-manual_test -> manual steps and result
+manual_test -> scoped criterion-linked observations and runtime evidence
 review -> review findings
 fix -> changed files plus evidence that failure is resolved
 revert -> reverted files or cleanup evidence

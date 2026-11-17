@@ -75,6 +75,133 @@ fn manual_test_result_evidence(parsed: &Value) -> Option<String> {
     .and_then(value_to_trimmed_text)
 }
 
+fn manual_result_words(text: &str) -> Vec<&str> {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn manual_result_problem_is_negated(text: &str, index: usize) -> bool {
+    let before = text[..index].trim_end();
+    ["no", "without"].iter().any(|negation| {
+        before.strip_suffix(negation).is_some_and(|prefix| {
+            prefix.is_empty()
+                || prefix
+                    .chars()
+                    .last()
+                    .is_some_and(|character| !character.is_ascii_alphanumeric())
+        })
+    })
+}
+
+fn manual_result_error_is_expected_validation(text: &str, index: usize) -> bool {
+    // Scope the exception to this observation, not the whole result. A passing
+    // invalid-input check must never hide a separate runtime error on save.
+    let clause_start = text[..index]
+        .rfind([';', '.', '\n'])
+        .map_or(0, |position| position + 1);
+    let clause_end = text[index..]
+        .find([';', '.', '\n'])
+        .map_or(text.len(), |position| index + position);
+    let clause = &text[clause_start..clause_end];
+    let before = manual_result_words(&text[clause_start..index]);
+    let after = manual_result_words(&text[index..clause_end]);
+    // Do not exempt embedded failures such as AssertionError or TypeError.
+    if index > 0 && text.as_bytes()[index - 1].is_ascii_alphanumeric() {
+        return false;
+    }
+    if !matches!(after.first(), Some(&"error" | &"errors"))
+        || [
+            "unexpected",
+            "unhandled",
+            "runtime",
+            "missing",
+            "absent",
+            "incorrect",
+            "not visible",
+            "not shown",
+            "not displayed",
+            "not rendered",
+            "not observed",
+            "not rejected",
+            "wasn't",
+            "wasn’t",
+            "isn't",
+            "isn’t",
+            "weren't",
+            "weren’t",
+            "did not",
+            "didn't",
+            "never appeared",
+            "never shown",
+        ]
+        .iter()
+        .any(|problem| clause.contains(problem))
+    {
+        return false;
+    }
+    let words = manual_result_words(clause);
+    if ["should", "would", "must", "will", "might", "may", "could"]
+        .iter()
+        .any(|word| words.contains(word))
+    {
+        return false;
+    }
+    let explicitly_expected = before.ends_with(&["expected", "validation"])
+        || before.ends_with(&["expected", "input", "validation"]);
+    let observed = [
+        "visible",
+        "shown",
+        "displayed",
+        "appeared",
+        "rendered",
+        "observed",
+    ]
+    .iter()
+    .any(|word| words.contains(word));
+    let visible_rejection_hint = before.last() == Some(&"visible")
+        && matches!(after.get(1), Some(&"hint" | &"message"))
+        && words.contains(&"rejected")
+        && ["empty", "whitespace", "invalid"]
+            .iter()
+            .any(|word| words.contains(word));
+    (explicitly_expected && observed) || visible_rejection_hint
+}
+
+fn manual_result_is_error_word(text: &str, index: usize) -> bool {
+    let start = text[..index]
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !character.is_ascii_alphanumeric())
+        .map_or(0, |(position, character)| position + character.len_utf8());
+    let end = text[index..]
+        .find(|character: char| !character.is_ascii_alphanumeric())
+        .map_or(text.len(), |position| index + position);
+    // An HTML `onerror` attribute is not an observed error. Still recognize
+    // conventional exception names, which do not contain a standalone word.
+    matches!(
+        &text[start..end],
+        "error"
+            | "errors"
+            | "typeerror"
+            | "assertionerror"
+            | "referenceerror"
+            | "syntaxerror"
+            | "rangeerror"
+            | "urierror"
+            | "evalerror"
+            | "aggregateerror"
+            | "internalerror"
+            | "networkerror"
+            | "timeouterror"
+            | "runtimeerror"
+            | "valueerror"
+            | "aborterror"
+            | "securityerror"
+            | "notallowederror"
+    )
+}
+
 fn manual_test_result_is_successful(result: &str) -> bool {
     let normalized = result
         .trim()
@@ -110,14 +237,24 @@ fn manual_test_result_is_successful(result: &str) -> bool {
         return false;
     }
 
-    let failure_is_clearly_negated = ["no fail", "no failure", "without fail", "without failure"]
-        .iter()
-        .any(|needle| normalized.contains(needle));
-    let error_is_clearly_negated = ["no error", "no errors", "without error", "without errors"]
-        .iter()
-        .any(|needle| normalized.contains(needle));
+    let failure_is_clearly_negated = normalized.contains("fail")
+        && normalized
+            .match_indices("fail")
+            .all(|(index, _)| manual_result_problem_is_negated(&normalized, index));
+    let error_indices = normalized
+        .match_indices("error")
+        .map(|(index, _)| index)
+        .filter(|index| manual_result_is_error_word(&normalized, *index))
+        .collect::<Vec<_>>();
+    let error_is_clearly_negated = !error_indices.is_empty()
+        && error_indices
+            .iter()
+            .all(|index| manual_result_problem_is_negated(&normalized, *index));
     if (normalized.contains("fail") && !failure_is_clearly_negated)
-        || (normalized.contains("error") && !error_is_clearly_negated)
+        || error_indices.iter().any(|index| {
+            !manual_result_problem_is_negated(&normalized, *index)
+                && !manual_result_error_is_expected_validation(&normalized, *index)
+        })
         || [
             "broken",
             "blocked",
@@ -156,6 +293,13 @@ fn manual_test_result_is_successful(result: &str) -> bool {
         || normalized.contains("no problems")
         || failure_is_clearly_negated
         || error_is_clearly_negated
+}
+
+#[cfg(test)]
+mod manual_result_validation_error_tests {
+    use super::*;
+
+    include!("../tests/manual_result_validation_errors.rs");
 }
 
 fn discussion_completed_transcript(
@@ -248,6 +392,7 @@ fn discussion_task_scope(task: &BoardTask) -> Value {
         "scopeVersion": task.hierarchy.scope_version,
         "plannedFiles": task.hierarchy.planned_files,
         "sideEffects": task.hierarchy.side_effects,
+        "manualVerification": task.hierarchy.manual_verification,
     })
 }
 
@@ -342,7 +487,11 @@ Rules:
 - If the user only asks a question, use `message`, leave payload empty, and answer in summary.
 - For edit or replace, payload may contain only ticket scope fields: title, details,
   description, kind, taskType, level, parentId, acceptanceCriteria, priority,
-  rank, blockedBy, dependsOn, required, plannedFiles, and sideEffects.
+  rank, blockedBy, dependsOn, required, plannedFiles, sideEffects, and manualVerification.
+  For manual verification, manualVerification must declare version 1 and mode ui, cli, api, or inspection. For explicit genuine-touch acceptance, include inputModality: "touch" (UI only); omitted/"any" leaves input modality unspecified. Preserve an existing touch requirement unless the approved scope explicitly changes it.
+  UI/phone/browser acceptance requires mode ui and required viewports [{{"width":360,"height":800}}]; never relabel UI acceptance as inspection.
+  A blocked legacy manual task missing this contract can be returned to Backlog and edited/re-approved through this discussion flow.
+  Split mixed UI, CLI/API and source-inspection manual criteria into coherent tickets with their own modes; do not invent GUI checks for README/source-only acceptance.
 - For reprioritize, payload must contain a valid priority p0, p1, p2, or p3.
 - For split, payload must contain an items array of one-purpose child tickets.
 - For merge, payload must contain targetId.
@@ -504,6 +653,7 @@ fn sanitize_discussion_payload(action: &str, parsed: &Value) -> Result<Value> {
         "required",
         "plannedFiles",
         "sideEffects",
+        "manualVerification",
         "supersedeSource",
         "items",
         "children",

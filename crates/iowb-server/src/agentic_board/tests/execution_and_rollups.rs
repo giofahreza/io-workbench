@@ -1135,6 +1135,10 @@
             "attempt-1",
             TASK_STATUS_DONE,
             finished_at,
+            Some(&json!({
+                "taskId": "task-1",
+                "changedBySubtask": [{"path": "src/budget.rs"}]
+            })),
         );
 
         let attempt = &run.tasks[0].hierarchy.attempts[0];
@@ -1148,6 +1152,168 @@
         );
         assert_eq!(attempt["summary"], "Budget flow implemented");
         assert!(attempt.get("transcriptStartIndex").is_none());
+    }
+
+    fn attempt_file_attribution_board() -> AgenticBoard {
+        let mut run = board_fixture(json!({
+            "command": "Implement Pocket Tasks",
+            "projectPath": "/tmp/project"
+        }));
+        let task = &mut run.tasks[0];
+        task.hierarchy.scope_version = 5;
+        task.changed_files = vec!["historical.js".to_string(), "current.js".to_string()];
+        task.changed_file_summary = Some(json!({
+            "taskId": "task-1",
+            "scopeVersion": 4,
+            "changedBySubtask": [{"path": "historical.js"}]
+        }));
+        task.hierarchy.attempts = vec![
+            json!({
+                "attemptId": "previous-attempt",
+                "scopeVersion": 4,
+                "status": "blocked",
+                "filesChanged": ["historical.js"]
+            }),
+            json!({
+                "attemptId": "current-attempt",
+                "scopeVersion": 5,
+                "startedAt": Utc::now(),
+                "status": "running",
+                "transcriptStartIndex": 0
+            }),
+        ];
+        run
+    }
+
+    #[test]
+    fn attempt_file_attribution_startup_failure_does_not_claim_historical_files() {
+        let mut run = attempt_file_attribution_board();
+        let historical_files = run.tasks[0].changed_files.clone();
+        let previous_attempt = run.tasks[0].hierarchy.attempts[0].clone();
+        run.tasks[0].result = Some(json!({"changedFiles": []}));
+        let current_summary = json!({
+            "taskId": "task-1",
+            "scopeVersion": 5,
+            "touchedFileCount": 0,
+            "changedBySubtask": []
+        });
+        run.tasks[0].changed_file_summary = Some(current_summary.clone());
+
+        finish_task_attempt(
+            &mut run,
+            "task-1",
+            "current-attempt",
+            TASK_STATUS_FAILED,
+            Utc::now(),
+            Some(&current_summary),
+        );
+
+        assert_eq!(run.tasks[0].hierarchy.attempts[1]["filesChanged"], json!([]));
+        assert_eq!(run.tasks[0].changed_files, historical_files);
+        assert_eq!(run.tasks[0].hierarchy.attempts[0], previous_attempt);
+    }
+
+    #[test]
+    fn attempt_file_attribution_uses_only_current_observed_delta() {
+        let mut run = attempt_file_attribution_board();
+        run.tasks[0].result = Some(json!({"changedFiles": ["historical.js", "claimed.js"]}));
+
+        finish_task_attempt(
+            &mut run,
+            "task-1",
+            "current-attempt",
+            TASK_STATUS_DONE,
+            Utc::now(),
+            Some(&json!({
+                "taskId": "task-1",
+                "scopeVersion": 5,
+                "changedBySubtask": [{"path": "current.js"}],
+                "preExistingChanges": [{"path": "pre-existing.js"}],
+                "unknownChanges": [{"path": "unknown.js"}]
+            })),
+        );
+
+        assert_eq!(run.tasks[0].hierarchy.attempts[1]["filesChanged"], json!(["current.js"]));
+        assert_eq!(run.tasks[0].changed_files, vec!["historical.js", "current.js"]);
+    }
+
+    #[test]
+    fn attempt_file_attribution_keeps_reused_evidence_distinct_from_new_changes() {
+        let mut run = attempt_file_attribution_board();
+        let reused = json!([{
+            "path": "historical.js",
+            "classification": "reused_same_task",
+            "originTaskId": "task-1",
+            "originScopeVersion": 5,
+            "afterHash": "verified-hash"
+        }]);
+        let current_summary = json!({
+            "taskId": "task-1",
+            "scopeVersion": 5,
+            "changedBySubtask": [],
+            "reusedEvidence": reused.clone()
+        });
+        run.tasks[0].changed_file_summary = Some(current_summary.clone());
+
+        finish_task_attempt(
+            &mut run,
+            "task-1",
+            "current-attempt",
+            TASK_STATUS_DONE,
+            Utc::now(),
+            Some(&current_summary),
+        );
+
+        assert_eq!(run.tasks[0].hierarchy.attempts[1]["filesChanged"], json!([]));
+        assert_eq!(run.tasks[0].hierarchy.attempts[1]["reusedEvidence"], reused);
+        assert_eq!(run.tasks[0].changed_file_summary, Some(current_summary));
+        assert_eq!(run.tasks[0].changed_files, vec!["historical.js", "current.js"]);
+    }
+
+    #[test]
+    fn attempt_file_attribution_without_snapshot_never_reuses_task_history() {
+        let mut run = attempt_file_attribution_board();
+        run.tasks[0].result = Some(json!({"changedFiles": ["claimed.js"]}));
+
+        finish_task_attempt(
+            &mut run,
+            "task-1",
+            "current-attempt",
+            TASK_STATUS_FAILED,
+            Utc::now(),
+            None,
+        );
+
+        assert_eq!(run.tasks[0].hierarchy.attempts[1]["filesChanged"], json!([]));
+        assert_eq!(run.tasks[0].hierarchy.attempts[1]["reusedEvidence"], json!([]));
+        assert_eq!(run.tasks[0].changed_files, vec!["historical.js", "current.js"]);
+    }
+
+    #[test]
+    fn attempt_file_attribution_rejects_another_task_or_scope_summary() {
+        for (task_id, scope_version) in [
+            ("task-1", Some(4_u64)),
+            ("other-task", Some(5_u64)),
+            ("task-1", None),
+        ] {
+            let mut run = attempt_file_attribution_board();
+            finish_task_attempt(
+                &mut run,
+                "task-1",
+                "current-attempt",
+                TASK_STATUS_DONE,
+                Utc::now(),
+                Some(&json!({
+                    "taskId": task_id,
+                    "scopeVersion": scope_version,
+                    "changedBySubtask": [{"path": "wrong.js"}],
+                    "reusedEvidence": [{"path": "also-wrong.js"}]
+                })),
+            );
+
+            assert_eq!(run.tasks[0].hierarchy.attempts[1]["filesChanged"], json!([]));
+            assert_eq!(run.tasks[0].hierarchy.attempts[1]["reusedEvidence"], json!([]));
+        }
     }
 
     #[test]
@@ -1334,7 +1500,10 @@
             }),
             &json!({ "touchedFileCount": 0 }),
         );
-        assert_eq!(recorded["status"], "done");
+        // Legacy environment aliases are still normalized, but prose alone
+        // can no longer certify runtime/manual acceptance.
+        assert_eq!(recorded["status"], "needs_followup");
+        assert_eq!(recorded["manualEvidenceGate"]["passed"], false);
         assert_eq!(
             recorded["manualTestEnvironment"]["deviceOrEmulator"],
             "emulator-5560"

@@ -57,6 +57,7 @@ fn executable_system_subtask_hierarchy(
         executable: true,
         required: true,
         scope_version: scope_version.max(1),
+        scope_approval: None,
         rank,
         attempts: Vec::new(),
         planned_files,
@@ -65,6 +66,7 @@ fn executable_system_subtask_hierarchy(
         side_effect_approval: None,
         side_effect_evidence: Vec::new(),
         manual_test_environment: None,
+        manual_verification: None,
         research_accepted: false,
         research_acceptance: None,
         discussion: Vec::new(),
@@ -168,7 +170,7 @@ fn append_final_qa_task(run: &mut AgenticBoard, reason: &str) -> bool {
 }
 
 fn append_promotion_review_task(run: &mut AgenticBoard, reason: &str) -> bool {
-    if run.promotion_candidates.is_empty() {
+    if !rag_enabled_from_settings(&run.rag_settings) || run.promotion_candidates.is_empty() {
         return false;
     }
     if run.tasks.iter().any(|task| is_promotion_review_task(task)) {
@@ -241,8 +243,13 @@ fn append_promotion_review_task(run: &mut AgenticBoard, reason: &str) -> bool {
 }
 
 fn is_promotion_review_task(task: &BoardTask) -> bool {
-    matches!(task.task_type.as_str(), "promotion" | TASK_KIND_REVIEW)
-        || task.id == PROMOTION_REVIEW_TASK_ID
+    // Review is a general read-only work kind, not an instruction to use RAG.
+    // Keep explicit provenance after normalization canonicalizes promotion to review.
+    !task.agents_knowledge_task
+        && task.id != AGENTS_KNOWLEDGE_TASK_ID
+        && (task.task_type == "promotion"
+            || task.id == PROMOTION_REVIEW_TASK_ID
+            || task.task_origin == "system_promotion")
 }
 
 fn append_agents_knowledge_task(
@@ -311,6 +318,9 @@ fn create_task_qa_task(run: &AgenticBoard, source_task: &BoardTask, reason: &str
     let details = [
         format!("Validate source task: {} - {}", source_task.id, source_task.title),
         "Inspect the current implementation before marking the task validated.".to_string(),
+        if canonical_task_kind(source_task) == TASK_KIND_MANUAL_TEST {
+            format!("Audit the source manualVerification contract and manualEvidence criterion-by-criterion, including actual environment, viewport, runtime actions, and screenshot artifacts. Open and inspect the screenshots; compare observed claims with the controls/behavior actually present. Automated-suite success, CSS grep, curl or a confident summary cannot satisfy UI manual acceptance. Missing/blocked evidence must remain blocked; QA cannot override the server evidence gate. Source contract: {}. Source result: {}", source_task.hierarchy.manual_verification.as_ref().unwrap_or(&Value::Null), source_task.result.as_ref().unwrap_or(&Value::Null))
+        } else { String::new() },
         "Cover the relevant happy path, failure path, and corner cases for the source task.".to_string(),
         "If locally actionable issues are found, return needs_followup with exact findings so the board can queue a fix.".to_string(),
         "Do not edit files during this validation task and do not modify git history.".to_string(),
@@ -468,6 +478,25 @@ fn task_needs_agents_knowledge_update(task: &BoardTask, parsed: &Value) -> bool 
     if is_qa_task(task) || task.agents_knowledge_task || task.id == AGENTS_KNOWLEDGE_TASK_ID {
         return false;
     }
+    if task
+        .deterministic_validation
+        .as_ref()
+        .is_some_and(|validation| {
+            validation.get("passed").and_then(Value::as_bool) == Some(false)
+                && validation.get("gatePassed").and_then(Value::as_bool) == Some(true)
+                && (validation
+                    .get("expectedRedAccepted")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                    || validation
+                        .get("remainingRedAccepted")
+                        .is_some_and(Value::is_object))
+        })
+    {
+        // Intentional red is an intermediate development observation, not
+        // durable project guidance worth interrupting the TDD dependency chain.
+        return false;
+    }
     let text = task_risk_text(task, parsed).to_lowercase();
     [
         "agents.md",
@@ -517,6 +546,7 @@ fn create_agents_knowledge_task(
     reason: &str,
     source_task: Option<&BoardTask>,
 ) -> BoardTask {
+    let planning_only = uses_hierarchical_orchestration(run);
     let source_task_id = source_task.map(|task| task.id.clone());
     let source_group_id = source_task.map(task_group_id_for_source);
     let source_title = source_task
@@ -527,7 +557,7 @@ fn create_agents_knowledge_task(
     } else {
         AGENTS_KNOWLEDGE_TASK_ID.to_string()
     };
-    let title = if source_task_id.is_some() {
+    let mut title = if source_task_id.is_some() {
         if source_title.trim().is_empty() {
             "Update AGENTS.md with durable knowledge".to_string()
         } else {
@@ -536,7 +566,7 @@ fn create_agents_knowledge_task(
     } else {
         "Update AGENTS.md with stable project knowledge from this agentic board".to_string()
     };
-    let details = [
+    let mut details = [
         "Read the applicable AGENTS.md file if it exists, or create a root AGENTS.md only when durable project guidance is available.".to_string(),
         "Record stable commands, architecture conventions, test workflows, or workflow rules that future coding agents should know.".to_string(),
         "Verify concrete project claims against the current filesystem, config, routes, migrations, command output, or QA evidence before writing them.".to_string(),
@@ -548,7 +578,7 @@ fn create_agents_knowledge_task(
     .filter(|item| !item.trim().is_empty())
     .collect::<Vec<_>>()
     .join("\n");
-    let hierarchy = executable_system_subtask_hierarchy(
+    let mut hierarchy = executable_system_subtask_hierarchy(
         source_task.and_then(system_sibling_parent_id),
         source_task
             .map(|task| vec![task.id.clone()])
@@ -563,21 +593,42 @@ fn create_agents_knowledge_task(
             .map(|task| task.hierarchy.planned_files.clone())
             .unwrap_or_default(),
     );
+    let mut acceptance_criteria = vec![
+        "Read applicable AGENTS.md guidance before editing.".to_string(),
+        "Preserve only stable project knowledge worth reusing in future coding tasks.".to_string(),
+        "Return the required task result JSON contract.".to_string(),
+    ];
+    if planning_only {
+        // System enrichment is not part of the user's approved implementation
+        // scope. Offer an optional, read-only review for explicit approval;
+        // never add a required documentation write or a green-suite barrier.
+        title = title.replacen("Update AGENTS.md", "Review guidance for AGENTS.md", 1);
+        details = format!(
+            "Review applicable AGENTS.md and verified project commands/conventions for durable guidance. Do not create or edit files. Record useful recommendations in evidence, or report that none are warranted. Any proposed documentation change requires a separate user-approved work item. This review does not certify application tests as green. Reason: {reason}"
+        );
+        acceptance_criteria = vec![
+            "Read any applicable AGENTS.md and verify proposed guidance against actual project evidence.".to_string(),
+            "Record only stable recommendations, or explicitly state none are warranted; do not edit files.".to_string(),
+            "Do not claim application acceptance or a passing suite from this guidance review.".to_string(),
+        ];
+        hierarchy.required = false;
+        hierarchy.planned_files.clear();
+    }
     BoardTask {
         id,
         title,
-        status: TASK_STATUS_TODO.to_string(),
+        status: if planning_only {
+            TASK_STATUS_BACKLOG
+        } else {
+            TASK_STATUS_TODO
+        }
+        .to_string(),
         summary: String::new(),
         details: details.clone(),
         description: details.clone(),
         prompt: details,
         error: None,
-        acceptance_criteria: vec![
-            "Read applicable AGENTS.md guidance before editing.".to_string(),
-            "Preserve only stable project knowledge worth reusing in future coding tasks."
-                .to_string(),
-            "Return the required task result JSON contract.".to_string(),
-        ],
+        acceptance_criteria,
         references: vec![
             "Applicable AGENTS.md files".to_string(),
             "Codebase recon summary".to_string(),
@@ -628,7 +679,11 @@ fn create_agents_knowledge_task(
         deterministic_validation: None,
         rag_context_refs: Vec::new(),
         rag_prompt_context: String::new(),
-        tdd_phase: default_tdd_phase(),
+        tdd_phase: if planning_only {
+            "disabled".to_string()
+        } else {
+            default_tdd_phase()
+        },
         qa_test_paths: Vec::new(),
         qa_test_commands: Vec::new(),
         qa_baseline_validation: None,

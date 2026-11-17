@@ -337,7 +337,8 @@
         refresh_hierarchy_rollups(&mut run);
 
         assert_eq!(run.tasks[1].status, TASK_STATUS_BLOCKED);
-        assert_eq!(run.tasks[0].status, TASK_STATUS_BLOCKED);
+        // Child progress cannot implicitly approve the Backlog root.
+        assert_eq!(run.tasks[0].status, TASK_STATUS_BACKLOG);
     }
 
     #[test]

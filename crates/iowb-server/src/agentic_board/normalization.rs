@@ -205,6 +205,42 @@ fn infer_prompt_task_kind(
     details: &str,
     acceptance_criteria: &[String],
 ) -> Option<&'static str> {
+    // A build/fix ticket commonly ends with manual acceptance checks. Those
+    // checks do not turn the requested implementation into verification-only
+    // work. Use the title's primary action, before a later "and/then" step,
+    // while retaining titles that explicitly ask for manual verification work.
+    let normalized_title = title.trim().to_ascii_lowercase();
+    let primary_title = normalized_title
+        .strip_prefix("please ")
+        .unwrap_or(&normalized_title)
+        .split(['\n', ';', ','])
+        .next()
+        .unwrap_or_default()
+        .split(" and ")
+        .next()
+        .unwrap_or_default()
+        .split(" then ")
+        .next()
+        .unwrap_or_default();
+    let implementation_action = matches!(
+        primary_title.split_whitespace().next(),
+        Some(
+            "build" | "implement" | "create" | "develop" | "add" | "fix" | "update"
+                | "change" | "remove" | "refactor" | "redesign" | "migrate" | "replace"
+                | "write"
+        )
+    );
+    let verification_scope = [
+        "manual test", "manual qa", "manual verification", "manual smoke",
+        "functional verification", "functional verify", "smoke test", "smoke pass",
+        "verification evidence", "verification report",
+    ]
+    .iter()
+    .any(|signal| primary_title.contains(signal));
+    if implementation_action && !verification_scope {
+        return None;
+    }
+
     let text = std::iter::once(title)
         .chain(std::iter::once(details))
         .chain(acceptance_criteria.iter().map(String::as_str))
@@ -297,6 +333,10 @@ fn task_status_is_done(status: &str) -> bool {
 }
 
 fn clear_backlog_approval(task: &mut BoardTask) {
+    task.hierarchy.scope_approval = Some(BoardTaskScopeApproval {
+        scope_version: task.hierarchy.scope_version.max(1),
+        approved: false,
+    });
     task.hierarchy.side_effects_approved = false;
     task.hierarchy.side_effect_approval = None;
     task.hierarchy.research_accepted = false;
@@ -475,6 +515,124 @@ fn validate_manual_task_source(run: &AgenticBoard, task: &BoardTask) -> Result<(
     Ok(())
 }
 
+fn task_scope_is_approved(task: &BoardTask) -> bool {
+    match canonical_task_status(&task.status) {
+        TASK_STATUS_TODO | TASK_STATUS_IN_PROGRESS => true,
+        TASK_STATUS_BLOCKED | TASK_STATUS_FAILED => {
+            // A rollup has no independent error. Actual planning, dependency,
+            // and side-effect blockers are not cleared by retained approval.
+            !task_is_executable(task)
+                && task
+                    .error
+                    .as_deref()
+                    .is_none_or(|error| error.trim().is_empty())
+                && task_side_effects_are_approved(task)
+                && task
+                    .hierarchy
+                    .scope_approval
+                    .as_ref()
+                    .is_some_and(|approval| {
+                        approval.approved
+                            && approval.scope_version == task.hierarchy.scope_version.max(1)
+                    })
+        }
+        _ => false,
+    }
+}
+
+fn legacy_scope_has_execution_evidence(run: &AgenticBoard, parent: &BoardTask) -> bool {
+    // Old boards did not persist approval separately. Recover only a pure
+    // rollup with real descendant execution evidence, never from Todo alone
+    // or a retry_request audit entry. An edited scope is deliberately not
+    // migrated from evidence belonging to its previous version.
+    if task_is_executable(parent)
+        || parent
+            .error
+            .as_deref()
+            .is_some_and(|error| !error.trim().is_empty())
+        || parent
+            .hierarchy
+            .discussion
+            .iter()
+            .any(|entry| entry.get("kind").and_then(Value::as_str) == Some("scope_edit"))
+    {
+        return false;
+    }
+    run.tasks.iter().any(|task| {
+        if !task_is_executable(task)
+            || !(task.attempt_count > 0
+                || task.hierarchy.attempts.iter().any(|attempt| {
+                    attempt
+                        .get("attemptNumber")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|n| n > 0)
+                        && attempt.get("startedAt").and_then(Value::as_str).is_some()
+                }))
+        {
+            return false;
+        }
+        let mut current_id = task.hierarchy.parent_id.as_deref();
+        let mut visited = BTreeSet::new();
+        while let Some(id) = current_id {
+            if !visited.insert(id) {
+                return false;
+            }
+            let Some(ancestor) = run.tasks.iter().find(|candidate| candidate.id == id) else {
+                return false;
+            };
+            if task_status_is_backlog(&ancestor.status)
+                || task_is_done(ancestor)
+                || ancestor
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| !error.trim().is_empty())
+                || ancestor
+                    .hierarchy
+                    .scope_approval
+                    .as_ref()
+                    .is_some_and(|approval| {
+                        !approval.approved
+                            || approval.scope_version != ancestor.hierarchy.scope_version.max(1)
+                    })
+            {
+                return false;
+            }
+            if ancestor.id == parent.id {
+                return true;
+            }
+            current_id = ancestor.hierarchy.parent_id.as_deref();
+        }
+        false
+    })
+}
+
+fn reconcile_scope_approval_records(run: &mut AgenticBoard) {
+    let approvals = run
+        .tasks
+        .iter()
+        .map(|task| {
+            let approved = match canonical_task_status(&task.status) {
+                TASK_STATUS_TODO | TASK_STATUS_IN_PROGRESS | TASK_STATUS_DONE => true,
+                TASK_STATUS_BACKLOG => false,
+                _ => task.hierarchy.scope_approval.as_ref().map_or_else(
+                    || legacy_scope_has_execution_evidence(run, task),
+                    |approval| {
+                        approval.approved
+                            && approval.scope_version == task.hierarchy.scope_version.max(1)
+                    },
+                ),
+            };
+            BoardTaskScopeApproval {
+                scope_version: task.hierarchy.scope_version.max(1),
+                approved,
+            }
+        })
+        .collect::<Vec<_>>();
+    for (task, approval) in run.tasks.iter_mut().zip(approvals) {
+        task.hierarchy.scope_approval = Some(approval);
+    }
+}
+
 fn task_ancestors_are_approved(run: &AgenticBoard, task: &BoardTask) -> bool {
     // `sourceTaskId`/`sourceQaTaskId` are links used to group legacy system
     // QA and follow-up work. They are not approval edges. Only an explicit
@@ -499,10 +657,7 @@ fn task_ancestors_are_approved(run: &AgenticBoard, task: &BoardTask) -> bool {
             if child_required || parent.superseded_by.is_some() {
                 return false;
             }
-        } else if !matches!(
-            canonical_task_status(&parent.status),
-            TASK_STATUS_TODO | TASK_STATUS_IN_PROGRESS
-        ) {
+        } else if !task_scope_is_approved(parent) {
             return false;
         }
         child_required = parent.hierarchy.required;
@@ -546,7 +701,7 @@ fn strip_removed_tracking_fields(value: &Value) -> Value {
                         .unwrap_or_else(|_| Value::String(text.clone()));
                 }
             }
-            if is_removed_tracking_text(text) {
+            if is_removed_tracking_reference(text) {
                 Value::String("[legacy tracking removed]".to_string())
             } else {
                 Value::String(text.clone())
@@ -555,14 +710,14 @@ fn strip_removed_tracking_fields(value: &Value) -> Value {
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .filter(|item| !item.as_str().is_some_and(is_removed_tracking_text))
+                .filter(|item| !item.as_str().is_some_and(is_removed_tracking_reference))
                 .map(strip_removed_tracking_fields)
                 .collect(),
         ),
         Value::Object(object) => Value::Object(
             object
                 .iter()
-                .filter(|(key, _)| !key.to_ascii_lowercase().contains("requirement"))
+                .filter(|(key, _)| !is_removed_tracking_field(key))
                 .map(|(key, value)| (key.clone(), strip_removed_tracking_fields(value)))
                 .collect(),
         ),
@@ -570,9 +725,39 @@ fn strip_removed_tracking_fields(value: &Value) -> Value {
     }
 }
 
-fn is_removed_tracking_text(text: &str) -> bool {
+fn is_removed_tracking_field(key: &str) -> bool {
+    // Remove the retired matrix schema, not arbitrary application prose or
+    // filenames such as requirements.txt. These are its persisted/API names;
+    // tolerate the historical snake_case spelling as well as camelCase.
+    let normalized = key.replace('_', "").to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "requirement"
+            | "requirements"
+            | "requirementid"
+            | "requirementids"
+            | "requirementmatrix"
+            | "requirementbaseline"
+            | "requirementcounts"
+            | "requirementextraction"
+            | "requirementupdates"
+            | "coveredrequirements"
+    )
+}
+
+fn is_removed_tracking_reference(text: &str) -> bool {
+    // Old references were complete REQ-n / REQ-MANUAL-n (or UUID) IDs.
+    // Matching a substring silently erased scope descriptions, acceptance
+    // criteria, evidence, and paths merely containing "requirements"/"req-".
     let normalized = text.trim().to_ascii_lowercase();
-    normalized.contains("requirement") || normalized.contains("req-")
+    let Some(id) = normalized.strip_prefix("req-") else {
+        return false;
+    };
+    let numeric = |value: &str| !value.is_empty() && value.bytes().all(|ch| ch.is_ascii_digit());
+    numeric(id)
+        || id.strip_prefix("manual-").is_some_and(|id| {
+            numeric(id) || uuid::Uuid::parse_str(id).is_ok()
+        })
 }
 
 fn task_group_id_or_self(task: &BoardTask) -> String {
@@ -917,6 +1102,7 @@ fn normalize_board_hierarchy(run: &mut AgenticBoard) {
 }
 
 fn reconcile_hierarchy_approval_states(run: &mut AgenticBoard) {
+    reconcile_scope_approval_records(run);
     let snapshot = run.tasks.clone();
     let mut invalid = Vec::new();
     for task in &snapshot {
@@ -954,7 +1140,7 @@ fn reconcile_hierarchy_approval_states(run: &mut AgenticBoard) {
                     ));
                     break;
                 }
-            } else if !matches!(parent_status, TASK_STATUS_TODO | TASK_STATUS_IN_PROGRESS) {
+            } else if !task_scope_is_approved(parent) {
                 invalid.push((
                     task.id.clone(),
                     parent.id.clone(),
@@ -1158,13 +1344,21 @@ fn redact_transcript_text(text: &str) -> String {
 }
 
 fn redact_secret_after_marker(text: &str, marker: &str) -> String {
+    if marker.is_empty() {
+        return text.to_string();
+    }
     let mut result = text.to_string();
     let marker = marker.to_ascii_lowercase();
+    let mut search_from = 0;
     loop {
-        let lower = result.to_ascii_lowercase();
-        let Some(marker_start) = lower.find(&marker) else {
+        let lower = result[search_from..].to_ascii_lowercase();
+        let Some(relative_start) = lower.find(&marker) else {
             break;
         };
+        let marker_start = search_from + relative_start;
+        // Always advance past the matched marker, including empty values.
+        // Re-searching from zero would redact our own replacement forever.
+        search_from = marker_start + marker.len();
         let mut value_start = marker_start + marker.len();
         while value_start < result.len()
             && (result.as_bytes()[value_start].is_ascii_whitespace()
@@ -1175,15 +1369,20 @@ fn redact_secret_after_marker(text: &str, marker: &str) -> String {
         if value_start >= result.len() {
             break;
         }
+        if result[value_start..].starts_with("[REDACTED]") {
+            search_from = value_start + "[REDACTED]".len();
+            continue;
+        }
         let value_end = result[value_start..]
             .char_indices()
             .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '}' | ']'))
             .map(|(index, _)| value_start + index)
             .unwrap_or(result.len());
         if value_end <= value_start {
-            break;
+            continue;
         }
         result.replace_range(value_start..value_end, "[REDACTED]");
+        search_from = value_start + "[REDACTED]".len();
     }
     result
 }

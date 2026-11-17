@@ -129,6 +129,7 @@ pub(crate) fn router() -> Router<AppState> {
             "/api/danger/boards/{id}/tools",
             patch(update_tools_settings),
         )
+        .route("/api/danger/boards/{id}/quality", patch(update_quality_settings))
         .route("/api/danger/boards/{id}/tdd", patch(update_tdd_settings))
         .route(
             "/api/danger/boards/{id}/validation",
@@ -146,6 +147,7 @@ pub(crate) fn router() -> Router<AppState> {
         )
         .route("/api/danger/boards/{id}/tasks", post(add_task))
         .route("/api/danger/boards/{id}/tasks/draft", post(draft_tasks))
+        .route("/api/danger/boards/{id}/tasks/draft/accept", post(accept_task_drafts))
         .route(
             "/api/danger/boards/{id}/tasks/backlog-from-prompt",
             post(backlog_from_prompt),
@@ -213,7 +215,8 @@ pub(crate) fn recover_active_boards(state: &AppState) {
         return;
     };
     for stored in boards {
-        if !matches!(stored.board.status.as_str(), "running")
+        if interrupted_execution_task_ids(&stored.board).is_empty()
+            && !matches!(stored.board.status.as_str(), "running")
             && !stored.board.active
             && !stored.board.loop_started
         {
@@ -227,9 +230,13 @@ pub(crate) fn recover_active_boards(state: &AppState) {
         handle.spawn(async move {
             match load_user_board(&state, &user_id, &board_id) {
                 Ok(mut stored) => {
-                    if let Err(error) =
-                        claim_project_execution(&stored.board.project_path, &stored.board.id)
-                    {
+                    let claim = claim_project_execution(&stored.board.project_path, &stored.board.id);
+                    if matches!(claim, Ok(false)) {
+                        // build_router can be called more than once. An existing
+                        // owner is a live worker, not an orphan to recover.
+                        return;
+                    }
+                    if let Err(error) = claim {
                         stored.board.status = TASK_STATUS_BLOCKED.to_string();
                         stored.board.active = false;
                         stored.board.loop_started = false;
@@ -241,6 +248,21 @@ pub(crate) fn recover_active_boards(state: &AppState) {
                         stored.board.touch();
                         if let Err(save_error) = save_board(&state, &stored.board) {
                             tracing::warn!(error = %server_error_message(&save_error), "failed to persist recovered board ownership conflict");
+                        }
+                        return;
+                    }
+                    let interrupted_tasks = interrupted_execution_task_ids(&stored.board);
+                    if !interrupted_tasks.is_empty() {
+                        if let Err(error) = recover_interrupted_board_execution(
+                            &state,
+                            &user_id,
+                            &board_id,
+                            &stored.board.project_path,
+                            interrupted_tasks,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %server_error_message(&error), "failed to recover interrupted board execution");
                         }
                         return;
                     }
@@ -340,7 +362,11 @@ async fn process_scheduled_starts(state: &AppState) -> Result<()> {
 async fn process_auto_retries(state: &AppState) -> Result<()> {
     let now = Utc::now();
     for mut stored in load_boards(state)? {
-        if stored.board.loop_started || !auto_retry_enabled(&stored.board.auto_retry) {
+        if stored.board.loop_started
+            || restart_recovery_requires_explicit_retry(&stored.board)
+            || !interrupted_execution_task_ids(&stored.board).is_empty()
+            || !auto_retry_enabled(&stored.board.auto_retry)
+        {
             continue;
         }
         if !is_resumable_board(&stored.board) {
@@ -443,6 +469,7 @@ include!("agentic_board/types.rs");
 include!("agentic_board/http.rs");
 include!("agentic_board/discussion/mod.rs");
 include!("agentic_board/execution.rs");
+include!("agentic_board/restart_recovery.rs");
 include!("agentic_board/hierarchy/mod.rs");
 include!("agentic_board/orchestration/mod.rs");
 include!("agentic_board/execution_support.rs");
@@ -450,6 +477,8 @@ include!("agentic_board/provider_runtime.rs");
 include!("agentic_board/task_execution.rs");
 include!("agentic_board/validation_and_settings.rs");
 include!("agentic_board/workspace_and_routing.rs");
+include!("agentic_board/test_tooling_policy.rs");
+include!("agentic_board/package_scope_constraints.rs");
 include!("agentic_board/persistence_and_prompt_generation.rs");
 include!("agentic_board/normalization.rs");
 

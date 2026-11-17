@@ -45,6 +45,15 @@ async fn execute_provider_task_with_retry_instruction(
         .tasks
         .get(task_index)
         .ok_or_else(|| not_found("Danger task not found"))?;
+    if let Some(issue) = manual_task_contract_issue(task) {
+        return Err(bad_request(issue));
+    }
+    if !automatic_qa_fix_scope_is_authorized(run, task) {
+        return Err(bad_request("Automatic QA fix cannot start: its originating approved scope does not authorize these file changes. Review and apply an explicit Edit/Replace scope before retrying."));
+    }
+    if let Some(issue) = task_package_scope_conflict(run, task) {
+        return Err(bad_request(issue));
+    }
     let mut prompt = build_task_execution_prompt(run, task, task_index);
     if let Some(instruction) =
         retry_instruction.filter(|instruction| !instruction.trim().is_empty())
@@ -701,6 +710,7 @@ fn reset_in_flight_board_tasks(run: &mut AgenticBoard, message: &str) {
         if !task_status_is_active(&task.status) {
             continue;
         }
+        close_interrupted_attempts(task, "cancelled", message, Utc::now());
         task.status = TASK_STATUS_TODO.to_string();
         task.started_at = None;
         task.completed_at = None;

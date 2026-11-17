@@ -36,6 +36,7 @@ fn append_research_planning_items(
     research: &BoardTask,
     items: Vec<Value>,
 ) -> Result<usize> {
+    let items = normalize_generated_manual_contracts(items)?;
     let mut seen_scope_keys = run
         .tasks
         .iter()

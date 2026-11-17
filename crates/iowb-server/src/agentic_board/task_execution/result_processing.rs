@@ -128,6 +128,7 @@ fn task_from_json(
     index: usize,
     status: &str,
 ) -> Option<BoardTask> {
+    let manual_verification = normalize_supplied_manual_verification(item.get("manualVerification").cloned()).ok()?;
     let title = item.get("title").and_then(Value::as_str)?.trim();
     if title.is_empty() {
         return None;
@@ -271,6 +272,7 @@ fn task_from_json(
                 .get("scopeVersion")
                 .and_then(Value::as_u64)
                 .unwrap_or(1),
+            scope_approval: None,
             rank: item.get("rank").and_then(Value::as_i64).unwrap_or(0),
             attempts: Vec::new(),
             planned_files: normalize_string_list(
@@ -281,6 +283,7 @@ fn task_from_json(
             side_effect_approval: None,
             side_effect_evidence: Vec::new(),
             manual_test_environment: None,
+            manual_verification,
             research_accepted: false,
             research_acceptance: None,
             discussion: Vec::new(),
@@ -869,11 +872,12 @@ fn apply_deterministic_validation_result(mut parsed: Value, validation: &Value) 
 }
 
 fn change_summary_touched_paths(summary: &Value) -> Vec<String> {
-    summary
+    let paths = summary
         .get("touchedFiles")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .chain(summary.get("reusedEvidence").and_then(Value::as_array).into_iter().flatten())
         .filter_map(|entry| match entry {
             Value::String(path) => Some(path.trim().to_string()),
             Value::Object(object) => object
@@ -884,7 +888,8 @@ fn change_summary_touched_paths(summary: &Value) -> Vec<String> {
             _ => None,
         })
         .filter(|path| !path.is_empty())
-        .collect()
+        .collect();
+    dedupe_strings(paths)
 }
 
 fn is_test_or_fixture_path(path: &str) -> bool {
@@ -926,8 +931,69 @@ fn task_file_edit_policy_violations(task: &BoardTask, change_summary: &Value) ->
         | TASK_KIND_DESIGN => touched,
         TASK_KIND_TEST_IMPLEMENTATION => touched
             .into_iter()
-            .filter(|path| !is_test_or_fixture_path(path))
+            .filter(|path| {
+                !is_test_or_fixture_path(path)
+                    && !is_planned_new_test_runner_config(task, path, change_summary)
+                    && !is_planned_test_tooling_file(task, path, change_summary)
+            })
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn is_planned_test_tooling_file(task: &BoardTask, path: &str, change_summary: &Value) -> bool {
+    let planned = |path: &str| task.hierarchy.planned_files.iter().any(|planned| {
+        planned.trim().strip_prefix("./").unwrap_or(planned.trim()) == path
+    });
+    let attribution = ["changedBySubtask", "reusedEvidence"].into_iter().find_map(|key| {
+        change_summary.get(key).and_then(Value::as_array).into_iter().flatten().find(|entry| {
+            entry.get("path").and_then(Value::as_str) == Some(path)
+                && entry.get("afterHash").and_then(Value::as_str).is_some_and(|hash| !hash.is_empty())
+        })
+    });
+    let Some(attribution) = attribution else { return false; };
+    if change_summary.get("snapshotComplete").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let evidence = if attribution.get("classification").and_then(Value::as_str) == Some("reused_same_task") {
+        attribution.get("testToolingPolicy")
+    } else { change_summary.get("testTooling") }.unwrap_or(&Value::Null);
+    match path {
+        "package.json" => planned(path) && evidence.get("manifestAllowed").and_then(Value::as_bool) == Some(true),
+        // npm generates this companion file from the explicitly planned
+        // manifest. It is permitted only with independently validated content.
+        "package-lock.json" => planned("package.json") && evidence.get("lockAllowed").and_then(Value::as_bool) == Some(true),
+        _ => playwright_config_path(path) && planned(path)
+            && evidence.get("playwrightConfigured").and_then(Value::as_bool) == Some(true),
+    }
+}
+
+fn is_planned_new_test_runner_config(
+    task: &BoardTask,
+    path: &str,
+    change_summary: &Value,
+) -> bool {
+    path == "package.json"
+        && task.hierarchy.planned_files.iter().any(|planned| {
+            planned.trim().strip_prefix("./").unwrap_or(planned.trim()) == path
+        })
+        && change_summary.get("snapshotProvider").and_then(Value::as_str)
+            == Some("filesystem sha256")
+        && change_summary.get("snapshotComplete").and_then(Value::as_bool) == Some(true)
+        && change_summary
+            .get("changedBySubtask")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|entry| {
+                entry.get("path").and_then(Value::as_str) == Some(path)
+                    && entry.get("classification").and_then(Value::as_str)
+                        == Some("changed_by_subtask")
+                    && entry.get("beforeHash").is_some_and(Value::is_null)
+                    && entry.get("beforeStatus").and_then(Value::as_str) == Some("")
+                    && entry.get("afterHash").and_then(Value::as_str)
+                        .is_some_and(|hash| !hash.is_empty())
+                    && entry.get("testRunnerConfig").and_then(Value::as_str)
+                        == Some("minimal-node-test-v1")
+            })
 }

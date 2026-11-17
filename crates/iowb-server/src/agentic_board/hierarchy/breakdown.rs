@@ -68,6 +68,11 @@ fn hierarchy_breakdown_max_new_children(existing_count: usize) -> usize {
 }
 
 fn validate_hierarchy_breakdown_parent(run: &AgenticBoard, parent: &BoardTask) -> Result<()> {
+    if parent.hierarchy.manual_verification.is_some()
+        && let Some(issue) = manual_task_contract_issue(parent)
+    {
+        return Err(bad_request(issue));
+    }
     if task_status_is_todo(&parent.status) && !task_ancestors_are_approved(run, parent) {
         return Err(ServerError::new(
             StatusCode::CONFLICT,
@@ -103,6 +108,73 @@ fn next_hierarchy_parent(run: &AgenticBoard) -> Option<BoardTask> {
     candidates.into_iter().next().map(|(_, task)| task)
 }
 
+fn hierarchy_breakdown_testing_policy(run: &AgenticBoard, parent: &BoardTask) -> String {
+    if !run.tdd_enabled {
+        return "TDD is disabled. Still plan verification appropriate to the requested behavior."
+            .to_string();
+    }
+
+    // A task may already be one stage of an approved tests -> implementation
+    // -> QA plan. Show the actual dependency scopes rather than demanding a
+    // second copy of the whole lifecycle below every planning item. These are
+    // planning records, not an assertion that their execution gates passed.
+    let related_stages = run
+        .tasks
+        .iter()
+        .filter(|task| task.id != parent.id && task.superseded_by.is_none())
+        .filter_map(|task| {
+            let relation = if hierarchical_task_depends_on(run, parent, &task.id) {
+                "Existing prerequisite"
+            } else if matches!(canonical_task_kind(task), TASK_KIND_QA | TASK_KIND_MANUAL_TEST)
+                && hierarchical_task_depends_on(run, task, &parent.id)
+            {
+                "Existing downstream verification"
+            } else {
+                return None;
+            };
+            Some(format!(
+                "{relation}: {} [{}]\nTitle: {}\nScope: {}\nAcceptance: {}\nPrerequisites: {}",
+                task.id,
+                canonical_task_kind(task),
+                task.title,
+                task.description,
+                task.acceptance_criteria.join("; "),
+                task_blockers(task).join(", ")
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let stage_scope = if task_level(parent) == TASK_LEVEL_TASK {
+        match canonical_task_kind(parent) {
+            TASK_KIND_TEST_IMPLEMENTATION =>
+                "Refine only this test-writing/baseline stage. Do not add production implementation or post-implementation QA children. Preserve the required executable tests and baseline evidence in this stage.",
+            TASK_KIND_IMPLEMENTATION =>
+                "Refine the implementation scope, reusing the prerequisite tests/baseline and downstream QA that cover it. Do not duplicate an existing test/baseline prerequisite or downstream QA stage inside this parent. Preserve an explicit one-implementation-subtask scope; producing several app files does not by itself require separate tickets. Running the existing suite to prove this implementation is green is completion verification, not a reason to add a duplicate QA stage.",
+            TASK_KIND_QA | TASK_KIND_MANUAL_TEST | TASK_KIND_REVIEW =>
+                "Refine only this verification stage. Do not create a fresh pre-development baseline or implementation stage. Preserve the checks, evidence, and dependencies assigned to this parent.",
+            _ => "Keep the children within the parent's assigned engineering purpose.",
+        }
+    } else {
+        "For behavior-changing scope not already covered by existing stages, plan separate test_implementation work before implementation and QA after implementation, with blockedBy edges preserving that order."
+    };
+    let evidence_contract = tdd_planning_evidence_contract(run);
+    format!(
+        "TDD is enabled. Policy: {}. Test-writing means executable automated tests, not a README/manual checklist. \
+         When the policy requires a failing baseline, its acceptance criteria must include running the tests and \
+         recording the expected failing result before development. Do not make test-writing depend on the \
+         implementation it is meant to precede. Documentation-only work does not require a failing test.\n\n\
+         {stage_scope}\n\n\
+         Existing stages are reusable only for behavior their recorded scope and acceptance criteria cover. \
+         If a required stage is missing, identify the missing prerequisite; do not invent completed evidence \
+         or expand an explicitly restricted parent into other stages. Planned prerequisites are not evidence \
+         of a completed baseline: their dependencies and required red evidence remain mandatory, and all applicable completion and green-test gates still apply.\n\n\
+         {evidence_contract}\n\n\
+         Relevant existing dependency scopes:\n{}",
+        run.tdd_policy,
+        if related_stages.is_empty() { "None recorded in this dependency chain." } else { &related_stages },
+    )
+}
+
 fn build_hierarchy_breakdown_prompt(
     run: &AgenticBoard,
     parent: &BoardTask,
@@ -132,16 +204,20 @@ fn build_hierarchy_breakdown_prompt(
     } else {
         parent.acceptance_criteria.join("\n- ")
     };
+    let testing_policy = hierarchy_breakdown_testing_policy(run, parent);
     format!(
         r#"Break down exactly one approved Kanban item into its next hierarchy level.
 
 Parent:
 - id: {id}
 - level: {level}
+- kind: {kind}
 - title: {title}
 - description: {description}
 - acceptance criteria:
 - {acceptance}
+- manual verification contract: {manual_verification}
+- prerequisites: {dependencies}
 
 Next level: {next_level}
 Breakdown mode: {breakdown_mode}
@@ -153,11 +229,17 @@ Existing direct child records:
 Codebase context:
 {codebase}
 
+Testing policy:
+{testing_policy}
+
+{scope_boundaries}
+
 Return JSON only. No markdown fence.
 Schema:
 {{
   "items": [
     {{
+      "id": "short-local-key",
       "level": "{next_level}",
       "title": "specific title",
       "kind": "research|design|implementation|test_implementation|qa|manual_test|review|fix|migration|revert|cleanup|revision|replacement",
@@ -167,14 +249,24 @@ Schema:
       "blockedBy": [],
       "required": true,
       "plannedFiles": [],
-      "sideEffects": []
+      "sideEffects": [],
+      "manualVerification": {{"version": 1, "mode": "ui", "viewports": [{{"width": 360, "height": 800}}, {{"width": 414, "height": 896}}]}}
     }}
   ]
 }}
 
 Rules:
 - Create only the next level, never skip a level.
+- Give each new item a unique `id` within this response. In `blockedBy`, use
+  `plan:<id>` for another new item, or `board:<id>` for an existing direct child.
+  Record real prerequisites: verification depends on the implementation it checks,
+  and work that consumes an artifact depends on the work that creates it. Do not
+  leave every dependency empty when work must happen in order. Never depend on
+  the parent itself; its prerequisites are inherited by the generated children.
 - One subtask has one engineering purpose. Separate implementation, test-writing, QA, review, and manual testing into separate subtasks.
+- For every manual_test item, declare manualVerification version 1 and the actual required mode. UI, browser, phone, touch, keyboard, or visual acceptance requires mode ui and concrete required viewports as objects with positive integer width and height, not dimension strings or device names. The schema dimensions are examples; use the actual approved scope. CLI/API verification uses cli/api with an empty viewports array; inspection is only for explicitly source/document inspection, never a substitute for runtime UI acceptance. Omit this field on non-manual items. Preserve the parent's manual verification contract when refining its manual scope. When acceptance explicitly requires genuine touch input, declare inputModality: "touch" in the UI manualVerification contract; omitted/"any" does not require touch. Touch scope requires observed touchscreen capability and touch events, and cannot pass using mouse clicks alone.
+- UI manual acceptance requires real runtime interactions with criterion-linked observations and screenshots; automated-suite success, CSS/source inspection, and curl alone are insufficient. Plan a blocked outcome if the required interaction tools/environment are unavailable; never downgrade the acceptance criteria to bypass evidence.
+- Split mixed UI, CLI/API, and source-inspection manual acceptance into separate coherent tickets with their own modes. Do not attach README setup or source-only inspection criteria to a UI ticket and then invent UI evidence for them. Every UI criterion is checked in every required viewport.
 - Subtask titles must be concrete engineer execution tickets, such as `Add endpoint PATCH /budget/{{month}}` or `Run Android emulator smoke test for budget edit flow`.
 - Do not create nice-to-have work as a required child. Put it in a separate Backlog story.
 - Return no more than {max_new_children} genuinely new child item(s).
@@ -183,13 +275,23 @@ Rules:
 - Set `required` to false for optional or out-of-scope work, and list every
   possible external side effect in `sideEffects`; those children stay in Backlog
   until the user explicitly approves them.
+- `sideEffects` means actions that mutate resources outside the project workspace,
+  such as production data, shared services, accounts, or infrastructure. Ordinary
+  project-file edits (including README and tests), implementing requested browser
+  localStorage behavior, and isolated local verification are not external side
+  effects. Do not list these in `sideEffects`. Actually changing existing user
+  browser data or other resources outside the isolated test environment still
+  requires an explicit side-effect declaration and approval.
 - Inspect the supplied codebase context and use real project architecture; do not invent endpoints or frameworks.
-- Use only the parent ticket description, acceptance criteria, dependencies, and codebase context."#,
+- Use only the parent ticket description, acceptance criteria, dependencies, inherited scope boundaries, and codebase context."#,
         id = parent.id,
         level = task_level(parent),
+        kind = canonical_task_kind(parent),
         title = parent.title,
         description = parent.description,
         acceptance = acceptance,
+        manual_verification = parent.hierarchy.manual_verification.as_ref().unwrap_or(&Value::Null),
+        dependencies = task_blockers(parent).join(", "),
         next_level = next_level,
         breakdown_mode = breakdown_mode,
         children = if children.is_empty() {
@@ -203,8 +305,79 @@ Rules:
             &direct_children
         },
         max_new_children = max_new_children,
+        testing_policy = testing_policy,
+        scope_boundaries = inherited_scope_constraints_block(run, parent),
         codebase = serde_json::to_string_pretty(&run.codebase_map).unwrap_or_default(),
     )
+}
+
+fn scope_exclusion_action_word(word: &str) -> bool {
+    matches!(word, "add" | "implement" | "build" | "create" | "introduce"
+        | "extend" | "expand" | "include" | "enable" | "ship" | "deploy" | "make"
+        | "provide" | "deliver" | "perform" | "execute" | "run" | "exercise"
+        | "change" | "modify" | "remove" | "delete" | "update" | "install" | "download")
+}
+
+fn scope_exclusion_negative_instruction(instruction: &str) -> bool {
+    // A causal explanation is an exclusion only when its governing instruction
+    // is itself negative. A nearby "do not" must not hide a new positive verb.
+    let Some(action) = ["do not ", "must not ", "never ", "don't "]
+        .iter().find_map(|prefix| instruction.trim().strip_prefix(prefix)) else {
+        return false;
+    };
+    if action.chars().any(|ch| matches!(ch, ';' | ':' | '!' | '?' | '&' | '|')) {
+        return false;
+    }
+    let words = action.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty()).collect::<Vec<_>>();
+    if words.len() < 2 || !scope_exclusion_action_word(words[0]) {
+        return false;
+    }
+    !words.iter().enumerate().skip(1).any(|(index, word)| {
+        matches!(*word, "but" | "then" | "however" | "instead" | "unless" | "if" | "except")
+            || (scope_exclusion_action_word(word)
+                // "the Add button" names a control, not a second command.
+                && !(*word == "add" && words.get(index + 1) == Some(&"button")
+                    && matches!(words[index - 1], "the" | "an")))
+    })
+}
+
+fn explicit_scope_exclusion_clause(before: &str, after: &str) -> bool {
+    // Recognize bounded grammatical exclusions, not whole-sentence examples:
+    // subject is/are [explicitly] out of scope [for this local item], optionally
+    // reinforced by "and must not be implemented". Reject any other tail.
+    let mut tail = after.trim().trim_end_matches(['.', '!', ';']).trim();
+    if let Some(context) = tail.strip_prefix("for this ") {
+        let mut words = context.splitn(2, char::is_whitespace);
+        if !matches!(words.next(), Some("task" | "story" | "ticket" | "feature")) {
+            return false;
+        }
+        tail = words.next().unwrap_or_default().trim();
+    }
+    if !matches!(tail, "" | "and must not be implemented") {
+        return false;
+    }
+    let before = before.trim_end();
+    let Some(mut subject) = [" are explicitly", " is explicitly", " are", " is"]
+        .iter()
+        .find_map(|suffix| before.strip_suffix(suffix))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    if let Some((instruction, reason_subject)) = subject.rsplit_once(" because ") {
+        if !scope_exclusion_negative_instruction(instruction) {
+            return false;
+        }
+        subject = reason_subject.trim();
+    }
+    if subject.is_empty() || subject.chars().any(|ch| matches!(ch, '.' | ';' | ':' | '!' | '?')) {
+        return false;
+    }
+    !subject.split(|ch: char| !ch.is_alphanumeric()).any(|word| {
+        scope_exclusion_action_word(word)
+            || matches!(word, "if" | "unless" | "but" | "then" | "however" | "instead" | "except")
+    })
 }
 
 fn generated_child_requires_backlog_approval(task: &BoardTask) -> bool {
@@ -215,15 +388,31 @@ fn generated_child_requires_backlog_approval(task: &BoardTask) -> bool {
         return true;
     }
     let text = task_external_effect_text(task);
-    [
-        "nice-to-have",
-        "nice to have",
-        "optional",
-        "out of scope",
-        "out-of-scope",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
+    if ["nice-to-have", "nice to have", "optional"]
+        .iter()
+        .any(|needle| text.contains(needle))
+    {
+        return true;
+    }
+    // A scope boundary can mention excluded work without proposing it. Keep
+    // the fallback conservative: exempt only bounded explicit exclusions or
+    // the existing elsewhere-responsibility sentence, not the whole task.
+    // Structured and external-effect guards above remain authoritative.
+    text.lines().flat_map(|line| line.split(';'))
+        .flat_map(|clause| clause.split(". ")).any(|sentence| {
+        ["out of scope", "out-of-scope"].iter().any(|marker| {
+            sentence.match_indices(marker).any(|(index, _)| {
+                let (before, after) = (&sentence[..index], &sentence[index + marker.len()..]);
+                let boundary =
+                (before.trim_start().starts_with("broader ")
+                    && before.contains(" remains the responsibility of ")
+                    && before.trim_end().ends_with(" and is")
+                    && after.trim().trim_end_matches(['.', '!', ';']).trim() == "here")
+                    || explicit_scope_exclusion_clause(before, after);
+                !boundary
+            })
+        })
+    })
 }
 
 fn generated_scope_wrapper_exists(run: &AgenticBoard, source_parent_id: &str, key: &str) -> bool {
@@ -261,6 +450,7 @@ fn mark_generated_scope_wrapper(
     task.hierarchy.discussion.push(json!({
         "kind": "generated_scope_wrapper",
         "sourceParentId": source_parent.id,
+        "sourceScopeVersion": source_parent.hierarchy.scope_version.max(1),
         "sourceParentTitle": source_parent.title,
         "sourceTitleKey": source_title_key,
         "wrappedLevel": wrapped_level,
@@ -321,7 +511,7 @@ fn wrap_generated_child_in_backlog(
     child.id = unique_task_id(run, &format!("{story_id}-{next_level}"));
     child.status = TASK_STATUS_BACKLOG.to_string();
     child.hierarchy.scope_version = source_parent.hierarchy.scope_version.saturating_add(1);
-    child.hierarchy.blocked_by = dedupe_strings(child.depends_on.clone());
+    child.hierarchy.blocked_by = task_blockers(&child);
     child.depends_on = child.hierarchy.blocked_by.clone();
     child.hierarchy.required = story.hierarchy.required;
     child.hierarchy.side_effects_approved = false;
@@ -377,6 +567,145 @@ fn wrap_generated_child_in_backlog(
     vec![story, child]
 }
 
+fn inherit_hierarchy_breakdown_dependencies(child: &mut BoardTask, parent: &BoardTask) {
+    if canonical_task_kind(child) == TASK_KIND_MANUAL_TEST
+        && canonical_task_kind(parent) == TASK_KIND_MANUAL_TEST
+        && parent.hierarchy.manual_verification.is_some()
+    {
+        child.hierarchy.manual_verification = parent.hierarchy.manual_verification.clone();
+    }
+    // Dependencies on a planning item must also constrain its executable
+    // descendants. Mark inherited server IDs explicitly so they cannot collide
+    // with response-local IDs during the remapping pass.
+    child.hierarchy.blocked_by = dedupe_strings(
+        task_blockers(child)
+            .into_iter()
+            .chain(
+                task_blockers(parent)
+                    .into_iter()
+                    .map(|id| format!("board:{id}")),
+            )
+            .collect(),
+    );
+    child.depends_on = child.hierarchy.blocked_by.clone();
+}
+
+fn retained_hierarchy_breakdown_child_id(
+    run: &AgenticBoard,
+    parent_id: &str,
+    next_level: &str,
+    title: &str,
+) -> Option<String> {
+    let mut candidates = run.tasks.iter().filter(|task| {
+        task_level(task) == next_level
+            && suggested_task_titles_are_semantic_duplicates(&task.title, title)
+            && (task.hierarchy.parent_id.as_deref() == Some(parent_id)
+                || (task.task_origin == "hierarchy_breakdown_wrapped"
+                    && task.hierarchy.discussion.iter().any(|entry| {
+                        entry.get("kind").and_then(Value::as_str) == Some("generated_scope_wrapper")
+                            && entry.get("sourceParentId").and_then(Value::as_str)
+                                == Some(parent_id)
+                            && entry.get("wrappedLevel").and_then(Value::as_str) == Some(next_level)
+                    })))
+    });
+    let first = candidates.next()?;
+    candidates.next().is_none().then(|| first.id.clone())
+}
+
+fn remap_hierarchy_breakdown_dependencies(
+    run: &mut AgenticBoard,
+    first_new_task: usize,
+    local_ids: &BTreeMap<String, String>,
+) -> Result<()> {
+    let existing_ids = run.tasks[..first_new_task]
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<BTreeSet<_>>();
+    let is_ancestor = |ancestor_id: &str, task: &BoardTask| {
+        let mut parent_id = task.hierarchy.parent_id.as_deref();
+        let mut visited = BTreeSet::new();
+        while let Some(id) = parent_id {
+            if id == ancestor_id {
+                return true;
+            }
+            if !visited.insert(id) {
+                break;
+            }
+            parent_id = run
+                .tasks
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .and_then(|parent| parent.hierarchy.parent_id.as_deref());
+        }
+        false
+    };
+    let mut resolved = Vec::new();
+    for task in &run.tasks[first_new_task..] {
+        let mut dependencies = Vec::new();
+        for reference in task_blockers(task) {
+            let dependency = if let Some(local_id) = reference.strip_prefix("plan:") {
+                local_ids.get(local_id).cloned()
+            } else if let Some(board_id) = reference.strip_prefix("board:") {
+                existing_ids.contains(board_id).then(|| board_id.to_string())
+            } else {
+                // Older providers returned unprefixed IDs. Retain support, but
+                // do not guess when an ID can mean either a board item or a
+                // different response-local item.
+                match (local_ids.get(&reference), existing_ids.contains(&reference)) {
+                    (Some(mapped), true) if mapped != &reference => {
+                        return Err(invalid_generated_plan(format!(
+                            "Ambiguous dependency {reference} for {}; use plan: or board:.",
+                            task.id
+                        )));
+                    }
+                    (Some(mapped), _) => Some(mapped.clone()),
+                    (None, true) => Some(reference.clone()),
+                    (None, false) => {
+                        // The earlier prompt had no item IDs, and providers
+                        // sometimes returned exact ticket titles as blockers.
+                        // Accept only an unambiguous exact match, never a
+                        // guessed/fuzzy dependency target.
+                        let mut matches = run.tasks.iter().filter(|candidate| {
+                            candidate.title.trim() == reference.trim()
+                        });
+                        matches.next().and_then(|candidate| {
+                            matches.next().is_none().then(|| candidate.id.clone())
+                        })
+                    }
+                }
+            }
+            .ok_or_else(|| {
+                invalid_generated_plan(format!(
+                    "Dependency {reference} for {} does not match a retained plan item or existing board item.",
+                    task.id
+                ))
+            })?;
+            let dependency_task = run
+                .tasks
+                .iter()
+                .find(|candidate| candidate.id == dependency);
+            if dependency == task.id
+                || is_ancestor(&dependency, task)
+                || dependency_task.is_some_and(|candidate| is_ancestor(&task.id, candidate))
+            {
+                return Err(invalid_generated_plan(format!(
+                    "Task {} cannot depend on itself, an ancestor, or a descendant ({dependency}).",
+                    task.id
+                )));
+            }
+            dependencies.push(dependency);
+        }
+        resolved.push(dedupe_strings(dependencies));
+    }
+    // Resolve the whole batch before changing any task, so invalid references
+    // cannot leave a partially rewritten dependency graph.
+    for (task, dependencies) in run.tasks[first_new_task..].iter_mut().zip(resolved) {
+        task.hierarchy.blocked_by = dependencies.clone();
+        task.depends_on = dependencies;
+    }
+    Ok(())
+}
+
 async fn plan_hierarchy_children(
     state: &AppState,
     user_id: &str,
@@ -400,6 +729,10 @@ async fn plan_hierarchy_children(
     let refinement = hierarchy_breakdown_has_children(&snapshot, &parent.id, next_level);
     let prompt = build_hierarchy_breakdown_prompt(&snapshot, &parent, next_level);
     let breakdown_started_at = Utc::now();
+    if let Some(failure) = task_package_scope_conflict(&snapshot, &parent) {
+        record_hierarchy_breakdown_failure(state, user_id, board_id, &parent, &prompt, breakdown_started_at, &failure, manual)?;
+        return Err(bad_request(failure));
+    }
     let output = execute_internal_prompt(
         state,
         user_id,
@@ -456,6 +789,14 @@ async fn plan_hierarchy_children(
         .or_else(|| output_json.get("tasks"))
         .and_then(Value::as_array)
         .is_some_and(Vec::is_empty);
+    let source_items = match normalize_hierarchy_manual_contracts(source_items, &parent) {
+        Ok(items) => items,
+        Err(error) => {
+            let failure = server_error_message(&error);
+            record_hierarchy_breakdown_failure(state, user_id, board_id, &parent, &prompt, breakdown_started_at, &failure, manual)?;
+            return Err(error);
+        }
+    };
     let children = source_items
         .into_iter()
         .enumerate()
@@ -477,6 +818,26 @@ async fn plan_hierarchy_children(
             Some((child, needs_backlog_approval))
         })
         .collect::<Vec<_>>();
+    let mut returned_ids = BTreeSet::new();
+    for (child, _) in &children {
+        if !returned_ids.insert(child.id.clone()) {
+            let failure = format!(
+                "Hierarchy breakdown returned duplicate item id: {}.",
+                child.id
+            );
+            record_hierarchy_breakdown_failure(
+                state,
+                user_id,
+                board_id,
+                &parent,
+                &prompt,
+                breakdown_started_at,
+                &failure,
+                manual,
+            )?;
+            return Err(bad_request(failure));
+        }
+    }
     if children.is_empty() && (!refinement || !returned_empty_items) {
         let failure = if refinement {
             "Hierarchy breakdown refinement returned no usable child items."
@@ -526,6 +887,15 @@ async fn plan_hierarchy_children(
             ));
         }
     };
+    // Validate every candidate against the current lineage before persisting any
+    // of them. A generated test-tooling plan cannot grant itself broader scope.
+    if let Some(failure) = children.iter().find_map(|(child, _)| {
+        hierarchy_package_scope_conflict(&stored.board, &current_parent, child)
+    }) {
+        drop(_guard);
+        record_hierarchy_breakdown_failure(state, user_id, board_id, &parent, &prompt, breakdown_started_at, &failure, manual)?;
+        return Err(bad_request(failure));
+    }
     let provider = effective_provider_for_phase(&snapshot, "hierarchy breakdown")
         .unwrap_or_else(|_| snapshot.provider.clone());
     let model = effective_model_for_phase(&snapshot, "hierarchy breakdown");
@@ -544,12 +914,23 @@ async fn plan_hierarchy_children(
     let mut created = 0usize;
     let candidate_count = children.len();
     let mut reused = 0usize;
+    let first_new_task = stored.board.tasks.len();
+    let mut local_ids = BTreeMap::new();
     for (mut child, needs_backlog_approval) in children {
         let key = normalize_suggested_task_key(&child.title);
-        if created >= max_new_children
-            || key.is_empty()
-            || hierarchy_breakdown_title_is_duplicate(&seen_titles, &child.title)
-        {
+        if hierarchy_breakdown_title_is_duplicate(&seen_titles, &child.title) {
+            if let Some(retained_id) = retained_hierarchy_breakdown_child_id(
+                &stored.board,
+                &parent.id,
+                next_level,
+                &child.title,
+            ) {
+                local_ids.insert(child.id.clone(), retained_id);
+            }
+            reused += 1;
+            continue;
+        }
+        if created >= max_new_children || key.is_empty() {
             reused += 1;
             continue;
         }
@@ -557,6 +938,8 @@ async fn plan_hierarchy_children(
         // A provider can return the same work with different wording or once
         // as a wrapped story and once as a normal child; neither is duplicated.
         seen_titles.push(child.title.clone());
+        let local_id = child.id.clone();
+        inherit_hierarchy_breakdown_dependencies(&mut child, &current_parent);
         if needs_backlog_approval {
             let wrapped = wrap_generated_child_in_backlog(
                 &mut stored.board,
@@ -565,16 +948,20 @@ async fn plan_hierarchy_children(
                 next_level,
                 &key,
             );
+            if let Some(wrapped_child) = wrapped.last() {
+                local_ids.insert(local_id, wrapped_child.id.clone());
+            }
             stored.board.tasks.extend(wrapped);
             created += 1;
             continue;
         }
         child.id = unique_task_id(&stored.board, &format!("{}-{}", parent.id, child.id));
+        local_ids.insert(local_id, child.id.clone());
         child.hierarchy.level = next_level.to_string();
         child.hierarchy.parent_id = Some(parent.id.clone());
         child.hierarchy.executable = next_level == TASK_LEVEL_SUBTASK;
         child.hierarchy.scope_version = parent.hierarchy.scope_version.saturating_add(1);
-        child.hierarchy.blocked_by = dedupe_strings(child.depends_on.clone());
+        child.hierarchy.blocked_by = task_blockers(&child);
         child.depends_on = child.hierarchy.blocked_by.clone();
         child.group_id = Some(root_group.clone());
         child.status = if child_status == TASK_STATUS_TODO && needs_backlog_approval {
@@ -586,6 +973,29 @@ async fn plan_hierarchy_children(
         child.prompt = parent.description.clone();
         stored.board.tasks.push(child);
         created += 1;
+    }
+    if let Err(error) =
+        remap_hierarchy_breakdown_dependencies(&mut stored.board, first_new_task, &local_ids)
+    {
+        let failure = format!(
+            "Hierarchy breakdown returned invalid dependencies: {}",
+            server_error_message(&error)
+        );
+        // Do not persist the candidate children with invalid edges. The
+        // failure recorder reloads the unchanged board and acquires its own
+        // mutation lock, leaving a visible retryable planning error.
+        drop(_guard);
+        record_hierarchy_breakdown_failure(
+            state,
+            user_id,
+            board_id,
+            &parent,
+            &prompt,
+            breakdown_started_at,
+            &failure,
+            manual,
+        )?;
+        return Err(bad_request(failure));
     }
     if created == 0 {
         if refinement || (candidate_count > 0 && reused == candidate_count) {
@@ -731,6 +1141,13 @@ fn record_hierarchy_breakdown_failure(
     // item with no retry or attention signal. Terminal boards are immutable.
     if matches!(stored.board.status.as_str(), "cancelled" | "completed") {
         return Ok(());
+    }
+    if stored.board.provider_call_label.as_deref()
+        == Some(format!("hierarchy breakdown for {}", parent.id).as_str())
+    {
+        stored.board.provider_call_started_at = None;
+        stored.board.provider_call_label = None;
+        stored.board.current_provider_session_id = None;
     }
     let provider = effective_provider_for_phase(&stored.board, "hierarchy breakdown")
         .unwrap_or_else(|_| stored.board.provider.clone());

@@ -111,6 +111,497 @@
     }
 
     #[test]
+    fn hierarchy_breakdown_preserves_blocked_by_and_inherits_parent_prerequisites() {
+        let mut run = board_fixture(json!({
+            "command": "Build a small app",
+            "projectPath": "/tmp/project"
+        }));
+        let prerequisite = BoardTask::draft(
+            &mut run,
+            "Agree on the data format".to_string(),
+            "Record the data format.".to_string(),
+        );
+        let prerequisite_id = prerequisite.id.clone();
+        run.tasks.push(prerequisite);
+        run.tasks[0].hierarchy.blocked_by = vec![prerequisite_id.clone()];
+        let parent = run.tasks[0].clone();
+        let first_new = run.tasks.len();
+        let mut local_ids = BTreeMap::new();
+        for (index, item) in [
+            json!({"id": "verify", "title": "Verify rendered content", "blockedBy": ["plan:render"]}),
+            json!({"id": "render", "title": "Render content"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut child = task_from_json(&run, item, index, TASK_STATUS_TODO).unwrap();
+            let local_id = child.id.clone();
+            inherit_hierarchy_breakdown_dependencies(&mut child, &parent);
+            child.id = unique_task_id(&run, &format!("{}-{}", parent.id, local_id));
+            child.hierarchy.parent_id = Some(parent.id.clone());
+            local_ids.insert(local_id, child.id.clone());
+            run.tasks.push(child);
+        }
+
+        remap_hierarchy_breakdown_dependencies(&mut run, first_new, &local_ids).unwrap();
+
+        assert_eq!(
+            task_blockers(&run.tasks[first_new]),
+            vec![local_ids["render"].clone(), prerequisite_id.clone()]
+        );
+        assert_eq!(
+            task_blockers(&run.tasks[first_new + 1]),
+            vec![prerequisite_id]
+        );
+        assert_eq!(
+            run.tasks[first_new].depends_on,
+            run.tasks[first_new].hierarchy.blocked_by
+        );
+
+        // A further breakdown must retain the prerequisite on the eventual
+        // executable subtask, not just on its planning parent.
+        let parent = run.tasks[first_new].clone();
+        let mut grandchild = task_from_json(
+            &run,
+            json!({"id": "browser", "title": "Run browser verification"}),
+            0,
+            TASK_STATUS_TODO,
+        )
+        .unwrap();
+        inherit_hierarchy_breakdown_dependencies(&mut grandchild, &parent);
+        grandchild.hierarchy.parent_id = Some(parent.id.clone());
+        let first_new = run.tasks.len();
+        run.tasks.push(grandchild);
+        remap_hierarchy_breakdown_dependencies(&mut run, first_new, &BTreeMap::new()).unwrap();
+        assert_eq!(task_blockers(&run.tasks[first_new]), task_blockers(&parent));
+    }
+
+    #[test]
+    fn hierarchy_breakdown_remaps_legacy_ids_after_unique_server_assignment() {
+        let mut run = board_fixture(json!({
+            "command": "Build an app",
+            "projectPath": "/tmp/project"
+        }));
+        let parent = run.tasks[0].clone();
+        let mut existing = BoardTask::draft(&mut run, "Existing work".into(), "Existing work".into());
+        existing.id = format!("{}-render", parent.id);
+        run.tasks.push(existing);
+        let first_new = run.tasks.len();
+        let mut local_ids = BTreeMap::new();
+        for (index, item) in [
+            json!({"id": "render", "title": "Render new content"}),
+            json!({"id": "verify", "title": "Verify new content", "blockedBy": ["render"], "dependsOn": ["board:task-1-render"]}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut child = task_from_json(&run, item, index, TASK_STATUS_TODO).unwrap();
+            let local_id = child.id.clone();
+            child.id = unique_task_id(&run, &format!("{}-{}", parent.id, child.id));
+            local_ids.insert(local_id, child.id.clone());
+            run.tasks.push(child);
+        }
+
+        remap_hierarchy_breakdown_dependencies(&mut run, first_new, &local_ids).unwrap();
+
+        assert_eq!(local_ids["render"], "task-1-render-2");
+        assert_eq!(
+            task_blockers(&run.tasks[first_new + 1]),
+            vec!["task-1-render-2".to_string(), "task-1-render".to_string()]
+        );
+    }
+
+    #[test]
+    fn hierarchy_breakdown_preserves_wrapped_child_dependencies_and_approval() {
+        let mut run = board_fixture(json!({
+            "command": "Build an app",
+            "projectPath": "/tmp/project"
+        }));
+        let parent = run.tasks[0].clone();
+        let first_new = run.tasks.len();
+        let mut ordinary = task_from_json(
+            &run,
+            json!({
+                "id": "prepare", "title": "Prepare migration scripts",
+            }),
+            0,
+            TASK_STATUS_TODO,
+        )
+        .unwrap();
+        ordinary.id = "task-1-prepare".to_string();
+        run.tasks.push(ordinary);
+        let risky = task_from_json(
+            &run,
+            json!({
+                "id": "migrate", "title": "Apply production migration",
+                "blockedBy": ["plan:prepare"],
+                "sideEffects": ["Change production database schema"],
+            }),
+            1,
+            TASK_STATUS_TODO,
+        )
+        .unwrap();
+        assert!(generated_child_requires_backlog_approval(&risky));
+        let wrapped = wrap_generated_child_in_backlog(
+            &mut run,
+            &parent,
+            risky,
+            TASK_LEVEL_TASK,
+            "apply production migration",
+        );
+        let risky_id = wrapped.last().unwrap().id.clone();
+        run.tasks.extend(wrapped);
+        let mut verification = task_from_json(
+            &run,
+            json!({
+                "id": "verify", "title": "Verify production migration",
+                "blockedBy": ["plan:migrate"],
+            }),
+            2,
+            TASK_STATUS_TODO,
+        )
+        .unwrap();
+        verification.id = "task-1-verify".to_string();
+        run.tasks.push(verification);
+        let local_ids = BTreeMap::from([
+            ("prepare".to_string(), "task-1-prepare".to_string()),
+            ("migrate".to_string(), risky_id.clone()),
+            ("verify".to_string(), "task-1-verify".to_string()),
+        ]);
+
+        remap_hierarchy_breakdown_dependencies(&mut run, first_new, &local_ids).unwrap();
+
+        let risky = run.tasks.iter().find(|task| task.id == risky_id).unwrap();
+        assert_eq!(task_blockers(risky), vec!["task-1-prepare"]);
+        assert_eq!(risky.status, TASK_STATUS_BACKLOG);
+        assert!(!risky.hierarchy.side_effects_approved);
+        assert_eq!(task_blockers(run.tasks.last().unwrap()), vec![risky_id]);
+    }
+
+    #[test]
+    fn hierarchy_breakdown_rejects_unknown_self_ancestor_and_ambiguous_dependencies() {
+        for reference in [
+            "plan:discarded",
+            "board:missing",
+            "plan:verify",
+            "board:task-1",
+            "task-1",
+        ] {
+            let mut run = board_fixture(json!({
+                "command": "Build an app",
+                "projectPath": "/tmp/project"
+            }));
+            let first_new = run.tasks.len();
+            let mut task = task_from_json(
+                &run,
+                json!({
+                    "id": "verify", "title": "Verify app", "blockedBy": [reference],
+                }),
+                0,
+                TASK_STATUS_TODO,
+            )
+            .unwrap();
+            task.id = "task-1-verify".to_string();
+            task.hierarchy.parent_id = Some("task-1".to_string());
+            run.tasks.push(task);
+            let local_ids = BTreeMap::from([
+                ("verify".to_string(), "task-1-verify".to_string()),
+                ("task-1".to_string(), "task-1-render".to_string()),
+            ]);
+            let before = task_blockers(&run.tasks[first_new]);
+
+            assert!(
+                remap_hierarchy_breakdown_dependencies(&mut run, first_new, &local_ids).is_err(),
+                "{reference}"
+            );
+            assert_eq!(task_blockers(&run.tasks[first_new]), before);
+        }
+    }
+
+    #[test]
+    fn hierarchy_breakdown_prompt_explains_dependencies_external_effects_and_tdd() {
+        let mut run = board_fixture(json!({
+            "command": "Build Pocket Tasks with localStorage",
+            "projectPath": "/tmp/project",
+            "tddEnabled": true
+        }));
+        let prompt = build_hierarchy_breakdown_prompt(&run, &run.tasks[0], TASK_LEVEL_TASK);
+        assert!(prompt.contains("plan:<id>"));
+        assert!(prompt.contains("verification depends on the implementation"));
+        assert!(prompt.contains("Ordinary\n  project-file edits"));
+        assert!(prompt.contains("localStorage behavior"));
+        assert!(prompt.contains("outside the isolated test environment"));
+        assert!(prompt.contains("TDD is enabled"));
+        assert!(prompt.contains("executable automated tests, not a README/manual checklist"));
+
+        run.tdd_enabled = false;
+        let prompt = build_hierarchy_breakdown_prompt(&run, &run.tasks[0], TASK_LEVEL_TASK);
+        assert!(prompt.contains("TDD is disabled"));
+        assert!(!prompt.contains("recording the expected failing result"));
+    }
+
+    #[test]
+    fn hierarchical_execution_prompts_scope_result_fields_to_current_ticket() {
+        let mut run = board_fixture(json!({
+            "command": "Build a complete app",
+            "projectPath": "/tmp/project"
+        }));
+        let task = &mut run.tasks[0];
+        task.hierarchy.level = TASK_LEVEL_SUBTASK.to_string();
+        task.hierarchy.executable = true;
+        task.description = "Create the static document shell only.".to_string();
+        task.acceptance_criteria = vec!["A title and empty list container exist.".to_string()];
+        for kind in [TASK_KIND_IMPLEMENTATION, TASK_KIND_TEST_IMPLEMENTATION, TASK_KIND_QA, TASK_KIND_MANUAL_TEST] {
+            run.tasks[0].task_type = kind.to_string();
+            let prompt = build_task_execution_prompt(&run, &run.tasks[0], 0);
+            assert!(prompt.contains("Create the static document shell only."), "{kind}");
+            assert!(prompt.contains("not completion of the entire app or parent scope"), "{kind}");
+            assert!(prompt.contains("They are not a roadmap of later work"), "{kind}");
+            assert!(prompt.contains("do not put it in remainingIssues, remainingGaps, or duplicate suggestedBacklogTasks"), "{kind}");
+            assert!(prompt.contains("Do not excuse an unmet acceptance criterion as downstream work"), "{kind}");
+        }
+        let repair = build_task_result_repair_prompt(
+            &run, &run.tasks[0], 0, &json!({}), "previous output", &json!({}), &["Missing status".to_string()],
+        );
+        assert!(repair.contains("Scope-local result reporting"));
+    }
+
+    #[test]
+    fn scoped_downstream_notes_do_not_override_evidence_or_real_incompleteness() {
+        let mut run = board_fixture(json!({
+            "command": "Build a complete app",
+            "projectPath": "/tmp/project"
+        }));
+        run.tasks[0].hierarchy.level = TASK_LEVEL_SUBTASK.to_string();
+        run.tasks[0].hierarchy.executable = true;
+        run.tasks[0].task_type = TASK_KIND_IMPLEMENTATION.to_string();
+        let task_id = run.tasks[0].id.clone();
+        let shell_result = json!({
+            "status": "done",
+            "qaResult": "pass",
+            "summary": "Static shell complete; behavior and styling belong to later tickets.",
+            "changedFiles": ["index.html"],
+            "commandsRun": ["validate HTML"],
+            "evidence": ["Title and empty list container exist."],
+            "remainingIssues": [],
+            "remainingGaps": [],
+        });
+        let change_summary = json!({
+            "touchedFileCount": 1,
+            "attributableChangedFileCount": 1,
+            "changedBySubtask": [{"path": "index.html"}],
+        });
+        let accepted = apply_completion_evidence_gate(&run, &task_id, shell_result.clone(), &change_summary);
+        assert_eq!(accepted["status"], "done");
+        assert_eq!(accepted["evidenceGate"]["passed"], true);
+        assert!(!append_followup_task_if_needed(&mut run, &task_id, &accepted));
+
+        // Older executors used remainingGaps for roadmap notes. The reported
+        // live failure must not be misdiagnosed as a prose-based blocking gate.
+        let mut legacy_result = shell_result.clone();
+        legacy_result["remainingGaps"] = json!(["Behavior and styling are assigned to later tickets."]);
+        let legacy_accepted = apply_completion_evidence_gate(&run, &task_id, legacy_result, &change_summary);
+        assert_eq!(legacy_accepted["status"], "done");
+        assert!(!append_followup_task_if_needed(&mut run, &task_id, &legacy_accepted));
+
+        let missing_evidence = apply_completion_evidence_gate(&run, &task_id, shell_result, &json!({"attributableChangedFileCount": 0}));
+        assert_eq!(missing_evidence["status"], "needs_followup");
+        assert_eq!(missing_evidence["evidenceGate"]["passed"], false);
+
+        let real_defect = json!({
+            "status": "needs_followup",
+            "qaResult": "fail",
+            "remainingIssues": ["Required title and task-list container are missing."],
+        });
+        assert!(!append_followup_task_if_needed(&mut run, &task_id, &real_defect));
+        assert_eq!(run.tasks[0].status, TASK_STATUS_BLOCKED);
+    }
+
+    #[test]
+    fn hierarchy_breakdown_reuses_existing_and_wrapped_dependency_targets() {
+        let mut run = board_fixture(json!({
+            "command": "Build an app",
+            "projectPath": "/tmp/project"
+        }));
+        let parent = run.tasks[0].clone();
+        let mut existing = task_from_json(&run, json!({
+            "id": "existing-shell", "title": "Implement app shell",
+        }), 0, TASK_STATUS_TODO).unwrap();
+        existing.hierarchy.level = TASK_LEVEL_TASK.to_string();
+        existing.hierarchy.parent_id = Some(parent.id.clone());
+        run.tasks.push(existing);
+        let risky = task_from_json(&run, json!({
+            "id": "migration", "title": "Apply production migration",
+            "sideEffects": ["Change production database schema"],
+        }), 1, TASK_STATUS_TODO).unwrap();
+        let wrapped = wrap_generated_child_in_backlog(
+            &mut run, &parent, risky, TASK_LEVEL_TASK, "apply production migration",
+        );
+        let wrapped_id = wrapped.last().unwrap().id.clone();
+        run.tasks.extend(wrapped);
+
+        let retained = retained_hierarchy_breakdown_child_id(
+            &run, &parent.id, TASK_LEVEL_TASK, "Implement app shell",
+        ).unwrap();
+        assert_eq!(retained, "existing-shell");
+        assert_eq!(retained_hierarchy_breakdown_child_id(
+            &run, &parent.id, TASK_LEVEL_TASK, "Apply production migration",
+        ), Some(wrapped_id.clone()));
+
+        let first_new = run.tasks.len();
+        let verification = task_from_json(&run, json!({
+            "id": "verify", "title": "Verify retained work",
+            "blockedBy": ["plan:shell", "Apply production migration"],
+        }), 2, TASK_STATUS_TODO).unwrap();
+        run.tasks.push(verification);
+        remap_hierarchy_breakdown_dependencies(
+            &mut run, first_new, &BTreeMap::from([("shell".to_string(), retained)]),
+        ).unwrap();
+        assert_eq!(task_blockers(run.tasks.last().unwrap()), vec!["existing-shell".to_string(), wrapped_id]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hierarchy_breakdown_contract_failure_is_persisted_and_clears_own_provider_activity() {
+        let root = std::env::temp_dir().join(format!("iowb-breakdown-contract-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        fs::create_dir_all(&project).unwrap();
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        }).await.unwrap();
+        let mut run = board_fixture(json!({
+            "command": "Build an app",
+            "projectPath": project.display().to_string(),
+            "provider": "codex"
+        }));
+        run.id = "breakdown-contract".to_string();
+        run.user_id = Some("user-1".to_string());
+        run.status = "paused".to_string();
+        run.tasks[0].status = TASK_STATUS_BACKLOG.to_string();
+        let parent = run.tasks[0].clone();
+        for failure in [
+            "Hierarchy breakdown returned duplicate item id: shell.",
+            "Hierarchy breakdown returned invalid dependencies: missing prerequisite.",
+        ] {
+            run.provider_call_label = Some(format!("hierarchy breakdown for {}", parent.id));
+            run.provider_call_started_at = Some(Utc::now());
+            run.current_provider_session_id = Some("planning-session".to_string());
+            save_board(&state, &run).unwrap();
+            record_hierarchy_breakdown_failure(
+                &state, "user-1", &run.id, &parent, "Break down the app", Utc::now(), failure, true,
+            ).unwrap();
+            let stored = load_user_board(&state, "user-1", &run.id).unwrap().board;
+            assert_eq!(stored.tasks.len(), 1);
+            assert_eq!(stored.tasks[0].error.as_deref(), Some(failure));
+            assert_eq!(stored.tasks[0].status, TASK_STATUS_BACKLOG);
+            assert!(is_retryable_hierarchy_breakdown_task(&stored.tasks[0]));
+            assert!(stored.provider_call_started_at.is_none());
+            assert!(stored.provider_call_label.is_none());
+            assert!(stored.current_provider_session_id.is_none());
+            assert_eq!(stored.tasks[0].transcript.last().unwrap()["content"], failure);
+        }
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_breakdown_persists_after_http_waiter_is_cancelled() {
+        let root = std::env::temp_dir().join(format!("iowb-breakdown-lifecycle-{}", Uuid::new_v4()));
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        fs::create_dir_all(&project).unwrap();
+        let state = AppState::initialize(AppConfig {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            config_dir: config_dir.clone(),
+            database_path: config_dir.join("test.db"),
+            workspace_root: root.clone(),
+            auth_required: false,
+            local_token: None,
+            otp_secret: None,
+            max_sessions: 10,
+            max_scan_depth: 2,
+            max_file_read_bytes: 1024 * 1024,
+        }).await.unwrap();
+        let mut run = board_fixture(json!({
+            "command": "Build an app",
+            "projectPath": project.display().to_string(),
+        }));
+        run.user_id = Some("lifecycle-user".to_string());
+        run.provider_call_started_at = Some(Utc::now());
+        run.provider_call_label = Some("hierarchy breakdown for task-1".to_string());
+        save_board(&state, &run).unwrap();
+        let board_id = run.id.clone();
+        let operation = claim_manual_breakdown_operation("lifecycle-user", &board_id).unwrap();
+        let operation_state = state.clone();
+        let operation_board_id = board_id.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let http_waiter = tokio::spawn(async move {
+            await_manual_breakdown_completion(operation, async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                // A delayed provider result reaches the same persistence
+                // boundary after the HTTP client has stopped waiting.
+                let _guard = board_mutation_lock();
+                let mut stored = load_user_board(&operation_state, "lifecycle-user", &operation_board_id)?;
+                let mut child = BoardTask::draft(
+                    &mut stored.board, "Generated delivery task".to_string(), "Build the app shell".to_string(),
+                );
+                child.hierarchy.parent_id = Some(stored.board.tasks[0].id.clone());
+                child.hierarchy.level = TASK_LEVEL_TASK.to_string();
+                stored.board.tasks.push(child);
+                stored.board.provider_call_started_at = None;
+                stored.board.provider_call_label = None;
+                stored.board.touch();
+                save_board(&operation_state, &stored.board)?;
+                finished_tx.send(()).unwrap();
+                Ok(1)
+            }).await
+        });
+        timeout(Duration::from_secs(2), started_rx).await.unwrap().unwrap();
+        http_waiter.abort();
+        assert!(http_waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(claim_manual_breakdown_operation("lifecycle-user", &board_id).unwrap_err().status, StatusCode::CONFLICT);
+        release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(2), finished_rx).await.unwrap().unwrap();
+
+        let stored = load_user_board(&state, "lifecycle-user", &board_id).unwrap().board;
+        assert_eq!(stored.tasks.len(), 2);
+        assert_eq!(stored.tasks[1].title, "Generated delivery task");
+        assert!(stored.provider_call_started_at.is_none());
+        assert!(stored.provider_call_label.is_none());
+        assert!(claim_manual_breakdown_operation("lifecycle-user", &board_id).is_ok());
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_breakdown_returns_outcome_and_releases_single_flight_claim() {
+        let board_id = Uuid::new_v4().to_string();
+        let operation = claim_manual_breakdown_operation("user", &board_id).unwrap();
+        assert_eq!(await_manual_breakdown_completion(operation, async { Ok(3) }).await.unwrap(), 3);
+        let operation = claim_manual_breakdown_operation("user", &board_id).unwrap();
+        let failure = await_manual_breakdown_completion(operation, async {
+            Err(bad_request("invalid generated plan"))
+        }).await.unwrap_err();
+        assert_eq!(failure.status, StatusCode::BAD_REQUEST);
+        assert_eq!(failure.body.error, "invalid generated plan");
+        assert!(claim_manual_breakdown_operation("user", &board_id).is_ok());
+    }
+
+    #[test]
     fn generated_plan_rejects_discarded_seed_dependency_without_mutating_source_board() {
         let run = board_fixture(json!({
             "command": "Initial task",

@@ -297,7 +297,7 @@ async fn generate_prompt_task_drafts(
                     "AI returned valid output but no usable task drafts.",
                 ))
             } else {
-                Ok((tasks, None))
+                normalize_generated_manual_contracts(tasks).map(|tasks| (tasks, None))
             };
             PromptTaskDraftAttempt {
                 result: generation_result,
@@ -455,6 +455,24 @@ fn prompt_task_generation_transcript(
     ])
 }
 
+// Keep planning compatible with the existing hierarchical validation and
+// test-tooling gates. Execution already explains the accepted reporters, but
+// that is too late once a contradictory runner has become approved scope.
+fn tdd_planning_evidence_contract(run: &AgenticBoard) -> &'static str {
+    if !run.tdd_enabled
+        || !uses_hierarchical_orchestration(run)
+        || !tdd_requires_failing_baseline(run)
+    {
+        return "";
+    }
+    "Deterministic TDD evidence contract:\n\
+     - Plan evidence the required red-baseline gate can actually verify: the Node built-in test runner's complete TAP/spec report through the main test script, or Playwright's JSON reporter through test, test:ui or test:e2e. For a new unconstrained JavaScript harness, select one of these supported formats, not an unrecognized runner report.\n\
+     - A baseline needs real executed behavior assertions, named failing tests and the actual failing exit status. Test setup must let assertions execute before the planned production module or UI exists; missing imports, syntax errors, missing runners, skips or timeouts do not prove missing behavior. Do not fabricate or translate reports to imitate a supported runner.\n\
+     - Preserve explicit user and existing-harness constraints; do not silently migrate, replace or weaken existing tests. If the requested or existing runner cannot supply supported evidence, report the compatibility blocker in the plan and identify any separately approved verification scope needed; do not promise that its unsupported red output will pass the gate.\n\
+     - For a new JavaScript harness in a non-Git workspace, put required package.json, test files and any permitted companion package-lock.json in plannedFiles on the eventual executable test ticket. The narrow tooling allowance covers local test scripts and versioned jsdom or Playwright devDependencies, not production/runtime dependencies or lifecycle scripts. This is a technical file allowance, not scope authorization: an unqualified user ban on packages/dependencies also forbids test/dev packages and npm/npx downloads. Use built-in or already available no-install tooling under that constraint; if compatible evidence is unavailable, report blocked rather than expanding scope or weakening TDD. Plan a root Playwright config only when using Playwright.\n\
+     - Reuse compatible existing tests and prerequisite stages; do not add another TDD lifecycle inside each task. A runner-configuration ticket may have an empty suite, but baseline capture needs real failing assertions; final implementation and QA still require green checks."
+}
+
 fn build_prompt_task_draft_prompt(run: &AgenticBoard, prompt: &str, profile: &str) -> String {
     format!(
         r#"Create implementation-ready Kanban backlog cards for this focused follow-up prompt.
@@ -465,6 +483,8 @@ Prompt:
 {board_profile_block}
 
 {git_policy_block}
+
+{tdd_evidence_contract}
 
 Current ticket scope:
 {scope_context}
@@ -506,6 +526,7 @@ Rules:
         prompt = prompt,
         board_profile_block = format_board_profile_block(profile),
         git_policy_block = git_policy_block(run),
+        tdd_evidence_contract = tdd_planning_evidence_contract(run),
         scope_context = "Use ticket descriptions and acceptance criteria as the only scope source. Do not invent a second scope layer.".to_string(),
         tasks = run
             .tasks
@@ -690,6 +711,7 @@ This story wraps the generated {} and keeps executable engineering work nested b
                 "details": wrapped_details,
                 "prompt": prompt,
                 "acceptanceCriteria": acceptance_criteria,
+                "manualVerification": task.get("manualVerification"),
                 "references": references,
                 "priority": normalize_priority(task.get("priority").and_then(Value::as_str)),
                 "blockedBy": [],
@@ -821,6 +843,7 @@ fn prepare_generated_prompt_task_trees(
     drafts: Vec<Value>,
     prompt: &str,
 ) -> Result<Vec<Vec<BoardTask>>> {
+    let drafts = normalize_generated_manual_contracts(drafts)?;
     let existing_ids = run
         .tasks
         .iter()
@@ -1212,6 +1235,7 @@ fn prompt_task_from_draft(run: &mut AgenticBoard, draft: Value, prompt: &str) ->
             .get("scopeVersion")
             .and_then(Value::as_u64)
             .unwrap_or(1),
+        scope_approval: None,
         rank: draft.get("rank").and_then(Value::as_i64).unwrap_or(0),
         attempts: Vec::new(),
         planned_files: normalize_string_list(
@@ -1222,6 +1246,7 @@ fn prompt_task_from_draft(run: &mut AgenticBoard, draft: Value, prompt: &str) ->
         side_effect_approval: None,
         side_effect_evidence: Vec::new(),
         manual_test_environment: None,
+        manual_verification: draft.get("manualVerification").cloned(),
         research_accepted: false,
         research_acceptance: None,
         discussion: Vec::new(),

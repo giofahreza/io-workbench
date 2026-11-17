@@ -19,7 +19,8 @@ async fn update_task(
         || request.dependencies.is_some()
         || request.required.is_some()
         || request.planned_files.is_some()
-        || request.side_effects.is_some();
+        || request.side_effects.is_some()
+        || request.manual_verification.is_some();
     if has_scope_edit {
         mutate_stored_board(&state, &user.0.id, &id, |run| {
             edit_backlog_task(run, &task_id, &request)
@@ -56,23 +57,67 @@ async fn discuss_task(
     AxumPath((id, task_id)): AxumPath<(String, String)>,
     Json(request): Json<DiscussionRequest>,
 ) -> Result<Json<Value>> {
+    let user_id = user.0.id.clone();
+    // Authorization is checked before claiming the board-wide worker slot.
+    load_user_board(&state, &user_id, &id)?;
+    let operation = claim_discussion_operation(&user_id, &id)?;
+    await_discussion_completion(
+        operation,
+        run_discussion_proposal_with_provider(
+            state,
+            user_id,
+            id,
+            task_id,
+            request,
+            |state, user_id, board_id, label, prompt| async move {
+                execute_discussion_prompt(&state, &user_id, &board_id, &label, &prompt).await
+            },
+        ),
+    )
+    .await
+}
+
+async fn run_discussion_proposal_with_provider<F, Fut>(
+    state: AppState,
+    user_id: String,
+    id: String,
+    task_id: String,
+    request: DiscussionRequest,
+    provider_call: F,
+) -> Result<Json<Value>>
+where
+    F: FnOnce(AppState, String, String, String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
     let message = trim_string(request.message).unwrap_or_default();
     let requested_action = normalize_discussion_action(request.action.as_deref());
     if message.is_empty() && requested_action.is_empty() {
         return Err(bad_request("Discussion message or action is required."));
     }
     let proposal_id = Uuid::new_v4().to_string();
-    let (snapshot, provider, model, started_at) = {
+    let (prompt, provider, model, started_at, scope_version) = {
         let _guard = board_mutation_lock();
-        let mut stored = load_user_board(&state, &user.0.id, &id)?;
+        let mut stored = load_user_board(&state, &user_id, &id)?;
         let snapshot = stored.board.clone();
-        if !snapshot.tasks.iter().any(|task| task.id == task_id) {
-            return Err(not_found("Agentic board task not found"));
-        }
+        let scope_version = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| not_found("Agentic board task not found"))?
+            .hierarchy
+            .scope_version;
+        let prompt = build_discussion_proposal_prompt(
+            &snapshot,
+            &task_id,
+            &message,
+            &requested_action,
+            request.payload.as_ref().unwrap_or(&Value::Null),
+        )?;
         let provider = effective_provider_for_phase(&snapshot, "discussion proposal")?;
         let model = effective_model_for_phase(&snapshot, "discussion proposal");
         let started_at = Utc::now();
-        let entry = discussion_running_entry(
+        recover_orphaned_discussion_proposals(&mut stored.board, &task_id);
+        let mut entry = discussion_running_entry(
             &proposal_id,
             &task_id,
             &message,
@@ -82,33 +127,30 @@ async fn discuss_task(
             model.as_str(),
             started_at,
         );
+        entry["sourceScopeVersion"] = json!(scope_version);
+        entry["sourceScopeIdentity"] =
+            discussion_source_identity(&discussion_scope_snapshot(&snapshot, &task_id))
+                .ok_or_else(|| bad_request("Cannot record discussion source scope."))?;
         append_discussion_proposal(&mut stored.board, &task_id, entry)?;
         stored.board.append_log(format!(
             "Started discussion proposal {proposal_id} for board item {task_id}"
         ));
         stored.board.touch();
         save_board(&state, &stored.board)?;
-        (snapshot, provider, model, started_at)
+        (prompt, provider, model, started_at, scope_version)
     };
 
-    let prompt = build_discussion_proposal_prompt(
-        &snapshot,
-        &task_id,
-        &message,
-        &requested_action,
-        request.payload.as_ref().unwrap_or(&Value::Null),
-    )?;
-    let provider_result = execute_internal_prompt(
-        &state,
-        &user.0.id,
-        &id,
-        &format!("discussion proposal for {task_id}"),
-        &prompt,
+    let provider_result = provider_call(
+        state.clone(),
+        user_id.clone(),
+        id.clone(),
+        format!("discussion proposal for {task_id}"),
+        prompt,
     )
     .await;
 
     let _guard = board_mutation_lock();
-    let mut stored = load_user_board(&state, &user.0.id, &id)?;
+    let mut stored = load_user_board(&state, &user_id, &id)?;
     let proposal_index = stored
         .board
         .discussion_proposals
@@ -118,6 +160,12 @@ async fn discuss_task(
         })
         .ok_or_else(|| not_found("Discussion proposal no longer exists"))?;
     let mut proposal = stored.board.discussion_proposals[proposal_index].clone();
+    if proposal.get("status").and_then(Value::as_str) != Some("running") {
+        return Ok(Json(
+            json!({"success": false, "proposalId": proposal_id, "proposal": proposal,
+            "board": stored.board.detail_json(Some(stored.path.display().to_string()))}),
+        ));
+    }
     let assistant_content = match provider_result {
         Ok(output) => output,
         Err(error) => {
@@ -150,6 +198,7 @@ async fn discuss_task(
         ))
     });
     let proposal_result = parsed.and_then(|parsed| {
+        validate_discussion_source_scope(&stored.board, &task_id, &proposal)?;
         sanitize_discussion_proposal(
             &stored.board,
             &task_id,
@@ -166,6 +215,11 @@ async fn discuss_task(
     match proposal_result {
         Ok(mut completed) => {
             if let Some(object) = completed.as_object_mut() {
+                object.insert("sourceScopeVersion".to_string(), json!(scope_version));
+                object.insert(
+                    "sourceScopeIdentity".to_string(),
+                    proposal["sourceScopeIdentity"].clone(),
+                );
                 object.insert(
                     "transcript".to_string(),
                     discussion_completed_transcript(
@@ -238,6 +292,7 @@ async fn apply_discussion_proposal(
             "Only pending discussion proposals can be applied.",
         ));
     }
+    validate_discussion_source_scope(&stored.board, &task_id, &proposal)?;
     let action = proposal
         .get("action")
         .and_then(Value::as_str)

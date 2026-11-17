@@ -121,6 +121,13 @@ fn append_suggested_backlog_tasks_from_result(
     if canonical_task_kind(&source_task) == TASK_KIND_RESEARCH {
         return Vec::new();
     }
+    let suggestions = match normalize_generated_manual_contracts(suggestions) {
+        Ok(suggestions) => suggestions,
+        Err(error) => {
+            run.append_log(format!("Rejected suggested Backlog tasks from {source_task_id}: {}", server_error_message(&error)));
+            return Vec::new();
+        }
+    };
     let mut existing_scope_keys = run
         .tasks
         .iter()
@@ -229,6 +236,7 @@ fn append_suggested_backlog_tasks_from_result(
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 scope_version: suggestion.get("scopeVersion").and_then(Value::as_u64),
+                manual_verification: suggestion.get("manualVerification").cloned(),
                 planned_files: suggestion
                     .get("plannedFiles")
                     .or_else(|| suggestion.get("files"))

@@ -4,6 +4,7 @@ fn capture_workspace_snapshot(project_path: &str) -> Value {
         .arg("--short")
         .current_dir(project_path)
         .env("PATH", augmented_user_path())
+        .env("LC_ALL", "C")
         .output();
     match output {
         Ok(output) if output.status.success() => {
@@ -70,14 +71,37 @@ fn capture_workspace_snapshot(project_path: &str) -> Value {
                 "capturedAt": Utc::now(),
             })
         }
-        Ok(output) => json!({
-            "provider": "git status --short",
-            "isGit": false,
-            "files": [],
-            "filesByPath": {},
-            "error": String::from_utf8_lossy(&output.stderr).trim(),
-            "capturedAt": Utc::now(),
-        }),
+        Ok(output) => {
+            let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            // Do not reinterpret a broken/inaccessible Git repository as a
+            // clean filesystem baseline: that would lose the dirty-worktree
+            // ownership guardrails. A normal folder needs no git init merely
+            // to provide deterministic implementation evidence.
+            if error.contains("not a git repository")
+                && env::var_os("GIT_DIR").is_none()
+                && !Path::new(project_path).ancestors().any(|ancestor| {
+                    match fs::symlink_metadata(ancestor.join(".git")) {
+                        Ok(_) => true,
+                        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+                    }
+                })
+            {
+                capture_filesystem_workspace_snapshot(
+                    project_path,
+                    &error,
+                    MAX_WORKSPACE_SNAPSHOT_FILES,
+                )
+            } else {
+                json!({
+                    "provider": "git status --short",
+                    "isGit": false,
+                    "files": [],
+                    "filesByPath": {},
+                    "error": error,
+                    "capturedAt": Utc::now(),
+                })
+            }
+        }
         Err(error) => json!({
             "provider": "git status --short",
             "isGit": false,
@@ -87,6 +111,188 @@ fn capture_workspace_snapshot(project_path: &str) -> Value {
             "capturedAt": Utc::now(),
         }),
     }
+}
+
+fn capture_filesystem_workspace_snapshot(
+    project_path: &str,
+    git_status_error: &str,
+    file_limit: usize,
+) -> Value {
+    let root = Path::new(project_path);
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    let mut truncated = false;
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| !should_skip_path(entry.path(), root))
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(error.to_string());
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if files.len() >= file_limit {
+            truncated = true;
+            break;
+        }
+        let path = relative_display(root, entry.path());
+        let hash = match hash_filesystem_snapshot_file(entry.path()) {
+            Ok(hash) => Some(hash),
+            Err(error) => {
+                errors.push(format!("{path}: {error}"));
+                None
+            }
+        };
+        let test_runner_config = path == "package.json"
+            && hash.as_deref().is_some_and(|hash| {
+                captured_minimal_node_test_manifest(entry.path(), hash)
+            });
+        let mut file = json!({"status": "present", "path": path, "hash": hash});
+        if test_runner_config {
+            file["testRunnerConfig"] = json!("minimal-node-test-v1");
+        }
+        files.push(file);
+    }
+    if truncated {
+        errors.push(format!(
+            "Filesystem snapshot exceeded the {file_limit}-file limit."
+        ));
+    }
+    let files_by_path = files
+        .iter()
+        .filter_map(|file| {
+            file.get("path")
+                .and_then(Value::as_str)
+                .map(|path| (path.to_string(), file.clone()))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let test_tooling = captured_test_tooling(project_path, &files_by_path);
+    json!({
+        "provider": "filesystem sha256",
+        "isGit": false,
+        "complete": errors.is_empty(),
+        "testRunnerManifestAbsent": fs::symlink_metadata(root.join("package.json"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "testRunnerLockAbsent": fs::symlink_metadata(root.join("package-lock.json"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "testTooling": test_tooling,
+        "truncated": truncated,
+        "files": files,
+        "filesByPath": files_by_path,
+        "gitStatusError": git_status_error,
+        "error": (!errors.is_empty()).then(|| errors.join("\n")),
+        "capturedAt": Utc::now(),
+    })
+}
+
+fn hash_filesystem_snapshot_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    // Stream bounded regular files, never following symlinks into other
+    // workspaces. An incomplete hash is not completion evidence.
+    const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+        return Err(std::io::Error::other(
+            "not a regular file within the 16 MiB snapshot limit",
+        ));
+    }
+    let mut file = fs::File::open(path)?.take(MAX_FILE_BYTES + 1);
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut bytes_read = 0_u64;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        bytes_read += count as u64;
+        if bytes_read > MAX_FILE_BYTES {
+            return Err(std::io::Error::other("file grew beyond the snapshot limit"));
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn captured_minimal_node_test_manifest(path: &Path, expected_hash: &str) -> bool {
+    use std::io::Read;
+    // This exception is derived from bounded, hash-matched workspace bytes,
+    // never from a provider's reported files or claims about their contents.
+    const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+        return false;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes).is_err()
+        || bytes.len() as u64 > MAX_MANIFEST_BYTES
+        || sha256_hex(&bytes) != expected_hash
+    {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .is_some_and(|manifest| is_minimal_node_test_manifest(&manifest))
+}
+
+fn is_minimal_node_test_manifest(manifest: &Value) -> bool {
+    let Some(fields) = manifest.as_object() else {
+        return false;
+    };
+    if !fields.iter().all(|(key, value)| match key.as_str() {
+        "name" | "version" | "description" | "license" => value.is_string(),
+        "private" => value.as_bool() == Some(true),
+        "type" => matches!(value.as_str(), Some("module" | "commonjs")),
+        "engines" => value.as_object().is_some_and(|engines| {
+            engines.len() == 1 && engines.get("node").is_some_and(Value::is_string)
+        }),
+        "scripts" => value.as_object().is_some_and(|scripts| {
+            scripts.len() == 1
+                && scripts
+                    .get("test")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_local_node_test_command)
+        }),
+        // In particular, no dependencies, install/pre/post lifecycle scripts,
+        // entry points, workspaces, or arbitrary configuration are test-only.
+        _ => false,
+    }) {
+        return false;
+    }
+    fields.contains_key("scripts")
+}
+
+fn is_local_node_test_command(command: &str) -> bool {
+    if command.chars().any(|ch| ch.is_control() && ch != '\t') {
+        return false;
+    }
+    let mut args = command.split_ascii_whitespace();
+    if args.next() != Some("node") || args.next() != Some("--test") {
+        return false;
+    }
+    args.all(|arg| {
+        matches!(
+            arg,
+            "--test-reporter=spec" | "--test-reporter=tap" | "--test-reporter=dot"
+        ) || (!arg.starts_with(['/', '-'])
+            && arg.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || b"_./*-".contains(&byte)
+            })
+            && !arg.split('/').any(|part| part == "..")
+            && is_test_or_fixture_path(arg))
+    })
 }
 
 fn extend_workspace_status_entries(
@@ -243,7 +449,9 @@ fn merge_dependencies(package_json: Option<&Value>) -> Value {
 
 fn should_skip_path(path: &Path, root: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
+    let mut component_path = root.to_path_buf();
     relative.components().any(|component| {
+        component_path.push(component.as_os_str());
         let name = component.as_os_str().to_string_lossy();
         matches!(
             name.as_ref(),
@@ -259,7 +467,8 @@ fn should_skip_path(path: &Path, root: &Path) -> bool {
                 | ".gradle"
                 | ".idea"
                 | ".DS_Store"
-        )
+        ) || (matches!(name.as_ref(), "test-results" | "playwright-report")
+            && component_path.is_dir())
     })
 }
 
@@ -903,12 +1112,38 @@ fn validation_summary(entries: &[Value]) -> Value {
         .iter()
         .filter(|entry| entry.get("passed").and_then(Value::as_bool) == Some(true))
         .count();
+    let failed = entries
+        .iter()
+        .filter(|entry| entry.get("passed").and_then(Value::as_bool) == Some(false))
+        .count();
+    let gates = validation_summary_gate_entries(entries);
+    let passed_gates = gates
+        .iter()
+        .filter(|entry| validation_summary_gate_passed(entry) == Some(true))
+        .count();
+    let failed_gates = gates
+        .iter()
+        .filter(|entry| validation_summary_gate_passed(entry) == Some(false))
+        .count();
     let latest = entries.last();
+    let latest_gate = gates.last().copied();
     let commands = entries.iter().map(validation_command_count).sum::<usize>();
     json!({
         "runs": runs,
         "passed": passed,
-        "failed": runs.saturating_sub(passed),
+        // Keep raw results available to existing clients. Missing/malformed
+        // outcomes are unknown, not implicit failures.
+        "failed": failed,
+        "unknown": runs - passed - failed,
+        "passedGates": passed_gates,
+        "failedGates": failed_gates,
+        "unknownGates": gates.len() - passed_gates - failed_gates,
+        "acceptedExpectedRed": gates.iter()
+            .filter(|entry| validation_summary_outcome(entry) == "expected_red").count(),
+        "acceptedRemainingRed": gates.iter()
+            .filter(|entry| validation_summary_outcome(entry) == "remaining_red").count(),
+        "latestGatePassed": latest_gate.and_then(validation_summary_gate_passed),
+        "latestGateOutcome": latest_gate.map(validation_summary_outcome),
         "latestStage": latest
             .and_then(|entry| entry.get("stage"))
             .and_then(Value::as_str)
@@ -918,6 +1153,55 @@ fn validation_summary(entries: &[Value]) -> Value {
             .and_then(Value::as_bool),
         "commands": commands,
     })
+}
+
+fn validation_summary_gate_passed(entry: &Value) -> Option<bool> {
+    entry
+        .get("gatePassed")
+        .or_else(|| entry.get("passed"))
+        .and_then(Value::as_bool)
+}
+
+fn validation_summary_outcome(entry: &Value) -> &'static str {
+    match validation_summary_gate_passed(entry) {
+        Some(false) => "failed",
+        None => "unknown",
+        Some(true) if entry.get("passed").and_then(Value::as_bool) == Some(false) => {
+            if entry.get("expectedRedAccepted").and_then(Value::as_bool) == Some(true) {
+                "expected_red"
+            } else if entry.get("remainingRedAccepted").is_some_and(|evidence| {
+                evidence.as_bool() == Some(true)
+                    || evidence.as_object().is_some_and(|value| !value.is_empty())
+            }) {
+                "remaining_red"
+            } else {
+                "accepted"
+            }
+        }
+        Some(true) => "passed",
+    }
+}
+
+fn validation_summary_gate_entries(entries: &[Value]) -> Vec<&Value> {
+    // commandsRun telemetry is appended after the deterministic gate, with
+    // the task verdict copied to each command. It must not mask accepted RED
+    // (or a failed gate). Only skip those summaries within the same task batch.
+    let mut gates: Vec<&Value> = Vec::new();
+    for entry in entries {
+        if entry.get("command").is_some()
+            && entry.get("stage").is_none()
+            && entry.get("gatePassed").is_none()
+            && let Some(task_id) = entry.get("taskId").and_then(Value::as_str)
+            && gates.last().is_some_and(|gate| {
+                gate.get("taskId").and_then(Value::as_str) == Some(task_id)
+                    && (gate.get("commands").is_some() || gate.get("gatePassed").is_some())
+            })
+        {
+            continue;
+        }
+        gates.push(entry);
+    }
+    gates
 }
 
 fn validation_command_count(entry: &Value) -> usize {

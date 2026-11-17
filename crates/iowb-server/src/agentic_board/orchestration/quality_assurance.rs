@@ -1,3 +1,5 @@
+include!("fix_scope.rs");
+
 fn is_qa_task(task: &BoardTask) -> bool {
     task.qa_task || task.final_qa_task || task.id == FINAL_QA_TASK_ID
 }
@@ -198,6 +200,58 @@ fn mark_qa_verdict_retry_blocked(run: &mut AgenticBoard, task_id: &str, parsed: 
     ));
 }
 
+fn hierarchical_followup_block_reason(task: &BoardTask, parsed: &Value) -> String {
+    let evidence_issues = normalize_string_list(parsed.pointer("/evidenceGate/issues"));
+    let issues = dedupe_strings(
+        evidence_issues
+            .iter()
+            .cloned()
+            .chain(normalize_string_list(parsed.get("remainingIssues")))
+            .collect(),
+    );
+    let actionable_gate_issues = issues
+        .iter()
+        .filter(|issue| {
+            issue.starts_with("File-edit policy failed")
+                || issue.starts_with("Deterministic validation failed")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let reason = if !actionable_gate_issues.is_empty() {
+        actionable_gate_issues.join("; ")
+    } else if parsed
+        .pointer("/filePolicy/passed")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        let paths = normalize_string_list(parsed.pointer("/filePolicy/violations"));
+        format!(
+            "File-edit policy failed for {}: review disallowed workspace file changes{}.",
+            canonical_task_kind(task),
+            if paths.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", paths.join(", "))
+            },
+        )
+    } else if completion_evidence_gate_failed(parsed) && !evidence_issues.is_empty() {
+        evidence_issues.join("; ")
+    } else if let Some(error) = task
+        .error
+        .as_deref()
+        .filter(|error| !error.trim().is_empty())
+    {
+        error.to_string()
+    } else if completion_evidence_gate_failed(parsed) {
+        "Completion evidence gate failed; provide valid evidence before this subtask can be done."
+            .to_string()
+    } else {
+        "Subtask reported incomplete work inside the approved scope; create or discuss a concrete fix subtask under this parent."
+            .to_string()
+    };
+    limit_text(&reason, 1200)
+}
+
 fn append_followup_task_if_needed(
     run: &mut AgenticBoard,
     source_task_id: &str,
@@ -222,10 +276,7 @@ fn append_followup_task_if_needed(
     {
         if let Some(task) = run.tasks.iter_mut().find(|task| task.id == source_task_id) {
             task.status = TASK_STATUS_BLOCKED.to_string();
-            task.error = Some(
-                "Subtask reported incomplete work inside the approved scope; create or discuss a concrete fix subtask under this parent."
-                    .to_string(),
-            );
+            task.error = Some(hierarchical_followup_block_reason(&source_task, parsed));
         }
         return false;
     }
@@ -272,7 +323,7 @@ fn append_followup_task_if_needed(
     let qa_fix = is_qa_task(&source_task)
         || matches!(
             canonical_task_kind(&source_task),
-            TASK_KIND_MANUAL_TEST | TASK_KIND_REVIEW
+            TASK_KIND_QA | TASK_KIND_MANUAL_TEST | TASK_KIND_REVIEW
         );
     let suggested = parsed
         .get("suggestedBacklogTasks")
@@ -408,6 +459,7 @@ fn append_followup_task_if_needed(
             executable: true,
             required: true,
             scope_version: source_task.hierarchy.scope_version,
+            scope_approval: None,
             rank: source_task.hierarchy.rank.saturating_add(1),
             attempts: Vec::new(),
             planned_files: source_task.hierarchy.planned_files.clone(),
@@ -416,12 +468,18 @@ fn append_followup_task_if_needed(
             side_effect_approval: None,
             side_effect_evidence: Vec::new(),
             manual_test_environment: None,
+            manual_verification: None,
             research_accepted: false,
             research_acceptance: None,
             discussion: Vec::new(),
         };
         followup.depends_on = vec![source_task_id.to_string()];
         followup.group_id = Some(group_id.clone());
+        if !automatic_qa_fix_scope_is_authorized(run, &followup) {
+            followup.status = TASK_STATUS_BACKLOG.to_string();
+            followup.error = Some("This fix requires explicit scope approval through a reviewed Edit/Replace before execution. The source QA/test scope does not authorize these file changes.".to_string());
+            run.append_log(format!("QA fix {id} remains Backlog pending explicit scope approval; no production or test-repair permission was inferred from failed validation"));
+        }
     }
     let insert_index = run
         .tasks

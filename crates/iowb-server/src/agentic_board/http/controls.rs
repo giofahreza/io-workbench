@@ -253,6 +253,26 @@ async fn update_tools_settings(
     })
 }
 
+/// Guard and apply all quality deltas under the same board mutation lock.
+async fn update_quality_settings(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    // Generic mutate_board deliberately persists planning errors on failure.
+    // A rejected settings guard must instead leave even that snapshot untouched.
+    let _guard = board_mutation_lock();
+    let mut stored = load_user_board(&state, &user.0.id, &id)?;
+    apply_guarded_quality_settings(&mut stored.board, &body)?;
+    stored.board.touch();
+    save_board(&state, &stored.board)?;
+    Ok(Json(json!({
+        "success": true,
+        "board": stored.board.detail_json(Some(stored.path.display().to_string())),
+    })))
+}
+
 async fn update_tdd_settings(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,

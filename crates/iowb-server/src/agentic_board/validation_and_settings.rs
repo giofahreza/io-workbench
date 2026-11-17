@@ -32,10 +32,22 @@ fn change_summary_paths(summary: &Value) -> Vec<String> {
 }
 
 fn change_summary_attributable_file_count(summary: &Value) -> u64 {
-    summary
+    let newly_changed = summary
         .get("attributableChangedFileCount")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| change_summary_paths(summary).len() as u64)
+        .unwrap_or_else(|| change_summary_paths(summary).len() as u64);
+    let reused = summary
+        .get("reusedEvidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.get("classification").and_then(Value::as_str) == Some("reused_same_task")
+        })
+        .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+    newly_changed.saturating_add(reused)
 }
 
 fn normalize_changed_file_summary(summary: &Value) -> Value {
@@ -106,6 +118,15 @@ fn refresh_codebase_context_after_task(run: &mut AgenticBoard, change_summary: &
 }
 
 async fn run_deterministic_validation(run: &AgenticBoard, task_id: &str, stage: &str) -> Value {
+    run_deterministic_validation_with_output_limit(run, task_id, stage, 1200).await
+}
+
+async fn run_deterministic_validation_with_output_limit(
+    run: &AgenticBoard,
+    task_id: &str,
+    stage: &str,
+    output_limit: usize,
+) -> Value {
     let started_at = Utc::now();
     if run.validation_config.get("enabled").and_then(value_as_bool) == Some(false) {
         return json!({
@@ -123,6 +144,14 @@ async fn run_deterministic_validation(run: &AgenticBoard, task_id: &str, stage: 
     let validation_timeout = validation_timeout(run);
     let mut commands = Vec::new();
     for (script_name, command_text) in scripts {
+        // The extra pre-attempt comparison must not rerun build, lint fixes,
+        // migrations, or arbitrary configured commands. Only package test
+        // suites are eligible; unsupported custom commands remain strict gates.
+        if stage == "test_preflight"
+            && !matches!(script_name.as_str(), "test" | "test:ui" | "test:e2e")
+        {
+            continue;
+        }
         let command_started = Utc::now();
         let result =
             run_shell_validation_command(&run.project_path, &command_text, validation_timeout)
@@ -130,17 +159,62 @@ async fn run_deterministic_validation(run: &AgenticBoard, task_id: &str, stage: 
         let duration_ms = (Utc::now() - command_started).num_milliseconds().max(0);
         let exit_code = result.as_ref().map(|result| result.0).unwrap_or(124);
         let output = result
-            .map(|result| limit_text(&format!("{}\n{}", result.1, result.2), 1200))
+            .map(|result| format!("{}\n{}", result.1, result.2))
             .unwrap_or_else(|error| error);
-        commands.push(json!({
+        let mut recorded_command = json!({
             "command": command_text,
             "scriptName": script_name,
             "exitCode": exit_code,
             "output": output,
             "durationMs": duration_ms,
-        }));
-        if exit_code != 0 && stage == "feature" {
+        });
+        // Extract identities from the complete server-observed report before
+        // limiting the display transcript; missing tails must not look green.
+        if let Some(report) = node_assertion_test_report(&recorded_command)
+            .or_else(|| playwright_assertion_test_report(&recorded_command))
+        {
+            recorded_command["testReport"] = report;
+        }
+        recorded_command["output"] = json!(limit_text(&output, output_limit));
+        commands.push(recorded_command);
+        if exit_code != 0 && stage == "feature" && output_limit == 1200 {
             break;
+        }
+    }
+    // A package-free project can deliberately use Node's built-in runner.
+    // Discover only bounded, snapshot-owned tests; never interpret provider
+    // prose as a shell command or install a runner to make validation work.
+    if commands.is_empty()
+        && validation_commands_for_stage(run, stage).is_empty()
+        && validation_max_commands_for_stage(run, stage) > 0
+    {
+        if let Some(paths) = package_free_node_test_paths(run) {
+            let command_started = Utc::now();
+            let mut process = Command::new("node");
+            process
+                .args(["--test", "--test-reporter=tap", "--"])
+                .args(paths.iter().map(|path| format!("./{path}")))
+                .current_dir(&run.project_path)
+                .env("PATH", augmented_user_path())
+                .kill_on_drop(true)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let observed = timeout(validation_timeout, process.output()).await;
+            let (exit_code, output) = match observed {
+                Ok(Ok(output)) => (output.status.code().unwrap_or(1), format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr))),
+                Ok(Err(error)) => (127, format!("Failed to run built-in Node tests: {error}")),
+                Err(_) => (124, format!("Built-in Node tests timed out after {} seconds", validation_timeout.as_secs())),
+            };
+            let mut recorded = json!({
+                "command": format!("node --test --test-reporter=tap -- {}", paths.iter().map(|path| serde_json::to_string(&format!("./{path}")).unwrap()).collect::<Vec<_>>().join(" ")),
+                "scriptName": "test", "runner": "node_builtin", "exitCode": exit_code,
+                "output": output, "durationMs": (Utc::now() - command_started).num_milliseconds().max(0),
+            });
+            if let Some(report) = node_assertion_test_report(&recorded) {
+                recorded["testReport"] = report;
+            }
+            recorded["output"] = json!(limit_text(&output, output_limit));
+            commands.push(recorded);
         }
     }
     let passed = commands
@@ -156,7 +230,76 @@ async fn run_deterministic_validation(run: &AgenticBoard, task_id: &str, stage: 
     })
 }
 
+fn node_builtin_test_path(path: &str) -> bool {
+    [".test.js", ".test.cjs", ".test.mjs"]
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
+}
+
+fn complete_validation_snapshot(snapshot: &Value) -> bool {
+    snapshot.get("complete").and_then(Value::as_bool) == Some(true)
+        || (snapshot.get("isGit").and_then(Value::as_bool) == Some(true)
+            && snapshot.get("error").is_none()
+            && snapshot.get("filesByPath").and_then(Value::as_object)
+                .is_some_and(|files| files.len() < MAX_WORKSPACE_SNAPSHOT_FILES))
+}
+
+fn package_free_node_test_paths(run: &AgenticBoard) -> Option<Vec<String>> {
+    use std::io::Read;
+    if !run.tdd_enabled || !uses_hierarchical_orchestration(run) {
+        return None;
+    }
+    let root = fs::canonicalize(&run.project_path).ok()?;
+    if !matches!(fs::symlink_metadata(root.join("package.json")), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+        return None;
+    }
+    let snapshot = run.latest_workspace_snapshot.as_ref()?;
+    if !complete_validation_snapshot(snapshot) { return None; }
+    let files = snapshot.get("filesByPath")?.as_object()?;
+    let candidates = files.keys().filter(|path| node_builtin_test_path(path)).collect::<Vec<_>>();
+    if candidates.is_empty() || candidates.len() > 64 { return None; }
+    let mut paths = Vec::new();
+    for path in candidates {
+        if !Path::new(path).components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+            return None;
+        }
+        let absolute = root.join(path);
+        let metadata = fs::symlink_metadata(&absolute).ok()?;
+        if !metadata.is_file() || metadata.len() > 1024 * 1024
+            || !fs::canonicalize(&absolute).ok()?.starts_with(&root)
+            || hash_filesystem_snapshot_file(&absolute).ok()?.as_str() != files.get(path)?.get("hash")?.as_str()?
+        { return None; }
+        let mut source = String::new();
+        fs::File::open(&absolute).ok()?.take(1024 * 1024 + 1).read_to_string(&mut source).ok()?;
+        if source.len() > 1024 * 1024 || !(source.contains("'node:test'") || source.contains("\"node:test\"")) {
+            return None;
+        }
+        paths.push(path.clone());
+    }
+    Some(paths)
+}
+
 async fn run_tdd_validation(run: &AgenticBoard, task: &BoardTask, stage: &str) -> Value {
+    if stage == "feature"
+        && (hierarchical_test_phase(run, task)
+            || hierarchical_test_qa_source(run, task).is_some()
+            || hierarchical_intermediate_qa_barrier(run, task).is_some())
+    {
+        let mut validation =
+            run_deterministic_validation_with_output_limit(run, &task.id, stage, 65536).await;
+        if !task.qa_test_commands.is_empty() {
+            let generated = run_generated_test_commands(
+                &run.project_path,
+                &task.id,
+                &task.qa_test_commands,
+                stage,
+                validation_timeout(run),
+            )
+            .await;
+            merge_task_validation_commands(&mut validation, &generated);
+        }
+        return classify_hierarchical_test_validation(run, task, validation);
+    }
     if is_qa_task(task) || task.qa_test_commands.is_empty() {
         return run_deterministic_validation(run, &task.id, stage).await;
     }
@@ -194,6 +337,688 @@ async fn run_tdd_validation(run: &AgenticBoard, task: &BoardTask, stage: &str) -
         "generatedTestCommands": task.qa_test_commands,
         "packageValidation": deterministic,
     })
+}
+
+// A test-writing branch may intentionally be red. This is not an exemption for
+// implementation, QA, or unrelated manual checks, even when they have a test
+// prerequisite. The manual child covers the separate baseline-recording ticket.
+fn merge_task_validation_commands(validation: &mut Value, extra: &Value) {
+    let mut commands = validation
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    commands.extend(
+        extra
+            .get("commands")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    validation["passed"] = json!(
+        commands
+            .iter()
+            .all(|command| command.get("exitCode").and_then(Value::as_i64) == Some(0))
+    );
+    validation["commands"] = json!(commands);
+}
+
+fn hierarchical_test_phase(run: &AgenticBoard, task: &BoardTask) -> bool {
+    if !run.tdd_enabled || !uses_hierarchical_orchestration(run) {
+        return false;
+    }
+    match canonical_task_kind(task) {
+        TASK_KIND_TEST_IMPLEMENTATION => return true,
+        TASK_KIND_MANUAL_TEST
+            if format!("{} {} {}", task.title, task.details, task.description)
+                .to_ascii_lowercase()
+                .contains("baseline") => {}
+        _ => return false,
+    }
+    let mut parent_id = task.hierarchy.parent_id.as_deref();
+    let mut seen = BTreeSet::new();
+    while let Some(id) = parent_id {
+        if !seen.insert(id) {
+            break;
+        }
+        let Some(parent) = run.tasks.iter().find(|item| item.id == id) else {
+            break;
+        };
+        if canonical_task_kind(parent) == TASK_KIND_TEST_IMPLEMENTATION {
+            return true;
+        }
+        parent_id = parent.hierarchy.parent_id.as_deref();
+    }
+    false
+}
+
+// Only generated, source-linked QA can verify an existing red test stage.
+// Ordinary/final QA and a mere dependency on tests still require green checks.
+fn hierarchical_test_qa_source<'a>(
+    run: &'a AgenticBoard,
+    task: &BoardTask,
+) -> Option<&'a BoardTask> {
+    if !run.tdd_enabled
+        || !uses_hierarchical_orchestration(run)
+        || !is_qa_task(task)
+        || task.final_qa_task
+        || !matches!(
+            task.task_origin.as_str(),
+            "system_qa" | "system_qa_verdict_retry"
+        )
+    {
+        return None;
+    }
+    let source = run
+        .tasks
+        .iter()
+        .find(|item| Some(item.id.as_str()) == task.source_task_id.as_deref())?;
+    if !task_status_is_done(&source.status)
+        || !task_is_executable(source)
+        || source.superseded_by.is_some()
+        || !hierarchical_test_phase(run, source)
+        || task.hierarchy.parent_id != source.hierarchy.parent_id
+        || task.hierarchy.scope_version != source.hierarchy.scope_version
+    {
+        return None;
+    }
+    let baseline = source.qa_baseline_validation.as_ref()?;
+    let fingerprint = hierarchical_validation_test_fingerprint(run)?;
+    (baseline.get("expectedRedAccepted").and_then(Value::as_bool) == Some(true)
+        && validation_gate_passed(baseline)
+        && baseline.get("passed").and_then(Value::as_bool) == Some(false)
+        && baseline.get("scopeVersion").and_then(Value::as_u64)
+            == Some(source.hierarchy.scope_version)
+        && baseline.get("testSuiteFingerprint") == Some(&fingerprint)
+        && source.deterministic_validation.as_ref() == Some(baseline))
+    .then_some(source)
+}
+
+fn trusted_test_qa_red_evidence(
+    run: &AgenticBoard,
+    task: &BoardTask,
+    commands: &[Value],
+) -> Option<Value> {
+    let source = hierarchical_test_qa_source(run, task)?;
+    let previous = source
+        .qa_baseline_validation
+        .as_ref()?
+        .get("commands")?
+        .as_array()?;
+    if previous.len() != commands.len() || commands.is_empty() {
+        return None;
+    }
+    let mut saw_red = false;
+    for command in commands {
+        let prior = previous.iter().find(|prior| {
+            prior.get("command") == command.get("command")
+                && prior.get("scriptName") == command.get("scriptName")
+        })?;
+        if command.get("exitCode") != prior.get("exitCode") {
+            return None;
+        }
+        if command.get("exitCode").and_then(Value::as_i64) == Some(0) {
+            continue;
+        }
+        let report = command.get("testReport")?;
+        let prior_report = prior.get("testReport")?;
+        if ["runner", "tests", "assertionFailures", "failedTestIds"]
+            .iter()
+            .any(|key| report.get(*key).is_none() || report.get(*key) != prior_report.get(*key))
+        {
+            return None;
+        }
+        if normalize_string_list(report.get("failedTestIds")).is_empty() {
+            return None;
+        }
+        saw_red = true;
+    }
+    saw_red.then(|| {
+        json!({
+            "sourceTaskId": source.id,
+            "sourceScopeVersion": source.hierarchy.scope_version,
+            "unchangedTestSuite": true,
+        })
+    })
+}
+
+fn hierarchical_task_requires_red_baseline(run: &AgenticBoard, task: &BoardTask) -> bool {
+    hierarchical_test_phase(run, task)
+        && tdd_requires_failing_baseline(run)
+        && format!("{} {} {}", task.title, task.details, task.description)
+            .to_ascii_lowercase()
+            .contains("baseline")
+}
+
+// Recognize actual Node test-runner assertion reports, not arbitrary nonzero
+// exits or provider claims. Unsupported/truncated output fails closed. In
+// particular missing imports, syntax errors, cancelled tests and absent runners
+// are broken tests/environment, not demonstrated behavior-level red baselines.
+fn node_assertion_test_report(command: &Value) -> Option<Value> {
+    let exit_code = command.get("exitCode").and_then(Value::as_i64)?;
+    if !matches!(exit_code, 0 | 1)
+        || command.get("scriptName").and_then(Value::as_str) != Some("test")
+    {
+        return None;
+    }
+    let output = command.get("output")?.as_str()?;
+    let counter = |name: &str| -> Option<u64> {
+        output.lines().find_map(|line| {
+            let line = line.trim();
+            let line = line
+                .strip_prefix("# ")
+                .or_else(|| line.strip_prefix("ℹ "))?;
+            line.strip_prefix(name)?
+                .strip_prefix(' ')?
+                .trim()
+                .parse()
+                .ok()
+        })
+    };
+    let total = counter("tests")?;
+    let failed = counter("fail")?;
+    let passed = counter("pass")?;
+    if total == 0
+        || passed + failed != total
+        || counter("cancelled")? != 0
+        || counter("skipped")? != 0
+        || counter("todo")? != 0
+    {
+        return None;
+    }
+    let error_codes = output
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("code:"))
+        .map(|code| code.trim().trim_end_matches(',').trim_matches(['\'', '"']))
+        .collect::<Vec<_>>();
+    if error_codes.len() as u64 != failed || error_codes.iter().any(|code| *code != "ERR_ASSERTION")
+    {
+        return None;
+    }
+    if (failed == 0) != (exit_code == 0) {
+        return None;
+    }
+    let mut failure_ids = BTreeSet::new();
+    let mut spec_location = None;
+    let mut tap_name = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(location) = line.strip_prefix("test at ") {
+            spec_location = Some(location.to_string());
+        } else if let Some(name) = line.strip_prefix("✖ ") {
+            if let Some(location) = spec_location.take() {
+                let name = name.rsplit_once(" (").map(|(name, _)| name).unwrap_or(name);
+                failure_ids.insert(format!("{location}::{name}"));
+            }
+        } else if let Some(name) = line.strip_prefix("not ok ") {
+            tap_name = name.split_once(" - ").map(|(_, name)| name.to_string());
+        } else if let Some(location) = line.strip_prefix("location: ") {
+            if let Some(name) = tap_name.take() {
+                let location = location.trim_matches(['\'', '"']);
+                failure_ids.insert(format!("{location}::{name}"));
+            }
+        }
+    }
+    if failure_ids.len() as u64 != failed {
+        return None;
+    }
+    Some(json!({
+        "runner": "node:test",
+        "tests": total,
+        "passed": passed,
+        "assertionFailures": failed,
+        "actualExitCode": exit_code,
+        "failedTestIds": failure_ids,
+    }))
+}
+
+// Playwright can embed SGR color/style escapes inside matcher names in its JSON
+// error messages. Normalize only a classification copy, never the saved output.
+// Leave malformed escapes and non-SGR controls intact so they fail closed.
+fn assertion_message_without_ansi_sgr(message: &str) -> String {
+    let mut normalized = String::with_capacity(message.len());
+    let mut remaining = message;
+    while let Some(start) = remaining.find("\u{1b}[") {
+        normalized.push_str(&remaining[..start]);
+        let parameters = &remaining[start + 2..];
+        let end = parameters
+            .find(|ch: char| !ch.is_ascii_digit() && ch != ';' && ch != ':')
+            .unwrap_or(parameters.len());
+        if parameters.as_bytes().get(end) == Some(&b'm') {
+            remaining = &parameters[end + 1..];
+        } else {
+            normalized.push_str("\u{1b}[");
+            remaining = parameters;
+        }
+    }
+    normalized.push_str(remaining);
+    normalized
+}
+
+fn playwright_assertion_test_report(command: &Value) -> Option<Value> {
+    let exit_code = command.get("exitCode").and_then(Value::as_i64)?;
+    if !matches!(exit_code, 0 | 1)
+        || !matches!(
+            command.get("scriptName").and_then(Value::as_str),
+            Some("test" | "test:ui" | "test:e2e")
+        )
+    {
+        return None;
+    }
+    let output = command.get("output")?.as_str()?;
+    // Do not let a later JSON report hide an earlier failing Node suite.
+    let json_start = output.find('{')?;
+    if output[..json_start].contains("ERR_ASSERTION") {
+        return None;
+    }
+    let report = parse_json_object(output)?;
+    if !report.get("errors")?.as_array()?.is_empty() {
+        return None;
+    }
+    let stats = report.get("stats")?;
+    let expected = stats.get("expected")?.as_u64()?;
+    let unexpected = stats.get("unexpected")?.as_u64()?;
+    if expected + unexpected == 0
+        || stats.get("skipped")?.as_u64()? != 0
+        || stats.get("flaky")?.as_u64()? != 0
+        || (unexpected == 0) != (exit_code == 0)
+    {
+        return None;
+    }
+    let mut pending = report.get("suites")?.as_array()?.iter().collect::<Vec<_>>();
+    let mut passed = 0;
+    let mut failure_ids = BTreeSet::new();
+    while let Some(suite) = pending.pop() {
+        if let Some(children) = suite.get("suites").and_then(Value::as_array) {
+            pending.extend(children);
+        }
+        for spec in suite.get("specs")?.as_array()? {
+            for test in spec.get("tests")?.as_array()? {
+                if test.get("expectedStatus")?.as_str()? != "passed" {
+                    return None;
+                }
+                let results = test.get("results")?.as_array()?;
+                if results.len() != 1 {
+                    return None;
+                }
+                let result = &results[0];
+                match result.get("status")?.as_str()? {
+                    "passed" => passed += 1,
+                    "failed" => {
+                        let errors = result.get("errors")?.as_array()?;
+                        if errors.is_empty()
+                            || errors.iter().any(|error| {
+                                let message = assertion_message_without_ansi_sgr(
+                                    error.get("message").and_then(Value::as_str).unwrap_or(""),
+                                );
+                                !message.contains("expect(")
+                                    || ![
+                                        ".toBe",
+                                        ".toHave",
+                                        ".toEqual",
+                                        ".toStrictEqual",
+                                        ".toContain",
+                                        ".toMatch",
+                                        ".toThrow",
+                                    ]
+                                    .iter()
+                                    .any(|matcher| message.contains(matcher))
+                                    || message.contains("Test timeout of")
+                                    || message.contains("browserType.launch")
+                                    || message.contains("ERR_CONNECTION_REFUSED")
+                            })
+                        {
+                            return None;
+                        }
+                        failure_ids.insert(format!(
+                            "{}:{}:{}::{}::{}",
+                            spec.get("file")?.as_str()?,
+                            spec.get("line")?.as_u64()?,
+                            spec.get("column")?.as_u64()?,
+                            spec.get("title")?.as_str()?,
+                            test.get("projectName")?.as_str()?,
+                        ));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+    if passed != expected || failure_ids.len() as u64 != unexpected {
+        return None;
+    }
+    Some(json!({
+        "runner": "playwright",
+        "tests": expected + unexpected,
+        "passed": expected,
+        "assertionFailures": unexpected,
+        "actualExitCode": exit_code,
+        "failedTestIds": failure_ids,
+    }))
+}
+
+fn hierarchical_validation_test_fingerprint(run: &AgenticBoard) -> Option<Value> {
+    let snapshot = run.latest_workspace_snapshot.as_ref()?;
+    let files = snapshot.get("filesByPath")?.as_object()?;
+    if !complete_validation_snapshot(snapshot) {
+        return None;
+    }
+    let mut hashes = serde_json::Map::new();
+    for (path, file) in files {
+        if path == "package.json"
+            || matches!(
+                path.as_str(),
+                "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" | "bun.lock" | "bun.lockb"
+            )
+            || path.starts_with("playwright.config.")
+            || is_test_or_fixture_path(path)
+        {
+            hashes.insert(path.clone(), json!(file.get("hash")?.as_str()?));
+        }
+    }
+    let supported_suite = (hashes.len() > 1 && hashes.contains_key("package.json"))
+        || (!hashes.contains_key("package.json") && hashes.keys().any(|path| node_builtin_test_path(path)));
+    supported_suite.then(|| Value::Object(hashes))
+}
+
+fn hierarchical_task_depends_on(run: &AgenticBoard, task: &BoardTask, target: &str) -> bool {
+    let mut pending = task_blockers(task);
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if id == target {
+            return true;
+        }
+        if seen.insert(id.clone()) {
+            if let Some(blocker) = run.tasks.iter().find(|item| item.id == id) {
+                pending.extend(task_blockers(blocker));
+            }
+        }
+    }
+    false
+}
+
+// Only a genuinely intermediate implementation slice can leave previously
+// observed red tests for its dependent sibling. The last implementation and the
+// explicit QA barrier must still make the complete suite green.
+fn hierarchical_intermediate_qa_barrier(run: &AgenticBoard, task: &BoardTask) -> Option<String> {
+    if !run.tdd_enabled
+        || !uses_hierarchical_orchestration(run)
+        || canonical_task_kind(task) != TASK_KIND_IMPLEMENTATION
+        || task.hierarchy.parent_id.is_none()
+    {
+        return None;
+    }
+    let sibling = run.tasks.iter().find(|item| {
+        item.id != task.id
+            && item.hierarchy.parent_id == task.hierarchy.parent_id
+            && canonical_task_kind(item) == TASK_KIND_IMPLEMENTATION
+            && mandatory_live_validation_barrier(run, item)
+            && hierarchical_task_depends_on(run, item, &task.id)
+    })?;
+    run.tasks
+        .iter()
+        .find(|item| {
+            item.hierarchy.parent_id == task.hierarchy.parent_id
+                && canonical_task_kind(item) == TASK_KIND_QA
+                && mandatory_live_validation_barrier(run, item)
+                && hierarchical_task_depends_on(run, item, &task.id)
+                && hierarchical_task_depends_on(run, item, &sibling.id)
+        })
+        .map(|item| item.id.clone())
+}
+
+fn mandatory_live_validation_barrier(run: &AgenticBoard, task: &BoardTask) -> bool {
+    let dependency_wait = canonical_task_status(&task.status) == TASK_STATUS_BLOCKED
+        && task
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("Waiting on dependency: "))
+        && task
+            .hierarchy
+            .scope_approval
+            .as_ref()
+            .is_some_and(|approval| {
+                approval.approved && approval.scope_version == task.hierarchy.scope_version.max(1)
+            })
+        && !unmet_task_dependencies(run, task).is_empty()
+        && task_blockers(task).iter().all(|id| {
+            run.tasks
+                .iter()
+                .any(|dependency| dependency.id == *id && dependency.superseded_by.is_none())
+        })
+        && task.result.as_ref().is_none_or(|result| {
+            !completion_evidence_gate_failed(result)
+                && !matches!(
+                    result.get("status").and_then(Value::as_str),
+                    Some("blocked" | "needs_followup")
+                )
+        });
+    task.hierarchy.required
+        && task_is_executable(task)
+        && task.superseded_by.is_none()
+        && (task_scope_is_approved(task) || dependency_wait)
+        && task_side_effects_are_approved(task)
+        && task_ancestors_are_approved(run, task)
+}
+
+fn hierarchical_baseline_is_prerequisite(
+    run: &AgenticBoard,
+    task: &BoardTask,
+    baseline: &BoardTask,
+) -> bool {
+    let mut candidate = Some(baseline.id.as_str());
+    let mut seen = BTreeSet::new();
+    while let Some(id) = candidate {
+        if !seen.insert(id) {
+            break;
+        }
+        if hierarchical_task_depends_on(run, task, id) {
+            return true;
+        }
+        let Some(parent) = run.tasks.iter().find(|item| item.id == id) else {
+            break;
+        };
+        candidate = parent.hierarchy.parent_id.as_deref();
+    }
+    false
+}
+
+fn trusted_remaining_red_baseline(
+    run: &AgenticBoard,
+    task: &BoardTask,
+    commands: &[Value],
+) -> Option<Value> {
+    let barrier = hierarchical_intermediate_qa_barrier(run, task)?;
+    let fingerprint = hierarchical_validation_test_fingerprint(run)?;
+    let attempt = task.hierarchy.attempts.last()?;
+    if attempt.get("scopeVersion").and_then(Value::as_u64)
+        != Some(u64::from(task.hierarchy.scope_version))
+        || attempt.get("testSuiteFingerprint") != Some(&fingerprint)
+    {
+        return None;
+    }
+    let pre_commands = attempt
+        .get("preExecutionValidation")?
+        .get("commands")?
+        .as_array()?;
+    let baseline = run
+        .tasks
+        .iter()
+        .filter(|item| {
+            task_status_is_done(&item.status)
+                && hierarchical_test_phase(run, item)
+                && item.superseded_by.is_none()
+                && hierarchical_baseline_is_prerequisite(run, task, item)
+                && item
+                    .qa_baseline_validation
+                    .as_ref()
+                    .is_some_and(|baseline| {
+                        baseline.get("expectedRedAccepted").and_then(Value::as_bool) == Some(true)
+                            && baseline.get("testSuiteFingerprint") == Some(&fingerprint)
+                            && baseline.get("scopeVersion").and_then(Value::as_u64)
+                                == Some(u64::from(item.hierarchy.scope_version))
+                            && item.deterministic_validation.as_ref() == Some(baseline)
+                    })
+        })
+        .max_by_key(|item| item.completed_at)?;
+    let baseline_commands = baseline
+        .qa_baseline_validation
+        .as_ref()?
+        .get("commands")?
+        .as_array()?;
+    let mut failures = 0;
+    for command in commands {
+        if command.get("exitCode").and_then(Value::as_i64) == Some(0) {
+            continue;
+        }
+        let report = command.get("testReport")?;
+        let current_ids = normalize_string_list(report.get("failedTestIds"));
+        if current_ids.is_empty() {
+            return None;
+        }
+        let baseline_command = baseline_commands.iter().find(|previous| {
+            previous.get("command") == command.get("command")
+                && previous.get("scriptName") == command.get("scriptName")
+        })?;
+        let previous_ids =
+            normalize_string_list(baseline_command.get("testReport")?.get("failedTestIds"));
+        let pre_command = pre_commands.iter().find(|previous| {
+            previous.get("command") == command.get("command")
+                && previous.get("scriptName") == command.get("scriptName")
+        })?;
+        let pre_ids = normalize_string_list(pre_command.get("testReport")?.get("failedTestIds"));
+        if pre_ids.iter().any(|id| !previous_ids.contains(id))
+            || current_ids.iter().any(|id| !pre_ids.contains(id))
+        {
+            return None;
+        }
+        // A production slice must demonstrate actual progress, not merely
+        // preserve a completely red suite and declare itself implemented.
+        if current_ids.len() >= pre_ids.len() {
+            return None;
+        }
+        failures += current_ids.len();
+    }
+    (failures > 0).then(|| {
+        json!({
+            "baselineTaskId": baseline.id,
+            "qaBarrierTaskId": barrier,
+            "remainingKnownAssertionFailures": failures,
+            "preAttemptValidationCompared": true,
+        })
+    })
+}
+
+fn classify_hierarchical_test_validation(
+    run: &AgenticBoard,
+    task: &BoardTask,
+    mut validation: Value,
+) -> Value {
+    let commands = validation
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let failed = commands
+        .iter()
+        .filter(|command| command.get("exitCode").and_then(Value::as_i64) != Some(0))
+        .collect::<Vec<_>>();
+    let red_evidence = failed
+        .iter()
+        .map(|command| command.get("testReport").cloned())
+        .collect::<Option<Vec<_>>>();
+    let test_phase = hierarchical_test_phase(run, task);
+    let test_qa_evidence = trusted_test_qa_red_evidence(run, task, &commands);
+    let expected_red = (test_phase || test_qa_evidence.is_some())
+        && !failed.is_empty()
+        && red_evidence.is_some();
+    let requires_red = hierarchical_task_requires_red_baseline(run, task);
+    let remaining_red = trusted_remaining_red_baseline(run, task, &commands);
+    let fingerprint = hierarchical_validation_test_fingerprint(run);
+    if let Some(object) = validation.as_object_mut() {
+        object.insert(
+            "scopeVersion".to_string(),
+            json!(task.hierarchy.scope_version),
+        );
+        object.insert(
+            "testPhase".to_string(),
+            json!(if test_phase {
+                "test_writing"
+            } else if test_qa_evidence.is_some() {
+                "test_validation"
+            } else {
+                "implementation"
+            }),
+        );
+        object.insert("expectedRedRequired".to_string(), json!(requires_red));
+        object.insert("expectedRedAccepted".to_string(), json!(expected_red));
+        if expected_red {
+            object.insert("gatePassed".to_string(), json!(true));
+            object.insert("redBaselineEvidence".to_string(), json!(red_evidence));
+            object.insert("testSuiteFingerprint".to_string(), json!(fingerprint));
+            if let Some(evidence) = test_qa_evidence {
+                object.insert("testStageQaEvidence".to_string(), evidence);
+            }
+            object.insert("summary".to_string(), json!(
+                "Expected assertion failures verified for the test-writing phase; the test suite remains red."
+            ));
+        } else if let Some(evidence) = remaining_red {
+            object.insert("gatePassed".to_string(), json!(true));
+            object.insert("remainingRedAccepted".to_string(), json!(evidence));
+            object.insert("summary".to_string(), json!(
+                "Only unchanged, previously observed assertion failures remain for dependent implementation; the suite is not green and downstream QA is still required."
+            ));
+        } else if requires_red && failed.is_empty() {
+            object.insert("gatePassed".to_string(), json!(false));
+            object.insert("failureReason".to_string(), json!(
+                "The baseline ticket requires executed, failing behavior assertions; no verified red baseline was observed."
+            ));
+        }
+    }
+    validation
+}
+
+fn apply_task_validation_result(parsed: Value, validation: &Value) -> Value {
+    let mut gate_validation = validation.clone();
+    gate_validation["passed"] = json!(validation_gate_passed(validation));
+    let mut parsed = apply_deterministic_validation_result(parsed, &gate_validation);
+    if let Some(object) = parsed.as_object_mut() {
+        object.insert("deterministicValidation".to_string(), validation.clone());
+        let gate_summary = format_validation_check(&gate_validation);
+        let actual_summary = format_validation_check(validation);
+        let evidence = normalize_string_list(object.get("evidence"))
+            .into_iter()
+            .map(|line| {
+                if line == gate_summary {
+                    actual_summary.clone()
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>();
+        object.insert("evidence".to_string(), json!(evidence));
+        if let Some(summary) = validation.get("summary").and_then(Value::as_str) {
+            let mut evidence = normalize_string_list(object.get("evidence"));
+            evidence.push(summary.to_string());
+            object.insert("evidence".to_string(), json!(dedupe_strings(evidence)));
+        }
+    }
+    if let Some(reason) = validation.get("failureReason").and_then(Value::as_str) {
+        if let Some(object) = parsed.as_object_mut() {
+            let mut issues = normalize_string_list(object.get("remainingIssues"));
+            issues.push(reason.to_string());
+            object.insert("remainingIssues".to_string(), json!(dedupe_strings(issues)));
+        }
+    }
+    parsed
+}
+
+fn validation_gate_passed(validation: &Value) -> bool {
+    validation
+        .get("gatePassed")
+        .or_else(|| validation.get("passed"))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 async fn run_generated_test_commands(
@@ -289,13 +1114,24 @@ fn package_validation_scripts(run: &AgenticBoard, stage: &str) -> Vec<(String, S
         return Vec::new();
     };
     let runner = infer_package_runner(project_path);
-    let candidates = if stage == "final" {
-        ["typecheck", "lint", "test", "build", "check"]
+    let candidates: &[&str] = if run.tdd_enabled && uses_hierarchical_orchestration(run) {
+        &[
+            "typecheck",
+            "test",
+            "test:ui",
+            "test:e2e",
+            "lint",
+            "build",
+            "check",
+        ]
+    } else if stage == "final" {
+        &["typecheck", "lint", "test", "build", "check"]
     } else {
-        ["typecheck", "test", "lint", "build", "check"]
+        &["typecheck", "test", "lint", "build", "check"]
     };
     candidates
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|name| scripts.contains_key(*name))
         .take(validation_max_commands_for_stage(run, stage))
         .map(|name| (name.to_string(), format!("{runner} run {name}")))
@@ -988,6 +1824,7 @@ fn retry_attention_tasks_in_board(
     fix_task_id: Option<&str>,
     reason: &str,
 ) -> Result<usize> {
+    reconcile_scope_approval_records(run);
     reconcile_dependency_statuses(run);
     let ids = if requested_ids.is_empty() {
         run.tasks
@@ -1049,6 +1886,21 @@ fn retry_attention_tasks_in_board(
                 ),
             ));
         }
+        if !task_ancestors_are_approved(run, task) {
+            return Err(ServerError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "Task {} has an unapproved, completed, or independently blocked parent; resolve the parent before retrying it.",
+                    task.id
+                ),
+            ));
+        }
+        if !task_side_effects_are_approved(task) {
+            return Err(ServerError::new(
+                StatusCode::CONFLICT,
+                task_side_effect_block_reason(task),
+            ));
+        }
         if task.error.as_deref().is_some_and(|error| {
             error.starts_with("External side-effect approval required")
                 || error.starts_with("Planning error:")
@@ -1092,6 +1944,7 @@ fn retry_attention_tasks_in_board(
             record_task_retry(task, mode, selected_fix_id.as_deref(), reason);
         }
     }
+    refresh_hierarchy_rollups(run);
     run.status = "running".to_string();
     run.active = true;
     run.loop_started = false;
@@ -1172,10 +2025,13 @@ fn run_has_transient_retryable_attention(run: &AgenticBoard) -> bool {
             )
             && !task_failure_is_dependency_blocked(task)
             && task_failure_is_transient(task)
+            && task_ancestors_are_approved(run, task)
+            && task_side_effects_are_approved(task)
     })
 }
 
 fn reset_attention_tasks_for_retry(run: &mut AgenticBoard) -> usize {
+    reconcile_scope_approval_records(run);
     let ids = run
         .tasks
         .iter()
@@ -1187,6 +2043,8 @@ fn reset_attention_tasks_for_retry(run: &mut AgenticBoard) -> usize {
                 )
                 && !task_failure_is_dependency_blocked(task)
                 && task_failure_is_transient(task)
+                && task_ancestors_are_approved(run, task)
+                && task_side_effects_are_approved(task)
         })
         .map(|task| task.id.clone())
         .collect::<Vec<_>>();
@@ -1198,6 +2056,7 @@ fn reset_attention_tasks_for_retry(run: &mut AgenticBoard) -> usize {
     if ids.is_empty() {
         return 0;
     }
+    refresh_hierarchy_rollups(run);
     run.status = "running".to_string();
     run.active = true;
     run.loop_started = false;
@@ -1227,4 +2086,105 @@ fn parse_optional_scheduled_start(value: Option<&str>) -> Result<Option<DateTime
     parse_rfc3339_utc(value)
         .map(Some)
         .ok_or_else(|| bad_request("scheduledStartAt must be a valid RFC3339 timestamp"))
+}
+
+
+/// This function must run inside mutate_board's lock. Validate every precondition
+/// before assigning anything, so a late-section conflict cannot partly save.
+fn apply_guarded_quality_settings(run: &mut AgenticBoard, body: &Value) -> Result<()> {
+    let request = body.as_object().ok_or_else(|| bad_request("Quality save must be an object"))?;
+    if request.len() != 2 || !request.contains_key("changes") || !request.contains_key("expected") {
+        return Err(bad_request("Quality save requires only changes and expected objects"));
+    }
+    let changes = request["changes"].as_object().ok_or_else(|| bad_request("changes must be an object"))?;
+    let expected = request["expected"].as_object().ok_or_else(|| bad_request("expected must be an object"))?;
+    if changes.is_empty() || changes.keys().ne(expected.keys()) {
+        return Err(bad_request("changes and expected must have the same nonempty field shape"));
+    }
+    let current = json!({
+        "tddEnabled": run.tdd_enabled,
+        "tddPolicy": run.tdd_policy,
+        "validationConfig": run.validation_config,
+        "ragSettings": run.rag_settings,
+        "qaPolicy": run.qa_policy,
+    });
+    for (section, delta) in changes {
+        let before = &expected[section];
+        if section == "tddEnabled" {
+            if !delta.is_boolean() || !before.is_boolean() {
+                return Err(bad_request("tddEnabled must be boolean in changes and expected"));
+            }
+            continue;
+        }
+        if !matches!(section.as_str(), "tddPolicy" | "validationConfig" | "ragSettings" | "qaPolicy") {
+            return Err(bad_request(format!("Unsupported quality field: {section}")));
+        }
+        let fields = delta.as_object().ok_or_else(|| bad_request(format!("{section} must be an object")))?;
+        let guards = before.as_object().ok_or_else(|| bad_request(format!("expected.{section} must be an object")))?;
+        if fields.is_empty() || fields.keys().ne(guards.keys()) {
+            return Err(bad_request(format!("{section} requires the same nonempty field shape in changes and expected")));
+        }
+        for (field, value) in fields {
+            validate_quality_field(section, field, value)?;
+            validate_quality_field(section, field, &guards[field])?;
+        }
+    }
+    // Separate validation and comparison passes: malformed requests are always 400.
+    for (section, delta) in changes {
+        if let Some(fields) = delta.as_object() {
+            for field in fields.keys() {
+                if current[section].get(field) != expected[section].get(field) {
+                    return Err(quality_settings_conflict(&format!("{section}.{field}")));
+                }
+            }
+        } else if current.get(section) != expected.get(section) {
+            return Err(quality_settings_conflict(section));
+        }
+    }
+    if let Some(value) = changes.get("tddEnabled") {
+        run.tdd_enabled = value.as_bool().expect("validated boolean");
+    }
+    if let Some(delta) = changes.get("tddPolicy") {
+        run.tdd_policy = normalize_tdd_policy(Some(&merge_json_objects(run.tdd_policy.clone(), delta.clone())));
+    }
+    if let Some(delta) = changes.get("validationConfig") {
+        run.validation_config = normalize_validation_config(Some(&merge_json_objects(run.validation_config.clone(), delta.clone())));
+    }
+    if let Some(delta) = changes.get("ragSettings") {
+        run.rag_settings = normalize_rag_settings(Some(&merge_json_objects(run.rag_settings.clone(), delta.clone())));
+        run.rag_enabled = rag_enabled_from_settings(&run.rag_settings);
+    }
+    if let Some(delta) = changes.get("qaPolicy") {
+        run.qa_policy = normalize_qa_policy(Some(&merge_json_objects(run.qa_policy.clone(), delta.clone())));
+    }
+    run.append_log("Updated guarded board quality settings");
+    Ok(())
+}
+
+fn quality_settings_conflict(field: &str) -> ServerError {
+    ServerError::new(StatusCode::CONFLICT, format!(
+        "Quality settings changed in another client ({field}). Reload saved settings before saving again."
+    ))
+}
+
+fn validate_quality_field(section: &str, field: &str, value: &Value) -> Result<()> {
+    let valid = match (section, field) {
+        ("tddPolicy", "requireFailingTestBeforeDev" | "allowImplementationWithoutTests") |
+        ("validationConfig", "enabled") |
+        ("ragSettings", "enabled" | "indexOnBootstrap" | "queryEnabled" | "ingestTaskResults" | "ingestValidationErrors") |
+        ("qaPolicy", "repairMalformedToolCalls") => value.is_boolean(),
+        ("tddPolicy", "maxFixAttempts") |
+        ("validationConfig", "maxFeatureCommands" | "maxFinalCommands" | "maxQaCommands") |
+        ("qaPolicy", "maxFollowupsPerGroup") => value.as_u64().is_some_and(|v| v <= 20),
+        ("validationConfig", "timeoutSeconds") => value.as_u64().is_some_and(|v| (5..=3600).contains(&v)),
+        ("ragSettings", "contextMaxChars") => value.as_u64().is_some_and(|v| (1000..=80000).contains(&v)),
+        ("qaPolicy", "maxTaskAttempts") => value.as_u64().is_some_and(|v| (1..=10).contains(&v)),
+        ("qaPolicy", "malformedToolCallRepairRetries") => value.as_u64().is_some_and(|v| v <= MAX_MALFORMED_TOOL_CALL_REPAIR_RETRIES),
+        ("validationConfig", "featureCommands" | "finalCommands" | "qaCommands") |
+        ("ragSettings", "scopes") => value.as_array().is_some_and(|items| items.iter().all(|item| item.as_str().is_some_and(|s| !s.trim().is_empty()))),
+        ("tddPolicy", "qaCommandStage" | "featureCommandStage" | "finalCommandStage") => value.is_string(),
+        ("qaPolicy", "taskQaMode") => value.as_str().is_some_and(|v| matches!(v, "off" | "all" | "high_risk")),
+        _ => false,
+    };
+    if valid { Ok(()) } else { Err(bad_request(format!("Unsupported or invalid quality field: {section}.{field}"))) }
 }

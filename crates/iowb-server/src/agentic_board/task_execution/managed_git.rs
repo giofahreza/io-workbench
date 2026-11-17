@@ -382,6 +382,14 @@ fn build_managed_git_commit_message(task: &BoardTask, group_id: &str) -> String 
 }
 
 fn summarize_workspace_delta(task_id: &str, before: &Value, after: &Value) -> Value {
+    let is_filesystem_snapshot = |snapshot: &Value| {
+        snapshot.get("provider").and_then(Value::as_str) == Some("filesystem sha256")
+    };
+    let filesystem_delta = is_filesystem_snapshot(before) || is_filesystem_snapshot(after);
+    let complete_filesystem_pair = is_filesystem_snapshot(before)
+        && is_filesystem_snapshot(after)
+        && before.get("complete").and_then(Value::as_bool) == Some(true)
+        && after.get("complete").and_then(Value::as_bool) == Some(true);
     let before_map = before
         .get("filesByPath")
         .and_then(Value::as_object)
@@ -406,13 +414,31 @@ fn summarize_workspace_delta(task_id: &str, before: &Value, after: &Value) -> Va
         if before_file == after_file {
             continue;
         }
-        let classification =
-            if before_file.is_none() || before_file.is_some_and(workspace_file_was_clean) {
-                "changed_by_subtask"
-            } else {
-                "unknown_change"
-            };
-        let entry = workspace_delta_entry(&path, before_file, after_file, classification);
+        let attributable = if filesystem_delta {
+            complete_filesystem_pair
+                && [before_file, after_file].into_iter().flatten().all(|file| {
+                    file.get("hash")
+                        .and_then(Value::as_str)
+                        .is_some_and(|hash| !hash.is_empty())
+                })
+        } else {
+            before_file.is_none() || before_file.is_some_and(workspace_file_was_clean)
+        };
+        let classification = if attributable {
+            "changed_by_subtask"
+        } else {
+            "unknown_change"
+        };
+        let mut entry = workspace_delta_entry(&path, before_file, after_file, classification);
+        if complete_filesystem_pair
+            && attributable
+            && before_file.is_none()
+            && before.get("testRunnerManifestAbsent").and_then(Value::as_bool) == Some(true)
+            && after_file.and_then(|file| file.get("testRunnerConfig")).and_then(Value::as_str)
+                == Some("minimal-node-test-v1")
+        {
+            entry["testRunnerConfig"] = json!("minimal-node-test-v1");
+        }
         touched_files.push(entry.clone());
         if classification == "changed_by_subtask" {
             changed_by_subtask.push(entry);
@@ -422,7 +448,7 @@ fn summarize_workspace_delta(task_id: &str, before: &Value, after: &Value) -> Va
     }
     let pre_existing_changes = before_map
         .iter()
-        .filter(|(_, before_file)| !workspace_file_was_clean(before_file))
+        .filter(|(_, before_file)| !filesystem_delta && !workspace_file_was_clean(before_file))
         .map(|(path, before_file)| {
             workspace_delta_entry(
                 path,
@@ -439,6 +465,9 @@ fn summarize_workspace_delta(task_id: &str, before: &Value, after: &Value) -> Va
         "taskId": task_id,
         "capturedAt": Utc::now(),
         "isGit": after.get("isGit").and_then(Value::as_bool).unwrap_or(false),
+        "snapshotProvider": after.get("provider").and_then(Value::as_str).unwrap_or(""),
+        "snapshotComplete": if filesystem_delta { Some(complete_filesystem_pair) } else { None },
+        "testTooling": test_tooling_delta(before, after),
         "touchedFiles": touched_files,
         "touchedFileCount": touched_file_count,
         "preExistingChanges": pre_existing_changes,

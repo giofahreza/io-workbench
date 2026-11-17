@@ -88,6 +88,70 @@ async fn draft_tasks(
     ))
 }
 
+static MANUAL_BREAKDOWN_OPERATIONS: OnceLock<Mutex<BTreeSet<(String, String)>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct ManualBreakdownOperation {
+    key: (String, String),
+}
+
+impl Drop for ManualBreakdownOperation {
+    fn drop(&mut self) {
+        if let Some(operations) = MANUAL_BREAKDOWN_OPERATIONS.get()
+            && let Ok(mut operations) = operations.lock()
+        {
+            operations.remove(&self.key);
+        }
+    }
+}
+
+fn claim_manual_breakdown_operation(
+    user_id: &str,
+    board_id: &str,
+) -> Result<ManualBreakdownOperation> {
+    let key = (user_id.to_string(), board_id.to_string());
+    let mut operations = MANUAL_BREAKDOWN_OPERATIONS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .map_err(|_| {
+            ServerError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Planning operation lock is unavailable.",
+            )
+        })?;
+    if !operations.insert(key.clone()) {
+        return Err(ServerError::new(
+            StatusCode::CONFLICT,
+            "A manual breakdown is already running for this board. Wait for it to finish and refresh the board.",
+        ));
+    }
+    Ok(ManualBreakdownOperation { key })
+}
+
+async fn await_manual_breakdown_completion<F>(
+    operation: ManualBreakdownOperation,
+    work: F,
+) -> Result<usize>
+where
+    F: std::future::Future<Output = Result<usize>> + Send + 'static,
+{
+    // Provider sessions already outlive their HTTP request. The subsequent
+    // board mutation must have the same lifetime: dropping an HTTP handler
+    // (client read timeout/navigation/disconnect) must not discard its plan.
+    // Dropping a JoinHandle detaches, rather than cancels, the spawned task.
+    tokio::spawn(async move {
+        let _operation = operation;
+        work.await
+    })
+    .await
+    .map_err(|error| {
+        ServerError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Manual hierarchy breakdown worker failed: {error}"),
+        )
+    })?
+}
+
 async fn breakdown_task(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -123,6 +187,7 @@ async fn breakdown_task(
             "Move the planning item to Backlog or Todo before breaking it down.",
         ));
     }
+    let operation = claim_manual_breakdown_operation(&user.0.id, &board_id)?;
 
     // Older failed breakdowns were persisted as Blocked and left the board's
     // historical abort marker behind. Convert that legacy attention state
@@ -177,7 +242,20 @@ async fn breakdown_task(
     }
     validate_hierarchy_breakdown_parent(&snapshot, parent)?;
 
-    let created = plan_hierarchy_children(&state, &user.0.id, &board_id, &task_id, true).await?;
+    let operation_state = state.clone();
+    let operation_user_id = user.0.id.clone();
+    let operation_board_id = board_id.clone();
+    let created = await_manual_breakdown_completion(operation, async move {
+        plan_hierarchy_children(
+            &operation_state,
+            &operation_user_id,
+            &operation_board_id,
+            &task_id,
+            true,
+        )
+        .await
+    })
+    .await?;
     let stored = load_user_board(&state, &user.0.id, &board_id)?;
     Ok(Json(json!({
         "success": true,

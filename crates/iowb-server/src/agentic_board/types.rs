@@ -52,6 +52,7 @@ struct TaskRequest {
     scope_version: Option<u64>,
     planned_files: Option<Value>,
     side_effects: Option<Value>,
+    manual_verification: Option<Value>,
     acceptance_criteria: Option<Value>,
     acceptance: Option<Value>,
     criteria: Option<Value>,
@@ -126,6 +127,7 @@ struct UpdateTaskRequest {
     required: Option<bool>,
     planned_files: Option<Value>,
     side_effects: Option<Value>,
+    manual_verification: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +338,13 @@ struct AgenticBoard {
     final_review: Option<Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BoardTaskScopeApproval {
+    scope_version: u64,
+    approved: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BoardTaskHierarchy {
@@ -351,6 +360,10 @@ struct BoardTaskHierarchy {
     required: bool,
     #[serde(default)]
     scope_version: u64,
+    // Approval survives progress rollups. None denotes a legacy record;
+    // an explicit false must never be inferred back into approval.
+    #[serde(default)]
+    scope_approval: Option<BoardTaskScopeApproval>,
     #[serde(default)]
     rank: i64,
     #[serde(default)]
@@ -367,6 +380,10 @@ struct BoardTaskHierarchy {
     side_effect_evidence: Vec<String>,
     #[serde(default)]
     manual_test_environment: Option<Value>,
+    // Approved verification scope, not a mode chosen by the completing agent.
+    // None preserves legacy records on load; new attempts must classify scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual_verification: Option<Value>,
     #[serde(default)]
     research_accepted: bool,
     #[serde(default)]
@@ -640,6 +657,7 @@ impl AgenticBoard {
                 scope_version: None,
                 planned_files: None,
                 side_effects: None,
+                manual_verification: None,
                 acceptance_criteria: None,
                 acceptance: None,
                 criteria: None,
@@ -1046,6 +1064,7 @@ fn task_detail_json(task: &BoardTask) -> Value {
 
 impl BoardTask {
     fn manual(run: &mut AgenticBoard, request: TaskRequest) -> Result<Self> {
+        let manual_verification = normalize_supplied_manual_verification(request.manual_verification.clone())?;
         let task_type = normalize_task_kind(
             request.kind.as_deref().or(request.task_type.as_deref()),
             TASK_KIND_IMPLEMENTATION,
@@ -1074,6 +1093,11 @@ impl BoardTask {
         let details =
             trim_string(request.details.or(request.description)).unwrap_or_else(|| prompt.clone());
         let status = normalize_task_status(request.status.as_deref(), "backlog")?;
+        // The native form may create a Backlog placeholder before discussion
+        // supplies its contract. It must never be executable on creation.
+        if task_type == TASK_KIND_MANUAL_TEST && task_status_is_todo(&status) && manual_verification.is_none() {
+            return Err(bad_request(MANUAL_VERIFICATION_CONTRACT_ERROR));
+        }
         let priority =
             task_priority_for_parent(run, parent_id.as_deref(), request.priority.as_deref());
         let id = allocate_task_id(run);
@@ -1153,6 +1177,7 @@ impl BoardTask {
                     && level == TASK_LEVEL_SUBTASK,
                 required: request.required.unwrap_or(true),
                 scope_version: request.scope_version.unwrap_or(1),
+                scope_approval: None,
                 rank: request.rank.unwrap_or(0),
                 attempts: Vec::new(),
                 planned_files: value_to_strings(request.planned_files),
@@ -1161,6 +1186,7 @@ impl BoardTask {
                 side_effect_approval: None,
                 side_effect_evidence: Vec::new(),
                 manual_test_environment: None,
+                manual_verification,
                 research_accepted: false,
                 research_acceptance: None,
                 discussion: Vec::new(),
@@ -1231,6 +1257,7 @@ impl BoardTask {
                 executable: false,
                 required: true,
                 scope_version: 1,
+                scope_approval: None,
                 rank: 0,
                 attempts: Vec::new(),
                 planned_files: Vec::new(),
@@ -1239,6 +1266,7 @@ impl BoardTask {
                 side_effect_approval: None,
                 side_effect_evidence: Vec::new(),
                 manual_test_environment: None,
+                manual_verification: None,
                 research_accepted: false,
                 research_acceptance: None,
                 discussion: Vec::new(),

@@ -76,6 +76,7 @@ fn split_discussion_item(run: &mut AgenticBoard, parent_id: &str, payload: &Valu
             "Discussion split requires at least one child item.",
         ));
     }
+    let items = normalize_hierarchy_manual_contracts(items.clone(), &parent)?;
     let snapshot = run.clone();
     let group_id = task_group_id_or_self(&parent);
     let mut children = Vec::new();

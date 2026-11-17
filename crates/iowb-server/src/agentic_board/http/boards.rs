@@ -55,6 +55,7 @@ async fn create_board(
                     scope_version: None,
                     planned_files: None,
                     side_effects: None,
+                    manual_verification: None,
                     acceptance_criteria: None,
                     acceptance: None,
                     criteria: None,
@@ -143,6 +144,9 @@ async fn list_boards(
     Query(query): Query<BoardsQuery>,
 ) -> Result<Json<Value>> {
     let project_path = trim_string(query.project_path);
+    if let Some(path) = project_path.as_deref() {
+        validate_board_read_project_access(&state, path).await?;
+    }
     let mut boards = load_boards(&state)?
         .into_iter()
         .filter(|stored| stored.board.user_id.as_deref() == Some(&user.0.id))
@@ -184,6 +188,7 @@ async fn get_board(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>> {
     let mut stored = load_user_board(&state, &user.0.id, &id)?;
+    validate_board_read_project_access(&state, &stored.board.project_path).await?;
     backfill_board_session_links(&state, &mut stored.board).await?;
     Ok(Json(
         json!({ "board": stored.board.detail_json(Some(stored.path.display().to_string())) }),
@@ -219,9 +224,8 @@ async fn backfill_board_session_links(state: &AppState, run: &mut AgenticBoard) 
     let window_end = run.updated_at + chrono::Duration::minutes(2);
     let sessions = state
         .storage
-        .list_sessions_including_board()?
+        .list_session_summaries_for_project(&run.project_path)?
         .into_iter()
-        .filter(|session| session.project_path == run.project_path)
         .filter(|session| {
             session.last_activity >= window_start && session.last_activity <= window_end
         })
@@ -230,11 +234,7 @@ async fn backfill_board_session_links(state: &AppState, run: &mut AgenticBoard) 
         if session.board_id.as_deref().is_some_and(|id| id != run.id) {
             continue;
         }
-        let messages = state.storage.list_messages(&session.id)?;
-        let Some(first_user_message) = messages
-            .iter()
-            .find(|message| message.role == MessageRole::User)
-        else {
+        let Some(first_user_message) = state.storage.first_user_message(&session.id)? else {
             continue;
         };
         let prompt = first_user_message.content.as_str();

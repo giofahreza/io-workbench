@@ -20,4 +20,5 @@ mod tests {
     include!("storage/tests/usage_and_forks.rs");
     include!("storage/tests/rollovers_and_sessions.rs");
     include!("storage/tests/credentials_and_runs.rs");
+    include!("storage/tests/board_session_backfill.rs");
 }

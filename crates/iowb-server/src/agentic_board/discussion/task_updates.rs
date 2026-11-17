@@ -25,6 +25,7 @@ fn edit_backlog_task(
             "Only Backlog items or items owned by a Backlog scope can be edited. Move the scope back to Backlog first.",
         ));
     }
+    let manual_verification = normalize_supplied_manual_verification(request.manual_verification.clone())?;
     let mut scope_changed = false;
     if request.title.is_some()
         || request.details.is_some()
@@ -42,6 +43,7 @@ fn edit_backlog_task(
         || request.required.is_some()
         || request.planned_files.is_some()
         || request.side_effects.is_some()
+        || request.manual_verification.is_some()
     {
         scope_changed = true;
         delete_generated_descendants_for_scope_change(run, task_id)?;
@@ -111,6 +113,9 @@ fn edit_backlog_task(
     }
     if let Some(files) = request.planned_files.clone() {
         task.hierarchy.planned_files = value_to_strings(Some(files));
+    }
+    if let Some(verification) = manual_verification {
+        task.hierarchy.manual_verification = Some(verification);
     }
     if let Some(side_effects) = request.side_effects.clone() {
         task.hierarchy.side_effects = value_to_strings(Some(side_effects));

@@ -19,7 +19,21 @@ fn apply_completion_evidence_gate(
         let manual_environment = manual_test_environment_evidence(&parsed);
         let manual_steps = manual_test_steps_evidence(&parsed);
         let manual_result = manual_test_result_evidence(&parsed);
-        let file_policy_violations = task_file_edit_policy_violations(task, change_summary);
+        let manual_verification = (kind == TASK_KIND_MANUAL_TEST)
+            .then(|| manual_verification_evidence_validation(run, task, &parsed));
+        let mut structured_manual_issues = manual_verification.as_ref()
+            .map(|validation| normalize_string_list(validation.get("issues")))
+            .unwrap_or_default();
+        structured_manual_issues.extend(source_manual_verification_issues(run, task));
+        let allowed_runtime_artifacts = allowed_manual_mcp_snapshots(run, task, change_summary);
+        let file_policy_violations = dedupe_strings(
+            task_file_edit_policy_violations(task, change_summary)
+                .into_iter()
+                .filter(|path| !allowed_runtime_artifacts.contains(path))
+                .chain(automatic_qa_fix_file_violations(run, task, change_summary))
+                .chain(task_package_file_policy_violations(run, task, change_summary))
+                .collect(),
+        );
         let file_policy_valid = file_policy_violations.is_empty();
         let has_code_evidence = attributable_file_count > 0;
         let has_validation_evidence = !commands.is_empty() || !evidence.is_empty();
@@ -27,8 +41,12 @@ fn apply_completion_evidence_gate(
             || (!manual_steps.is_empty()
                 && manual_result
                     .as_deref()
-                    .is_some_and(manual_test_result_is_successful));
+                    .is_some_and(|result| manual_task_result_is_successful(run, task, result)));
+        let read_only_baseline = read_only_red_baseline_capture(run, task);
         let kind_evidence_valid = match kind {
+            TASK_KIND_TEST_IMPLEMENTATION if read_only_baseline => {
+                verified_unchanged_red_baseline(run, task, change_summary)
+            }
             TASK_KIND_IMPLEMENTATION
             | TASK_KIND_TEST_IMPLEMENTATION
             | TASK_KIND_FIX
@@ -51,9 +69,11 @@ fn apply_completion_evidence_gate(
             && external_effect_evidence_valid
             && manual_environment_valid
             && manual_evidence_valid
+            && structured_manual_issues.is_empty()
             && file_policy_valid;
         if let Some(object) = parsed.as_object_mut() {
             if kind == TASK_KIND_MANUAL_TEST {
+                object.insert("manualEvidenceGate".to_string(), manual_verification.clone().unwrap_or(Value::Null));
                 object.insert("manualTestSteps".to_string(), json!(manual_steps.clone()));
                 object.insert(
                     "manualTestResult".to_string(),
@@ -81,9 +101,13 @@ fn apply_completion_evidence_gate(
                     .get("remainingIssues")
                     .map(|value| normalize_string_list(Some(value)))
                     .unwrap_or_default();
+                issues.extend(structured_manual_issues);
                 issues.push(format!(
                     "Completion evidence gate failed for {kind}: provide the evidence required by the subtask kind."
                 ));
+                if read_only_baseline && !kind_evidence_valid {
+                    issues.push("Read-only baseline capture requires current server-verified assertion-red evidence and a complete unchanged workspace; do not modify files to satisfy this task.".to_string());
+                }
                 if !external_effect_evidence_valid {
                     issues.push(
                             "Declared external side effects require explicit externalSideEffects evidence describing what changed or was not changed."
@@ -116,7 +140,7 @@ fn apply_completion_evidence_gate(
                 }
                 if !file_policy_valid {
                     issues.push(format!(
-                        "File-edit policy failed for {kind}: this subtask kind cannot modify these Git-visible files: {}.",
+                        "File-edit policy failed for {kind}: this subtask kind cannot modify these workspace files: {}.",
                         file_policy_violations.join(", ")
                     ));
                 }
@@ -178,6 +202,115 @@ fn apply_completion_evidence_gate(
     parsed
 }
 
+// A generated test-writing branch can have a separate, explicitly read-only
+// baseline capture leaf. It must not be forced to edit tests just to satisfy
+// its kind, nor can merely claiming a red run replace server-owned evidence.
+fn read_only_red_baseline_capture(run: &AgenticBoard, task: &BoardTask) -> bool {
+    if canonical_task_kind(task) != TASK_KIND_TEST_IMPLEMENTATION
+        || !hierarchical_task_requires_red_baseline(run, task)
+        || !task.hierarchy.planned_files.is_empty()
+    { return false; }
+    let title = task.title.to_ascii_lowercase();
+    let scope = format!("{} {}", task.details, task.description).to_ascii_lowercase();
+    (title.starts_with("run ") || title.starts_with("capture "))
+        && title.contains("capture") && title.contains("baseline")
+        && (scope.contains("do not modify any source file")
+            || (scope.contains("do not modify")
+                && scope.contains("or any other source file during this task")))
+}
+
+fn verified_unchanged_red_baseline(run: &AgenticBoard, task: &BoardTask, delta: &Value) -> bool {
+    let Some(validation) = task.deterministic_validation.as_ref() else { return false; };
+    let Some(fingerprint) = hierarchical_validation_test_fingerprint(run) else { return false; };
+    let verified = delta.get("snapshotComplete").and_then(Value::as_bool) == Some(true)
+        && delta.get("touchedFileCount").and_then(Value::as_u64) == Some(0)
+        && delta.get("unknownChangeCount").and_then(Value::as_u64) == Some(0)
+        && change_summary_attributable_file_count(delta) == 0
+        && validation.get("expectedRedAccepted").and_then(Value::as_bool) == Some(true)
+        && validation.get("gatePassed").and_then(Value::as_bool) == Some(true)
+        && validation.get("passed").and_then(Value::as_bool) == Some(false)
+        && validation.get("scopeVersion").and_then(Value::as_u64) == Some(task.hierarchy.scope_version)
+        && validation.get("testSuiteFingerprint") == Some(&fingerprint)
+        && task.qa_baseline_validation.as_ref() == Some(validation)
+        && validation.get("redBaselineEvidence").and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+    if !verified { return false; }
+    // The provider delta predates deterministic validation. Even a direct
+    // Node process can execute a test that writes files: verify its current
+    // workspace too before accepting an explicitly read-only capture.
+    let current = capture_workspace_snapshot(&run.project_path);
+    complete_validation_snapshot(&current)
+        && current.get("filesByPath")
+            == run.latest_workspace_snapshot.as_ref().and_then(|snapshot| snapshot.get("filesByPath"))
+}
+
+fn manual_task_result_is_successful(run: &AgenticBoard, task: &BoardTask, result: &str) -> bool {
+    let baseline_capture = hierarchical_task_requires_red_baseline(run, task);
+    let text = result.to_ascii_lowercase();
+    if baseline_capture
+        && [
+            "blocked",
+            "not captured",
+            "not actually captured",
+            "not successfully captured",
+            "capture failed",
+            "failed capture",
+            "capture failure",
+            "did not capture",
+            "failed to",
+            "unable to",
+            "could not",
+            "couldn't",
+            "cannot",
+            "can't",
+            "timed out",
+            "timeout",
+            "syntax error",
+            "missing runner",
+        ]
+        .iter()
+        .any(|problem| text.contains(problem))
+    {
+        return false;
+    }
+    if manual_test_result_is_successful(result) {
+        return true;
+    }
+    if !baseline_capture {
+        return false;
+    }
+    let Some(validation) = task.deterministic_validation.as_ref() else {
+        return false;
+    };
+    if validation
+        .get("expectedRedAccepted")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || validation.get("gatePassed").and_then(Value::as_bool) != Some(true)
+        || validation.get("passed").and_then(Value::as_bool) != Some(false)
+        || validation.get("scopeVersion").and_then(Value::as_u64)
+            != Some(u64::from(task.hierarchy.scope_version))
+        || task.qa_baseline_validation.as_ref() != Some(validation)
+        || !validation
+            .get("redBaselineEvidence")
+            .and_then(Value::as_array)
+            .is_some_and(|evidence| !evidence.is_empty())
+    {
+        return false;
+    }
+    // A verified RED capture may truthfully mention failing tests after an
+    // explicit successful capture verdict. Do not treat that detail as a
+    // failed manual operation, or extend this exception to ordinary app QA.
+    let verdict = text.split([';', '\n']).next().unwrap_or("").trim();
+    let leading = verdict
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("");
+    matches!(leading, "pass" | "passed")
+        && verdict.contains("baseline")
+        && verdict.contains("captured")
+        && manual_test_result_is_successful(verdict)
+}
+
 fn parsed_qa_passed(parsed: Option<&Value>) -> bool {
     !matches!(
         parsed
@@ -195,23 +328,35 @@ fn apply_task_result_to_board(board: &mut AgenticBoard, task_id: &str, parsed: &
             "reportedAt": Utc::now(),
         }));
     }
-    for command in normalize_string_list(parsed.get("commandsRun")) {
-        let passed = !matches!(
-            parsed.get("qaResult").and_then(Value::as_str),
-            Some("fail" | "blocked")
-        );
-        board.validation_runs.push(json!({
-            "taskId": task_id,
-            "command": command,
-            "passed": passed,
-            "completedAt": Utc::now(),
-        }));
-    }
+    // commandsRun is a provider-reported list, not per-command execution evidence.
+    // Keep it in the task result/transcript; the execution path records actual
+    // deterministic validation separately. A blocked manual outcome must not
+    // turn a passing test command into a failed validation (or the reverse).
+    // Do not rewrite historical validation records here.
 }
 
 fn record_task_workspace_changes(run: &mut AgenticBoard, task_id: &str, before: Value) -> Value {
     let after = capture_workspace_snapshot(&run.project_path);
-    let summary = summarize_workspace_delta(task_id, &before, &after);
+    let mut summary = summarize_workspace_delta(task_id, &before, &after);
+    if let Some(task) = run.tasks.iter().find(|task| task.id == task_id) {
+        retain_same_task_workspace_evidence(task, &before, &after, &mut summary);
+        if canonical_task_kind(task) == TASK_KIND_MANUAL_TEST
+            && before.get("scopeVersion").and_then(Value::as_u64) == Some(task.hierarchy.scope_version)
+            && before.get("manualRuntimeAttempt") == Some(&manual_runtime_attempt_identity(task))
+        {
+            // Identity was captured BEFORE execution, not invented when the
+            // result arrives. Do not bless stale snapshots or reused history.
+            summary["manualRuntimeAttempt"] = before["manualRuntimeAttempt"].clone();
+        }
+        let runtime_paths = allowed_manual_mcp_snapshots(run, task, &summary);
+        if !runtime_paths.is_empty() {
+            summary["runtimeArtifacts"] = json!(summary.get("changedBySubtask")
+                .and_then(Value::as_array).into_iter().flatten()
+                .filter(|entry| entry.get("path").and_then(Value::as_str).is_some_and(|path| runtime_paths.contains(path)))
+                .map(|entry| json!({"path":entry["path"],"sha256":entry["afterHash"],"kind":"playwright_mcp_snapshot"}))
+                .collect::<Vec<_>>());
+        }
+    }
     if let Some(task) = run.tasks.iter_mut().find(|task| task.id == task_id) {
         task.changed_file_summary = Some(summary.clone());
         let paths = change_summary_paths(&summary);
@@ -245,6 +390,7 @@ fn finish_task_attempt(
     attempt_id: &str,
     status: &str,
     finished_at: DateTime<Utc>,
+    workspace_changes: Option<&Value>,
 ) {
     let Some(task) = run.tasks.iter_mut().find(|task| task.id == task_id) else {
         return;
@@ -273,7 +419,28 @@ fn finish_task_attempt(
         .cloned()
         .collect::<Vec<_>>();
     let attempt_commands = task.commands_run.clone();
-    let attempt_files = task.changed_files.clone();
+    // Task-level changed_files is cumulative history. Only the workspace
+    // snapshot captured by this caller belongs to the finishing attempt.
+    // Do not fall back to a previous task summary or model-reported paths.
+    let attempt_scope = task.hierarchy.attempts[attempt_index]
+        .get("scopeVersion")
+        .and_then(Value::as_u64)
+        .filter(|scope| *scope > 0);
+    let workspace_changes = workspace_changes.filter(|summary| {
+        summary.get("taskId").and_then(Value::as_str) == Some(task_id)
+            && attempt_scope.is_none_or(|scope| {
+                summary.get("scopeVersion").and_then(Value::as_u64) == Some(scope)
+            })
+    });
+    let attempt_files = workspace_changes
+        .map(change_summary_paths)
+        .map(dedupe_strings)
+        .unwrap_or_default();
+    let attempt_reused_evidence = workspace_changes
+        .and_then(|summary| summary.get("reusedEvidence"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let attempt_evidence = task.evidence.clone();
     let attempt_side_effect_evidence = task.hierarchy.side_effect_evidence.clone();
     let attempt_environment = task.hierarchy.manual_test_environment.clone();
@@ -296,6 +463,7 @@ fn finish_task_attempt(
         );
         object.insert("commands".to_string(), json!(attempt_commands));
         object.insert("filesChanged".to_string(), json!(attempt_files));
+        object.insert("reusedEvidence".to_string(), json!(attempt_reused_evidence));
         object.insert("evidence".to_string(), json!(attempt_evidence));
         object.insert(
             "externalSideEffects".to_string(),
