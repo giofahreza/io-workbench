@@ -33,6 +33,18 @@ struct CreateBoardRequest {
     scheduled_start_at: Option<String>,
 }
 
+impl CreateBoardRequest {
+    fn initial_prompt(&self) -> Result<Option<String>> {
+        self.command
+            .as_ref()
+            .or(self.prompt.as_ref())
+            .map(|prompt| {
+                trim_string(Some(prompt.clone())).ok_or_else(|| bad_request("Prompt is required"))
+            })
+            .transpose()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TaskRequest {
@@ -506,8 +518,7 @@ struct BoardTask {
 
 impl AgenticBoard {
     fn new(user_id: Option<String>, request: CreateBoardRequest) -> Result<Self> {
-        let prompt = trim_string(request.command.or(request.prompt))
-            .ok_or_else(|| bad_request("Prompt is required"))?;
+        let prompt = request.initial_prompt()?;
         let project_path = trim_string(request.project_path)
             .ok_or_else(|| bad_request("Project path is required"))?;
         let provider = normalize_provider(request.provider.as_deref())?;
@@ -562,7 +573,7 @@ impl AgenticBoard {
             project_name: trim_string(request.project_name)
                 .unwrap_or_else(|| project_name_from_path(&project_path)),
             project_path,
-            source_prompt: prompt.clone(),
+            source_prompt: prompt.clone().unwrap_or_default(),
             status: if should_schedule {
                 "scheduled".to_string()
             } else {
@@ -583,6 +594,8 @@ impl AgenticBoard {
             paused_at: if should_schedule { None } else { Some(now) },
             pause_reason: if should_schedule {
                 None
+            } else if prompt.is_none() {
+                Some("Board created without tasks.".to_string())
             } else {
                 Some("Board created with backlog planning item.".to_string())
             },
@@ -638,6 +651,9 @@ impl AgenticBoard {
             final_review: None,
         };
         sync_session_policy_with_task_models(&mut run, "board creation");
+        let Some(prompt) = prompt else {
+            return Ok(run);
+        };
         let task = BoardTask::manual(
             &mut run,
             TaskRequest {

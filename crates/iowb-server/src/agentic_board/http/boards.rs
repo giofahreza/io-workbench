@@ -26,6 +26,16 @@ async fn create_board(
         if let Some(project_path) = trim_string(request.project_path.clone())
             && let Some(mut latest) = latest_board_for_project(&state, &user.0.id, &project_path)?
         {
+            if request.initial_prompt()?.is_none() && trim_string(request.title.clone()).is_none() {
+                return Ok((
+                    StatusCode::OK,
+                    Json(json!({
+                        "success": true,
+                        "reused": true,
+                        "board": latest.board.detail_json(Some(latest.path.display().to_string())),
+                    })),
+                ));
+            }
             let board_was_active = latest.board.loop_started
                 || latest.board.active
                 || latest.board.status == "running";

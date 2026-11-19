@@ -24,6 +24,7 @@ mod tests {
     include!("tests/transcript_redaction_progress.rs");
     include!("tests/blocked_error_feedback.rs");
     include!("tests/planning_and_recovery.rs");
+    include!("tests/empty_board_creation.rs");
     include!("tests/hierarchy_planning_contract.rs");
     include!("tests/scope_exclusion_boundary.rs");
     include!("tests/wrapped_scope_completion.rs");
