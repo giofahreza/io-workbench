@@ -503,7 +503,8 @@ impl AgentRuntimeManager {
                 return Ok(());
             }
         };
-        let turn_params = codex_app_server_live_turn_params(&context);
+        let mut turn_params = codex_app_server_live_turn_params(&context);
+        apply_codex_live_profile_defaults(&mut turn_params, launch_options.as_ref());
         let client = self.codex_app_server.clone();
         let manager = self.clone();
         let (event_tx, mut event_rx) = mpsc::channel::<CodexAppServerLiveTurnEvent>(256);
@@ -524,7 +525,12 @@ impl AgentRuntimeManager {
 
         tokio::spawn(async move {
             let mut output = String::new();
-            let mut normalizer = CodexAppServerLiveOutputNormalizer::default();
+            let mut normalizer = CodexAppServerLiveOutputNormalizer::for_live_turn(
+                context
+                    .native_resume_session_id
+                    .as_deref()
+                    .is_some_and(|id| !id.trim().is_empty()),
+            );
             let mut runner = tokio::spawn(async move {
                 client
                     .run_live_turn_with_options(

@@ -128,11 +128,15 @@ async fn process_codex_app_server_live_event(
     output: &mut String,
 ) {
     match event {
+        CodexAppServerLiveTurnEvent::UsageBaseline { token_usage } => {
+            normalizer.usage_tracker.set_baseline(&token_usage);
+        }
         CodexAppServerLiveTurnEvent::ThreadAssociated { thread_id } => {
             persist_native_session_id(context, Some(thread_id)).await;
         }
         CodexAppServerLiveTurnEvent::TurnAssociated { turn_id } => {
             debug_assert!(!turn_id.trim().is_empty());
+            normalizer.associate_usage_turn(turn_id);
         }
         CodexAppServerLiveTurnEvent::Notification { method, params } => {
             let visible = normalizer.push_notification(&method, &params);

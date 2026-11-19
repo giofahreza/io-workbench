@@ -1,4 +1,40 @@
 impl CodexAppServerLiveOutputNormalizer {
+    fn for_live_turn(resumed: bool) -> Self {
+        let mut normalizer = Self {
+            usage_waiting_for_turn: true,
+            ..Self::default()
+        };
+        if resumed {
+            normalizer.usage_tracker.previous_total = None;
+        }
+        normalizer
+    }
+
+    fn associate_usage_turn(&mut self, turn_id: String) {
+        if self.usage_turn_id.is_some() {
+            return;
+        }
+        self.usage_turn_id = Some(turn_id);
+        self.usage_waiting_for_turn = false;
+        for params in std::mem::take(&mut self.pending_usage) {
+            if params
+                .get("turnId")
+                .or_else(|| params.get("turn_id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| Some(id) != self.usage_turn_id.as_deref())
+            {
+                if let Some(token_usage) = params
+                    .get("tokenUsage")
+                    .or_else(|| params.get("token_usage"))
+                {
+                    self.usage_tracker.set_baseline(token_usage);
+                }
+            } else {
+                self.normalize_token_usage(&params);
+            }
+        }
+    }
+
     fn push_notification(&mut self, method: &str, params: &Value) -> String {
         if method == "thread/tokenUsage/updated" {
             return self.normalize_token_usage(params);
@@ -309,13 +345,26 @@ impl CodexAppServerLiveOutputNormalizer {
     }
 
     fn normalize_token_usage(&mut self, params: &Value) -> String {
+        if self.usage_waiting_for_turn {
+            self.pending_usage.push(params.clone());
+            return String::new();
+        }
+        if let Some(turn_id) = self.usage_turn_id.as_deref()
+            && params
+                .get("turnId")
+                .or_else(|| params.get("turn_id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != turn_id)
+        {
+            return String::new();
+        }
         let Some(token_usage) = params
             .get("tokenUsage")
             .or_else(|| params.get("token_usage"))
         else {
             return String::new();
         };
-        self.final_usage = Some(normalize_codex_app_server_token_usage(token_usage));
+        self.final_usage = self.usage_tracker.update(token_usage);
         if !self.emitted_visible_turn_output {
             return String::new();
         }

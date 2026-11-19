@@ -34,8 +34,8 @@ fn resolve_agent_command(
         .ok()
         .or_else(|| env::var("IO_WORKBENCH_AGENT_ARGS_JSON").ok());
     let cli_prompt = resolve_cli_slash_prompt(command_provider, prompt)?;
-    let args = if let Some(args_template) = args_template {
-        let raw_args: Vec<String> = serde_json::from_str(&args_template).map_err(|error| {
+    let mut args = if let Some(args_template) = args_template.as_ref() {
+        let raw_args: Vec<String> = serde_json::from_str(args_template).map_err(|error| {
             CoreError::InvalidInput(format!("invalid agent args JSON: {error}"))
         })?;
         raw_args
@@ -63,6 +63,9 @@ fn resolve_agent_command(
             runtime,
         )
     };
+    if command_provider == Provider::Codex && args_template.is_none() {
+        apply_codex_profile_args(&mut args, runtime)?;
+    }
 
     let stdin_prompt = env_bool(&format!("{provider_prefix}STDIN"), false)
         || env_bool("IO_WORKBENCH_AGENT_STDIN", false);

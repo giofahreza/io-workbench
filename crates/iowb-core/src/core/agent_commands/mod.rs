@@ -6,3 +6,4 @@ include!("recovery.rs");
 include!("output_limits.rs");
 include!("event_processing.rs");
 include!("persistence.rs");
+include!("codex_profile.rs");

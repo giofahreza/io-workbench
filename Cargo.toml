@@ -52,6 +52,7 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql", "any", "chrono", "json"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+toml = "0.8"
 tower-http = { version = "0.6", features = ["compression-full", "cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

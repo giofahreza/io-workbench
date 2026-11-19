@@ -124,6 +124,10 @@ struct CodexLiveOutputNormalizer {
 
 #[derive(Default)]
 struct CodexAppServerLiveOutputNormalizer {
+    usage_tracker: CodexTurnUsageTracker,
+    usage_turn_id: Option<String>,
+    usage_waiting_for_turn: bool,
+    pending_usage: Vec<Value>,
     pending_agent_message: Option<String>,
     streamed_agent_items: HashSet<String>,
     streamed_agent_text: HashMap<String, String>,

@@ -84,6 +84,7 @@ Repository design and operator material lives in [`docs/`](docs/):
 - [Rust rewrite architecture](docs/architecture/rust-rewrite-plan.md)
 - [Agentic Board / Kanban design](docs/design/kanban.md)
 - [Codex app-server migration plan](docs/migrations/codex-app-server.md)
+- [Codex model settings and token accounting](docs/codex-configuration.md)
 
 ## Project layout
 

@@ -45,6 +45,7 @@ pub(crate) struct CodexAppServerLiveTurnParams {
     pub(crate) input: Vec<Value>,
     pub(crate) client_user_message_id: Option<String>,
     pub(crate) model: Option<String>,
+    pub(crate) model_provider: Option<String>,
     pub(crate) effort: Option<String>,
     pub(crate) service_tier: Option<String>,
     pub(crate) approval_policy: Option<Value>,
@@ -53,6 +54,7 @@ pub(crate) struct CodexAppServerLiveTurnParams {
 
 #[derive(Debug)]
 pub(crate) enum CodexAppServerLiveTurnEvent {
+    UsageBaseline { token_usage: Value },
     ThreadAssociated { thread_id: String },
     TurnAssociated { turn_id: String },
     Notification { method: String, params: Value },

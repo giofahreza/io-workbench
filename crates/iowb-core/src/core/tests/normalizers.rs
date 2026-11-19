@@ -272,6 +272,17 @@
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn codex_app_server_live_runtime_persists_assistant_and_thread_id() {
+        assert_codex_app_server_runtime_persistence(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_app_server_live_runtime_persists_resumed_turn_usage() {
+        assert_codex_app_server_runtime_persistence(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_codex_app_server_runtime_persistence(resumed: bool) {
         use std::os::unix::fs::PermissionsExt;
 
         let (mut state, root, project) = temporary_app_state("app-server-live-runtime").await;
@@ -313,6 +324,34 @@
         )
         .expect("rollout");
         let original_rollout = std::fs::read_to_string(&rollout).expect("original rollout");
+        let baseline = if resumed { 1000 } else { 0 };
+        let usage_line = |turn_id, last, total| {
+            let notification = serde_json::json!({
+                "method": "thread/tokenUsage/updated",
+                "params": {"threadId": "thread-runtime", "turnId": turn_id,
+                    "tokenUsage": {"last": last, "total": total}}
+            });
+            format!("printf '%s\\n' '{notification}'\n")
+        };
+        let baseline_line = if resumed {
+            usage_line(
+                "previous-turn",
+                codex_usage_report(100, 10, 0, 0),
+                codex_usage_report(baseline, 100, 0, 0),
+            )
+        } else {
+            String::new()
+        };
+        let first_usage = usage_line(
+            "turn-runtime",
+            codex_usage_report(100, 10, 90, 3),
+            codex_usage_report(baseline + 100, baseline / 10 + 10, 90, 3),
+        );
+        let second_usage = usage_line(
+            "turn-runtime",
+            codex_usage_report(50, 5, 40, 2),
+            codex_usage_report(baseline + 150, baseline / 10 + 15, 130, 5),
+        );
         std::fs::write(
             &script,
             format!(
@@ -321,15 +360,22 @@
                  printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\"}}}}'\n\
                  read second\nprintf '%s\\n' \"$second\" >> '{}'\n\
                  read third\nprintf '%s\\n' \"$third\" >> '{}'\n\
+                 {}\
                  printf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"thread-runtime\"}}}}}}'\n\
                  read fourth\nprintf '%s\\n' \"$fourth\" >> '{}'\n\
+                 {}\
                  printf '%s\\n' '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-runtime\",\"status\":\"inProgress\",\"items\":[]}}}}}}'\n\
                  printf '%s\\n' '{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"threadId\":\"thread-runtime\",\"turnId\":\"turn-runtime\",\"itemId\":\"msg-runtime\",\"delta\":\"runtime answer\"}}}}'\n\
+                 {}{}\
                  printf '%s\\n' '{{\"method\":\"turn/completed\",\"params\":{{\"threadId\":\"thread-runtime\",\"turn\":{{\"id\":\"turn-runtime\",\"status\":\"completed\",\"items\":[{{\"type\":\"agentMessage\",\"id\":\"msg-runtime\",\"text\":\"runtime answer\",\"phase\":\"final_answer\"}}]}}}}}}'\n",
                 log.display(),
                 log.display(),
                 log.display(),
+                baseline_line,
                 log.display(),
+                first_usage,
+                second_usage,
+                second_usage,
             ),
         )
         .expect("script");
@@ -402,11 +448,11 @@
                 prompt: "hello runtime".to_string(),
                 model: None,
                 runtime: ChatRuntime::NativeCli,
-                effort: None,
+                effort: Some("high".to_string()),
                 mode: None,
-                thinking: None,
+                thinking: Some(true),
                 fast: None,
-                native_resume_session_id: None,
+                native_resume_session_id: resumed.then(|| "thread-runtime".to_string()),
                 native_rollout_owned_by_provider: false,
                 context_rollover_id: None,
                 direct_ai_config: None,
@@ -447,10 +493,11 @@
                 .as_i64()
                 .is_some_and(|elapsed| elapsed < 10_000)
         );
-        assert!(
-            assistant.metadata["tokenUsage"].is_null(),
-            "no usage was reported by this attempt"
-        );
+        assert_eq!(assistant.metadata["tokenUsage"]["used"], 165);
+        assert_eq!(assistant.metadata["tokenUsage"]["input"], 150);
+        assert_eq!(assistant.metadata["tokenUsage"]["output"], 15);
+        assert_eq!(assistant.metadata["tokenUsage"]["cacheRead"], 130);
+        assert_eq!(assistant.metadata["tokenUsage"]["reasoning"], 5);
         assert!(
             messages.iter().any(|message| {
                 message.role == MessageRole::Assistant && message.content == "runtime answer"
@@ -465,6 +512,23 @@
         assert!(!stored.active);
         assert_eq!(stored.native_session_id.as_deref(), Some("thread-runtime"));
         assert!(stored.native_rollout_owned_by_provider);
+        let latest_usage = state
+            .storage
+            .latest_session_token_usage(&session.id)
+            .expect("stored attempt usage")
+            .expect("usage");
+        assert_eq!(latest_usage.used, 165);
+        let lifetime = state
+            .storage
+            .list_sessions()
+            .expect("session list")
+            .into_iter()
+            .find(|stored| stored.id == session.id)
+            .unwrap()
+            .lifetime_token_usage
+            .unwrap();
+        assert_eq!(lifetime.total, 165);
+        assert_eq!(lifetime.completeness, TokenUsageCompleteness::Complete);
         let visible_messages = state
             .sessions
             .messages_including_external(&session.id)
@@ -507,9 +571,15 @@
             Some("thread-runtime")
         );
         let requests = std::fs::read_to_string(log).expect("requests");
-        assert!(requests.contains("\"method\":\"thread/start\""));
+        assert!(requests.contains(if resumed {
+            "\"method\":\"thread/resume\""
+        } else {
+            "\"method\":\"thread/start\""
+        }));
         assert!(requests.contains("\"method\":\"turn/start\""));
         assert!(requests.contains("\"approvalPolicy\":\"never\""));
+        assert!(requests.contains("\"effort\":\"high\""));
+        assert!(!requests.contains("\"effort\":\"xhigh\""));
         assert_eq!(
             original_rollout,
             std::fs::read_to_string(&rollout).expect("rollout after app-server live turn"),

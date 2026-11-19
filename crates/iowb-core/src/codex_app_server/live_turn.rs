@@ -22,7 +22,7 @@ async fn initialize_app_server(
         }),
     )
     .await?;
-    let _ = read_response_with_events(lines, stdin, 1, events).await?;
+    let _ = read_response_with_events(lines, stdin, 1, events, None).await?;
     write_json_line(stdin, &json!({ "method": "initialized", "params": {} })).await
 }
 
@@ -42,7 +42,16 @@ async fn start_or_resume_thread(
         "approvalPolicy": params.approval_policy.clone().unwrap_or_else(|| json!("never")),
     });
     insert_optional_string(&mut request_params, "model", params.model.as_deref());
-    insert_optional_string(&mut request_params, "effort", params.effort.as_deref());
+    insert_optional_string(
+        &mut request_params,
+        "modelProvider",
+        params.model_provider.as_deref(),
+    );
+    // Thread start/resume accepts effort through config; only turn/start has
+    // an `effort` field. Explicit config also overrides saved resume settings.
+    if let Some(effort) = params.effort.as_deref() {
+        request_params["config"] = json!({"model_reasoning_effort": effort});
+    }
     insert_optional_string(
         &mut request_params,
         "serviceTier",
@@ -68,7 +77,7 @@ async fn start_or_resume_thread(
         }),
     )
     .await?;
-    let result = read_response_with_events(lines, stdin, 2, events).await?;
+    let result = read_response_with_events(lines, stdin, 2, events, existing_thread_id).await?;
     extract_thread_id(&result)
         .or_else(|| existing_thread_id.map(str::to_string))
         .ok_or_else(|| {
@@ -113,7 +122,7 @@ async fn start_turn(
         }),
     )
     .await?;
-    let result = read_response_with_events(lines, stdin, 3, events).await?;
+    let result = read_response_with_events(lines, stdin, 3, events, None).await?;
     Ok(result
         .pointer("/turn/id")
         .and_then(Value::as_str)
@@ -142,6 +151,7 @@ async fn read_response_with_events(
     stdin: &mut tokio::process::ChildStdin,
     expected_id: i64,
     events: &mpsc::Sender<CodexAppServerLiveTurnEvent>,
+    baseline_thread_id: Option<&str>,
 ) -> Result<Value> {
     while let Some(line) = lines.next_line().await? {
         let value: Value = serde_json::from_str(&line)?;
@@ -155,7 +165,7 @@ async fn read_response_with_events(
                 )
             });
         }
-        handle_nonmatching_jsonrpc_message(&value, stdin, events).await?;
+        handle_nonmatching_jsonrpc_message(&value, stdin, events, baseline_thread_id).await?;
     }
     Err(CoreError::Io(std::io::Error::new(
         std::io::ErrorKind::UnexpectedEof,
@@ -167,6 +177,7 @@ async fn handle_nonmatching_jsonrpc_message(
     value: &Value,
     stdin: &mut tokio::process::ChildStdin,
     events: &mpsc::Sender<CodexAppServerLiveTurnEvent>,
+    baseline_thread_id: Option<&str>,
 ) -> Result<()> {
     let Some(method) = value.get("method").and_then(Value::as_str) else {
         return Ok(());
@@ -176,6 +187,24 @@ async fn handle_nonmatching_jsonrpc_message(
         return Ok(());
     }
     let params = value.get("params").cloned().unwrap_or(Value::Null);
+    if let Some(thread_id) = baseline_thread_id
+        && method == "thread/tokenUsage/updated"
+    {
+        if !notification_matches_thread(&params, thread_id) {
+            return Ok(());
+        }
+        if let Some(token_usage) = params
+            .get("tokenUsage")
+            .or_else(|| params.get("token_usage"))
+        {
+            let _ = events
+                .send(CodexAppServerLiveTurnEvent::UsageBaseline {
+                    token_usage: token_usage.clone(),
+                })
+                .await;
+        }
+        return Ok(());
+    }
     let _ = events
         .send(CodexAppServerLiveTurnEvent::Notification {
             method: method.to_string(),
@@ -219,7 +248,9 @@ async fn handle_live_jsonrpc_line(
     let is_thread_level = notification_is_thread_level(method);
     let has_notification_turn_id = notification_turn_id(&params).is_some();
     let should_forward = if is_thread_level {
-        *saw_current_turn_notification && (matches_turn || !has_notification_turn_id)
+        // A billed response can arrive before any visible assistant output.
+        (method == "thread/tokenUsage/updated" && matches_turn && has_notification_turn_id)
+            || (*saw_current_turn_notification && (matches_turn || !has_notification_turn_id))
     } else {
         matches_turn
     };

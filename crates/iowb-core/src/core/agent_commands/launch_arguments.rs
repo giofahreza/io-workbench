@@ -186,16 +186,13 @@ fn default_agent_args_with_resume(
     args
 }
 
-fn effective_codex_reasoning_effort(effort: Option<&str>, thinking: bool) -> Option<&str> {
-    let selected = effort.and_then(|value| match value {
+fn effective_codex_reasoning_effort(effort: Option<&str>, _thinking: bool) -> Option<&str> {
+    // Codex already reasons at the selected effort. The shared Thinking toggle
+    // must not silently replace that choice or the user's configured default.
+    effort.and_then(|value| match value {
         "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => Some(value),
         _ => None,
-    });
-    if thinking && !matches!(selected, Some("xhigh" | "max" | "ultra")) {
-        Some("xhigh")
-    } else {
-        selected
-    }
+    })
 }
 
 /// Returns true when a model id belongs to the IO gateway namespace.
@@ -292,23 +289,27 @@ fn codex_app_server_launch_options(
     runtime: ChatRuntime,
     config: Option<&DirectAiRuntimeConfig>,
 ) -> Result<Option<CodexAppServerLaunchOptions>> {
-    if runtime != ChatRuntime::IoGateway {
+    let mut args = vec!["app-server".to_string()];
+    apply_codex_profile_args(&mut args, runtime)?;
+    let mut launch_env = Vec::new();
+    if runtime == ChatRuntime::IoGateway {
+        let config = config.ok_or_else(|| {
+            CoreError::InvalidInput(
+                "IO Gateway is not configured for Codex context compaction".to_string(),
+            )
+        })?;
+        apply_codex_cli_io_gateway_args(&mut args, &config.base_url);
+        launch_env.push((
+            IO_WORKBENCH_GATEWAY_KEY_ENV.to_string(),
+            config.api_key.clone(),
+        ));
+    } else if args.len() == 1 {
         return Ok(None);
     }
-    let config = config.ok_or_else(|| {
-        CoreError::InvalidInput(
-            "IO Gateway is not configured for Codex context compaction".to_string(),
-        )
-    })?;
-    let mut args = vec!["app-server".to_string()];
-    apply_codex_cli_io_gateway_args(&mut args, &config.base_url);
     args.push("--stdio".to_string());
     Ok(Some(CodexAppServerLaunchOptions {
         args,
-        env: vec![(
-            IO_WORKBENCH_GATEWAY_KEY_ENV.to_string(),
-            config.api_key.clone(),
-        )],
+        env: launch_env,
     }))
 }
 
@@ -388,6 +389,7 @@ fn codex_app_server_live_turn_params(context: &AgentStartContext) -> CodexAppSer
         input: codex_app_server_prompt_input(&context.prompt, &context.project_path),
         client_user_message_id,
         model: selected_model,
+        model_provider: None,
         effort,
         service_tier,
         approval_policy: Some(serde_json::json!("never")),

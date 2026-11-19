@@ -3,6 +3,7 @@
 include!("types.rs");
 include!("manager.rs");
 include!("usage.rs");
+include!("codex_usage.rs");
 include!("process_ownership.rs");
 include!("process_control.rs");
 include!("defaults.rs");

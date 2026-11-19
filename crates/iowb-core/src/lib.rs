@@ -26,4 +26,5 @@ mod tests {
     include!("core/tests/history_windows.rs");
     include!("core/tests/session_recovery.rs");
     include!("core/tests/runtime_and_models.rs");
+    include!("core/tests/codex_configuration_and_usage.rs");
 }

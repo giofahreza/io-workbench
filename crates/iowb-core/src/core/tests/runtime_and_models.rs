@@ -701,14 +701,14 @@
         assert!(
             thinking_args
                 .windows(2)
-                .any(|pair| { pair == ["-c", "model_reasoning_effort=\"xhigh\""] })
+                .any(|pair| { pair == ["-c", "model_reasoning_effort=\"medium\""] })
         );
         assert!(!thinking_args.iter().any(|arg| arg == "--reasoning-effort"));
     }
 
     #[test]
     fn codex_extended_efforts_are_forwarded_without_downgrade() {
-        for effort in ["xhigh", "max", "ultra"] {
+        for effort in ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] {
             let args = default_agent_args_with(
                 Provider::Codex,
                 "hi",

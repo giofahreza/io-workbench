@@ -208,8 +208,10 @@
         let client = CodexAppServerClient::new(script.as_os_str(), Duration::from_secs(2));
         let (_abort_tx, abort_rx) = oneshot::channel();
         let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut params = live_turn_params(&root, None);
+        params.effort = Some("medium".to_string());
         let outcome = client
-            .run_live_turn_with_options(live_turn_params(&root, None), None, abort_rx, event_tx)
+            .run_live_turn_with_options(params, None, abort_rx, event_tx)
             .await
             .expect("live turn");
 
@@ -232,6 +234,14 @@
         assert!(requests.contains("\"method\":\"thread/start\""));
         assert!(requests.contains("\"method\":\"turn/start\""));
         assert!(requests.contains("\"input\":[{\"text\":\"hello\",\"type\":\"text\"}]"));
+        let thread_start: Value = requests
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(thread_start["params"]["modelProvider"], "test-provider");
+        assert_eq!(thread_start["params"]["config"]["model_reasoning_effort"], "medium");
+        assert!(thread_start["params"].get("effort").is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -354,7 +364,7 @@
             }
         }
         assert_eq!(deltas, ["right"]);
-        assert_eq!(output_tokens, [222]);
+        assert_eq!(output_tokens, [111, 222]);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -505,6 +515,7 @@
         thread_id: Option<&str>,
     ) -> CodexAppServerLiveTurnParams {
         CodexAppServerLiveTurnParams {
+            model_provider: Some("test-provider".to_string()),
             thread_id: thread_id.map(str::to_string),
             cwd: root.to_path_buf(),
             input: vec![json!({ "type": "text", "text": "hello" })],
