@@ -38,12 +38,32 @@ async function updateSessionModel() {
   await loadProjects().catch(() => {});
 }
 
+const PROJECT_SESSIONS_PAGE_SIZE = 50;
+
 async function loadProjectSessions() {
   const project = activeProjectKey();
   if (!project) return;
-  const body = await api(`/api/projects/${encodeURIComponent(project)}/sessions`);
-  state.sessions = (Array.isArray(body) ? body : body.sessions || [])
-    .filter((session) => !isBoardChatSession(session));
+  const loaded = [];
+  const seen = new Set();
+  let offset = 0;
+  for (;;) {
+    const body = await api(
+      `/api/projects/${encodeURIComponent(project)}/sessions?limit=${PROJECT_SESSIONS_PAGE_SIZE}&offset=${offset}`,
+    );
+    // Older servers ignore limit/offset and send every session as one array.
+    const page = Array.isArray(body) ? body : body.sessions || [];
+    for (const session of page) {
+      // New activity can reorder sessions between pages, so skip repeats.
+      const key = `${session.provider}\n${session.id}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        loaded.push(session);
+      }
+    }
+    offset += page.length;
+    if (Array.isArray(body) || !body.hasMore || !page.length) break;
+  }
+  state.sessions = loaded.filter((session) => !isBoardChatSession(session));
   renderSessions();
   renderJson("#sessions-output", { project, sessions: state.sessions });
 }

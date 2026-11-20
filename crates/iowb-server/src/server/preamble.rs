@@ -44,8 +44,9 @@ use iowb_protocol::{
     ForkSessionResponse, HealthResponse, HealthStatus, LoginRequest,
     ManualCompactSessionContextRequest, MessageRole, MessagesResponse, PRODUCT_NAME,
     PlaceholderResponse, ProcessInputRequest, ProcessResizeRequest, ProcessStartRequest,
-    ProcessStartResponse, ProjectListResponse, ProjectSummary, PromptHistoryCursor,
-    PromptHistoryResponse, Provider, RegisterFcmTokenRequest, RenameFileRequest,
+    ProcessStartResponse, ProjectListResponse, ProjectSessionsPage, ProjectSummary,
+    PromptHistoryCursor, PromptHistoryResponse, Provider, RegisterFcmTokenRequest,
+    RenameFileRequest,
     ServerStatusResponse, SessionDraftResponse, SessionSnapshotResponse, SessionSummary,
     SessionTokenUsage, UpdateSessionDraftRequest, WS_COMMAND_CHANNEL_CAPACITY, WorkspaceType,
     WsClientCommand, WsServerEvent, new_id,
@@ -107,6 +108,8 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_HISTORY: usize = 50;
 const SESSION_HISTORY_DEFAULT_MESSAGES: usize = 30;
 const SESSION_HISTORY_MAX_MESSAGES: usize = 100;
+const PROJECT_SESSIONS_DEFAULT_LIMIT: usize = 50;
+const PROJECT_SESSIONS_MAX_LIMIT: usize = 200;
 const SESSION_PROMPT_HISTORY_DEFAULT: usize = 10;
 const SESSION_PROMPT_HISTORY_MAX: usize = 100;
 const SESSION_RESPONSE_MAX_CONTENT_BYTES: usize = 512 * 1024;

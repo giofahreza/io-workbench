@@ -66,7 +66,31 @@
       "delete": { "tags": ["Projects"], "summary": "Delete a project record" }
     },
     "/api/projects/{project_name}/sessions": {
-      "get": { "tags": ["Sessions"], "summary": "List persisted sessions for a project" }
+      "get": {
+        "tags": ["Sessions"],
+        "summary": "List persisted sessions for a project",
+        "description": "Sessions are ordered by newest activity first. Without limit or offset the response is the complete legacy array of sessions. With either parameter the response is one page: { sessions, hasMore, totalCount }. limit defaults to 50 and is clamped to 1-200. Advance by offset + the number of sessions returned and de-duplicate by provider and id, because new activity can reorder sessions between requests. Clients should always send limit.",
+        "parameters": [
+          {
+            "name": "project_name",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "minLength": 1 }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 0, "default": 0 }
+          }
+        ]
+      }
     },
     "/api/projects/{project_name}/sessions/{session_id}/token-usage": {
       "get": { "tags": ["Sessions"], "summary": "Read token usage for a project session" }

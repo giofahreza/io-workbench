@@ -35,6 +35,17 @@ pub struct ChatMessage {
     pub metadata: Value,
 }
 
+/// One page of a project's sessions, newest activity first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSessionsPage {
+    pub sessions: Vec<SessionSummary>,
+    /// `true` when more sessions exist after this page.
+    pub has_more: bool,
+    /// Total number of sessions listed for the project.
+    pub total_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagesResponse {
     pub session_id: String,

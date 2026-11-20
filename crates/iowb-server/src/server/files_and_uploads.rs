@@ -1,9 +1,35 @@
+#[derive(Debug, Deserialize)]
+struct ProjectSessionsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// With neither `limit` nor `offset` this returns the full legacy array so older
+/// clients keep working; with either it returns one `ProjectSessionsPage`.
 async fn project_sessions(
     State(state): State<AppState>,
     AxumPath(project_name): AxumPath<String>,
-) -> Result<Json<Vec<SessionSummary>>> {
+    Query(query): Query<ProjectSessionsQuery>,
+) -> Result<Response> {
     let project = state.projects.find_by_ref(&project_name)?;
-    Ok(Json(state.sessions.list_for_project(&project.path).await?))
+    let sessions = state.sessions.list_for_project(&project.path).await?;
+    if query.limit.is_none() && query.offset.is_none() {
+        return Ok(Json(sessions).into_response());
+    }
+    let offset = query.offset.unwrap_or(0);
+    let limit = query
+        .limit
+        .unwrap_or(PROJECT_SESSIONS_DEFAULT_LIMIT)
+        .clamp(1, PROJECT_SESSIONS_MAX_LIMIT);
+    let total_count = sessions.len();
+    let sessions: Vec<SessionSummary> = sessions.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset + sessions.len() < total_count;
+    Ok(Json(ProjectSessionsPage {
+        sessions,
+        has_more,
+        total_count,
+    })
+    .into_response())
 }
 
 async fn delete_project(
