@@ -319,6 +319,42 @@ async fn persist_normalized_tool_messages(
     }
 }
 
+async fn persist_claude_history_messages(
+    context: &AgentStartContext,
+    normalizer: &mut Option<ClaudeLiveOutputNormalizer>,
+    final_assistant: Option<&str>,
+) {
+    let Some(normalizer) = normalizer.as_mut() else {
+        return;
+    };
+    let messages = normalizer.take_history_messages(final_assistant);
+    if context.context_rollover_id.is_some() {
+        return;
+    }
+    for message in messages {
+        let metadata = serde_json::json!({
+            "kind": message.kind,
+            "toolName": message.tool_name,
+            "callId": message.call_id,
+            "provider": context.provider.as_str(),
+            "durableRunId": context.durable_run_id,
+            "responseId": context.response_id,
+        });
+        if let Err(error) = context
+            .sessions
+            .append_message_with_metadata(
+                &context.session_id,
+                message.role,
+                message.content,
+                Some(metadata),
+            )
+            .await
+        {
+            warn!(error = %error, session_id = %context.session_id, "failed to persist bounded Claude activity");
+        }
+    }
+}
+
 async fn persist_native_session_id(context: &AgentStartContext, native_session_id: Option<String>) {
     let Some(native_session_id) = native_session_id else {
         return;

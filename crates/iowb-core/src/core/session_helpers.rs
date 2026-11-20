@@ -174,6 +174,60 @@ fn evict_external_message_cache(cache: &mut ExternalSessionCache) {
     }
 }
 
+fn merge_mapped_claude_messages(
+    stored: Vec<ChatMessage>,
+    external: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    let key = |message: &ChatMessage| {
+        if message.role == MessageRole::Tool
+            && let Some(call_id) = message
+                .metadata
+                .get("callId")
+                .or_else(|| message.metadata.get("toolCallId"))
+                .and_then(Value::as_str)
+            && !call_id.is_empty()
+        {
+            return format!(
+                "{}:{call_id}",
+                message
+                    .metadata
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+            );
+        }
+        if message.role == MessageRole::Assistant {
+            return format!(
+                "assistant\0{}",
+                bound_agent_text(
+                    message.content.trim(),
+                    AGENT_TOOL_MESSAGE_MAX_BYTES,
+                    "activity"
+                )
+            );
+        }
+        message_match_key(message)
+    };
+    let stored_keys = stored.iter().map(&key).collect::<Vec<_>>();
+    let external_keys = external.iter().map(&key).collect::<Vec<_>>();
+    let matches = ordered_text_matches(&stored_keys, &external_keys);
+    let mut merged = Vec::new();
+    let mut stored_cursor = 0;
+    let mut external_cursor = 0;
+    for (stored_index, external_index) in matches {
+        merged.extend_from_slice(&stored[stored_cursor..stored_index]);
+        merged.extend_from_slice(&external[external_cursor..external_index]);
+        let mut matched = stored[stored_index].clone();
+        matched.timestamp = external[external_index].timestamp;
+        merged.push(matched);
+        stored_cursor = stored_index + 1;
+        external_cursor = external_index + 1;
+    }
+    merged.extend_from_slice(&external[external_cursor..]);
+    merged.extend_from_slice(&stored[stored_cursor..]);
+    merged
+}
+
 fn merge_mapped_external_messages(
     stored: Vec<ChatMessage>,
     mut external: Vec<ChatMessage>,

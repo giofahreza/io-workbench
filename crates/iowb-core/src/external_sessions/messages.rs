@@ -1,7 +1,13 @@
 fn load_claude_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
+    let mut tool_names = HashMap::new();
+    let mut seen_tools = HashSet::new();
+    let mut seen_entries = HashSet::new();
     for_each_json_line(&record.file_path, |entry| {
-        if entry.get("sessionId").and_then(Value::as_str) != Some(record.summary.id.as_str())
+        if !matches!(
+            entry.get("type").and_then(Value::as_str),
+            Some("user" | "assistant")
+        ) || entry.get("sessionId").and_then(Value::as_str) != Some(record.summary.id.as_str())
             || entry
                 .get("isSidechain")
                 .and_then(Value::as_bool)
@@ -17,6 +23,11 @@ fn load_claude_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
         else {
             return;
         };
+        if let Some(uuid) = entry.get("uuid").and_then(Value::as_str)
+            && !seen_entries.insert(uuid.to_string())
+        {
+            return;
+        }
         let mut content = extract_text(
             entry
                 .get("message")
@@ -32,6 +43,49 @@ fn load_claude_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
             content,
             value_timestamp(entry.get("timestamp")),
         );
+        for block in entry
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let kind = match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") if role == MessageRole::Assistant => "tool_call",
+                Some("tool_result") => "tool_result",
+                _ => continue,
+            };
+            let call_id = block
+                .get("tool_use_id")
+                .or_else(|| block.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !call_id.is_empty() && !seen_tools.insert(format!("{kind}:{call_id}")) {
+                continue;
+            }
+            let content = if kind == "tool_call" {
+                crate::format_claude_tool_use(block, &mut tool_names)
+            } else {
+                crate::format_claude_tool_result(block, &tool_names)
+            };
+            let name = tool_names
+                .get(call_id)
+                .map(String::as_str)
+                .unwrap_or("tool");
+            push_message_with_metadata(
+                &mut messages,
+                record,
+                MessageRole::Tool,
+                content,
+                value_timestamp(entry.get("timestamp")),
+                tool_metadata(kind, name, call_id),
+            );
+            if !call_id.is_empty()
+                && let Some(message) = messages.last_mut()
+            {
+                message.id = format!("external_claude_{}_{kind}_{call_id}", record.summary.id);
+            }
+        }
     });
     messages
 }

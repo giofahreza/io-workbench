@@ -104,10 +104,12 @@ impl SessionManager {
             if external.is_empty() {
                 return Ok(None);
             }
-            let messages = Arc::new(merge_mapped_external_messages(
-                self.messages(session_id)?,
-                external.as_ref().clone(),
-            ));
+            let merge = if record.summary.provider == Provider::Claude {
+                merge_mapped_claude_messages
+            } else {
+                merge_mapped_external_messages
+            };
+            let messages = Arc::new(merge(self.messages(session_id)?, external.as_ref().clone()));
             if self.storage.message_history_version(session_id)? != version
                 || external_file_fingerprint(&record.file_path) != fingerprint
             {

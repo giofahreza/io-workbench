@@ -317,6 +317,7 @@ impl AgentRuntimeManager {
                                 .as_mut()
                                 .and_then(ClaudeLiveOutputNormalizer::take_final_assistant_message);
                             persist_codex_tool_messages(&context, &mut codex_normalizer).await;
+                            persist_claude_history_messages(&context, &mut claude_normalizer, claude_final_assistant.as_deref()).await;
                             let provider_specific_final = codex_final_assistant
                                 .or(claude_final_assistant);
                             match status {
@@ -433,6 +434,7 @@ impl AgentRuntimeManager {
                                 .as_mut()
                                 .and_then(ClaudeLiveOutputNormalizer::take_final_assistant_message);
                             persist_codex_tool_messages(&context, &mut codex_normalizer).await;
+                            persist_claude_history_messages(&context, &mut claude_normalizer, claude_final_assistant.as_deref()).await;
                             let final_assistant = codex_final_assistant
                                 .or(claude_final_assistant)
                                 .unwrap_or_else(|| output.clone());

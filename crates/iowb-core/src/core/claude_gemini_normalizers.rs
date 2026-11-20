@@ -13,13 +13,27 @@ struct ClaudeLiveOutputNormalizer {
     emitted_tool_results: HashSet<String>,
     final_assistant_message: Option<String>,
     final_usage: Option<NormalizedRunUsage>,
+    history_messages: Vec<ClaudeHistoryMessage>,
+    history_bytes: usize,
+    recorded_activity: HashSet<String>,
+    pending_public_text: String,
+    streamed_message_text: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ClaudeStreamingTool {
     id: Option<String>,
     name: String,
     input_json: String,
+}
+
+struct ClaudeHistoryMessage {
+    role: MessageRole,
+    content: String,
+    kind: &'static str,
+    tool_name: String,
+    call_id: Option<String>,
+    source_hash: [u8; 32],
 }
 
 impl ClaudeLiveOutputNormalizer {
@@ -75,10 +89,185 @@ impl ClaudeLiveOutputNormalizer {
             self.saw_stream_event = true;
             return event
                 .get("event")
-                .map(|stream_event| self.normalize_event(stream_event))
+                .map(|stream_event| {
+                    self.observe_history_event(stream_event);
+                    self.normalize_event(stream_event)
+                })
                 .unwrap_or_default();
         }
+        self.observe_history_event(&event);
         self.normalize_event(&event)
+    }
+
+    fn observe_history_event(&mut self, event: &Value) {
+        match event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "message_start" => {
+                self.flush_public_text();
+                self.streamed_message_text = false;
+            }
+            "content_block_delta" => {
+                if let Some(text) = event
+                    .get("delta")
+                    .filter(|delta| delta.get("type").and_then(Value::as_str) == Some("text_delta"))
+                    .and_then(|delta| delta.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    self.streamed_message_text = true;
+                    self.pending_public_text.push_str(text);
+                    self.pending_public_text = bound_agent_final_text(&self.pending_public_text);
+                }
+            }
+            "content_block_start" => {
+                if let Some(block) = event.get("content_block") {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("tool_use") => self.flush_public_text(),
+                        Some("text") => {
+                            if !self.pending_public_text.is_empty() {
+                                self.pending_public_text.push('\n');
+                            }
+                            if let Some(text) = block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .filter(|text| !text.is_empty())
+                            {
+                                self.streamed_message_text = true;
+                                self.pending_public_text.push_str(text);
+                                self.pending_public_text =
+                                    bound_agent_final_text(&self.pending_public_text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_stop" => {
+                if let Some(tool) = self.active_tool.clone() {
+                    let content = format_claude_streaming_tool(tool.clone());
+                    self.record_history(
+                        MessageRole::Tool,
+                        "tool_call",
+                        &tool.name,
+                        tool.id,
+                        content,
+                    );
+                }
+            }
+            "message_stop" | "result" => self.flush_public_text(),
+            "assistant" | "user" => {
+                let message = event.get("message").unwrap_or(event);
+                let assistant = event.get("type").and_then(Value::as_str) == Some("assistant");
+                if assistant && (!self.saw_stream_event || !self.streamed_message_text) {
+                    if let Some(text) = extract_claude_assistant_text(message) {
+                        self.record_history(MessageRole::Assistant, "progress", "", None, text);
+                    }
+                }
+                if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+                    for block in blocks {
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("tool_use") if assistant => self.record_history_tool(block, false),
+                            Some("tool_result") => self.record_history_tool(block, true),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "tool_use" => self.record_history_tool(event, false),
+            "tool_result" | "tool_use_result" => self.record_history_tool(event, true),
+            _ => {}
+        }
+    }
+
+    fn record_history_tool(&mut self, event: &Value, result: bool) {
+        self.flush_public_text();
+        let call_id = claude_tool_result_key(event);
+        let name = if result {
+            call_id
+                .as_ref()
+                .and_then(|id| self.tool_names.get(id))
+                .cloned()
+                .unwrap_or_else(|| claude_tool_name(event))
+        } else {
+            claude_tool_name(event)
+        };
+        let content = if result {
+            format_claude_tool_result(event, &self.tool_names)
+        } else {
+            format_claude_tool_use(event, &mut self.tool_names)
+        };
+        self.record_history(
+            MessageRole::Tool,
+            if result { "tool_result" } else { "tool_call" },
+            &name,
+            call_id,
+            content,
+        );
+    }
+
+    fn flush_public_text(&mut self) {
+        let text = std::mem::take(&mut self.pending_public_text);
+        self.record_history(MessageRole::Assistant, "progress", "", None, text);
+    }
+
+    fn record_history(
+        &mut self,
+        role: MessageRole,
+        kind: &'static str,
+        name: &str,
+        call_id: Option<String>,
+        content: String,
+    ) {
+        if content.trim().is_empty()
+            || self.history_messages.len() >= AGENT_TOOL_MESSAGES_MAX_COUNT
+            || self.history_bytes >= AGENT_TOOL_MESSAGES_MAX_TOTAL_BYTES
+        {
+            return;
+        }
+        let source_hash: [u8; 32] = Sha256::digest(content.trim().as_bytes()).into();
+        let content = bound_agent_text(
+            &content,
+            AGENT_TOOL_MESSAGE_MAX_BYTES
+                .min(AGENT_TOOL_MESSAGES_MAX_TOTAL_BYTES - self.history_bytes),
+            "activity",
+        );
+        let key = format!(
+            "{kind}:{}",
+            call_id.clone().unwrap_or_else(|| hex::encode(source_hash))
+        );
+        if !self.recorded_activity.insert(key) {
+            return;
+        }
+        self.history_bytes += content.len();
+        self.history_messages.push(ClaudeHistoryMessage {
+            role,
+            content,
+            kind,
+            tool_name: name.to_string(),
+            call_id,
+            source_hash,
+        });
+    }
+
+    fn take_history_messages(
+        &mut self,
+        final_assistant: Option<&str>,
+    ) -> Vec<ClaudeHistoryMessage> {
+        self.flush_public_text();
+        let mut messages = std::mem::take(&mut self.history_messages);
+        if let Some(index) = messages
+            .iter()
+            .rposition(|message| message.role == MessageRole::Assistant)
+            && final_assistant.is_some_and(|text| {
+                <[u8; 32]>::from(Sha256::digest(text.trim().as_bytes()))
+                    == messages[index].source_hash
+            })
+        {
+            messages.remove(index);
+        }
+        messages
     }
 
     fn normalize_event(&mut self, event: &Value) -> String {
@@ -185,12 +374,10 @@ impl ClaudeLiveOutputNormalizer {
                 .unwrap_or_default(),
             "assistant" if !self.saw_stream_event => {
                 let message = event.get("message").unwrap_or(event);
-                if self.final_assistant_message.is_none() {
-                    if let Some(text) = extract_claude_assistant_text(message) {
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            self.final_assistant_message = Some(bound_agent_final_text(&text));
-                        }
+                if let Some(text) = extract_claude_assistant_text(message) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        self.final_assistant_message = Some(bound_agent_final_text(&text));
                     }
                 }
                 let section = format_claude_message_content(message, false, &mut self.tool_names);
@@ -331,7 +518,10 @@ fn format_claude_streaming_tool(tool: ClaudeStreamingTool) -> String {
     format_claude_tool_sections(&tool.name, tool.id.as_deref(), Some(&input), None)
 }
 
-fn format_claude_tool_use(event: &Value, tool_names: &mut HashMap<String, String>) -> String {
+pub(crate) fn format_claude_tool_use(
+    event: &Value,
+    tool_names: &mut HashMap<String, String>,
+) -> String {
     let name = claude_tool_name(event);
     let id = event
         .get("id")
@@ -350,7 +540,10 @@ fn format_claude_tool_use(event: &Value, tool_names: &mut HashMap<String, String
     format_claude_tool_sections(&name, id, input.as_deref(), None)
 }
 
-fn format_claude_tool_result(event: &Value, tool_names: &HashMap<String, String>) -> String {
+pub(crate) fn format_claude_tool_result(
+    event: &Value,
+    tool_names: &HashMap<String, String>,
+) -> String {
     let id = event
         .get("tool_use_id")
         .or_else(|| event.get("toolUseId"))

@@ -187,7 +187,7 @@ impl SessionManager {
             .get(session_id)
             .cloned()
             .or_else(|| self.storage.get_session_summary(session_id).ok().flatten())?;
-        if session.provider != Provider::Codex {
+        if !matches!(session.provider, Provider::Codex | Provider::Claude) {
             return None;
         }
         let native_session_id = session.native_session_id.as_deref()?;
@@ -255,10 +255,12 @@ impl SessionManager {
         }
 
         let stored = self.messages(session_id)?;
-        Ok(Some(merge_mapped_external_messages(
-            stored,
-            external.as_ref().clone(),
-        )))
+        let merge = if record.summary.provider == Provider::Claude {
+            merge_mapped_claude_messages
+        } else {
+            merge_mapped_external_messages
+        };
+        Ok(Some(merge(stored, external.as_ref().clone())))
     }
 
     async fn active_context_messages_including_external(

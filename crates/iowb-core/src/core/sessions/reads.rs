@@ -78,6 +78,28 @@ impl SessionManager {
             } else {
                 None
             }
+        } else if session.provider == Provider::Claude && session.native_session_id.is_some() {
+            if let Some(record) = self.external_record_for_messages(&session.id).await {
+                let key = format!(
+                    "mapped:{}:{}",
+                    session.id,
+                    external_session_cache_key(&record)
+                );
+                if let Some(cached) = self.cached_history_window(&key).await
+                    && cached.version.as_ref()
+                        == Some(&self.storage.message_history_version(&session.id)?)
+                    && cached.fingerprint == external_file_fingerprint(&record.file_path)
+                    && let HistoryWindowValue::Messages(messages) = cached.value
+                {
+                    Some(messages.len())
+                } else {
+                    self.cached_external_record_message_count(&record)
+                        .await
+                        .map(|total| total.max(stored_summary_count))
+                }
+            } else {
+                None
+            }
         } else if session.provider == Provider::Codex
             && session.native_session_id.is_some()
             && !session.native_rollout_owned_by_provider
