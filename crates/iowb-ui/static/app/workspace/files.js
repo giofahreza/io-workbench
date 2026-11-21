@@ -442,12 +442,37 @@ async function createFolderInFolderBrowser() {
   showToast("Folder created", "ok");
 }
 
-function openFolderBrowser(targetInput = "", options = {}) {
+function configuredWorkspaceRoot() {
+  const candidates = [
+    state.settings?.server?.status?.workspaceRoot,
+    state.settings?.server?.status?.workspace_root,
+    state.settings?.server?.webStatus?.server?.appRoot,
+    state.settings?.server?.webStatus?.server?.workspaceRoot,
+  ];
+  return candidates.find((value) => typeof value === "string" && value.trim())?.trim() || "";
+}
+
+async function loadConfiguredWorkspaceRoot() {
+  const existing = configuredWorkspaceRoot();
+  if (existing) return existing;
+  try {
+    state.settings = await api("/api/settings/server-status");
+    return configuredWorkspaceRoot();
+  } catch {
+    return "";
+  }
+}
+
+async function openFolderBrowser(targetInput = "", options = {}) {
   const currentValue = targetInput ? qs(targetInput)?.value.trim() : "";
+  let initialPath = options.path || currentValue;
+  if (!initialPath && options.action === "add-project") {
+    initialPath = await loadConfiguredWorkspaceRoot();
+  }
   state.folderBrowser.open = true;
   state.folderBrowser.action = options.action || "select";
   state.folderBrowser.targetInput = targetInput;
-  state.folderBrowser.path = options.path || currentValue || "~";
+  state.folderBrowser.path = initialPath || "~";
   state.folderBrowser.filter = "";
   state.folderBrowser.entries = [];
   state.folderBrowser.showHidden = false;
