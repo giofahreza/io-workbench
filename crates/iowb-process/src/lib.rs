@@ -55,6 +55,7 @@ pub enum ProcessEvent {
         process_id: String,
         stream: ProcessStream,
         data: String,
+        sequence: u64,
     },
     Exited {
         process_id: String,
@@ -73,6 +74,7 @@ pub enum ProcessEvent {
 pub struct ProcessOutputChunk {
     pub stream: ProcessStream,
     pub data: String,
+    pub sequence: u64,
 }
 
 #[derive(Clone)]
@@ -92,18 +94,25 @@ struct ProcessRecord {
 struct ProcessOutputBuffer {
     chunks: VecDeque<ProcessOutputChunk>,
     byte_len: usize,
+    sequence: u64,
 }
 
 impl ProcessOutputBuffer {
-    fn push(&mut self, stream: ProcessStream, data: String) {
+    fn push(&mut self, stream: ProcessStream, data: String) -> u64 {
+        self.sequence += 1;
         self.byte_len = self.byte_len.saturating_add(data.len());
-        self.chunks.push_back(ProcessOutputChunk { stream, data });
+        self.chunks.push_back(ProcessOutputChunk {
+            stream,
+            data,
+            sequence: self.sequence,
+        });
         while self.byte_len > PROCESS_OUTPUT_REPLAY_BYTES {
             let Some(removed) = self.chunks.pop_front() else {
                 break;
             };
             self.byte_len = self.byte_len.saturating_sub(removed.data.len());
         }
+        self.sequence
     }
 
     fn snapshot(&self) -> Vec<ProcessOutputChunk> {
@@ -508,7 +517,7 @@ where
                 Ok(0) => break,
                 Ok(read) => {
                     let data = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                    output
+                    let sequence = output
                         .lock()
                         .expect("process output buffer lock must not be poisoned")
                         .push(stream, data.clone());
@@ -516,6 +525,7 @@ where
                         process_id: process_id.clone(),
                         stream,
                         data,
+                        sequence,
                     });
                 }
                 Err(error) => {
@@ -549,7 +559,7 @@ fn spawn_pty_reader(
                         .expect("PTY output gate lock must not be poisoned");
                     if *output_open {
                         let data = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                        output
+                        let sequence = output
                             .lock()
                             .expect("process output buffer lock must not be poisoned")
                             .push(ProcessStream::Stdout, data.clone());
@@ -557,6 +567,7 @@ fn spawn_pty_reader(
                             process_id: process_id.clone(),
                             stream: ProcessStream::Stdout,
                             data,
+                            sequence,
                         });
                     }
                 }
@@ -762,6 +773,7 @@ mod tests {
                     process_id,
                     stream: ProcessStream::Stdout,
                     data,
+                    ..
                 } if process_id == started.id && data.contains("got:hello") => {
                     saw_output = true;
                     break;
@@ -971,6 +983,7 @@ mod tests {
                     process_id,
                     stream: ProcessStream::Stdout,
                     data,
+                    ..
                 } if process_id == started.id && data.contains("PIPE_STDOUT") => {
                     saw_stdout = true;
                 }
@@ -978,6 +991,7 @@ mod tests {
                     process_id,
                     stream: ProcessStream::Stderr,
                     data,
+                    ..
                 } if process_id == started.id && data.contains("PIPE_STDERR") => {
                     saw_stderr = true;
                 }
@@ -1106,5 +1120,11 @@ mod tests {
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].stream, ProcessStream::Stderr);
         assert_eq!(replay[0].data, "b");
+        assert_eq!(
+            replay[0].sequence, 2,
+            "trimming must not reset chunk identity"
+        );
+        assert_eq!(output.push(ProcessStream::Stdout, "c".into()), 3);
+        assert_eq!(output.snapshot()[0].sequence, 2);
     }
 }

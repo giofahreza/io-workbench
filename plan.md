@@ -471,3 +471,7 @@ PLAYWRIGHT_MODULE=/path/to/playwright node scripts/test-provider-acceptance.mjs
 ```
 
 The runner requires browser execution, serializes Rust tests that mutate process-global environment, and limits Node test-file concurrency. One pre-existing Git `FETCH_HEAD` compatibility test remains explicitly excluded and one pre-existing Rust test remains ignored; neither is counted as provider-feature acceptance coverage. All commands and their exact totals are recorded in `/tmp/iowb-acceptance-isolated-full.log` for this machine.
+
+### Follow-up: mobile terminal recovery
+
+The subsequent terminal investigation, fixes, Android emulator checks, Linux PTY checks, regression results, and delivered APK are documented in [mobile terminal recovery validation](docs/testing/mobile-terminal-recovery.md). The user authorized clean installation with the existing Mac signing key because the original Linux key was unavailable. This supersedes the signing/delivery blocker for that terminal build; it does not mark the remaining provider onboarding/device cases above as passed.

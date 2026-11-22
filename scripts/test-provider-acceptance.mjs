@@ -43,7 +43,7 @@ async function run(command, args, cwd = repository) {
   if (code !== 0) throw new Error(`${command} failed with exit code ${code}`);
 }
 try {
-  await run('cargo', [`+${toolchain}`, 'test', '--offline', '-p', 'iowb-core', '-p', 'iowb-protocol', '-p', 'iowb-server', '-p', 'iowb-storage', '-p', 'iowb-tui', '-p', 'iowb-ui', '--lib', '--', '--test-threads=1', '--skip', 'fetch_all_remotes_matches_lazygit_and_preserves_fetch_head']);
+  await run('cargo', [`+${toolchain}`, 'test', '--offline', '-p', 'iowb-core', '-p', 'iowb-process', '-p', 'iowb-protocol', '-p', 'iowb-server', '-p', 'iowb-storage', '-p', 'iowb-tui', '-p', 'iowb-ui', '--lib', '--', '--test-threads=1', '--skip', 'fetch_all_remotes_matches_lazygit_and_preserves_fetch_head']);
   await run('cargo', [`+${toolchain}`, 'build', '--offline', '-p', 'iowb-cli']);
   const { readdir } = await import('node:fs/promises');
   for (const directory of ['crates/iowb-ui/tests', 'crates/iowb-server/tests']) {

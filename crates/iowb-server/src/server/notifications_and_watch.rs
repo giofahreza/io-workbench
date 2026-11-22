@@ -338,10 +338,12 @@ fn spawn_process_event_bridge(state: AppState) {
                     process_id,
                     stream,
                     data,
+                    sequence,
                 }) => hub.publish(WsServerEvent::ProcessOutput {
                     process_id,
                     stream,
                     data,
+                    sequence: Some(sequence),
                 }),
                 Ok(ProcessEvent::Exited { process_id, code }) => {
                     hub.publish(WsServerEvent::ProcessExited { process_id, code });

@@ -239,6 +239,7 @@ async fn handle_ws_command(
                             process_id: process_id.clone(),
                             stream: chunk.stream,
                             data: chunk.data,
+                            sequence: Some(chunk.sequence),
                         })
                         .is_err()
                     {

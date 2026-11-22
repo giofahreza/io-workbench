@@ -1,6 +1,6 @@
     use super::{
         AUTO_SESSION_TITLE_MAX_CHARS, ForkSessionRequest, SessionLifetimeTokenUsage, SessionMode,
-        SessionSpentTokenUsage, SessionSummary, WsClientCommand, session_title_from_prompt,
+        SessionSpentTokenUsage, SessionSummary, WsClientCommand, WsServerEvent, ProcessStream, session_title_from_prompt,
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
@@ -281,4 +281,18 @@
             session_title_from_prompt("Review this\n\n![screen](data:image/png;base64,QUJDRA==)"),
             Some("Review this Attached image: screen".to_string())
         );
+    }
+
+    #[test]
+    fn terminal_output_sequence_is_optional_for_legacy_peers() {
+        let legacy = serde_json::json!({"type":"process_output", "processId":"terminal", "stream":"stdout", "data":"prompt"});
+        let event: WsServerEvent = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(event).unwrap(), legacy);
+        let event = WsServerEvent::ProcessOutput {
+            process_id: "terminal".into(),
+            stream: ProcessStream::Stdout,
+            data: "prompt".into(),
+            sequence: Some(42),
+        };
+        assert_eq!(serde_json::to_value(event).unwrap()["sequence"], 42);
     }

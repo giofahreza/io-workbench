@@ -209,6 +209,8 @@ pub enum WsServerEvent {
         process_id: String,
         stream: ProcessStream,
         data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
     },
     ProcessExited {
         #[serde(rename = "processId")]
