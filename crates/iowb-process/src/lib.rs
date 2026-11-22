@@ -79,6 +79,7 @@ pub struct ProcessOutputChunk {
 pub struct ProcessManager {
     processes: Arc<RwLock<HashMap<String, Arc<ProcessRecord>>>>,
     events: broadcast::Sender<ProcessEvent>,
+    default_working_directory: Option<PathBuf>,
 }
 
 struct ProcessRecord {
@@ -130,6 +131,14 @@ impl ProcessManager {
         Self {
             processes: Arc::new(RwLock::new(HashMap::new())),
             events,
+            default_working_directory: None,
+        }
+    }
+
+    pub fn with_working_directory(directory: PathBuf) -> Self {
+        Self {
+            default_working_directory: Some(directory),
+            ..Self::new()
         }
     }
 
@@ -137,9 +146,16 @@ impl ProcessManager {
         self.events.subscribe()
     }
 
-    pub async fn start(&self, request: ProcessStartRequest) -> Result<ProcessStartResponse> {
+    pub async fn start(&self, mut request: ProcessStartRequest) -> Result<ProcessStartResponse> {
         if request.command.trim().is_empty() {
             return Err(ProcessError::EmptyCommand);
+        }
+
+        if request.cwd.is_none() {
+            request.cwd = self
+                .default_working_directory
+                .as_ref()
+                .map(|path| path.display().to_string());
         }
 
         if request.pty {
@@ -658,6 +674,58 @@ fn spawn_input_writer(
 mod tests {
     use super::*;
     use tokio::time::{Duration, Instant, timeout};
+
+    #[tokio::test]
+    async fn workspace_directory_is_used_unless_request_overrides_it() {
+        let root = std::env::temp_dir().join(format!("iowb-cwd-{}", Uuid::new_v4()));
+        let workspace = root.join("dev");
+        let project = workspace.join("project");
+        std::fs::create_dir_all(&project).expect("workspace exists");
+        let manager = ProcessManager::with_working_directory(workspace.clone());
+
+        for pty in [false, true] {
+            for explicit in [false, true] {
+                let expected = if explicit { &project } else { &workspace };
+                let mut events = manager.subscribe();
+                let started = manager
+                    .start(ProcessStartRequest {
+                        command: "/bin/sh".into(),
+                        args: vec!["-c".into(), "pwd -P".into()],
+                        cwd: explicit.then(|| project.display().to_string()),
+                        pty,
+                        cols: 80,
+                        rows: 24,
+                    })
+                    .await
+                    .expect("process starts");
+                let output = timeout(Duration::from_secs(5), async {
+                    let mut output = String::new();
+                    loop {
+                        match events.recv().await.expect("process event") {
+                            ProcessEvent::Output {
+                                process_id, data, ..
+                            } if process_id == started.id => output.push_str(&data),
+                            ProcessEvent::Exited { process_id, code }
+                                if process_id == started.id =>
+                            {
+                                assert_eq!(code, Some(0));
+                                break output;
+                            }
+                            ProcessEvent::Failed { message, .. } => panic!("{message}"),
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .expect("process exits");
+                assert_eq!(
+                    output.trim(),
+                    expected.canonicalize().unwrap().to_str().unwrap()
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).expect("remove workspace");
+    }
 
     #[tokio::test]
     async fn writes_process_input_to_child_stdin() {

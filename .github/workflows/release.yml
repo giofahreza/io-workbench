@@ -69,6 +69,7 @@ jobs:
           sh -n scripts/install-termux.sh
           sh -n scripts/uninstall-termux.sh
           sh scripts/install.sh --help >/dev/null
+          node --test scripts/tests/install-workspace.test.mjs
           pwsh -NoLogo -NoProfile -Command '$tokens = $null; $errors = $null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "scripts/install.ps1"), [ref]$tokens, [ref]$errors) | Out-Null; if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_; }; exit 1 }'
 
   package-native:

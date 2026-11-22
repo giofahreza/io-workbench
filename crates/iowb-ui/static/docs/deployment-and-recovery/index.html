@@ -76,11 +76,12 @@ After=network-online.target
 
 [Service]
 User=io-workbench
-WorkingDirectory=/srv/projects
+WorkingDirectory=/var/lib/io-workbench/dev
+Environment=HOME=/var/lib/io-workbench
 Environment=IO_WORKBENCH_HOST=127.0.0.1
 Environment=IO_WORKBENCH_PORT=8100
 Environment=IO_WORKBENCH_CONFIG_DIR=/var/lib/io-workbench
-Environment=IO_WORKBENCH_WORKSPACE_ROOT=/srv/projects
+Environment=IO_WORKBENCH_WORKSPACE_ROOT=/var/lib/io-workbench/dev
 ExecStart=/opt/io-workbench/io-workbench start
 Restart=on-failure
 
@@ -91,16 +92,18 @@ After=network-online.target
 
 [Service]
 User=io-workbench
-WorkingDirectory=/srv/projects
+WorkingDirectory=/var/lib/io-workbench/dev
+Environment=HOME=/var/lib/io-workbench
 Environment=IO_WORKBENCH_HOST=127.0.0.1
 Environment=IO_WORKBENCH_PORT=8100
 Environment=IO_WORKBENCH_CONFIG_DIR=/var/lib/io-workbench
-Environment=IO_WORKBENCH_WORKSPACE_ROOT=/srv/projects
+Environment=IO_WORKBENCH_WORKSPACE_ROOT=/var/lib/io-workbench/dev
 ExecStart=/opt/io-workbench/io-workbench start
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target</code></pre><p class="docs-copy-status" aria-live="polite"></p></div>
+<p>For this dedicated service account, <code>~/dev</code> is <code>/var/lib/io-workbench/dev</code>. Create it before starting the unit with <code>sudo install -d -o io-workbench -g io-workbench /var/lib/io-workbench/dev</code>. Set both workspace paths explicitly if projects belong under another account's home.</p>
 <p>Build the release binary with <code>cargo build --release -p iowb-cli --bin io-workbench</code>, or let the tag workflow replace <code>/opt/io-workbench/io-workbench</code>. Run the service as a dedicated non-login account where appropriate, and use <a class="docs-inline-link" href="/docs/remote-access/">Remote access</a> rather than publishing a development listener directly.</p>
 </section>
 <section id="release-tag-production-deployment" aria-labelledby="release-tag-production-deployment-title">

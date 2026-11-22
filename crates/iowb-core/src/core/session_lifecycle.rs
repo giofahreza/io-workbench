@@ -81,7 +81,8 @@ impl AppConfig {
             env_path("IO_WORKBENCH_CONFIG_DIR").unwrap_or_else(|| home.join(CONFIG_DIR_NAME));
         let database_path = env_path("IO_WORKBENCH_DATABASE_PATH")
             .unwrap_or_else(|| config_dir.join(DATABASE_FILE_NAME));
-        let workspace_root = env_path("IO_WORKBENCH_WORKSPACE_ROOT").unwrap_or(home);
+        let workspace_root =
+            env_path("IO_WORKBENCH_WORKSPACE_ROOT").unwrap_or_else(|| home.join("dev"));
         let host = env::var("IO_WORKBENCH_HOST")
             .ok()
             .and_then(|value| value.parse().ok())

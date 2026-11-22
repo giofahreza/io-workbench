@@ -80,7 +80,7 @@ Runtime options:
   --port <port>              POSIX-style spelling of -Port.
   -ConfigDir <path>          Data directory (default: %USERPROFILE%\.io-workbench).
   --config-dir <path>        POSIX-style spelling of -ConfigDir.
-  -WorkspaceRoot <path>      Existing directory the UI may browse.
+  -WorkspaceRoot <path>      Directory the UI may browse (default: ~/dev; created).
   --workspace-root <path>    POSIX-style spelling of -WorkspaceRoot.
   -AutoStart                 Register and start a per-user Scheduled Task.
   -NoAutoStart               Do not create one; removes an installer-managed
@@ -602,6 +602,7 @@ function Write-WorkbenchLauncher {
         "`$env:IO_WORKBENCH_CONFIG_DIR = $(ConvertTo-PowerShellLiteral -Value $ConfigDir)",
         "`$env:IO_WORKBENCH_WORKSPACE_ROOT = $(ConvertTo-PowerShellLiteral -Value $WorkspaceRoot)",
         "`$env:Path = $(ConvertTo-PowerShellLiteral -Value $pathPrefix) + [System.IO.Path]::PathSeparator + `$env:Path",
+        "Set-Location -LiteralPath $(ConvertTo-PowerShellLiteral -Value $WorkspaceRoot)",
         "& $(ConvertTo-PowerShellLiteral -Value $WorkbenchPath) start",
         'exit $LASTEXITCODE',
         ''
@@ -1124,7 +1125,7 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = Join-Path $localA
 if ([string]::IsNullOrWhiteSpace($BindHost)) { $BindHost = '127.0.0.1' }
 if ([string]::IsNullOrWhiteSpace($Port)) { $Port = '8787' }
 if ([string]::IsNullOrWhiteSpace($ConfigDir)) { $ConfigDir = Join-Path $userProfile '.io-workbench' }
-if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) { $WorkspaceRoot = $userProfile }
+if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) { $WorkspaceRoot = Join-Path $userProfile 'dev' }
 if ([string]::IsNullOrWhiteSpace($NpmPrefix)) { $NpmPrefix = Join-Path $localAppData 'io-workbench\npm' }
 
 $InstallDir = Resolve-InstallerPath -Value $InstallDir -Name 'Install directory' -UserProfile $userProfile
@@ -1170,7 +1171,7 @@ if ($interactiveSetup) {
         $ConfigDir = Read-InstallerDirectory -Prompt 'Data/configuration directory' -Default $ConfigDir -MustExist $false -UserProfile $userProfile
     }
     if (-not $workspaceRootExplicit) {
-        $WorkspaceRoot = Read-InstallerDirectory -Prompt 'Workspace root (existing directory)' -Default $WorkspaceRoot -MustExist $true -UserProfile $userProfile
+        $WorkspaceRoot = Read-InstallerDirectory -Prompt 'Workspace root (created if missing)' -Default $WorkspaceRoot -MustExist $false -UserProfile $userProfile
     }
 }
 
@@ -1180,7 +1181,10 @@ if ((Test-Path -LiteralPath $ConfigDir) -and -not (Test-Path -LiteralPath $Confi
     throw "Data/configuration path exists but is not a directory: $ConfigDir"
 }
 if (-not (Test-Path -LiteralPath $WorkspaceRoot -PathType Container)) {
-    throw "Workspace root does not exist or is not a directory: $WorkspaceRoot"
+    if ($workspaceRootExplicit -or (Test-Path -LiteralPath $WorkspaceRoot)) {
+        throw "Workspace root does not exist or is not a directory: $WorkspaceRoot"
+    }
+    New-Item -ItemType Directory -Path $WorkspaceRoot -Force | Out-Null
 }
 if (Test-InstallerRootDirectory -Path $WorkspaceRoot) {
     if ($interactiveSetup) {

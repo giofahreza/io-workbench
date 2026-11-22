@@ -364,7 +364,7 @@ prepare_project_deletion() {
     PROJECT_DELETE_PLAN=unsafe
     PROJECT_WORKSPACE_ROOT=
     # Only a runtime-owned, private setting is evidence that a directory is
-    # this local runtime's project root.  Falling back to ~/projects after a
+    # this local runtime's project root.  Falling back to ~/dev after a
     # partial/old uninstall could erase an unrelated Termux folder.
     if ! path_exists "$WORKSPACE_SETTING"; then
         note 'the runtime-owned workspace setting is absent; keeping projects.'

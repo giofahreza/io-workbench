@@ -16,7 +16,7 @@ impl AppState {
             projects: ProjectIndex::new(storage),
             agents: AgentRuntimeManager::new(config.max_sessions),
             tasks: TaskManager::new(),
-            processes: ProcessManager::new(),
+            processes: ProcessManager::with_working_directory(config.workspace_root.clone()),
             files,
             path_validator,
             watch: WatchManager::new(),

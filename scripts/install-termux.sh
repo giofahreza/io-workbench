@@ -18,7 +18,7 @@ RUNTIME_HOME=${IO_WORKBENCH_TERMUX_HOME:-"$HOME/.local/share/io-workbench"}
 SOURCE_DIR=${IO_WORKBENCH_TERMUX_SOURCE_DIR:-"$RUNTIME_HOME/source"}
 BIN_DIR=${IO_WORKBENCH_BIN_DIR:-"$HOME/.local/bin"}
 CONFIG_DIR=${IO_WORKBENCH_CONFIG_DIR:-"$HOME/.io-workbench"}
-WORKSPACE_ROOT=${IO_WORKBENCH_WORKSPACE_ROOT:-"$HOME/projects"}
+WORKSPACE_ROOT=${IO_WORKBENCH_WORKSPACE_ROOT:-}
 CARGO_BUILD_JOBS=${IO_WORKBENCH_TERMUX_CARGO_JOBS:-1}
 INSTALL_METHOD=${IO_WORKBENCH_TERMUX_INSTALL_METHOD:-prebuilt}
 START_AFTER_INSTALL=1
@@ -72,7 +72,7 @@ usage() {
         '  --repo <url>            Source repository (default: official io-workbench repository).' \
         '  --ref <branch-or-tag>   Git ref to build (default: main).' \
         '  --port <port>            Loopback port (default: 8787).' \
-        '  --workspace-root <dir>  Private Termux project parent (default: ~/projects).' \
+        '  --workspace-root <dir>  Private Termux project parent (default: ~/dev).' \
         '  --prebuilt              Download the verified release runtime (default).' \
         '  --build-from-source     Explicit fallback: clone and build natively in Termux.' \
         '  --no-start              Install but do not start the host.' \
@@ -544,6 +544,15 @@ umask 077
 LOG_DIR="$CONFIG_DIR/logs"
 LOG_PATH="$LOG_DIR/termux-bootstrap.log"
 RUNTIME_TOKEN_PATH="$CONFIG_DIR/termux-runtime-token"
+# Upgrades keep the workspace saved by a previous install. Fresh installs
+# start in ~/dev; an explicit environment variable or flag takes precedence.
+if [ -z "$WORKSPACE_ROOT" ]; then
+    saved_workspace_root=
+    if [ -r "$CONFIG_DIR/termux-runtime-workspace-root" ]; then
+        IFS= read -r saved_workspace_root <"$CONFIG_DIR/termux-runtime-workspace-root" || true
+    fi
+    WORKSPACE_ROOT=${saved_workspace_root:-"$HOME/dev"}
+fi
 mkdir -p "$LOG_DIR" "$RUNTIME_HOME" "$BIN_DIR" "$CONFIG_DIR" "$WORKSPACE_ROOT" || \
     fail 'could not create the private runtime directories.'
 : >"$LOG_PATH" || fail "could not write $LOG_PATH"
@@ -1091,7 +1100,7 @@ fi
 PORT=${IO_WORKBENCH_PORT:-"$DEFAULT_PORT"}
 valid_port "$PORT" || { printf '%s\n' 'io-workbench local runtime port is invalid.' >&2; exit 2; }
 
-DEFAULT_WORKSPACE_ROOT="$TERMUX_HOME/projects"
+DEFAULT_WORKSPACE_ROOT="$TERMUX_HOME/dev"
 saved_workspace_root=
 if [ -r "$RUNTIME_WORKSPACE_ROOT_PATH" ]; then
     IFS= read -r saved_workspace_root <"$RUNTIME_WORKSPACE_ROOT_PATH" || true

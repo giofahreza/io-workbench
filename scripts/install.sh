@@ -65,7 +65,7 @@ usage() {
         '  --host <IP>              Bind IPv4 address, ::1, or :: (default: 127.0.0.1).' \
         '  --port <port>            TCP port (default: 8787).' \
         '  --config-dir <path>      Data directory (default: ~/.io-workbench).' \
-        '  --workspace-root <path>  Existing directory the UI may browse.' \
+        '  --workspace-root <path>  Directory the UI may browse (default: ~/dev; created).' \
         '  --autostart              Enable/start a user service (Linux systemd or macOS LaunchAgent).' \
         '  --no-autostart           Do not create/start a service.' \
         '  --no-start               Alias for --no-autostart.' \
@@ -802,7 +802,7 @@ validate_choice IO_WORKBENCH_INTERACTIVE "$INTERACTIVE_MODE"
 
 [ -n "${HOME:-}" ] || die 'HOME is not set; choose a user account before running the installer.'
 [ -n "$CONFIG_DIR" ] || CONFIG_DIR="$HOME/.io-workbench"
-[ -n "$WORKSPACE_ROOT" ] || WORKSPACE_ROOT="$HOME"
+[ -n "$WORKSPACE_ROOT" ] || WORKSPACE_ROOT="$HOME/dev"
 [ -n "$BIN_DIR" ] || BIN_DIR="$HOME/.local/bin"
 [ -n "$NPM_PREFIX" ] || NPM_PREFIX="$HOME/.local"
 is_valid_port "$PORT" || die "invalid port: $PORT. Choose a whole-number TCP port from 1 through 65535."
@@ -859,7 +859,7 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         [ "$(ask_yes_no 'Continue with this network-exposed bind address?' no)" = yes ] || die 'installation cancelled before downloading a release.'
     fi
     [ "$CONFIG_DIR_EXPLICIT" -eq 1 ] || CONFIG_DIR=$(ask_directory 'Data/configuration directory' "$CONFIG_DIR" no)
-    [ "$WORKSPACE_ROOT_EXPLICIT" -eq 1 ] || WORKSPACE_ROOT=$(ask_directory 'Workspace root (existing directory)' "$WORKSPACE_ROOT" yes)
+    [ "$WORKSPACE_ROOT_EXPLICIT" -eq 1 ] || WORKSPACE_ROOT=$(ask_directory 'Workspace root (created if missing)' "$WORKSPACE_ROOT" no)
     CONFIG_DIR=$(absolute_path "$CONFIG_DIR")
     WORKSPACE_ROOT=$(absolute_path "$WORKSPACE_ROOT")
     if [ "$WORKSPACE_ROOT" = / ]; then
@@ -971,7 +971,11 @@ CONFIG_DIR=$(absolute_path "$CONFIG_DIR")
 WORKSPACE_ROOT=$(absolute_path "$WORKSPACE_ROOT")
 BIN_DIR=$(absolute_path "$BIN_DIR")
 NPM_PREFIX=$(absolute_path "$NPM_PREFIX")
-[ -d "$WORKSPACE_ROOT" ] || die "workspace root does not exist: $WORKSPACE_ROOT"
+[ ! -e "$WORKSPACE_ROOT" ] || [ -d "$WORKSPACE_ROOT" ] || die "workspace path exists but is not a directory: $WORKSPACE_ROOT"
+if [ ! -d "$WORKSPACE_ROOT" ]; then
+    [ "$WORKSPACE_ROOT_EXPLICIT" -eq 0 ] || die "workspace root does not exist: $WORKSPACE_ROOT"
+    mkdir -p "$WORKSPACE_ROOT" || die "could not create workspace root: $WORKSPACE_ROOT"
+fi
 [ ! -e "$CONFIG_DIR" ] || [ -d "$CONFIG_DIR" ] || die "config path exists but is not a directory: $CONFIG_DIR"
 
 TMP_BASE=$(printenv TMPDIR 2>/dev/null || printf '%s' /tmp)

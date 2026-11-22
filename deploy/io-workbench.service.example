@@ -4,15 +4,17 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Provision the service user's workspace before starting this unit:
+# sudo install -d -o io-workbench -g io-workbench /var/lib/io-workbench/dev
 Type=simple
 User=io-workbench
 Group=io-workbench
-WorkingDirectory=/srv/projects
+WorkingDirectory=/var/lib/io-workbench/dev
 Environment=HOME=/var/lib/io-workbench
 Environment=IO_WORKBENCH_HOST=127.0.0.1
 Environment=IO_WORKBENCH_PORT=8100
 Environment=IO_WORKBENCH_CONFIG_DIR=/var/lib/io-workbench
-Environment=IO_WORKBENCH_WORKSPACE_ROOT=/srv/projects
+Environment=IO_WORKBENCH_WORKSPACE_ROOT=/var/lib/io-workbench/dev
 ExecStart=/opt/io-workbench/io-workbench start
 Restart=on-failure
 RestartSec=5

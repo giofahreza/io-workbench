@@ -50,6 +50,8 @@ io-workbench start
 
 Open <http://127.0.0.1:8787>, complete first-user setup, add a project, and confirm the provider CLIs you want to use are installed and authenticated on that host.
 
+The default workspace is `~/dev` (`%USERPROFILE%\dev` on Windows), created automatically on first install or startup. Terminals without a selected project start there. Set `IO_WORKBENCH_WORKSPACE_ROOT` or pass `--workspace-root` to use another directory; installer-managed services retain the workspace chosen during setup.
+
 After a first install or upgrade, run `io-workbench doctor --require-running` for a repair-oriented local check. Use `io-workbench doctor --json --require-running` in automation, or `io-workbench setup` to print the non-mutating first-run checklist.
 
 For remote access, put the server behind your own VPN, authenticated reverse proxy, or tunnel with HTTPS/WSS support. `workbench.giofahreza.com` is the public GitHub Pages landing and docs site—not an io-workbench API or host endpoint.
