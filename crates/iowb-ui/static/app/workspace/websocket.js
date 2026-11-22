@@ -42,6 +42,7 @@ function connectWs() {
   });
 
   ws.addEventListener("message", (event) => {
+    if (state.ws !== ws || ws._iowbGeneration !== state.wsGeneration) return;
     let payload;
     try {
       payload = JSON.parse(event.data);
@@ -443,6 +444,9 @@ function connectWs() {
     if (payload.type === "chat_recovery_required") {
       handleChatRecoveryRequired(payload);
     }
+    if (payload.type === "chat_setup_required") {
+      handleChatSetupRequired(payload);
+    }
     if (payload.type === "process_output") {
       appendShell(payload.data);
     }
@@ -456,6 +460,11 @@ function connectWs() {
       }
     }
     if (payload.type === "error") {
+      if (!payload.sessionId) {
+        setWsStatus("error", payload.message || "WebSocket request failed");
+        showToast(payload.message || "WebSocket request failed", "danger");
+        return;
+      }
       if (payload.sessionId && !isActiveChatSessionEvent(payload)) return;
       appendChatLine(`[error] ${payload.message}${payload.details ? `: ${payload.details}` : ""}`);
     }

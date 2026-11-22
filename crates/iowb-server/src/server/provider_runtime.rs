@@ -101,68 +101,11 @@ fn looks_like_email(value: &str) -> bool {
 }
 
 async fn provider_cli_status(provider: Provider) -> Value {
-    let command = provider_command(provider);
-    let version = command_version(&command).await;
-    let installed = version.is_some();
-    let auth = provider_auth_hint(provider);
-    let authenticated = auth.is_some();
-    let error = if installed {
-        (!authenticated).then_some("Not authenticated")
-    } else {
-        Some("CLI not installed or not in PATH")
-    };
-
-    serde_json::json!({
-        "authenticated": authenticated,
-        "email": auth.as_deref(),
-        "method": auth_method(provider, auth.as_deref()),
-        "error": error,
-        "installed": installed,
-        "command": command,
-        "version": version,
-    })
+    cached_provider_readiness(provider, false).await
 }
 
 fn provider_command(provider: Provider) -> String {
-    let command = match provider {
-        Provider::Claude => "claude",
-        Provider::Codex => "codex",
-        Provider::Gemini => "gemini",
-    };
-    preferred_user_command(command).unwrap_or_else(|| command.to_string())
-}
-
-fn preferred_user_command(command: &str) -> Option<String> {
-    let home = home_dir()?;
-    let candidate = home.join(".local").join("bin").join(command);
-    if candidate.is_file() {
-        Some(candidate.display().to_string())
-    } else {
-        None
-    }
-}
-
-async fn command_version(command: &str) -> Option<String> {
-    // Node-based provider wrappers routinely need more than two seconds on a
-    // cold Android/Termux process. Keep the status check bounded, but leave
-    // enough room for Gemini's wrapper to start before declaring an installed
-    // CLI missing.
-    const PROVIDER_VERSION_TIMEOUT: Duration = Duration::from_secs(8);
-    let result = tokio::time::timeout(
-        PROVIDER_VERSION_TIMEOUT,
-        Command::new(command)
-            .arg("--version")
-            .env("PATH", augmented_user_path())
-            .output(),
-    )
-    .await;
-    let output = match result {
-        Ok(Ok(output)) if output.status.success() => output,
-        _ => return None,
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    [stdout, stderr].into_iter().find(|value| !value.is_empty())
+    iowb_core::provider_executable(provider)
 }
 
 fn provider_auth_hint(provider: Provider) -> Option<String> {
@@ -201,6 +144,7 @@ fn provider_auth_hint(provider: Provider) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn auth_method(provider: Provider, auth: Option<&str>) -> Option<&'static str> {
     auth.map(|auth| {
         if auth.starts_with("API Key Auth") {

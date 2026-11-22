@@ -1170,9 +1170,9 @@ mod tests {
         assert!(source.contains("API key is required when IO Gateway is selected."));
         assert!(source.contains("Gateway URL must start with http:// or https://."));
         assert!(source.contains("Secret OTP must be a valid Base32 TOTP secret."));
-        assert!(source.contains("mode: \"aiproxy\""));
+        assert!(source.contains("mode: normalizedUrl ? \"aiproxy\" : \"off\""));
         assert!(source.contains("chatRuntime: useIoGateway ? \"io_gateway\" : \"native_cli\""));
-        assert!(source.contains("baseUrl: `${normalizedUrl}/claude`"));
+        assert!(source.contains("baseUrl: normalizedUrl ? `${normalizedUrl}/claude` : null"));
         assert!(source.contains("gatewayUrl: normalizedUrl"));
     }
 

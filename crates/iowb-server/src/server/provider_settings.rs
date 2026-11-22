@@ -1,19 +1,17 @@
 async fn cli_provider_status(AxumPath(provider): AxumPath<String>) -> Result<Json<Value>> {
     let provider = parse_provider_param(&provider)?;
-    Ok(Json(provider_cli_status(provider).await))
+    Ok(Json(cached_provider_readiness(provider, true).await))
 }
 
 async fn cli_overview() -> Json<Value> {
-    let mut providers = serde_json::Map::new();
-    for provider in [Provider::Claude, Provider::Codex, Provider::Gemini] {
-        providers.insert(
-            provider.as_str().to_string(),
-            provider_cli_status(provider).await,
-        );
-    }
+    let (claude, codex, gemini) = tokio::join!(
+        provider_cli_status(Provider::Claude),
+        provider_cli_status(Provider::Codex),
+        provider_cli_status(Provider::Gemini)
+    );
     Json(serde_json::json!({
         "success": true,
-        "providers": providers,
+        "providers": { "claude": claude, "codex": codex, "gemini": gemini },
     }))
 }
 

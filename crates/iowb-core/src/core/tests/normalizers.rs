@@ -438,6 +438,7 @@
             CodexAppServerClient::new(script.as_os_str(), Duration::from_secs(2));
         manager
             .start_codex_app_server_live(AgentStartContext {
+                request_id: None,
                 provider: Provider::Codex,
                 session_id: session.id.clone(),
                 durable_run_id: Some(run_id.clone()),

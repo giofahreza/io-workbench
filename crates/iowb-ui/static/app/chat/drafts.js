@@ -285,6 +285,7 @@ function chooseNewChatProvider(provider) {
   setChatProvider(provider);
   updatePendingChatProvider(provider);
   renderChatProviderPicker();
+  loadChatModelsIntoSelect(provider).catch(() => {});
   qs("#chat-prompt")?.focus();
 }
 

@@ -173,6 +173,7 @@ async fn claude_history_is_persisted_before_terminal_status_and_survives_restart
             .await
             .expect("prompt");
         let mut context = AgentStartContext {
+            request_id: None,
             provider: Provider::Claude,
             session_id: session.id.clone(),
             durable_run_id: None,

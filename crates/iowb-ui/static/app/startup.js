@@ -35,6 +35,7 @@ async function bootstrapProtected() {
       renderCachedChatSession(savedSessionId);
     }
     await switchView(targetView);
+    loadChatModelsIntoSelect(chatCliValue()).catch(() => {});
     if (targetView === "chat" && savedSessionId) {
       const session = findChatSession(savedSessionId);
       await pickChatSession(savedSessionId, sessionProjectPath(session, savedProjectPath || activeProjectPath())).catch(showError);

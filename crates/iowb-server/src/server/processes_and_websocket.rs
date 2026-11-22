@@ -249,6 +249,8 @@ async fn handle_ws_command(
         }
         WsClientCommand::StartSession {
             provider,
+            request_id,
+            runtime: requested_runtime,
             project_path,
             prompt,
             session_id,
@@ -258,13 +260,91 @@ async fn handle_ws_command(
             thinking,
             fast,
         } => {
-            let runtime = resolve_session_chat_runtime(
+            let runtime = requested_chat_runtime(
                 state,
                 &user.id,
                 provider,
                 session_id.as_deref(),
-                model.as_deref(),
+                requested_runtime,
             );
+            // Context recovery takes precedence over unrelated setup checks.
+            if let Some(id) = session_id.as_deref()
+                && let Ok(Some(recovery)) = state.context_recovery(id).await
+            {
+                let _ = direct_tx
+                    .send(WsServerEvent::ChatRecoveryRequired {
+                        provider,
+                        session_id: id.to_string(),
+                        response_id: None,
+                        recovery,
+                    })
+                    .await;
+                return;
+            }
+            let mut model = model
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty());
+            let mut problem = native_model_problem(runtime, model.as_deref());
+            if let Some(session) = session_id
+                .as_deref()
+                .and_then(|id| state.storage.get_session_summary(id).ok().flatten())
+                && session.provider != provider
+            {
+                problem = Some(chat_setup_problem(
+                    "chat_provider_mismatch",
+                    "This chat belongs to a different provider. Start a new chat to change providers.",
+                    "choose_route",
+                    None,
+                ));
+            }
+            if problem.is_none() {
+                let catalog = chat_route_catalog(state, &user.id, provider, runtime, true).await;
+                problem = catalog.get("problem").filter(|v| !v.is_null()).cloned();
+                if problem.is_none() {
+                    let stored = session_id
+                        .as_deref()
+                        .and_then(|id| state.storage.get_session_summary(id).ok().flatten());
+                    match checked_route_model(
+                        runtime,
+                        model.as_deref(),
+                        &catalog,
+                        stored.as_ref().and_then(|session| session.model.as_deref()),
+                    ) {
+                        Ok(canonical) => model = canonical,
+                        Err(error) => problem = Some(error),
+                    }
+                }
+            }
+            if let Some(problem) = problem {
+                let event = if request_id.is_none() {
+                    WsServerEvent::Error {
+                        message: problem["message"]
+                            .as_str()
+                            .unwrap_or("Check provider setup.")
+                            .to_string(),
+                        details: None,
+                        session_id: session_id.clone(),
+                    }
+                } else {
+                    WsServerEvent::ChatSetupRequired {
+                        provider,
+                        session_id: session_id.clone().unwrap_or_default(),
+                        request_id,
+                        code: problem["code"]
+                            .as_str()
+                            .unwrap_or("chat_setup_required")
+                            .to_string(),
+                        message: problem["message"]
+                            .as_str()
+                            .unwrap_or("Check provider setup.")
+                            .to_string(),
+                        action: problem["action"].as_str().unwrap_or("recheck").to_string(),
+                        docs_url: problem["docsUrl"].as_str().map(str::to_string),
+                    }
+                };
+                let _ = direct_tx.send(event).await;
+                return;
+            }
             let (model, effort, mode, thinking) = if runtime == ChatRuntime::NativeCli
                 && model.as_deref().is_none_or(|model| model.trim().is_empty())
             {
@@ -277,7 +357,7 @@ async fn handle_ws_command(
                 .flatten();
             let requested_session_id = session_id.clone();
             if let Err(error) = state
-                .start_agent_session(
+                .start_agent_session_with_request(
                     provider,
                     project_path,
                     prompt,
@@ -290,6 +370,7 @@ async fn handle_ws_command(
                     runtime,
                     direct_ai_config,
                     Some(user.id.clone()),
+                    request_id,
                 )
                 .await
             {
@@ -411,6 +492,7 @@ fn ws_event_session_id(event: &WsServerEvent) -> Option<&str> {
             ..
         }
         | WsServerEvent::ChatRecoveryRequired { session_id, .. }
+        | WsServerEvent::ChatSetupRequired { session_id, .. }
         | WsServerEvent::SessionStatus { session_id, .. }
         | WsServerEvent::SessionMetadata { session_id, .. }
         | WsServerEvent::Output { session_id, .. } => Some(session_id),
@@ -432,11 +514,11 @@ fn ws_event_visible_to_connection(
         return board_session_subscriptions.contains(session_id);
     }
     match event {
-        WsServerEvent::Output { .. } | WsServerEvent::ChatRecoveryRequired { .. } => {
-            chat_session_subscriptions
-                .as_ref()
-                .map_or(true, |session_ids| session_ids.contains(session_id))
-        }
+        WsServerEvent::Output { .. }
+        | WsServerEvent::ChatRecoveryRequired { .. }
+        | WsServerEvent::ChatSetupRequired { .. } => chat_session_subscriptions
+            .as_ref()
+            .map_or(true, |session_ids| session_ids.contains(session_id)),
         _ => true,
     }
 }
@@ -446,28 +528,49 @@ fn resolve_session_chat_runtime(
     user_id: &str,
     provider: Provider,
     session_id: Option<&str>,
-    model: Option<&str>,
+    _model: Option<&str>,
 ) -> ChatRuntime {
-    if provider == Provider::Gemini {
-        return ChatRuntime::NativeCli;
-    }
     if let Some(session) = session_id
         .and_then(|session_id| state.storage.get_session_summary(session_id).ok().flatten())
     {
         return session.runtime.unwrap_or_else(|| {
-            if model
-                .or(session.model.as_deref())
-                .is_some_and(is_io_gateway_model)
-            {
+            if provider == Provider::Gemini {
+                ChatRuntime::NativeCli
+            } else if session.model.as_deref().is_some_and(is_io_gateway_model) {
                 ChatRuntime::IoGateway
             } else {
-                // Imported and legacy chats may have no saved runtime. Use
-                // the user's selected route, just as we do for a new chat.
-                configured_chat_runtime(state, user_id)
+                // A new default cannot safely identify an old CLI thread's
+                // origin. Only a saved gateway model is evidence for gateway
+                // routing; otherwise keep legacy chats on Native CLI. The
+                // first successful start persists this inferred route.
+                ChatRuntime::NativeCli
             }
         });
     }
-    configured_chat_runtime(state, user_id)
+    if provider == Provider::Gemini {
+        ChatRuntime::NativeCli
+    } else {
+        configured_chat_runtime(state, user_id)
+    }
+}
+
+fn requested_chat_runtime(
+    state: &AppState,
+    user_id: &str,
+    provider: Provider,
+    session_id: Option<&str>,
+    requested: Option<ChatRuntime>,
+) -> ChatRuntime {
+    // A client may choose a route only before a session exists. Legacy runtime
+    // inference uses stored metadata, never a newly submitted model.
+    let exists = session_id
+        .and_then(|id| state.storage.get_session_summary(id).ok().flatten())
+        .is_some();
+    if exists || requested.is_none() {
+        resolve_session_chat_runtime(state, user_id, provider, session_id, None)
+    } else {
+        requested.unwrap_or(ChatRuntime::NativeCli)
+    }
 }
 
 async fn send_ws_event(

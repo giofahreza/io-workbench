@@ -30,6 +30,7 @@ async fn mobile_settings_overview(
                 "codex": codex_status,
                 "gemini": gemini_status,
             });
+            let catalogs = mobile_chat_catalogs(&state, user_id, &providers).await;
             return Ok(Json(serde_json::json!({
                 "success": true,
                 "agents": {
@@ -50,11 +51,8 @@ async fn mobile_settings_overview(
                         "claude": { "config": claude_mcp_config },
                         "codex": { "config": codex_mcp_config },
                     },
-                    "models": {
-                        "claude": fallback_models(Provider::Claude),
-                        "codex": fallback_models(Provider::Codex),
-                        "gemini": fallback_models(Provider::Gemini),
-                    }
+                    "models": catalogs["models"],
+                    "routes": catalogs["routes"],
                 }
             })));
         }
@@ -113,6 +111,7 @@ async fn mobile_settings_overview(
     providers.insert(Provider::Claude.as_str().to_string(), claude_status);
     providers.insert(Provider::Codex.as_str().to_string(), codex_status);
     providers.insert(Provider::Gemini.as_str().to_string(), gemini_status);
+    let catalogs = mobile_chat_catalogs(&state, user_id, &Value::Object(providers.clone())).await;
     let direct_ai_models = match direct_ai_models {
         Ok(Ok(models)) => models,
         _ => Vec::new(),
@@ -219,11 +218,8 @@ async fn mobile_settings_overview(
                     "allServers": mcp_utils_all,
                 },
             },
-            "models": {
-                "claude": fallback_models(Provider::Claude),
-                "codex": fallback_models(Provider::Codex),
-                "gemini": fallback_models(Provider::Gemini),
-            }
+            "models": catalogs["models"],
+            "routes": catalogs["routes"],
         },
         "codex": {
             "config": codex_config,
@@ -536,6 +532,12 @@ async fn set_direct_ai(
 struct ChatModelsQuery {
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default, rename = "sessionId")]
+    session_id: Option<String>,
+    #[serde(default)]
+    runtime: Option<ChatRuntime>,
+    #[serde(default)]
+    refresh: bool,
 }
 
 /// Per-provider model catalog used by the chat UI's model picker. Native CLI
@@ -550,62 +552,38 @@ async fn chat_provider_models(
         Some(name) => parse_provider_param(name)?,
         None => Provider::Codex,
     };
-    let runtime = configured_chat_runtime(&state, &user.0.id);
-    let mut models: Vec<String> = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut gateway_available = true;
-
-    if runtime == ChatRuntime::IoGateway && matches!(provider, Provider::Codex | Provider::Claude) {
-        if let Some(gateway_models) = direct_ai_models_for_user(&state, &user.0.id, provider).await
-        {
-            for model in gateway_models {
-                push_chat_model(&mut models, &mut seen, model);
-            }
-        } else {
-            gateway_available = false;
-        }
-    } else if matches!(provider, Provider::Codex) {
-        let mut base_models = Vec::new();
-        if let Some(model) = configured_codex_model()
-            .await
-            .filter(|model| is_local_codex_cli_model(model))
-        {
-            base_models.push(model);
-        }
-        base_models.extend(
-            cached_codex_models()
-                .await
-                .into_iter()
-                .filter(|model| is_local_codex_cli_model(model)),
-        );
-        push_codex_chat_models(&mut models, &mut seen, base_models);
-    } else {
-        for model in fallback_models(provider) {
-            push_chat_model(&mut models, &mut seen, model);
-        }
-    }
-
-    let mut model_values: Vec<Value> = Vec::new();
-    if runtime == ChatRuntime::NativeCli && matches!(provider, Provider::Codex | Provider::Claude) {
-        model_values.push(serde_json::json!({
-            "value": "",
-            "label": "CLI default",
-        }));
-    }
-    model_values.extend(models.into_iter().map(|value| {
-        serde_json::json!({
-            "label": value.clone(),
-            "value": value,
+    let runtime = requested_chat_runtime(
+        &state,
+        &user.0.id,
+        provider,
+        query.session_id.as_deref(),
+        query.runtime,
+    );
+    let mut catalog =
+        chat_route_catalog(&state, &user.0.id, provider, runtime, query.refresh).await;
+    let stored = query
+        .session_id
+        .as_deref()
+        .and_then(|id| state.storage.get_session_summary(id).ok().flatten());
+    catalog["pinned"] = Value::Bool(stored.is_some());
+    if runtime == ChatRuntime::NativeCli
+        && catalog["ready"] == true
+        && let Some(session) = stored.filter(|session| session.provider == provider)
+        && let Some(model) = session.model.as_deref().filter(|model| {
+            valid_chat_model_id(model)
+                && !model.contains(':')
+                && !model.eq_ignore_ascii_case("gpt-5-codex")
         })
-    }));
-
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "provider": provider.as_str(),
-        "runtime": runtime,
-        "gatewayAvailable": gateway_available,
-        "models": model_values,
-    })))
+        && let Some(models) = catalog["models"].as_array_mut()
+        && !models.iter().any(|item| {
+            item["value"]
+                .as_str()
+                .is_some_and(|id| id.eq_ignore_ascii_case(model))
+        })
+    {
+        models.push(serde_json::json!({"value": model, "label": format!("{model} (this chat)")}));
+    }
+    Ok(Json(catalog))
 }
 
 fn push_chat_model(
@@ -668,10 +646,10 @@ fn is_io_gateway_model(model: &str) -> bool {
 }
 
 async fn cached_codex_models() -> Vec<String> {
-    let Some(home) = home_dir() else {
+    let Some(home) = codex_configuration_dir() else {
         return Vec::new();
     };
-    let path = home.join(".codex").join("models_cache.json");
+    let path = home.join("models_cache.json");
     let Some(content) = read_text_path(&path).await else {
         return Vec::new();
     };
@@ -690,7 +668,7 @@ async fn cached_codex_models() -> Vec<String> {
 }
 
 async fn configured_codex_model() -> Option<String> {
-    let path = home_dir()?.join(".codex").join("config.toml");
+    let path = codex_configuration_dir()?.join("config.toml");
     let content = read_text_path(&path).await?;
     parse_top_level_toml_values(&content)
         .get("model")
@@ -699,33 +677,10 @@ async fn configured_codex_model() -> Option<String> {
         .map(str::to_string)
 }
 
-/// Fetch the configured gateway's model list for a chat provider.
-async fn direct_ai_models_for_user(
-    state: &AppState,
-    user_id: &str,
-    provider: Provider,
-) -> Option<Vec<String>> {
-    let config = chat_ai_config_for_user(state, user_id, provider);
-    let raw = fetch_direct_ai_models(&config).await.unwrap_or_default();
-    if raw.is_empty() {
-        return None;
-    }
-    let ids: Vec<String> = raw
-        .into_iter()
-        .filter_map(|model| {
-            model
-                .get("value")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| {
-                    model
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-        })
-        .collect();
-    if ids.is_empty() { None } else { Some(ids) }
+fn codex_configuration_dir() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".codex")))
 }
 
 fn direct_ai_runtime_config_for_user(
@@ -750,6 +705,29 @@ fn direct_ai_runtime_config_for_user(
 /// CLI turns.
 fn chat_ai_config_for_user(state: &AppState, user_id: &str, provider: Provider) -> Value {
     let mut config = resolved_direct_ai_config_for_user(state, user_id);
+    if config.get("mode").and_then(Value::as_str) == Some("off") {
+        return config;
+    }
+    // Chat setup requires an explicit destination. A stored credential alone
+    // must not cause discovery or a CLI turn to use the legacy default host.
+    let endpoint_key = if provider == Provider::Codex {
+        "codexEndpoint"
+    } else {
+        "claudeEndpoint"
+    };
+    let has_url = ["gatewayUrl", "baseUrl", "base_url"].iter().any(|key| {
+        config
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.trim().is_empty())
+    }) || config
+        .get(endpoint_key)
+        .and_then(Value::as_str)
+        .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"));
+    if !has_url {
+        config["mode"] = Value::String("off".to_string());
+        return config;
+    }
     if matches!(provider, Provider::Codex | Provider::Claude) {
         apply_io_gateway_config(&mut config, provider);
     }
@@ -834,7 +812,9 @@ fn io_gateway_settings_status(state: &AppState, user_id: &str) -> Result<Value> 
             "apiKeyEnv": effective.get("apiKeyEnv").cloned().unwrap_or(Value::Null),
             "model": effective.get("model").cloned().unwrap_or(Value::Null),
         },
-        "runtimeReady": direct_ai_endpoint_config(&effective).is_some(),
+        "runtimeReady": direct_ai_runtime_config_for_user(state, user_id, Provider::Claude).is_some(),
+        "configured": direct_ai_runtime_config_for_user(state, user_id, Provider::Claude).is_some(),
+        "verification": "Configuration only. Check the selected route's model catalog in Chat.",
         "apiKeyConfigured": api_key_configured,
         "gatewayOtpConfigured": otp_configured,
         "auth": {
@@ -854,6 +834,15 @@ fn apply_io_gateway_config(config: &mut Value, provider: Provider) {
         return;
     };
     obj.insert("mode".to_string(), Value::String("aiproxy".to_string()));
+    if obj
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .is_none_or(|url| url.trim().is_empty())
+    {
+        if let Some(legacy_url) = obj.get("base_url").cloned() {
+            obj.insert("baseUrl".to_string(), legacy_url);
+        }
+    }
     obj.remove("base_url");
     let endpoint_key = if provider == Provider::Codex {
         "codexEndpoint"
@@ -951,7 +940,11 @@ fn preserve_direct_ai_settings(stored: &Value, config: &mut Value) {
     };
     // Older clients do not know about the context guard. Their unrelated
     // settings saves must not silently re-enable a user's disabled guard.
-    for key in ["gatewayApiKey", "gatewayOtpSecret", "codexContextLimitEnabled"] {
+    for key in [
+        "gatewayApiKey",
+        "gatewayOtpSecret",
+        "codexContextLimitEnabled",
+    ] {
         if !config.contains_key(key) {
             if let Some(value) = stored.get(key) {
                 config.insert(key.to_string(), value.clone());

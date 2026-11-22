@@ -199,6 +199,15 @@ function bindForms() {
   document.querySelectorAll("[data-chat-provider-option]").forEach((button) => {
     button.addEventListener("click", () => chooseNewChatProvider(button.dataset.chatProviderOption));
   });
+  qs("#chat-route")?.addEventListener("change", (event) => {
+    state.newChatRuntime = event.target.value;
+    state.preferences.chatModel = "";
+    loadChatModelsIntoSelect(chatCliValue()).catch(() => {});
+  });
+  qs("#io-gateway-enabled")?.addEventListener("change", (event) => {
+    const note = qs("#io-gateway-route-note");
+    if (note) note.hidden = !event.target.checked;
+  });
   qs("#folder-browser-close").addEventListener("click", closeFolderBrowser);
   qs("#folder-browser").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) closeFolderBrowser();
@@ -640,6 +649,8 @@ function bindForms() {
     }
     const message = {
       type: "start_session",
+      requestId: globalThis.crypto?.randomUUID?.() || `request-${Date.now()}-${Math.random()}`,
+      runtime: state.newChatRuntime || undefined,
       provider: cli,
       projectPath,
       prompt,
@@ -650,6 +661,7 @@ function bindForms() {
       fast,
     };
     if (sessionId) message.sessionId = sessionId;
+    state.chatSetupAttempt = { sessionId, requestId: message.requestId, draft: draftContent, projectPath, handled: false };
     try {
       state.ws.send(JSON.stringify(message));
     } catch (error) {

@@ -180,11 +180,18 @@ impl AgentRuntimeManager {
                     self.publish(
                         &context.hub,
                         &key,
-                        WsServerEvent::Error {
+                        if context.request_id.is_some() && matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) {
+                            WsServerEvent::ChatSetupRequired {
+                                provider: context.provider, session_id: context.session_id.clone(),
+                                request_id: context.request_id.clone(), code: "provider_cli_unavailable".into(),
+                                message: "The provider CLI became unavailable. Check its installation and permissions for the Workbench service user, then Recheck setup.".into(),
+                                action: "install".into(), docs_url: None,
+                            }
+                        } else { WsServerEvent::Error {
                             message: "failed to spawn agent provider".to_string(),
                             details: Some(error_message.clone()),
                             session_id: Some(context.session_id.clone()),
-                        },
+                        } },
                     )
                     .await;
                     self.finish(
@@ -1366,6 +1373,7 @@ impl AgentRuntimeManager {
 
         let follow_up_context = AgentStartContext {
             provider: context.provider,
+            request_id: context.request_id.clone(),
             session_id: session_id.clone(),
             durable_run_id: Some(run_id.clone()),
             attempt_id: Some(attempt_id),

@@ -206,6 +206,8 @@ pub struct Chat {
     /// Assistant text that is streaming in and not stored yet.
     pub live: String,
     pub running: bool,
+    pub request_id: Option<String>,
+    pub pending_prompt: Option<String>,
     /// The server has said the run began; until then the prompt is still being sent.
     pub started: bool,
     /// An abort was asked for and the run has not ended yet.
@@ -668,6 +670,26 @@ impl App {
                     });
                 }
             }
+            WsServerEvent::ChatSetupRequired {
+                session_id,
+                request_id,
+                message,
+                docs_url,
+                ..
+            } if current.as_deref() == Some(session_id.as_str())
+                && request_id.is_some()
+                && request_id == self.chat.request_id =>
+            {
+                self.chat.running = false;
+                self.chat.stopping = false;
+                self.chat.request_id = None;
+                if self.chat.input.text().is_empty()
+                    && let Some(prompt) = self.chat.pending_prompt.take()
+                {
+                    self.chat.input.set(prompt);
+                }
+                self.notify(format!("{message} {}", docs_url.unwrap_or_default()));
+            }
             WsServerEvent::ChatRecoveryRequired { session_id, .. }
                 if current.as_deref() == Some(session_id.as_str()) =>
             {
@@ -872,8 +894,11 @@ impl App {
             self.notify("A reply is still running. Esc stops it.");
             return;
         }
+        let request_id = format!("tui-{}", Utc::now().timestamp_micros());
         let command = WsClientCommand::StartSession {
             provider: session.provider,
+            request_id: Some(request_id.clone()),
+            runtime: session.runtime,
             project_path: session.project_path.clone(),
             prompt: prompt.clone(),
             session_id: Some(session.id.clone()),
@@ -887,6 +912,8 @@ impl App {
             self.notify("Not connected to the server yet.");
             return;
         }
+        self.chat.request_id = Some(request_id);
+        self.chat.pending_prompt = Some(prompt.clone());
         self.chat.messages.push(ChatMessage {
             id: format!("local-{}", self.chat.total_count),
             role: MessageRole::User,

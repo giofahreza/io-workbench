@@ -1495,6 +1495,8 @@ async function startNewChatForProject(projectPath) {
   state.chatSessionId = "";
   state.pendingChatSessionId = "";
   state.currentSession = null;
+  state.chatSetupAttempt = null;
+  state.newChatRuntime = "";
   clearActiveChatSelection();
   ensureChatPromptHistoryScope("");
   state.chatBuffer = "";
@@ -1516,6 +1518,7 @@ async function startNewChatForProject(projectPath) {
     state.chatPromptDraftSessionId = "";
     prompt.focus();
   }
+  loadChatModelsIntoSelect(chatCliValue()).catch(() => {});
 }
 
 function pickDefaultChatSession() {

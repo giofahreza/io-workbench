@@ -1,5 +1,5 @@
 #[tokio::test(flavor = "current_thread")]
-async fn chat_runtime_legacy_sessions_inherit_configured_gateway() {
+async fn chat_runtime_legacy_sessions_use_stored_models_not_global_defaults() {
     let (root, state) = board_scope_test_state().await;
     let user_id = "runtime-routing-user";
     state
@@ -29,15 +29,15 @@ async fn chat_runtime_legacy_sessions_inherit_configured_gateway() {
                     Some(&session.id),
                     requested_model,
                 ),
-                ChatRuntime::IoGateway,
-                "legacy {} chat must use the same route as a new chat",
+                ChatRuntime::NativeCli,
+                "legacy {} chat must not be rerouted by a new default",
                 provider.as_str(),
             );
         }
     }
 
-    // Changing the configured route also applies to legacy chats until their
-    // first Workbench turn explicitly persists a runtime.
+    // A saved gateway prefix is evidence for a legacy gateway route. A newly
+    // submitted model is not evidence for the old thread's origin.
     state
         .storage
         .set_setting(
@@ -63,9 +63,14 @@ async fn chat_runtime_legacy_sessions_inherit_configured_gateway() {
             Some("legacy-codex"),
             Some("cod:gpt-6.1-sol"),
         ),
-        ChatRuntime::IoGateway,
-        "an explicit gateway model still identifies the gateway route",
+        ChatRuntime::NativeCli,
+        "a newly submitted model must not change legacy route inference",
     );
+    state.storage.upsert_session(&SessionSummary {
+        id: "legacy-gateway".to_string(), provider: Provider::Codex,
+        model: Some("cod:gpt-6.1-sol".to_string()), runtime: None, ..Default::default()
+    }).unwrap();
+    assert_eq!(resolve_session_chat_runtime(&state, user_id, Provider::Codex, Some("legacy-gateway"), None), ChatRuntime::IoGateway);
 
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
@@ -95,6 +100,7 @@ async fn chat_runtime_preserves_explicit_session_routes() {
             ..Default::default()
         };
         state.storage.upsert_session(&session).unwrap();
+        assert_eq!(requested_chat_runtime(&state, user_id, Provider::Codex, Some(&session.id), Some(ChatRuntime::NativeCli)), runtime);
         assert_eq!(
             resolve_session_chat_runtime(
                 &state,
@@ -111,6 +117,12 @@ async fn chat_runtime_preserves_explicit_session_routes() {
         resolve_session_chat_runtime(&state, user_id, Provider::Gemini, None, None),
         ChatRuntime::NativeCli,
     );
+    state.storage.upsert_session(&SessionSummary {
+        id: "gemini-pinned".to_string(), provider: Provider::Gemini,
+        runtime: Some(ChatRuntime::IoGateway), ..Default::default()
+    }).unwrap();
+    assert_eq!(requested_chat_runtime(&state, user_id, Provider::Gemini, Some("gemini-pinned"), Some(ChatRuntime::NativeCli)), ChatRuntime::IoGateway,
+        "unsupported saved routes must be explained, never silently downgraded");
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }

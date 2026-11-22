@@ -30,6 +30,10 @@ pub enum WsClientCommand {
     },
     StartSession {
         provider: Provider,
+        #[serde(default, rename = "requestId", skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<ChatRuntime>,
         #[serde(rename = "projectPath")]
         project_path: String,
         prompt: String,
@@ -91,6 +95,20 @@ pub enum WsServerEvent {
         response_id: Option<String>,
         #[serde(flatten)]
         recovery: ChatContextRecovery,
+    },
+    /// Preflight failures are scoped to the sending attempt, never inferred
+    /// from arbitrary provider stderr. Older clients can ignore this event.
+    ChatSetupRequired {
+        provider: Provider,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        code: String,
+        message: String,
+        action: String,
+        #[serde(rename = "docsUrl", skip_serializing_if = "Option::is_none")]
+        docs_url: Option<String>,
     },
     LoadingProgress {
         message: String,

@@ -18,6 +18,7 @@ struct AgentRuntimeRecord {
 #[derive(Clone)]
 struct AgentStartContext {
     provider: Provider,
+    request_id: Option<String>,
     session_id: String,
     durable_run_id: Option<String>,
     attempt_id: Option<String>,

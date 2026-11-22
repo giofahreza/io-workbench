@@ -13,12 +13,35 @@ fn compat_value(
 }
 
 async fn fetch_direct_ai_models(config: &Value) -> std::result::Result<Vec<Value>, ServerError> {
+    timeout(Duration::from_secs(8), async {
+        static CATALOG_CHECKS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+        let _permit = CATALOG_CHECKS.acquire().await.map_err(|_| {
+            ServerError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "IO Gateway check unavailable.",
+            )
+        })?;
+        fetch_direct_ai_models_inner(config).await
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(ServerError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "IO Gateway model check timed out. Recheck the URL and connection.",
+        ))
+    })
+}
+
+async fn fetch_direct_ai_models_inner(
+    config: &Value,
+) -> std::result::Result<Vec<Value>, ServerError> {
     let Some((base_url, api_key)) = direct_ai_endpoint_config(config) else {
         return Ok(Vec::new());
     };
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| {
             ServerError::with_details(
@@ -41,7 +64,23 @@ async fn fetch_direct_ai_models(config: &Value) -> std::result::Result<Vec<Value
         urls.push(format!("{origin}/v1/models"));
     }
 
+    let mut seen_urls = HashSet::new();
+    let mut catalog_received = false;
     for url in urls {
+        if !seen_urls.insert(url.clone()) {
+            continue;
+        }
+        let parsed = reqwest::Url::parse(&url).ok().filter(|u| {
+            matches!(u.scheme(), "http" | "https")
+                && u.username().is_empty()
+                && u.password().is_none()
+        });
+        if parsed.is_none() {
+            return Err(ServerError::new(
+                StatusCode::BAD_REQUEST,
+                "Invalid IO Gateway URL.",
+            ));
+        }
         let response = match client
             .get(&url)
             .bearer_auth(&api_key)
@@ -53,20 +92,44 @@ async fn fetch_direct_ai_models(config: &Value) -> std::result::Result<Vec<Value
             Ok(response) => response,
             Err(_) => continue,
         };
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            return Err(ServerError::new(
+                StatusCode::UNAUTHORIZED,
+                "IO Gateway rejected its credentials. Check the gateway API key.",
+            ));
+        }
         if !response.status().is_success() {
             continue;
         }
-        let body = match response.json::<Value>().await {
+        // Bound catalog memory even when the server omits Content-Length.
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Ok(Some(chunk)) = response.chunk().await {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(ServerError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "IO Gateway catalog is too large.",
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body = match serde_json::from_slice::<Value>(&bytes) {
             Ok(body) => body,
             Err(_) => continue,
         };
-        let raw_models = body
+        let Some(raw_models) = body
             .get("data")
             .or_else(|| body.get("models"))
             .and_then(Value::as_array)
             .or_else(|| body.as_array())
             .cloned()
-            .unwrap_or_default();
+        else {
+            continue;
+        };
+        catalog_received = true;
         if raw_models.is_empty() {
             continue;
         }
@@ -120,7 +183,14 @@ async fn fetch_direct_ai_models(config: &Value) -> std::result::Result<Vec<Value
         }
     }
 
-    Ok(Vec::new())
+    if catalog_received {
+        Ok(Vec::new())
+    } else {
+        Err(ServerError::new(
+            StatusCode::BAD_GATEWAY,
+            "IO Gateway model catalog could not be checked. Check the URL, connection and catalog format, then Recheck.",
+        ))
+    }
 }
 
 /// Extract the origin (scheme + host + port) from a URL string. Returns

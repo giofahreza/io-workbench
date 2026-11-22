@@ -249,20 +249,10 @@
             )
             .expect("setting");
 
-        let Json(body) = chat_provider_models(
-            State(state),
-            Extension(AuthenticatedUser(iowb_protocol::UserProfile {
-                id: user_id.to_string(),
-                username: "model-test".to_string(),
-                email: None,
-                created_at: chrono::Utc::now(),
-            })),
-            Query(ChatModelsQuery {
-                provider: Some("codex".to_string()),
-            }),
-        )
-        .await
-        .expect("models response");
+        let body = chat_route_catalog_with_status(
+            &state, user_id, Provider::Codex, ChatRuntime::IoGateway,
+            serde_json::json!({"installed": true, "nativeReady": false}),
+        ).await;
 
         assert_eq!(body.get("success").and_then(Value::as_bool), Some(true));
         assert_eq!(
@@ -344,20 +334,10 @@
             )
             .expect("setting");
 
-        let Json(body) = chat_provider_models(
-            State(state),
-            Extension(AuthenticatedUser(iowb_protocol::UserProfile {
-                id: user_id.to_string(),
-                username: "codex-model-test".to_string(),
-                email: None,
-                created_at: chrono::Utc::now(),
-            })),
-            Query(ChatModelsQuery {
-                provider: Some("codex".to_string()),
-            }),
-        )
-        .await
-        .expect("models response");
+        let body = chat_route_catalog_with_status(
+            &state, user_id, Provider::Codex, ChatRuntime::IoGateway,
+            serde_json::json!({"installed": true, "nativeReady": false}),
+        ).await;
 
         let model_values: Vec<_> = body
             .get("models")

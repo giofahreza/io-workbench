@@ -151,6 +151,7 @@ impl AppState {
         let start_result = self
             .agents
             .start(AgentStartContext {
+                request_id: None,
                 provider,
                 session_id: run.session_id.clone(),
                 durable_run_id: Some(run.id.clone()),
@@ -411,6 +412,7 @@ impl AppState {
         });
 
         let start_context = AgentStartContext {
+            request_id: None,
             provider: Provider::Codex,
             session_id: session_id.to_string(),
             durable_run_id: Some(compact_run_id.clone()),
@@ -682,5 +684,4 @@ impl AppState {
             state: "starting".to_string(),
         })
     }
-
 }

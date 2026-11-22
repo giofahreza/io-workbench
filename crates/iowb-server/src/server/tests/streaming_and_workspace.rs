@@ -459,6 +459,8 @@
             },
             WsClientCommand::StartSession {
                 provider: Provider::Codex,
+                request_id: None,
+                runtime: None,
                 project_path: project.display().to_string(),
                 prompt: "another message".to_string(),
                 session_id: Some(session_id.to_string()),

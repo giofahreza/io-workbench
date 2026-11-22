@@ -54,6 +54,7 @@ impl AppState {
         session.native_session_id = Some(task.native_session_id.clone());
         session.external = false;
         let context = AgentStartContext {
+            request_id: None,
             provider: Provider::Codex,
             session_id: task.session.id.clone(),
             durable_run_id: Some(task.retry_run_id.clone()),
@@ -218,7 +219,11 @@ impl AppState {
         Ok(self
             .storage
             .get_setting(&format!("user:{user_id}:direct-ai"))?
-            .and_then(|config| config.get("codexContextLimitEnabled").and_then(Value::as_bool))
+            .and_then(|config| {
+                config
+                    .get("codexContextLimitEnabled")
+                    .and_then(Value::as_bool)
+            })
             .unwrap_or(true))
     }
 

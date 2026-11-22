@@ -64,6 +64,43 @@ impl AppState {
             direct_ai_config,
             user_id,
             None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_agent_session_with_request(
+        &self,
+        provider: Provider,
+        project_path: impl Into<String>,
+        prompt: impl Into<String>,
+        session_id: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        mode: Option<String>,
+        thinking: Option<bool>,
+        fast: Option<bool>,
+        runtime: ChatRuntime,
+        direct_ai_config: Option<DirectAiRuntimeConfig>,
+        user_id: Option<String>,
+        request_id: Option<String>,
+    ) -> Result<SessionSummary> {
+        self.start_agent_session_scoped(
+            provider,
+            project_path,
+            prompt,
+            session_id,
+            model,
+            effort,
+            mode,
+            thinking,
+            fast,
+            runtime,
+            direct_ai_config,
+            user_id,
+            None,
+            request_id,
         )
         .await
     }
@@ -103,8 +140,8 @@ impl AppState {
             direct_ai_config,
             user_id,
             Some((board_id.into(), board_task_id)),
+            None,
         )
         .await
     }
-
 }

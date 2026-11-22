@@ -102,13 +102,15 @@ function renderIoGatewayConfig(status) {
       ioGatewaySummaryRow("API Key", apiKeyConfigured ? "configured" : "missing", apiKeyConfigured ? "ok" : "warn"),
       ioGatewaySummaryRow("Secret OTP", otpConfigured ? "configured" : "missing", otpConfigured ? "ok" : "warn"),
       ioGatewaySummaryRow("Model", firstDefined(config.model, effective.model, "unset")),
-      ioGatewaySummaryRow("Runtime", runtimeReady ? "ready" : "not ready", runtimeReady ? "ok" : "warn"),
+      ioGatewaySummaryRow("Configuration", runtimeReady ? "configured · check models in Chat" : "incomplete", runtimeReady ? "ok" : "warn"),
     ].join("");
   }
   const enabled = qs("#io-gateway-enabled");
   const contextLimit = qs("#io-gateway-context-limit");
   const url = qs("#io-gateway-url");
   if (enabled) enabled.checked = effective.chatRuntime === "io_gateway";
+  const routeNote = qs("#io-gateway-route-note");
+  if (routeNote) routeNote.hidden = !enabled?.checked;
   if (contextLimit) contextLimit.checked = (effective.codexContextLimitEnabled ?? config.codexContextLimitEnabled) !== false;
   if (url) url.value = gatewayUrl === "unset" ? "" : gatewayUrl;
   const apiKey = qs("#io-gateway-api-key");
@@ -184,10 +186,11 @@ async function toggleIoGatewaySecret(secretKey) {
 
 async function saveIoGatewayConfig(event) {
   event.preventDefault();
-  const normalizedUrl = normalizeIoGatewayUrl(qs("#io-gateway-url")?.value);
+  const useIoGateway = qs("#io-gateway-enabled")?.checked === true;
+  const rawUrl = qs("#io-gateway-url")?.value.trim() || "";
+  const normalizedUrl = rawUrl || useIoGateway ? normalizeIoGatewayUrl(rawUrl) : "";
   const key = qs("#io-gateway-api-key")?.value.trim() || "";
   const secret = normalizeTotpSecret(qs("#io-gateway-otp-secret")?.value);
-  const useIoGateway = qs("#io-gateway-enabled")?.checked === true;
   const serverApiKeyConfigured = ioGatewayConfigured(state.ioGatewayStatus, "gatewayApiKey");
   if (useIoGateway && !key && !serverApiKeyConfigured) {
     throw new Error("API key is required when IO Gateway is selected.");
@@ -195,10 +198,10 @@ async function saveIoGatewayConfig(event) {
   if (secret) validateTotpSecret(secret);
   const storedConfig = state.ioGatewayStatus?.config || {};
   const payload = {
-    mode: "aiproxy",
+    mode: normalizedUrl ? "aiproxy" : "off",
     chatRuntime: useIoGateway ? "io_gateway" : "native_cli",
     codexContextLimitEnabled: qs("#io-gateway-context-limit")?.checked !== false,
-    baseUrl: `${normalizedUrl}/claude`,
+    baseUrl: normalizedUrl ? `${normalizedUrl}/claude` : null,
     model: storedConfig.model ?? null,
     gatewayUrl: normalizedUrl,
   };
@@ -209,12 +212,14 @@ async function saveIoGatewayConfig(event) {
     body: JSON.stringify(payload),
   });
   if (qs("#io-gateway-url")) qs("#io-gateway-url").value = normalizedUrl;
-  if (qs("#io-gateway-api-key")) qs("#io-gateway-api-key").value = key;
-  if (qs("#io-gateway-otp-secret")) qs("#io-gateway-otp-secret").value = secret;
+  if (qs("#io-gateway-api-key")) qs("#io-gateway-api-key").value = "";
+  if (qs("#io-gateway-otp-secret")) qs("#io-gateway-otp-secret").value = "";
   setIoGatewaySecretVisibility("gatewayApiKey", false);
   setIoGatewaySecretVisibility("gatewayOtpSecret", false);
   state.ioGatewayStatus = null;
   await loadIoGatewayConfig({ force: true });
+  state.newChatRuntime = "";
+  loadChatModelsIntoSelect(chatCliValue(), true).catch(() => {});
   const sessionId = state.chatSessionId;
   const previousRecovery = state.chatRecoveryBySession?.[sessionId];
   if (sessionId && previousRecovery) {

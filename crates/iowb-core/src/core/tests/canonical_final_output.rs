@@ -166,6 +166,7 @@ async fn canonical_final_output_persists_json_while_live_display_remains_sanitiz
         .take_final_assistant_message()
         .expect("canonical final");
     let context = AgentStartContext {
+        request_id: None,
         provider: Provider::Codex,
         session_id: session.id.clone(),
         durable_run_id: None,

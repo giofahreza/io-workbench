@@ -407,7 +407,7 @@ function updateChatFastControl() {
   });
 }
 
-async function loadChatModelsIntoSelect(provider) {
+async function loadChatModelsIntoSelect(provider, refresh = false) {
   const select = qs("#chat-model");
   if (!select) return;
   if (!canLoadProtectedData()) {
@@ -416,11 +416,25 @@ async function loadChatModelsIntoSelect(provider) {
     return;
   }
   const targetProvider = CHAT_PROVIDERS_LOCAL.includes(provider) ? provider : "codex";
+  const generation = (state.chatModelsGeneration || 0) + 1;
+  state.chatModelsGeneration = generation;
+  const sessionId = state.chatSessionId || "";
+  const requestedRuntime = state.newChatRuntime || "";
+  const scope = JSON.stringify([targetProvider, sessionId, requestedRuntime]);
+  const previousCatalog = state.chatRouteCatalogScope === scope ? state.chatRouteCatalog : null;
+  const currentRequest = () => state.chatModelsGeneration === generation
+    && (state.chatSessionId || "") === sessionId && chatCliValue() === targetProvider;
   select.dataset.modelProvider = targetProvider;
   select.disabled = true;
   try {
-    const body = await api(`/api/chat/models?provider=${encodeURIComponent(targetProvider)}`);
-    if (select.dataset.modelProvider !== targetProvider) return;
+    const query = new URLSearchParams({ provider: targetProvider, refresh: String(refresh) });
+    if (sessionId) query.set("sessionId", sessionId);
+    if (requestedRuntime) query.set("runtime", requestedRuntime);
+    const body = await api(`/api/chat/models?${query}`);
+    if (!currentRequest()) return;
+    state.chatRouteCatalog = body;
+    state.chatRouteCatalogScope = scope;
+    renderChatReadiness(body);
     const list = Array.isArray(body.models) ? body.models : [];
     // Normalize each entry to {value,label}. The server may return either a
     // plain string or an object {value,label} depending on which catalog
@@ -451,18 +465,118 @@ async function loadChatModelsIntoSelect(provider) {
     const preferred = String(state.preferences.chatModel ?? "").trim();
     if (values.includes(preferred)) select.value = preferred;
     else if (values.includes(current)) select.value = current;
-    else select.value = "";
+    else select.value = values[0] ?? "";
     state.preferences.chatModel = select.value;
     savePreferences();
   } catch (error) {
-    console.warn("[io-workbench] could not load chat models", error);
-    if (select.dataset.modelProvider === targetProvider) {
-      select.innerHTML = `<option value="">CLI default</option>`;
+    if (currentRequest()) {
+      state.chatRouteCatalog = { ...previousCatalog, ready: false, provider: targetProvider, models: [],
+        runtime: previousCatalog?.runtime || requestedRuntime || "native_cli",
+        problem: { message: "Could not check this chat route. Check the connection and Recheck.", action: "recheck",
+          docsUrl: previousCatalog?.problem?.docsUrl || null } };
+      state.chatRouteCatalogScope = scope;
+      renderChatReadiness(state.chatRouteCatalog);
+      select.innerHTML = `<option value="">Models unavailable — Recheck</option>`;
       select.value = "";
+      state.preferences.chatModel = "";
     }
   } finally {
-    if (select.dataset.modelProvider === targetProvider) select.disabled = false;
+    if (currentRequest()) select.disabled = state.chatRouteCatalog?.ready === false;
   }
+}
+
+function safeProviderDocsUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password
+      && ["developers.openai.com", "code.claude.com", "geminicli.com", "nodejs.org"].includes(url.hostname)
+      ? url.href : "";
+  } catch { return ""; }
+}
+
+function renderChatReadiness(body) {
+  const route = qs("#chat-route");
+  const existing = state.currentSession || (state.chatSessionId && findChatSession(state.chatSessionId));
+  if (route) {
+    route.disabled = body.pinned === true || Boolean(existing?.runtime);
+    route.value = route.disabled ? body.runtime : state.newChatRuntime || "";
+  }
+  const label = body.runtime === "io_gateway" ? "IO Gateway" : "Native CLI";
+  const status = qs("#chat-route-status");
+  if (status) status.textContent = `${body.pinned || existing?.runtime ? "Pinned: " : "Selected: "}${label}${body.ready === true ? (body.readiness?.authState === "configured_unverified" && body.runtime === "native_cli" ? " · authentication unverified" : " · ready") : " · setup needed"}`;
+  const card = qs("#chat-provider-readiness");
+  if (!card) return;
+  card.classList.toggle("hidden", body.ready === true);
+  card.replaceChildren();
+  if (body.ready === true) return;
+  const message = document.createElement("p");
+  message.textContent = body.problem?.message || "Check provider setup on the Workbench server.";
+  card.append(message);
+  const scope = document.createElement("small");
+  scope.textContent = body.readiness?.scope || "Install and authenticate on the Workbench server as the service user, not on your phone.";
+  card.append(scope);
+  for (const [raw, text] of [[body.problem?.docsUrl, "Official setup guide"],
+    [body.readiness?.nodeAvailable === false || body.readiness?.npmAvailable === false ? body.readiness?.nodeInstallUrl : null, "Node.js installation guide"]]) {
+    const url = safeProviderDocsUrl(raw);
+    if (!url) continue;
+    const link = document.createElement("a");
+    link.href = url; link.target = "_blank"; link.rel = "noopener noreferrer"; link.textContent = text;
+    card.append(link);
+  }
+  const recheck = document.createElement("button");
+  recheck.type = "button"; recheck.textContent = "Recheck";
+  recheck.onclick = () => loadChatModelsIntoSelect(chatCliValue(), true);
+  card.append(recheck);
+  if (body.problem?.action === "gateway_settings") {
+    const settings = document.createElement("button");
+    settings.type = "button"; settings.textContent = "Configure IO Gateway";
+    settings.onclick = () => { switchView("settings"); qs('[data-settings-tab="direct-ai"]')?.click(); };
+    card.append(settings);
+  }
+}
+
+function chatSetupEventMatches(payload, attempt) {
+  return Boolean(attempt && payload.sessionId && isActiveChatSessionEvent(payload)
+    && payload.sessionId === attempt.sessionId && !attempt.handled
+    && payload.requestId && payload.requestId === attempt.requestId);
+}
+
+function handleChatSetupRequired(payload) {
+  const attempt = state.chatSetupAttempt;
+  if (!chatSetupEventMatches(payload, attempt)) return;
+  attempt.handled = true;
+  clearChatProcessing();
+  rememberSidebarSessionStatus({ sessionId: payload.sessionId, provider: payload.provider, status: "failed" });
+  // Restore only this rejected draft, never replace text entered since send.
+  if (!qs("#chat-prompt")?.value.trim()) {
+    setChatPromptValue(attempt.draft);
+    writeLocalChatPromptDraft(attempt.draft, payload.sessionId);
+  }
+  const card = document.createElement("div");
+  card.className = "chat-setup-card"; card.setAttribute("role", "alert");
+  const message = document.createElement("p"); message.textContent = payload.message;
+  card.append(message);
+  const url = safeProviderDocsUrl(payload.docsUrl);
+  if (url) {
+    const link = document.createElement("a"); link.href = url; link.target = "_blank";
+    link.rel = "noopener noreferrer"; link.textContent = "Official setup guide"; card.append(link);
+  }
+  const action = document.createElement("button"); action.type = "button";
+  action.textContent = payload.action === "new_chat" ? "Start new chat" : "Recheck setup";
+  action.onclick = async () => {
+    if (!isActiveChatSessionEvent(payload)) return;
+    if (payload.action === "new_chat") {
+      const draft = qs("#chat-prompt")?.value || attempt.draft;
+      await startNewChatForProject(attempt.projectPath);
+      state.newChatRuntime = "io_gateway";
+      setChatPromptValue(draft); writeLocalChatPromptDraft(draft, "");
+    }
+    togglePromptConfigPanel(true);
+    await loadChatModelsIntoSelect(chatCliValue(), true);
+  };
+  card.append(action);
+  qs("#chat-output")?.append(card);
+  updateChatComposerState();
 }
 
 function readSessionOverrides() {
@@ -557,9 +671,7 @@ function loadSessionOverridesIntoState(sessionId, session = null) {
     savePreferences();
   }
   renderChatProviderPicker();
-  if (!qs("#prompt-config-panel")?.classList.contains("hidden")) {
-    loadChatModelsIntoSelect(next.cli).catch(() => {});
-  }
+  loadChatModelsIntoSelect(next.cli).catch(() => {});
   updateChatComposerState();
 }
 

@@ -31,6 +31,7 @@ async function openChatScrollPage(browser, { width = 1280, autoScroll = false } 
   const errors = [];
   const requests = [];
   const sockets = [];
+  const clientMessages = [];
   const gates = new Map();
   const session = {
     id: 'scroll-regression', provider: 'claude', title: 'Synthetic scroll regression',
@@ -44,7 +45,7 @@ async function openChatScrollPage(browser, { width = 1280, autoScroll = false } 
   page.on('pageerror', error => errors.push(error.message));
   await page.routeWebSocket('**/ws**', socket => {
     sockets.push(socket);
-    socket.onMessage(() => {});
+    socket.onMessage(data => clientMessages.push(JSON.parse(String(data))));
   });
   await page.route('**/*', async route => {
     const request = route.request();
@@ -123,7 +124,7 @@ async function openChatScrollPage(browser, { width = 1280, autoScroll = false } 
   await settle(page);
 
   const fixture = {
-    page, context, errors, requests, session, messages,
+    page, context, errors, requests, session, messages, clientMessages,
     addSession(id, count = 6) {
       const otherSession = { ...session, id, title: `Synthetic ${id}`, messageCount: count, active: false };
       const otherMessages = Array.from({ length: count }, (_, index) => ({

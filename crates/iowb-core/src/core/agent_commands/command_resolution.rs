@@ -20,15 +20,7 @@ fn resolve_agent_command(
         "IO_WORKBENCH_{}_",
         command_provider.as_str().to_ascii_uppercase()
     );
-    let command = env::var(format!("{provider_prefix}COMMAND"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            env::var("IO_WORKBENCH_AGENT_COMMAND")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| default_agent_command(command_provider));
+    let command = provider_executable(command_provider);
 
     let args_template = env::var(format!("{provider_prefix}ARGS_JSON"))
         .ok()
@@ -76,6 +68,22 @@ fn resolve_agent_command(
         stdin_prompt,
         prompt: cli_prompt,
     })
+}
+
+/// Shared by actual launches and readiness probes, including service overrides.
+pub fn provider_executable(provider: Provider) -> String {
+    env::var(format!(
+        "IO_WORKBENCH_{}_COMMAND",
+        provider.as_str().to_ascii_uppercase()
+    ))
+    .ok()
+    .filter(|value| !value.trim().is_empty())
+    .or_else(|| {
+        env::var("IO_WORKBENCH_AGENT_COMMAND")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+    .unwrap_or_else(|| default_agent_command(provider))
 }
 
 fn resolve_cli_slash_prompt(provider: Provider, prompt: &str) -> Result<String> {

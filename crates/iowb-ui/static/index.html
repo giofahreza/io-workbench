@@ -234,6 +234,11 @@
             <button id="chat-jump-latest" class="chat-jump-latest icon-button" type="button" aria-label="Go to latest message" title="Go to latest message" data-symbol="arrow-down"></button>
           </div>
           <form id="chat-form" class="chat-composer">
+            <div class="chat-route-row">
+              <label>Chat route <select id="chat-route"><option value="">Server default for new chat</option><option value="native_cli">Use Native CLI</option><option value="io_gateway">Use IO Gateway</option></select></label>
+              <small id="chat-route-status" aria-live="polite"></small>
+            </div>
+            <div id="chat-provider-readiness" class="chat-setup-card hidden" role="status"></div>
             <div id="prompt-config-panel" class="prompt-config-panel hidden" aria-label="Prompt config">
               <div class="chat-config-provider-picker" role="group" aria-label="CLI">
                 <button type="button" class="chat-config-provider-option" data-chat-provider-option="codex" aria-label="Use Codex" title="Codex">
@@ -777,6 +782,7 @@
                       <input id="io-gateway-enabled" type="checkbox" />
                       <span>Use IO Gateway for chat</span>
                     </label>
+                    <small id="io-gateway-route-note" hidden>IO Gateway applies to new chats. Existing chats keep their original route. Gateway models such as cod:gpt-6.1-sol require a new chat if the current chat uses Native CLI.</small>
                     <label class="toolbar-check io-gateway-runtime-toggle">
                       <input id="io-gateway-context-limit" name="codexContextLimitEnabled" type="checkbox" checked aria-describedby="io-gateway-context-limit-help" />
                       <span>16 MB Codex context guard</span>

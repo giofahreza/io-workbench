@@ -20,11 +20,13 @@ include!("server/notifications_and_watch.rs");
 include!("server/configuration.rs");
 include!("server/direct_ai.rs");
 include!("server/provider_runtime.rs");
+include!("server/chat_readiness.rs");
 include!("server/tools_and_compat.rs");
 
 #[cfg(test)]
 mod tests {
     include!("server/tests/chat_runtime_routing.rs");
+    include!("server/tests/chat_readiness.rs");
     include!("server/tests/message_usage_metadata.rs");
     include!("server/tests/project_sessions_paging.rs");
     include!("server/tests/streaming_and_workspace.rs");

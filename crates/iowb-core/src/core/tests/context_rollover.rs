@@ -232,6 +232,7 @@
             .list_messages(&session.id)
             .expect("baseline transcript");
         let context = AgentStartContext {
+            request_id: None,
             provider: Provider::Codex,
             session_id: session.id.clone(),
             durable_run_id: Some(retry_run.id.clone()),
@@ -438,6 +439,7 @@
         );
 
         let context = AgentStartContext {
+            request_id: None,
             provider: Provider::Codex,
             session_id: session.id.clone(),
             durable_run_id: Some(retry_run.id.clone()),

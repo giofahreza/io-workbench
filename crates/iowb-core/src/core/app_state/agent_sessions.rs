@@ -15,6 +15,7 @@ impl AppState {
         direct_ai_config: Option<DirectAiRuntimeConfig>,
         user_id: Option<String>,
         board_scope: Option<(String, Option<String>)>,
+        request_id: Option<String>,
     ) -> Result<SessionSummary> {
         let project_path = project_path.into();
         let prompt = prompt.into();
@@ -106,16 +107,15 @@ impl AppState {
         } else {
             None
         };
-        let native_rollout_bytes =
-            if enforce_context_limit && native_resume_session_id.is_some() {
-                if let Some(session_id) = session_id.as_deref() {
-                    self.sessions.native_rollout_size(session_id).await
-                } else {
-                    None
-                }
+        let native_rollout_bytes = if enforce_context_limit && native_resume_session_id.is_some() {
+            if let Some(session_id) = session_id.as_deref() {
+                self.sessions.native_rollout_size(session_id).await
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         let mut session = if let Some((board_id, board_task_id)) = board_scope {
             self.sessions
@@ -287,6 +287,7 @@ impl AppState {
             .agents
             .start(AgentStartContext {
                 provider,
+                request_id,
                 session_id: session.id.clone(),
                 durable_run_id: Some(durable_run_id.clone()),
                 attempt_id: Some(attempt_id),
@@ -541,5 +542,4 @@ impl AppState {
             }
         }
     }
-
 }
