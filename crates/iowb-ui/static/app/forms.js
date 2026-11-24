@@ -456,10 +456,10 @@ function bindForms() {
     prompt.focus();
   });
   qs("#clear-shell").addEventListener("click", () => {
-    state.shellBuffer = "";
-    renderShell();
+    clearShellOutput();
   });
   qs("#restart-shell").addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => startShell({ force: true })).catch(showError));
+  qs("#safe-shell").addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => startShell({ force: true, safe: true })).catch(showError));
   const shellOutput = qs("#shell-output");
   shellOutput.addEventListener("keydown", handleShellOutputKey);
   shellOutput.addEventListener("mousedown", focusShellTerm);
@@ -751,15 +751,7 @@ function bindForms() {
     const sid = state.chatSessionId || state.pendingChatSessionId || state.preferences.lastChatSessionId;
     if (sid) saveSessionOverrides(sid, { effort: state.preferences.chatEffort });
   });
-  qs("#stop-shell").addEventListener("click", async () => {
-    if (!state.currentShellProcess) return;
-    await api(`/api/process/${state.currentShellProcess}`, { method: "DELETE" });
-    state.currentShellProcess = null;
-    state.currentShellProjectPath = "";
-    resetShellResizeTracking();
-    updateShellStatus();
-    loadProcesses().catch(() => {});
-  });
+  qs("#stop-shell").addEventListener("click", (event) => withButtonLoading(event.currentTarget, stopShell).catch(showError).finally(() => updateShellStatus()));
   qs("#refresh-processes").addEventListener("click", (event) => {
     state.shellProcessListOpen = !state.shellProcessListOpen;
     withButtonLoading(event.currentTarget, loadProcesses).catch(showError);

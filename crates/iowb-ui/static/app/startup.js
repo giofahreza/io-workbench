@@ -253,11 +253,6 @@ function renderAnsi(value) {
   return html.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
 }
 
-function defaultShellCommand() {
-  if (navigator.userAgent.includes("Windows")) return "powershell.exe";
-  return "/bin/bash";
-}
-
 function initCodeEditor() {
   if (!window.CodeMirror || state.codeEditor) return;
   const textarea = qs("#file-editor-content");

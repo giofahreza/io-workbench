@@ -35,6 +35,7 @@ function connectWs() {
     setWsStatus("connected");
     ws.send(JSON.stringify({ type: "ping", nonce: String(Date.now()) }));
     sendWorkspaceSubscription();
+    refreshShellSnapshot().catch(showError);
     startChatActivityPoll();
     reconcileSelectedChatRecoverySnapshot(generation).catch((error) => {
       console.warn("Unable to refresh selected chat recovery after reconnect", error);
@@ -447,17 +448,8 @@ function connectWs() {
     if (payload.type === "chat_setup_required") {
       handleChatSetupRequired(payload);
     }
-    if (payload.type === "process_output") {
-      appendShell(payload.data);
-    }
-    if (payload.type === "process_exited") {
-      appendShell(`\n[process exited: ${payload.code ?? "terminated"}]\n`);
-      if (state.currentShellProcess === payload.processId) {
-        state.currentShellProcess = null;
-        state.currentShellProjectPath = "";
-        resetShellResizeTracking();
-        updateShellStatus();
-      }
+    if (payload.type === "process_output" || payload.type === "process_exited") {
+      handleShellProcessEvent(payload);
     }
     if (payload.type === "error") {
       if (!payload.sessionId) {
@@ -475,6 +467,7 @@ function connectWs() {
     window.clearTimeout(state.wsConnectTimer);
     state.wsConnectTimer = null;
     state.ws = null;
+    if (state.shellAttachment) scheduleShellSnapshot(state.shellAttachment, 1000);
     if (!state.auth?.enabled || state.token) {
       const delay = Math.min(WS_RETRY_MAX_MS, WS_RETRY_BASE_MS * (2 ** state.wsRetryAttempt));
       state.wsRetryAttempt += 1;
@@ -498,6 +491,7 @@ function sendWorkspaceSubscription() {
     type: "subscribe",
     topics: ["sessions", "processes", "projects"],
     sessionIds: boardSessionId ? [boardSessionId] : [],
+    processIds: state.currentShellProcess ? [state.currentShellProcess] : [],
   }));
   return true;
 }

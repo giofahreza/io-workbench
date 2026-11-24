@@ -211,6 +211,8 @@ const state = {
   floatingNavSyncRaf: null,
   floatingNavSettleTimer: null,
   shellStarting: false,
+  shellGeneration: 0,
+  shellAttachment: null,
   currentShellProjectPath: "",
   shellAutoStartedProjectPath: "",
   shellLastResizeSignature: "",

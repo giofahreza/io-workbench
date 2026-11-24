@@ -7,18 +7,18 @@
     <meta name="theme-color" content="#080a0f" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20261005-02" />
+    <link rel="stylesheet" href="/styles.css?v=20261124-terminal-01" />
   </head>
   <body class="auth-pending">
     <div class="brand-loader" data-brand-loader role="status" aria-live="polite" aria-label="Opening io-workbench">
       <div class="brand-loader__inner">
-        <img class="brand-loader__mark" src="/brand-loader.svg?v=20261005-02" alt="" />
+        <img class="brand-loader__mark" src="/brand-loader.svg?v=20261124-terminal-01" alt="" />
         <span class="brand-loader__label">Connecting to workbench</span>
       </div>
     </div>
     <aside class="sidebar">
       <div class="brand">
-          <img class="brand-signal" src="/icon.svg?v=20261005-02" alt="" />
+          <img class="brand-signal" src="/icon.svg?v=20261124-terminal-01" alt="" />
         <span>
           <strong>io-workbench</strong>
           <small class="brand-status status" aria-label="Connection status">
@@ -58,7 +58,7 @@
     <main class="workspace">
       <section id="auth-panel" class="panel auth-panel hidden">
         <div class="auth-card">
-          <img class="auth-logo" src="/icon.svg?v=20261005-02" alt="" />
+          <img class="auth-logo" src="/icon.svg?v=20261124-terminal-01" alt="" />
           <h2 id="auth-title">Setup</h2>
           <p id="auth-description">Create or enter your io-workbench credentials.</p>
           <form id="auth-form" class="auth-form">
@@ -374,6 +374,7 @@
             <div class="shell-header-actions">
               <button id="clear-shell" class="icon-button" type="button" aria-label="Clear shell" title="Clear shell" data-symbol="trash"></button>
               <button id="restart-shell" class="icon-button" type="button" aria-label="Restart shell" title="Restart shell" data-symbol="refresh"></button>
+              <button id="safe-shell" class="icon-button" type="button" aria-label="Open safe terminal" title="Open safe terminal without user startup files" data-symbol="shield"></button>
               <button id="refresh-processes" class="icon-button" type="button" aria-label="List processes" title="List processes" data-symbol="list"></button>
               <button id="stop-shell" class="icon-button" type="button" aria-label="Stop shell" title="Stop shell" data-symbol="stop"></button>
             </div>
@@ -1312,6 +1313,6 @@ validation_error</textarea><small>One scope per line.</small></label>
     </nav>
     <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
 
-    <script src="/app.js?v=20261005-02" defer></script>
+    <script src="/app.js?v=20261124-terminal-01" defer></script>
   </body>
 </html>

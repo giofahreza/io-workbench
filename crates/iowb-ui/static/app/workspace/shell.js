@@ -157,11 +157,225 @@ function updateShellStatus(label = "") {
   const dot = qs("#shell-status-dot");
   const status = qs("#shell-status-label");
   if (!dot || !status) return;
-  dot.classList.toggle("connected", !!state.currentShellProcess);
-  dot.classList.toggle("connecting", !!state.shellStarting);
+  const attachment = state.shellAttachment;
+  const connected = !!state.currentShellProcess && attachment?.ready && attachment.phase === "running";
+  const connecting = state.shellStarting || attachment?.syncing;
+  dot.classList.toggle("connected", !!connected);
+  dot.classList.toggle("connecting", !!connecting);
   status.textContent = label
-    || (state.shellStarting ? "Starting terminal" : state.currentShellProcess ? "Terminal connected" : "Terminal");
+    || (connecting ? "Connecting terminal" : connected ? `Terminal connected${attachment.safe ? " · safe mode" : ""}`
+      : attachment?.phase === "exited" ? "Terminal exited" : attachment ? "Terminal disconnected" : "Terminal");
   qs("#stop-shell").disabled = !state.currentShellProcess;
+}
+
+function resetShellScreen() {
+  state.shellBuffer = "";
+  if (state.shellTerm) {
+    state.shellTerm.dispose();
+    state.shellTerm = null;
+    initXterm();
+  }
+  renderShell();
+}
+
+function clearShellOutput() {
+  const attachment = state.shellAttachment;
+  if (attachment) {
+    attachment.sequence = Math.max(attachment.sequence, ...attachment.pending.keys());
+    attachment.pending.clear();
+    attachment.pendingBytes = 0;
+    attachment.legacy = [];
+    attachment.legacyBytes = 0;
+  }
+  resetShellScreen();
+}
+
+function detachShellAttachment() {
+  const previous = state.shellAttachment;
+  if (previous) {
+    window.clearTimeout(previous.timer);
+    previous.controller.abort();
+  }
+  state.shellAttachment = null;
+  state.currentShellProcess = null;
+  state.currentShellProjectPath = "";
+  resetShellResizeTracking();
+  return previous;
+}
+
+function createShellAttachment(id, projectPath, shell = {}) {
+  const attachment = {
+    id, projectPath, safe: !!shell.safe, phase: "attaching", ready: false,
+    sequence: 0, pending: new Map(), pendingBytes: 0, legacy: [], legacyBytes: 0,
+    syncing: false, snapshotPromise: null, refreshAgain: false,
+    pendingExit: null, timer: null, controller: new AbortController(),
+    inputPromise: Promise.resolve(),
+  };
+  state.shellAttachment = attachment;
+  state.currentShellProcess = id;
+  state.currentShellProjectPath = projectPath;
+  return attachment;
+}
+
+function queueShellChunk(attachment, chunk) {
+  const sequence = Number(chunk.sequence);
+  if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+    const data = String(chunk.data || "");
+    attachment.legacy.push(data);
+    attachment.legacyBytes += data.length;
+    while (attachment.legacy.length > 128 || attachment.legacyBytes > 128_000) {
+      attachment.legacyBytes -= attachment.legacy.shift().length;
+    }
+    return;
+  }
+  if (sequence <= attachment.sequence || attachment.pending.has(sequence)) return;
+  const data = String(chunk.data || "");
+  attachment.pending.set(sequence, data);
+  attachment.pendingBytes += data.length;
+  if (attachment.pendingBytes > 128_000 || attachment.pending.size > 512) {
+    attachment.pending.clear();
+    attachment.pendingBytes = 0;
+    scheduleShellSnapshot(attachment);
+  }
+}
+
+function flushShellChunks(attachment) {
+  if (state.shellAttachment !== attachment || attachment.syncing) return;
+  while (attachment.pending.has(attachment.sequence + 1)) {
+    const sequence = attachment.sequence + 1;
+    const data = attachment.pending.get(sequence);
+    attachment.pending.delete(sequence);
+    attachment.pendingBytes -= data.length;
+    attachment.sequence = sequence;
+    appendShell(data);
+  }
+  for (const data of attachment.legacy.splice(0)) appendShell(data);
+  attachment.legacyBytes = 0;
+  if (attachment.pending.size) scheduleShellSnapshot(attachment);
+}
+
+function finishShellAttachment(attachment, code, error = "") {
+  if (state.shellAttachment !== attachment || attachment.phase === "exited") return;
+  attachment.phase = "exited";
+  attachment.ready = false;
+  window.clearTimeout(attachment.timer);
+  state.currentShellProcess = null;
+  resetShellResizeTracking();
+  appendShell(`\n[process exited: ${code ?? "terminated"}] ${attachment.id}\n`);
+  if (error) appendShell(`[terminal error] ${error}\n`);
+  updateShellStatus();
+}
+
+function scheduleShellSnapshot(attachment, delay = 30) {
+  if (state.shellAttachment !== attachment || attachment.phase === "exited" || attachment.timer) return;
+  attachment.timer = window.setTimeout(() => {
+    attachment.timer = null;
+    refreshShellSnapshot(attachment).catch(showError);
+  }, delay);
+}
+
+function refreshShellSnapshot(attachment = state.shellAttachment) {
+  if (!attachment || state.shellAttachment !== attachment || attachment.phase === "exited") return Promise.resolve();
+  if (attachment.snapshotPromise) {
+    attachment.refreshAgain = true;
+    return attachment.snapshotPromise;
+  }
+  window.clearTimeout(attachment.timer);
+  attachment.timer = null;
+  attachment.syncing = true;
+  updateShellStatus();
+  attachment.snapshotPromise = api(`/api/terminal/${encodeURIComponent(attachment.id)}?afterSequence=${attachment.sequence}`, {
+    signal: attachment.controller.signal,
+  }).then((snapshot) => {
+    if (state.shellAttachment !== attachment) return;
+    if (snapshot.process?.id !== attachment.id || !Number.isSafeInteger(snapshot.lastSequence)) {
+      throw new Error("Invalid terminal snapshot from the Workbench host.");
+    }
+    if (snapshot.firstSequence > attachment.sequence + 1) {
+      appendShell("\n[earlier terminal output is no longer available]\n");
+      attachment.sequence = snapshot.firstSequence - 1;
+      for (const [sequence, data] of attachment.pending) {
+        if (sequence <= attachment.sequence) {
+          attachment.pending.delete(sequence);
+          attachment.pendingBytes -= data.length;
+        }
+      }
+    }
+    for (const chunk of snapshot.chunks || []) queueShellChunk(attachment, chunk);
+    attachment.syncing = false;
+    flushShellChunks(attachment);
+    if (!snapshot.running) {
+      finishShellAttachment(attachment, snapshot.exitCode, snapshot.error);
+    } else {
+      attachment.ready = !attachment.pendingExit;
+      attachment.phase = attachment.pendingExit ? "closing" : "running";
+    }
+    updateShellStatus();
+  }).catch((error) => {
+    if (state.shellAttachment !== attachment || error.name === "AbortError") return;
+    attachment.ready = false;
+    if (error.status === 404) {
+      finishShellAttachment(attachment, null, "The process ended or the host restarted; its retained output is unavailable.");
+      return;
+    }
+    attachment.phase = "disconnected";
+    throw error;
+  }).finally(() => {
+    attachment.syncing = false;
+    attachment.snapshotPromise = null;
+    if (state.shellAttachment === attachment) {
+      updateShellStatus();
+      if (attachment.refreshAgain && attachment.phase !== "exited") {
+        attachment.refreshAgain = false;
+        scheduleShellSnapshot(attachment);
+      } else if (attachment.phase === "closing" || (attachment.phase === "running" && state.ws?.readyState !== WebSocket.OPEN)) {
+        scheduleShellSnapshot(attachment, 1000);
+      }
+    }
+  });
+  return attachment.snapshotPromise;
+}
+
+function handleShellProcessEvent(payload) {
+  const attachment = state.shellAttachment;
+  if (!attachment || payload.processId !== attachment.id || attachment.phase === "exited") return;
+  if (payload.type === "process_output") {
+    queueShellChunk(attachment, payload);
+    if (attachment.ready) flushShellChunks(attachment);
+    else if (!attachment.syncing) scheduleShellSnapshot(attachment, 1000);
+  } else if (payload.type === "process_exited") {
+    attachment.pendingExit = payload;
+    attachment.ready = false;
+    attachment.phase = "closing";
+    refreshShellSnapshot(attachment).catch(showError);
+  }
+}
+
+async function useShellProcess(id, projectPath = activeProjectPath("#active-project")) {
+  ++state.shellGeneration;
+  state.shellStarting = false;
+  detachShellAttachment();
+  resetShellScreen();
+  const attachment = createShellAttachment(id, projectPath);
+  appendShell(`[selected ${id}]\n`);
+  sendWorkspaceSubscription();
+  await refreshShellSnapshot(attachment);
+  focusShellTerm();
+}
+
+async function stopShell() {
+  const attachment = state.shellAttachment;
+  if (!attachment || !state.currentShellProcess) return;
+  await api(`/api/process/${encodeURIComponent(attachment.id)}`, { method: "DELETE" }).catch((error) => {
+    if (error.status !== 404) throw error;
+  });
+  if (state.shellAttachment === attachment && attachment.phase !== "exited") {
+    attachment.ready = false;
+    attachment.phase = "closing";
+    updateShellStatus("Stopping terminal");
+    await refreshShellSnapshot(attachment);
+  }
+  loadProcesses().catch(() => {});
 }
 
 function focusShellTerm() {
@@ -177,7 +391,6 @@ function focusShellTerm() {
 
 async function startShell(options = {}) {
   if (state.shellStarting) return;
-  const command = defaultShellCommand();
   const projectPath = activeProjectPath("#active-project");
   if (!projectPath) return;
   if (!options.force && state.currentShellProcess && state.currentShellProjectPath === projectPath) {
@@ -185,40 +398,47 @@ async function startShell(options = {}) {
     return;
   }
   state.shellStarting = true;
+  const generation = ++state.shellGeneration;
   updateShellStatus("Starting terminal");
-  if (options.force && state.currentShellProcess) {
-    await api(`/api/process/${encodeURIComponent(state.currentShellProcess)}`, { method: "DELETE" }).catch(() => {});
-    state.currentShellProcess = null;
-    state.currentShellProjectPath = "";
-    resetShellResizeTracking();
-  }
-  state.shellBuffer = "";
-  renderShell();
+  const previous = detachShellAttachment();
+  resetShellScreen();
   const terminalSize = terminalSizeFromSettings();
   state.shellTerm?.resize(terminalSize.cols, terminalSize.rows);
   try {
-    const body = await api("/api/process", {
+    if (previous && previous.phase !== "exited") {
+      await api(`/api/process/${encodeURIComponent(previous.id)}`, { method: "DELETE" }).catch((error) => {
+        if (error.status !== 404) throw error;
+      });
+    }
+    const body = await api("/api/terminal", {
       method: "POST",
       body: JSON.stringify({
-        command,
-        args: [],
         cwd: projectPath,
-        pty: true,
+        safe: !!options.safe,
         cols: terminalSize.cols,
         rows: terminalSize.rows,
       }),
     });
-    state.currentShellProcess = body.id;
-    state.currentShellProjectPath = projectPath;
+    if (generation !== state.shellGeneration || projectPath !== activeProjectPath("#active-project")) {
+      await api(`/api/process/${encodeURIComponent(body.id)}`, { method: "DELETE" }).catch(() => {});
+      return;
+    }
+    const attachment = createShellAttachment(body.id, projectPath, body.shell);
     state.shellLastResizeSignature = `${body.id}:${terminalSize.cols}x${terminalSize.rows}`;
     if (options.auto) state.shellAutoStartedProjectPath = projectPath;
-    appendShell(`[started ${body.id}]\n`);
-    updateShellStatus();
+    appendShell(`[started ${body.id}] ${body.shell?.command || ""}${body.shell?.safe ? " · safe mode" : ""}\n`);
+    sendWorkspaceSubscription();
+    await refreshShellSnapshot(attachment);
     focusShellTerm();
     loadProcesses().catch(() => {});
   } finally {
-    state.shellStarting = false;
-    updateShellStatus();
+    if (generation === state.shellGeneration) {
+      state.shellStarting = false;
+      updateShellStatus();
+      if (projectPath !== activeProjectPath("#active-project") && activeView() === "shell") {
+        ensureShellRunningForActiveProject().catch(showError);
+      }
+    }
   }
 }
 
@@ -229,11 +449,11 @@ async function ensureShellRunningForActiveProject() {
     focusShellTerm();
     return;
   }
-  if (state.currentShellProcess && state.currentShellProjectPath !== projectPath) {
+  if (state.shellAttachment && state.currentShellProjectPath !== projectPath) {
     await startShell({ auto: true, force: true });
     return;
   }
-  if (state.currentShellProcess) {
+  if (state.shellAttachment) {
     updateShellStatus();
     focusShellTerm();
     return;
@@ -242,19 +462,20 @@ async function ensureShellRunningForActiveProject() {
 }
 
 async function sendShellInput(data) {
-  if (!state.currentShellProcess) return;
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify({
-      type: "process_input",
-      processId: state.currentShellProcess,
-      data,
-    }));
-    return;
-  }
-  await api(`/api/process/${encodeURIComponent(state.currentShellProcess)}/input`, {
-    method: "POST",
-    body: JSON.stringify({ data }),
+  const attachment = state.shellAttachment;
+  if (!state.currentShellProcess || !attachment?.ready) return;
+  const pending = attachment.inputPromise.catch(() => {}).then(async () => {
+    if (state.shellAttachment !== attachment || !attachment.ready) return;
+    if (state.ws?.readyState === WebSocket.OPEN) {
+      state.ws.send(JSON.stringify({ type: "process_input", processId: attachment.id, data }));
+      return;
+    }
+    await api(`/api/process/${encodeURIComponent(attachment.id)}/input`, {
+      method: "POST", body: JSON.stringify({ data }), signal: attachment.controller.signal,
+    });
   });
+  attachment.inputPromise = pending;
+  await pending;
 }
 
 async function resizeCurrentShell() {
@@ -480,25 +701,18 @@ function renderProcesses(processes) {
   </article>`).join("");
   target.querySelectorAll("[data-process-use]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.currentShellProcess = button.dataset.processUse;
-      state.currentShellProjectPath = "";
-      resetShellResizeTracking();
-      appendShell(`[selected ${state.currentShellProcess}]\n`);
-      updateShellStatus();
-      focusShellTerm();
+      useShellProcess(button.dataset.processUse).catch(showError);
     });
   });
   target.querySelectorAll("[data-process-stop]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await api(`/api/process/${encodeURIComponent(button.dataset.processStop)}`, { method: "DELETE" });
+    button.addEventListener("click", () => withButtonLoading(button, async () => {
       if (state.currentShellProcess === button.dataset.processStop) {
-        state.currentShellProcess = null;
-        state.currentShellProjectPath = "";
-        resetShellResizeTracking();
+        await stopShell();
+        return;
       }
-      updateShellStatus();
+      await api(`/api/process/${encodeURIComponent(button.dataset.processStop)}`, { method: "DELETE" });
       await loadProcesses();
-    });
+    }).catch(showError));
   });
 }
 
