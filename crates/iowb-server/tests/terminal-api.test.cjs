@@ -28,9 +28,9 @@ const text = value => value.chunks.map(chunk => chunk.data).join('');
 
 test('terminal API selects the host shell, reads startup files, accepts input/resize and reconciles exit', {
   skip: !enabled, timeout: 30000,
-}, async t => {
+}, async testContext => {
   const fixture = await providerServer({ env: { SHELL: '/bin/bash' } });
-  t.after(() => fixture.close());
+  testContext.after(() => fixture.close());
   await fs.writeFile(join(fixture.root, '.bashrc'), "printf 'HOST_STARTUP_LOADED\\n'\n");
   const process = await start(fixture, { cols: 91, rows: 27 });
   assert.deepEqual(process.shell, { command: '/bin/bash', args: [], source: 'environment', safe: false });
@@ -59,12 +59,12 @@ test('terminal API selects the host shell, reads startup files, accepts input/re
 
 test('terminal snapshot retains a fast exit before the client knows its ID, with identical WebSocket identities', {
   skip: !enabled, timeout: 30000,
-}, async t => {
+}, async testContext => {
   const fixture = await providerServer({ env: {
     SHELL: '/missing/implicit-shell', IO_WORKBENCH_TERMINAL_SHELL: '/bin/sh',
     IO_WORKBENCH_TERMINAL_ARGS: JSON.stringify(['-c', "printf 'FAST_FINAL_TAIL\\n'; exit 7"]),
   } });
-  t.after(() => fixture.close());
+  testContext.after(() => fixture.close());
   const socket = await fixture.websocket();
   const process = await start(fixture);
   assert.equal(process.shell.source, 'configured');
@@ -84,12 +84,12 @@ test('terminal snapshot retains a fast exit before the client knows its ID, with
 
 test('invalid configured profiles are visible and safe mode bypasses profiles and startup environment hooks', {
   skip: !enabled, timeout: 30000,
-}, async t => {
+}, async testContext => {
   const fixture = await providerServer({ env: {
     IO_WORKBENCH_TERMINAL_SHELL: '/missing/profile', IO_WORKBENCH_TERMINAL_ARGS: '{bad-json',
     ENV: '/missing/startup-hook', BASH_ENV: '/missing/other-hook', IO_WORKBENCH_TOKEN: 'fixture-host-secret',
   } });
-  t.after(() => fixture.close());
+  testContext.after(() => fixture.close());
   await fs.writeFile(join(fixture.root, '.bashrc'), "printf 'UNSAFE_STARTUP_LOADED\\n'; exit 42\n");
   const invalid = await request(fixture, '/api/terminal', { cwd: fixture.project });
   assert.equal(invalid.status, 400);
@@ -109,9 +109,9 @@ test('invalid configured profiles are visible and safe mode bypasses profiles an
 
 test('terminal routes retain auth and workspace boundaries without changing arbitrary process starts', {
   skip: !enabled, timeout: 30000,
-}, async t => {
+}, async testContext => {
   const fixture = await providerServer({ auth: true, env: { SHELL: '/bin/sh' } });
-  t.after(() => fixture.close());
+  testContext.after(() => fixture.close());
   assert.equal((await request(fixture, '/api/terminal', { cwd: fixture.project })).status, 401);
   assert.equal((await request(fixture, '/api/terminal/unknown')).status, 401);
   const registration = await request(fixture, '/api/auth/register', { username: 'terminal-test', password: 'terminal-fixture-password' });

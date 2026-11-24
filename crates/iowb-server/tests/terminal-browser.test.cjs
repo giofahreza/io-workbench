@@ -4,16 +4,16 @@ const { providerServer, until, pause } = require('./fixtures/provider-server.cjs
 
 const enabled = !!process.env.IOWB_TEST_BINARY && !!process.env.PLAYWRIGHT_MODULE && process.platform !== 'win32';
 
-async function openTerminal(t, env) {
+async function openTerminal(testContext, env) {
   const fixture = await providerServer({ env });
-  t.after(() => fixture.close());
+  testContext.after(() => fixture.close());
   const created = await fetch(`${fixture.origin}/api/projects/create`, { method: 'POST',
     headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: fixture.project }) });
   assert.equal(created.status, 200);
   const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
   const browser = await chromium.launch({ headless: true,
     ...(process.env.CHROME_EXECUTABLE ? { executablePath: process.env.CHROME_EXECUTABLE } : {}) });
-  t.after(() => browser.close());
+  testContext.after(() => browser.close());
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, serviceWorkers: 'block' });
   const page = await context.newPage();
   const errors = [];
@@ -37,8 +37,8 @@ async function typeCommand(page, command) {
 
 test('actual browser and host PTY support command input, process isolation, reconnect, safe restart and exit', {
   skip: !enabled, timeout: 60000,
-}, async t => {
-  const { fixture, context, page, errors } = await openTerminal(t, { SHELL: '/bin/sh', PS1: 'IOWB_TEST> ' });
+}, async testContext => {
+  const { fixture, context, page, errors } = await openTerminal(testContext, { SHELL: '/bin/sh', PS1: 'IOWB_TEST> ' });
   await page.waitForFunction(() => state.shellAttachment?.ready && state.shellBuffer.includes('IOWB_TEST>'));
   const processId = await page.evaluate(() => state.currentShellProcess);
   await typeCommand(page, "printf 'BROWSER_%s\\n' INPUT_OK; pwd -P");
@@ -82,8 +82,8 @@ test('actual browser and host PTY support command input, process isolation, reco
 
 test('actual browser can explicitly recover from an unusable host shell profile with a safe terminal', {
   skip: !enabled, timeout: 30000,
-}, async t => {
-  const { page, errors } = await openTerminal(t, { IO_WORKBENCH_TERMINAL_SHELL: '/missing/broken-profile' });
+}, async testContext => {
+  const { page, errors } = await openTerminal(testContext, { IO_WORKBENCH_TERMINAL_SHELL: '/missing/broken-profile' });
   await page.waitForFunction(() => !state.shellStarting && document.querySelector('#toast-stack').textContent.includes('safe terminal'));
   assert.equal(await page.evaluate(() => state.currentShellProcess), null);
   await page.locator('#safe-shell').click();

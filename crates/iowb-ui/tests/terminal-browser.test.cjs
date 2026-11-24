@@ -40,17 +40,17 @@ async function terminalPage(browser, options = {}) {
   return fixture;
 }
 
-async function launch(t) {
+async function launch(testContext) {
   const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
   const browser = await chromium.launch({ headless: true,
     ...(process.env.CHROME_EXECUTABLE ? { executablePath: process.env.CHROME_EXECUTABLE } : {}) });
-  t.after(() => browser.close());
+  testContext.after(() => browser.close());
   return browser;
 }
 
-test('terminal isolates processes and merges replay/live output exactly once in sequence order', { skip: !enabled }, async t => {
-  const fixture = await terminalPage(await launch(t));
-  t.after(() => fixture.close());
+test('terminal isolates processes and merges replay/live output exactly once in sequence order', { skip: !enabled }, async testContext => {
+  const fixture = await terminalPage(await launch(testContext));
+  testContext.after(() => fixture.close());
   await fixture.open();
   await fixture.page.waitForFunction(() => state.shellAttachment?.ready);
   assert.deepEqual(fixture.starts, [{ cwd: fixture.session.projectPath, safe: false, cols: 100, rows: 30 }]);
@@ -77,14 +77,14 @@ test('terminal isolates processes and merges replay/live output exactly once in 
   assert.deepEqual(fixture.errors, []);
 });
 
-test('terminal recovers output and an exit which arrive before the start response', { skip: !enabled }, async t => {
-  const fixture = await terminalPage(await launch(t), { start: async (route, fixture) => {
+test('terminal recovers output and an exit which arrive before the start response', { skip: !enabled }, async testContext => {
+  const fixture = await terminalPage(await launch(testContext), { start: async (route, fixture) => {
     fixture.send({ type: 'process_output', processId: 'fast-terminal', sequence: 1, data: 'FAST_FINAL_OUTPUT\r\n' });
     fixture.send({ type: 'process_exited', processId: 'fast-terminal', code: 7 });
     fixture.current = snapshot('fast-terminal', [chunk(1, 'FAST_FINAL_OUTPUT\r\n')], { running: false, exitCode: 7 });
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'fast-terminal', shell }) });
   } });
-  t.after(() => fixture.close());
+  testContext.after(() => fixture.close());
   await fixture.open();
   await fixture.page.waitForFunction(() => state.shellAttachment?.phase === 'exited');
   assert.match(await fixture.output(), /FAST_FINAL_OUTPUT[\s\S]*process exited: 7/);
@@ -95,11 +95,11 @@ test('terminal recovers output and an exit which arrive before the start respons
   assert.deepEqual(fixture.errors, []);
 });
 
-test('terminal waits for the final snapshot when exit overlaps an older running snapshot', { skip: !enabled }, async t => {
+test('terminal waits for the final snapshot when exit overlaps an older running snapshot', { skip: !enabled }, async testContext => {
   let release;
   const held = new Promise(resolve => { release = resolve; });
   let holdNext = false;
-  const fixture = await terminalPage(await launch(t), { read: async (route, fixture) => {
+  const fixture = await terminalPage(await launch(testContext), { read: async (route, fixture) => {
     const body = JSON.stringify(fixture.current);
     if (holdNext) {
       holdNext = false;
@@ -107,7 +107,7 @@ test('terminal waits for the final snapshot when exit overlaps an older running 
     }
     await route.fulfill({ status: 200, contentType: 'application/json', body });
   } });
-  t.after(() => { release(); return fixture.close(); });
+  testContext.after(() => { release(); return fixture.close(); });
   await fixture.open();
   await fixture.page.waitForFunction(() => state.shellAttachment?.ready);
   holdNext = true;
@@ -123,16 +123,16 @@ test('terminal waits for the final snapshot when exit overlaps an older running 
   assert.deepEqual(fixture.errors, []);
 });
 
-test('selecting another process aborts stale attachment responses and replays the selected process', { skip: !enabled }, async t => {
+test('selecting another process aborts stale attachment responses and replays the selected process', { skip: !enabled }, async testContext => {
   let release;
   const held = new Promise(resolve => { release = resolve; });
-  const fixture = await terminalPage(await launch(t), { read: async (route, fixture) => {
+  const fixture = await terminalPage(await launch(testContext), { read: async (route, fixture) => {
     const id = new URL(route.request().url()).pathname.split('/').at(-1);
     if (id === 'terminal-1') await held;
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(
       snapshot(id, [chunk(1, id === 'terminal-1' ? 'STALE_OUTPUT' : 'SELECTED_HISTORY')])) });
   } });
-  t.after(() => { release(); return fixture.close(); });
+  testContext.after(() => { release(); return fixture.close(); });
   await fixture.open();
   await fixture.page.waitForFunction(() => state.shellAttachment?.syncing);
   await fixture.page.evaluate(() => useShellProcess('selected-terminal'));
@@ -147,9 +147,9 @@ test('selecting another process aborts stale attachment responses and replays th
   assert.deepEqual(fixture.errors, []);
 });
 
-test('safe terminal is an explicit profile-free restart and Stop retains the final tail', { skip: !enabled }, async t => {
-  const fixture = await terminalPage(await launch(t));
-  t.after(() => fixture.close());
+test('safe terminal is an explicit profile-free restart and Stop retains the final tail', { skip: !enabled }, async testContext => {
+  const fixture = await terminalPage(await launch(testContext));
+  testContext.after(() => fixture.close());
   await fixture.open();
   await fixture.page.waitForFunction(() => state.shellAttachment?.ready);
   fixture.current = snapshot('safe-terminal', [chunk(1, 'SAFE_PROMPT')]);
@@ -168,9 +168,9 @@ test('safe terminal is an explicit profile-free restart and Stop retains the fin
   assert.deepEqual(fixture.errors, []);
 });
 
-test('a new WebSocket refreshes the selected terminal without replay duplicates', { skip: !enabled }, async t => {
-  const fixture = await terminalPage(await launch(t));
-  t.after(() => fixture.close());
+test('a new WebSocket refreshes the selected terminal without replay duplicates', { skip: !enabled }, async testContext => {
+  const fixture = await terminalPage(await launch(testContext));
+  testContext.after(() => fixture.close());
   await fixture.open();
   await fixture.page.waitForFunction(() => state.shellAttachment?.ready);
   fixture.current = snapshot('terminal-1', [chunk(1, 'INITIAL_PROMPT\r\n'), chunk(2, 'OFFLINE_OUTPUT\r\n')]);
@@ -184,18 +184,18 @@ test('a new WebSocket refreshes the selected terminal without replay duplicates'
   assert.deepEqual(fixture.errors, []);
 });
 
-test('HTTP fallback serializes keystrokes instead of racing input requests', { skip: !enabled }, async t => {
+test('HTTP fallback serializes keystrokes instead of racing input requests', { skip: !enabled }, async testContext => {
   let release;
   const held = new Promise(resolve => { release = resolve; });
   const inputs = [];
-  const fixture = await terminalPage(await launch(t), { process: async route => {
+  const fixture = await terminalPage(await launch(testContext), { process: async route => {
     if (new URL(route.request().url()).pathname.endsWith('/input')) {
       inputs.push(route.request().postDataJSON().data);
       if (inputs.length === 1) await held;
     }
     await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
   } });
-  t.after(() => { release(); return fixture.close(); });
+  testContext.after(() => { release(); return fixture.close(); });
   await fixture.open();
   await fixture.page.waitForFunction(() => state.shellAttachment?.ready);
   await fixture.page.evaluate(() => {
@@ -213,15 +213,15 @@ test('HTTP fallback serializes keystrokes instead of racing input requests', { s
   assert.deepEqual(fixture.errors, []);
 });
 
-test('selecting a process during a pending start cannot attach or leak the stale new process', { skip: !enabled }, async t => {
+test('selecting a process during a pending start cannot attach or leak the stale new process', { skip: !enabled }, async testContext => {
   let release;
   const held = new Promise(resolve => { release = resolve; });
-  const fixture = await terminalPage(await launch(t), { start: async route => {
+  const fixture = await terminalPage(await launch(testContext), { start: async route => {
     await held;
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'stale-new-process', shell }) });
   }, read: async route => route.fulfill({ status: 200, contentType: 'application/json',
     body: JSON.stringify(snapshot('selected-terminal', [chunk(1, 'SELECTED_EXISTING_HISTORY')])) }) });
-  t.after(() => { release(); return fixture.close(); });
+  testContext.after(() => { release(); return fixture.close(); });
   await fixture.open();
   await fixture.page.waitForFunction(() => state.shellStarting);
   await fixture.page.evaluate(() => useShellProcess('selected-terminal'));
@@ -238,13 +238,13 @@ test('selecting a process during a pending start cannot attach or leak the stale
   assert.deepEqual(fixture.errors, []);
 });
 
-test('ring-buffer gaps and expired process IDs are explicit rather than stuck connected', { skip: !enabled }, async t => {
+test('ring-buffer gaps and expired process IDs are explicit rather than stuck connected', { skip: !enabled }, async testContext => {
   let expired = false;
-  const fixture = await terminalPage(await launch(t), { read: async (route, fixture) => {
+  const fixture = await terminalPage(await launch(testContext), { read: async (route, fixture) => {
     await route.fulfill({ status: expired ? 404 : 200, contentType: 'application/json',
       body: JSON.stringify(expired ? { error: 'process not found' } : fixture.current) });
   } });
-  t.after(() => fixture.close());
+  testContext.after(() => fixture.close());
   fixture.current = snapshot('terminal-1', [chunk(40, 'RETAINED_TAIL')]);
   await fixture.open();
   await fixture.page.waitForFunction(() => state.shellAttachment?.ready);

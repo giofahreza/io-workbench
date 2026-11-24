@@ -470,6 +470,24 @@
     "/api/process/{process_id}/resize": {
       "post": { "tags": ["Process"], "summary": "Resize a PTY process" }
     },
+    "/api/terminal": {
+      "post": {
+        "tags": ["Process"],
+        "summary": "Start an interactive shell resolved on the Workbench host",
+        "description": "Accepts cwd, cols (default 80), rows (default 24), and safe (default false). Returns the process ID, started_at, and resolved shell metadata. Safe mode bypasses user startup profiles and ignores configured shell overrides. Explicit invalid shell configuration returns 400; cwd must be an allowed host directory. Input, resize, and stop use the existing process routes."
+      }
+    },
+    "/api/terminal/{process_id}": {
+      "get": {
+        "tags": ["Process"],
+        "summary": "Read sequenced terminal output and authoritative process status",
+        "description": "Returns process, chunks, firstSequence, lastSequence, running, exitCode, and error. Chunks share immutable sequence IDs with WebSocket output. Retains the 64 KiB output ring for completed processes for at most five minutes, capped at 64 completed processes. Unknown, expired, or pre-restart IDs return 404.",
+        "parameters": [
+          { "name": "process_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "afterSequence", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "default": 0 } }
+        ]
+      }
+    },
     "/api/settings/server-status": {
       "get": { "tags": ["Settings"], "summary": "Read server configuration status" }
     },
