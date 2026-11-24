@@ -1,3 +1,5 @@
+include!("terminals.rs");
+
 async fn list_processes(State(state): State<AppState>) -> Json<Vec<iowb_protocol::ProcessInfo>> {
     Json(state.processes.list().await)
 }

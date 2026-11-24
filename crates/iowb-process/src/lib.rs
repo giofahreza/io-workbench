@@ -18,6 +18,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod snapshots;
+mod terminal;
+
 const PROCESS_EVENT_CAPACITY: usize = 512;
 const PROCESS_INPUT_CAPACITY: usize = 256;
 const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8192;
@@ -45,6 +48,8 @@ pub enum ProcessError {
     EventStreamClosed,
     #[error("process input stream is closed")]
     InputClosed,
+    #[error("invalid terminal shell configuration: {0}")]
+    InvalidShell(String),
 }
 
 pub type Result<T> = std::result::Result<T, ProcessError>;
@@ -70,18 +75,14 @@ pub enum ProcessEvent {
 /// A bounded, in-memory output chunk that can be replayed to a client that
 /// reconnects to an active process. It deliberately is not persisted: a
 /// process and its terminal screen both end when the server stops.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProcessOutputChunk {
-    pub stream: ProcessStream,
-    pub data: String,
-    pub sequence: u64,
-}
+pub type ProcessOutputChunk = iowb_protocol::TerminalOutputChunk;
 
 #[derive(Clone)]
 pub struct ProcessManager {
     processes: Arc<RwLock<HashMap<String, Arc<ProcessRecord>>>>,
     events: broadcast::Sender<ProcessEvent>,
     default_working_directory: Option<PathBuf>,
+    retired: Arc<StdMutex<snapshots::RetiredProcesses>>,
 }
 
 struct ProcessRecord {
@@ -141,6 +142,7 @@ impl ProcessManager {
             processes: Arc::new(RwLock::new(HashMap::new())),
             events,
             default_working_directory: None,
+            retired: Arc::new(StdMutex::new(snapshots::RetiredProcesses::default())),
         }
     }
 
@@ -155,7 +157,15 @@ impl ProcessManager {
         self.events.subscribe()
     }
 
-    pub async fn start(&self, mut request: ProcessStartRequest) -> Result<ProcessStartResponse> {
+    pub async fn start(&self, request: ProcessStartRequest) -> Result<ProcessStartResponse> {
+        self.start_with_options(request, false).await
+    }
+
+    async fn start_with_options(
+        &self,
+        mut request: ProcessStartRequest,
+        safe: bool,
+    ) -> Result<ProcessStartResponse> {
         if request.command.trim().is_empty() {
             return Err(ProcessError::EmptyCommand);
         }
@@ -168,7 +178,7 @@ impl ProcessManager {
         }
 
         if request.pty {
-            return self.start_pty(request).await;
+            return self.start_pty(request, safe).await;
         }
 
         let id = format!("proc_{}", Uuid::new_v4().simple());
@@ -245,6 +255,7 @@ impl ProcessManager {
 
         let events = self.events.clone();
         let processes = Arc::clone(&self.processes);
+        let retired = Arc::clone(&self.retired);
         let process_id = id.clone();
         tokio::spawn(async move {
             let completion = tokio::select! {
@@ -258,9 +269,21 @@ impl ProcessManager {
                     ProcessCompletion::Killed(child.kill().await.err().map(|error| error.to_string()))
                 }
             };
-            processes.write().await.remove(&process_id);
+            {
+                let mut active = processes.write().await;
+                if let Some(record) = active.remove(&process_id) {
+                    retired
+                        .lock()
+                        .expect("retired process lock")
+                        .retain(&record);
+                }
+            }
             drain_output_reader(stdout_reader).await;
             drain_output_reader(stderr_reader).await;
+            retired
+                .lock()
+                .expect("retired process lock")
+                .finish(&process_id, &completion);
 
             match completion {
                 ProcessCompletion::Exited(code) => {
@@ -279,6 +302,10 @@ impl ProcessManager {
                     }
                 }
                 ProcessCompletion::Failed(message) => {
+                    let _ = events.send(ProcessEvent::Exited {
+                        process_id: process_id.clone(),
+                        code: None,
+                    });
                     let _ = events.send(ProcessEvent::Failed {
                         process_id,
                         message,
@@ -290,7 +317,11 @@ impl ProcessManager {
         Ok(ProcessStartResponse { id, started_at })
     }
 
-    async fn start_pty(&self, request: ProcessStartRequest) -> Result<ProcessStartResponse> {
+    async fn start_pty(
+        &self,
+        request: ProcessStartRequest,
+        safe: bool,
+    ) -> Result<ProcessStartResponse> {
         let id = format!("proc_{}", Uuid::new_v4().simple());
         let started_at = Utc::now();
         let cwd = request.cwd.as_ref().map(PathBuf::from);
@@ -309,6 +340,10 @@ impl ProcessManager {
         // with the parent environment, so remove the host-only bearer before
         // the PTY child is spawned.
         command.env_remove("IO_WORKBENCH_TOKEN");
+        if safe {
+            command.env_remove("ENV");
+            command.env_remove("BASH_ENV");
+        }
         configure_pty_environment(&mut command);
         if let Some(cwd) = &cwd {
             command.cwd(cwd);
@@ -360,6 +395,7 @@ impl ProcessManager {
 
         let events = self.events.clone();
         let processes = Arc::clone(&self.processes);
+        let retired = Arc::clone(&self.retired);
         let process_id = id.clone();
         tokio::spawn(async move {
             let completion = match tokio::task::spawn_blocking(move || child.wait()).await {
@@ -374,19 +410,35 @@ impl ProcessManager {
             // Bound that drain and close the output gate before publishing
             // exit, so clients never see a final chunk after their terminal
             // is marked closed.
-            processes.write().await.remove(&process_id);
+            {
+                let mut active = processes.write().await;
+                if let Some(record) = active.remove(&process_id) {
+                    retired
+                        .lock()
+                        .expect("retired process lock")
+                        .retain(&record);
+                }
+            }
             let _ = tokio::time::timeout(PTY_OUTPUT_DRAIN_TIMEOUT, reader_done).await;
 
             let mut output_open = output_gate
                 .lock()
                 .expect("PTY output gate lock must not be poisoned");
             *output_open = false;
+            retired
+                .lock()
+                .expect("retired process lock")
+                .finish(&process_id, &completion);
             match completion {
                 ProcessCompletion::Exited(code) => {
                     let _ = events.send(ProcessEvent::Exited { process_id, code });
                 }
                 ProcessCompletion::Killed(_) => unreachable!("PTY control handles termination"),
                 ProcessCompletion::Failed(message) => {
+                    let _ = events.send(ProcessEvent::Exited {
+                        process_id: process_id.clone(),
+                        code: None,
+                    });
                     let _ = events.send(ProcessEvent::Failed {
                         process_id,
                         message,

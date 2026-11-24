@@ -349,6 +349,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/process/{process_id}", delete(abort_process))
         .route("/api/process/{process_id}/input", post(write_process_input))
         .route("/api/process/{process_id}/resize", post(resize_process))
+        .route("/api/terminal", post(start_terminal))
+        .route("/api/terminal/{process_id}", get(terminal_snapshot))
         .merge(database::router())
         .route(
             "/api/mcp/servers",
@@ -532,7 +534,9 @@ impl From<ProcessError> for ServerError {
     fn from(error: ProcessError) -> Self {
         match error {
             ProcessError::NotFound => Self::new(StatusCode::NOT_FOUND, error.to_string()),
-            ProcessError::EmptyCommand => Self::new(StatusCode::BAD_REQUEST, error.to_string()),
+            ProcessError::EmptyCommand | ProcessError::InvalidShell(_) => {
+                Self::new(StatusCode::BAD_REQUEST, error.to_string())
+            }
             _ => Self::with_details(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "process error",

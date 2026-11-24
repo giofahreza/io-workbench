@@ -100,3 +100,48 @@ pub struct ProcessInfo {
     #[serde(default)]
     pub pty: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalStartRequest {
+    pub cwd: Option<String>,
+    #[serde(default = "default_terminal_cols")]
+    pub cols: u16,
+    #[serde(default = "default_terminal_rows")]
+    pub rows: u16,
+    #[serde(default)]
+    pub safe: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalShellInfo {
+    pub command: String,
+    pub args: Vec<String>,
+    pub source: String,
+    pub safe: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalStartResponse {
+    #[serde(flatten)]
+    pub process: ProcessStartResponse,
+    pub shell: TerminalShellInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalOutputChunk {
+    pub stream: ProcessStream,
+    pub data: String,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSnapshotResponse {
+    pub process: ProcessInfo,
+    pub chunks: Vec<TerminalOutputChunk>,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+}
