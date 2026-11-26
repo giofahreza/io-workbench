@@ -351,6 +351,28 @@
     }
 
     #[test]
+    fn claude_submission_receipt_survives_reopen_and_protects_accepted_prompt() {
+        let (storage, root) = temporary_storage("claude-submission");
+        let mut session = test_session("claude-chat", true);
+        session.provider = Provider::Claude;
+        let prompt = test_message("accepted-claude-prompt", MessageRole::User, "continue", 0);
+        let mut run = StoredDurableChatRun::new("claude-run", None, session.id.clone(), "claude", "continue", session.project_path.clone());
+        run.user_message_id = Some(prompt.id.clone());
+        storage.create_durable_chat_turn(&session, &prompt, &run).unwrap();
+        storage.record_native_run_submission(&run.id, "claude_bridge", None).unwrap();
+        storage.record_native_run_submission(&run.id, "claude_bridge", Some("native-turn")).unwrap();
+        storage.record_native_run_submission(&run.id, "claude_bridge", None).unwrap();
+        drop(storage);
+        let storage = Storage::open(root.join("test.db")).unwrap();
+        assert_eq!(storage.native_run_submission(&run.id).unwrap(), Some(("claude_bridge".into(), Some("native-turn".into()))));
+        assert!(!storage.reject_native_run_before_acceptance(&run.id, "busy").unwrap());
+        assert_eq!(storage.list_messages(&session.id).unwrap().len(), 1);
+        assert_eq!(storage.get_durable_chat_run(&run.id).unwrap().unwrap().status, "running");
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejected_codex_send_removes_only_the_unaccepted_prompt_and_retains_diagnostics() {
         let (storage, root) = temporary_storage("codex-rejected");
         let mut session = test_session("native-chat", true);

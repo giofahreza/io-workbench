@@ -1,3 +1,41 @@
+#[test]
+fn claude_live_history_matches_native_uuid_when_cli_repeats_the_same_prompt() {
+    let message = |id: &str, role, content: &str, native: Option<&str>| ChatMessage {
+        id: id.into(),
+        role,
+        content: content.into(),
+        timestamp: Utc::now(),
+        metadata: serde_json::json!({"nativeUserUuid":native}),
+    };
+    let stored = vec![
+        message("local-user", MessageRole::User, "again", Some("wb-native")),
+        message("local-answer", MessageRole::Assistant, "answer", None),
+        message("local-error", MessageRole::System, "unsent", None),
+    ];
+    let external = vec![
+        message("cli-user", MessageRole::User, "again", Some("cli-native")),
+        message("cli-answer", MessageRole::Assistant, "answer", None),
+        message("native-user", MessageRole::User, "again", Some("wb-native")),
+        message("native-answer", MessageRole::Assistant, "answer", None),
+        message("later-cli", MessageRole::User, "next", Some("later-native")),
+    ];
+    let merged = merge_mapped_claude_messages(stored, external);
+    assert_eq!(
+        merged
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "cli-user",
+            "cli-answer",
+            "local-user",
+            "local-answer",
+            "later-cli",
+            "local-error"
+        ]
+    );
+}
+
 fn claude_history_events(streamed: bool, final_text: &str) -> String {
     let progress = serde_json::json!({"type": "assistant", "message": {
         "content": [{"type": "text", "text": "Checking the fixture."}]

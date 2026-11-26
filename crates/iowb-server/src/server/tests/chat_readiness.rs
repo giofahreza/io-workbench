@@ -1,4 +1,14 @@
 #[test]
+fn claude_native_catalog_offers_inheritance_without_overriding_the_terminal() {
+    let session = SessionSummary { provider:Provider::Claude,runtime:Some(ChatRuntime::NativeCli),external:true,..Default::default() };
+    let mut catalog = serde_json::json!({"ready":true,"models":[{"value":"","label":"Native default"},{"value":"sonnet"}]});
+    apply_imported_chat_catalog(&mut catalog,Some(&session));
+    assert_eq!(catalog["nativeSessionSettings"],true);
+    assert_eq!(catalog["models"][0]["label"],"Keep native Claude session settings");
+    assert_eq!(catalog["models"].as_array().unwrap().len(),2);
+}
+
+#[test]
 fn chat_model_preflight_handles_prefix_case_whitespace_and_injection() {
     for id in ["cod:gpt-6.1-sol", " COD:gpt-6.1-sol ", "cld:sonnet-4"] {
         assert_eq!(

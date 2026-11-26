@@ -458,3 +458,7 @@ fn load_receipts(root: &Path) -> Result<HashMap<String, Submission>> {
     }
     Ok(requests)
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
