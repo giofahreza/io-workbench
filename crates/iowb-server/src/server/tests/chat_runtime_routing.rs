@@ -126,3 +126,17 @@ async fn chat_runtime_preserves_explicit_session_routes() {
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
+#[test]
+fn imported_codex_catalog_uses_native_auth_without_claiming_it_was_verified() {
+    let imported = SessionSummary { provider: Provider::Codex, external: true, runtime: Some(ChatRuntime::NativeCli), ..Default::default() };
+    let mut catalog = serde_json::json!({"ready":false, "models":[], "readiness":{"installed":true,"authenticated":false}, "problem":{"code":"provider_auth_required"}});
+    apply_imported_chat_catalog(&mut catalog, Some(&imported));
+    assert_eq!(catalog["ready"], true);
+    assert_eq!(catalog["readiness"]["authenticated"], false);
+    assert_eq!(catalog["readiness"]["authState"], "configured_unverified");
+    assert_eq!(catalog["models"][0]["value"], "");
+    let mut unavailable = serde_json::json!({"ready":false,"models":[],"readiness":{"installed":false},"problem":{"code":"provider_cli_unavailable"}});
+    apply_imported_chat_catalog(&mut unavailable, Some(&imported));
+    assert_eq!(unavailable["ready"], false);
+    assert!(unavailable["models"].as_array().unwrap().is_empty());
+}

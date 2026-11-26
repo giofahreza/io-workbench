@@ -25,4 +25,5 @@ include!("thread.rs");
 #[cfg(test)]
 mod tests {
     include!("tests.rs");
+    include!("shared_tests.rs");
 }

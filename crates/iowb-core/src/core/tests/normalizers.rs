@@ -356,6 +356,7 @@
             &script,
             format!(
                 "#!/bin/sh\n\
+                 if [ \"$2\" = daemon ]; then printf \"error: unrecognized subcommand 'daemon'\\n\" >&2; exit 1; fi\n\
                  read first\nprintf '%s\\n' \"$first\" >> '{}'\n\
                  printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\"}}}}'\n\
                  read second\nprintf '%s\\n' \"$second\" >> '{}'\n\
@@ -578,7 +579,7 @@
             "\"method\":\"thread/start\""
         }));
         assert!(requests.contains("\"method\":\"turn/start\""));
-        assert!(requests.contains("\"approvalPolicy\":\"never\""));
+        assert!(!requests.contains("\"approvalPolicy\""));
         assert!(requests.contains("\"effort\":\"high\""));
         assert!(!requests.contains("\"effort\":\"xhigh\""));
         assert_eq!(

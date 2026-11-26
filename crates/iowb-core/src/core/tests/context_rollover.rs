@@ -681,6 +681,7 @@
             &script,
             format!(
                 "#!/bin/sh\n\
+                 if [ \"$2\" = daemon ]; then printf \"error: unrecognized subcommand 'daemon'\\n\" >&2; exit 1; fi\n\
                  printf '%s\\n' \"args:$*\" >> '{}'\n\
                  printf '%s\\n' \"gateway:${{IOWB_IO_GATEWAY_API_KEY:-}}\" >> '{}'\n\
                  read first\nprintf '%s\\n' \"$first\" >> '{}'\n\
@@ -858,6 +859,7 @@
         use std::os::unix::fs::PermissionsExt;
 
         let (mut state, root, project) = temporary_app_state("native-manual-compact-async").await;
+        state.sessions.external_home = Arc::new(root.clone());
         let script = root.join("compact-codex.sh");
         let log = root.join("compact-requests.log");
         let release = root.join("release-compact");
@@ -865,6 +867,7 @@
             &script,
             format!(
                 "#!/bin/sh\n\
+                 if [ \"$2\" = daemon ]; then printf \"error: unrecognized subcommand 'daemon'\\n\" >&2; exit 1; fi\n\
                  read first\nprintf '%s\\n' \"$first\" >> '{}'\n\
                  printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\"}}}}'\n\
                  read second\nprintf '%s\\n' \"$second\" >> '{}'\n\
@@ -985,6 +988,7 @@
             &script,
             format!(
                 "#!/bin/sh\n\
+                 if [ \"$2\" = daemon ]; then printf \"error: unrecognized subcommand 'daemon'\\n\" >&2; exit 1; fi\n\
                  read first\nprintf '%s\\n' \"$first\" >> '{}'\n\
                  printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"test\"}}}}'\n\
                  read second\nprintf '%s\\n' \"$second\" >> '{}'\n\

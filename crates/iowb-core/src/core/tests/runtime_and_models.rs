@@ -1055,7 +1055,7 @@
         manager.max_replay_bytes = 900;
         let (abort_tx, _abort_rx) = oneshot::channel();
         let key = "codex:replay-test".to_string();
-        manager.register(key.clone(), abort_tx).await;
+        manager.register(key.clone(), abort_tx).await.expect("register run");
         let hub = WsHub::new();
         for sequence in 1..=4 {
             manager

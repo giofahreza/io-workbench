@@ -104,6 +104,16 @@ test('stale model preferences are replaced by a model in the current catalog', a
   assert.equal(run(c, 'state.preferences.chatModel'), 'cod:new');
 });
 
+test('imported Codex chats inherit native settings instead of global model preferences', async () => {
+  const context = fixture();
+  run(context, `state.preferences.chatModel='another-model'`);
+  const pending = run(context, `loadChatModelsIntoSelect('codex')`);
+  run(context, `requests[0].resolve({ready:true,runtime:'native_cli',nativeSessionSettings:true,models:[{value:'',label:'Keep native Codex session settings'},{value:'another-model',label:'Another'}]})`);
+  await pending;
+  assert.equal(run(context, 'select.value'), '');
+  assert.equal(run(context, 'state.preferences.chatModel'), '');
+});
+
 test('offline Recheck retains documentation only for the same provider, session and route', async () => {
   for (const change of ['', "provider='claude'", "state.newChatRuntime='io_gateway'", "state.chatSessionId='session-b'"]) {
     const c=fixture();

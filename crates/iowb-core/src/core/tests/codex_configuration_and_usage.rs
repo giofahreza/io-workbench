@@ -153,6 +153,8 @@ fn codex_live_profile_defaults_override_saved_settings_below_chat_choices() {
         service_tier: None,
         approval_policy: None,
         sandbox_policy: None,
+        durable_submission: false,
+        recovery: None,
     };
     let mut options = CodexAppServerLaunchOptions::default();
     options.args = vec!["app-server".to_string()];
@@ -177,6 +179,137 @@ fn codex_live_profile_defaults_override_saved_settings_below_chat_choices() {
     assert_eq!(params.model.as_deref(), Some("chat-model"));
     assert_eq!(params.effort.as_deref(), Some("medium"));
     assert_eq!(params.service_tier.as_deref(), Some("fast"));
+}
+
+#[test]
+fn native_codex_resume_does_not_apply_workbench_profile_defaults() {
+    let mut params = CodexAppServerLiveTurnParams {
+        thread_id: Some("native-thread".into()),
+        cwd: PathBuf::from("/tmp"),
+        input: Vec::new(),
+        client_user_message_id: None,
+        model: None,
+        model_provider: None,
+        effort: None,
+        service_tier: None,
+        approval_policy: None,
+        sandbox_policy: None,
+        durable_submission: false,
+        recovery: None,
+    };
+    let options = CodexAppServerLaunchOptions {
+        args: vec![
+            "app-server".into(),
+            "-c".into(),
+            "model_provider=another-provider".into(),
+            "-c".into(),
+            "model=another-model".into(),
+        ],
+        transport: CodexAppServerTransport::NativeDaemon,
+        ..Default::default()
+    };
+    apply_codex_live_profile_defaults(&mut params, Some(&options));
+    assert!(params.model_provider.is_none());
+    assert!(params.model.is_none());
+    assert!(params.approval_policy.is_none());
+}
+
+#[tokio::test]
+async fn workbench_created_native_thread_inherits_settings_after_cli_switching() {
+    let (state, root, project) = temporary_app_state("native-shared-settings").await;
+    let session = state
+        .sessions
+        .create_or_update(
+            Provider::Codex,
+            project.display().to_string(),
+            None,
+            false,
+            Some("saved-model".into()),
+            Some(ChatRuntime::NativeCli),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    state
+        .sessions
+        .set_native_session_id(&session.id, "shared-native-thread")
+        .await
+        .unwrap();
+    state
+        .sessions
+        .set_native_rollout_owned_by_provider(&session.id, true)
+        .await
+        .unwrap();
+    let inherited = state
+        .native_chat_configuration(Provider::Codex, Some(&session.id))
+        .await
+        .unwrap();
+    assert_eq!(inherited.id, session.id);
+    assert!(!inherited.external);
+    assert_eq!(inherited.runtime, Some(ChatRuntime::NativeCli));
+    assert!(
+        state
+            .native_chat_configuration(Provider::Claude, Some(&session.id))
+            .await
+            .is_none()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn shared_native_history_keeps_local_rows_and_later_cli_messages_without_setup_context() {
+    let started = Utc::now();
+    let message = |id: &str, role, content: &str, seconds| ChatMessage {
+        id: id.to_string(),
+        role,
+        content: content.to_string(),
+        timestamp: started + chrono::Duration::seconds(seconds),
+        metadata: Value::Null,
+    };
+    let mut user = message("local-user", MessageRole::User, "/review changes", 0);
+    user.metadata = serde_json::json!({"nativeInput":"Expanded review instructions"});
+    let stored = vec![
+        user,
+        message("local-answer", MessageRole::Assistant, "Review complete", 2),
+    ];
+    let external = vec![
+        message("setup", MessageRole::User, "Unrelated setup", -2),
+        message(
+            "native-user",
+            MessageRole::User,
+            "Expanded review instructions",
+            1,
+        ),
+        message(
+            "native-answer",
+            MessageRole::Assistant,
+            "Review complete",
+            2,
+        ),
+        message("cli-user", MessageRole::User, "CLI follow-up", 3),
+        message("cli-answer", MessageRole::Assistant, "CLI reply", 4),
+    ];
+    let merged = merge_shared_codex_messages(stored.clone(), external.clone(), false);
+    assert_eq!(
+        merged
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/review changes",
+            "Review complete",
+            "CLI follow-up",
+            "CLI reply"
+        ]
+    );
+    assert_eq!(merged[0].id, "local-user");
+    assert_eq!(merged[1].id, "local-answer");
+    let imported = merge_shared_codex_messages(stored, external, true);
+    assert_eq!(imported.first().unwrap().content, "Unrelated setup");
+    assert_eq!(imported.len(), 5);
 }
 
 fn codex_usage_report(input: u64, output: u64, cached: u64, reasoning: u64) -> Value {

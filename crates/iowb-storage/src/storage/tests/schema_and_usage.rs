@@ -335,3 +335,37 @@
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
+    #[test]
+    fn codex_submission_ledger_survives_reopen_and_preserves_accepted_turns() {
+        let (storage, root) = temporary_storage("codex-submission");
+        storage.record_codex_run_submission("run-native", None).unwrap();
+        assert_eq!(storage.codex_run_submission("run-native").unwrap(), Some(("run-native".into(), None)));
+        storage.record_codex_run_submission("run-native", Some("native-turn")).unwrap();
+        storage.record_codex_run_submission("run-native", None).unwrap();
+        drop(storage);
+        let storage = Storage::open(root.join("test.db")).unwrap();
+        assert_eq!(storage.codex_run_submission("run-native").unwrap().unwrap().1.as_deref(), Some("native-turn"));
+        assert!(!storage.reject_codex_run_before_acceptance("run-native", "busy").unwrap());
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejected_codex_send_removes_only_the_unaccepted_prompt_and_retains_diagnostics() {
+        let (storage, root) = temporary_storage("codex-rejected");
+        let mut session = test_session("native-chat", true);
+        session.message_count = 1;
+        let prompt = test_message("unsent-native-prompt", MessageRole::User, "continue", 0);
+        let mut run = StoredDurableChatRun::new("rejected-run", None, session.id.clone(), "codex", "continue", session.project_path.clone());
+        run.user_message_id = Some(prompt.id.clone());
+        storage.create_durable_chat_turn(&session, &prompt, &run).unwrap();
+        assert!(storage.reject_codex_run_before_acceptance(&run.id, "native thread already has an active writer").unwrap());
+        assert!(storage.list_messages(&session.id).unwrap().is_empty());
+        let restored = storage.get_durable_chat_run(&run.id).unwrap().unwrap();
+        assert_eq!(restored.status, "rejected");
+        assert!(restored.last_error.unwrap().contains("active writer"));
+        assert!(!storage.get_session_summary(&session.id).unwrap().unwrap().active);
+        assert!(!storage.reject_codex_run_before_acceptance(&run.id, "retry").unwrap());
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }

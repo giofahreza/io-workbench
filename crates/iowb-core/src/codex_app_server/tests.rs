@@ -525,6 +525,8 @@
             service_tier: None,
             approval_policy: Some(json!("never")),
             sandbox_policy: None,
+            durable_submission: false,
+            recovery: None,
         }
     }
 
