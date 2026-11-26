@@ -436,6 +436,77 @@
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn io_gateway_model_discovery_requests_compact_codex_catalog_and_preserves_ids() {
+        async fn models(
+            axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+            headers: HeaderMap,
+        ) -> impl IntoResponse {
+            assert_eq!(uri.query(), Some("view=discovery"));
+            assert_eq!(headers[header::AUTHORIZATION], "Bearer stored-key");
+            assert_eq!(headers["x-api-key"], "stored-key");
+            Json(serde_json::json!({"models": [
+                {"slug": "gpt-test", "display_name": "Test"},
+                {"id": "cod:gpt-test", "slug": "cod:gpt-test", "display_name": "Test alias"},
+                {"slug": "ctm:custom-test", "display_name": "Custom"},
+                {"slug": "cod:hidden", "visibility": "HIDE"}
+            ]}))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/root/codex/models", get(models)),
+            )
+            .await
+        });
+        let result = fetch_direct_ai_models(&serde_json::json!({
+            "mode": "aiproxy",
+            "baseUrl": format!("http://{address}/root/codex"),
+            "gatewayApiKey": "stored-key",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            vec![
+                serde_json::json!({"value":"gpt-test", "label":"Test"}),
+                serde_json::json!({"value":"cod:gpt-test", "label":"Test alias"}),
+                serde_json::json!({"value":"ctm:custom-test", "label":"Custom"}),
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_provider_codex_catalog_does_not_request_gateway_discovery_view() {
+        async fn models(
+            axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+        ) -> impl IntoResponse {
+            assert!(uri.query().is_none());
+            Json(serde_json::json!({"models": [{"slug":"direct-test"}]}))
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/codex/models", get(models))).await
+        });
+        let result = fetch_direct_ai_models(&serde_json::json!({
+            "mode": "direct",
+            "baseUrl": format!("http://{address}/codex"),
+            "gatewayApiKey": "stored-key",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            vec![serde_json::json!({"value":"direct-test", "label":"direct-test"})]
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn io_gateway_model_catalog_uses_stored_key_and_keeps_full_list() {
         async fn models(headers: HeaderMap) -> impl IntoResponse {
             let bearer = headers
