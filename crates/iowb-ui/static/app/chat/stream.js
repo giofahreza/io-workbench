@@ -893,7 +893,29 @@ function replayChatMessages(messages, options = {}) {
     } else if (role === "system") {
       const node = existingNode || document.createElement("div");
       node.className = "chat-line-system";
-      if (node.textContent !== content) node.textContent = content;
+      if (persistedMeta.kind === "chat_error") {
+        node.classList.add("chat-error-history");
+        node.replaceChildren();
+        const title = document.createElement("strong");
+        title.textContent = persistedMeta.phase === "rejected" ? "Message not sent" : "Chat error";
+        const text = document.createElement("p"); text.textContent = content;
+        node.append(title, text);
+        if (persistedMeta.action) {
+          const action = document.createElement("button"); action.type = "button";
+          action.textContent = "Review chat setup";
+          action.onclick = async () => {
+            togglePromptConfigPanel(true);
+            await loadChatModelsIntoSelect(chatCliValue(), true);
+          };
+          node.append(action);
+        }
+        const url = safeProviderDocsUrl(persistedMeta.docsUrl);
+        if (url) {
+          const link = document.createElement("a"); link.href = url; link.target = "_blank";
+          link.rel = "noopener noreferrer"; link.textContent = "Official setup guide";
+          node.append(link);
+        }
+      } else if (node.textContent !== content) node.textContent = content;
       placeChatRenderedLine(output, node, placement);
       renderedNode = node;
     }

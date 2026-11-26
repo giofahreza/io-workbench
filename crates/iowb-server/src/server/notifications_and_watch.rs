@@ -352,6 +352,7 @@ fn spawn_process_event_bridge(state: AppState) {
                     process_id,
                     message,
                 }) => hub.publish(WsServerEvent::Error {
+                    history_message: None,
                     message: format!("process {process_id} failed"),
                     details: Some(message),
                     session_id: None,

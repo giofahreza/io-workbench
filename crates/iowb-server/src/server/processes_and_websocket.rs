@@ -132,12 +132,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
                 ).await;
             }
             Some(event) = direct_rx.recv() => {
-                if ws_event_visible_to_connection(
+                let event = state.ws_hub.prepare_event(event);
+                // Direct failures acknowledge this connection's command;
+                // streaming/replayed board events still require subscriptions.
+                if (matches!(&event, WsServerEvent::Error { .. } | WsServerEvent::ChatSetupRequired { .. } | WsServerEvent::ChatRecoveryRequired { .. }) || ws_event_visible_to_connection(
                     &state,
                     &event,
                     &board_session_subscriptions,
                     &chat_session_subscriptions,
-                ) && send_ws_event(&mut sender, event).await.is_err() {
+                )) && send_ws_event(&mut sender, event).await.is_err() {
                     break;
                 }
             }
@@ -155,6 +158,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         let warning = WsServerEvent::Error {
+                            history_message: None,
                             message: "websocket client fell behind".to_string(),
                             details: Some(format!("skipped {skipped} events")),
                             session_id: None,
@@ -263,6 +267,7 @@ async fn handle_ws_command(
             thinking,
             fast,
         } => {
+            let session_id = Some(session_id.unwrap_or_else(|| new_id("session")));
             let runtime = requested_chat_runtime(
                 state,
                 &user.id,
@@ -319,8 +324,16 @@ async fn handle_ws_command(
                 }
             }
             if let Some(problem) = problem {
+                let history_message = match persist_rejected_chat_send(
+                    state, &user.id, provider, runtime, session_id.as_deref().unwrap(),
+                    request_id.as_deref(), &project_path, &prompt, &problem,
+                ).await {
+                    Ok(message) => Some(message),
+                    Err(error) => { warn!(error = %error.body.error, "could not persist rejected chat send"); None }
+                };
                 let event = if request_id.is_none() {
                     WsServerEvent::Error {
+                        history_message,
                         message: problem["message"]
                             .as_str()
                             .unwrap_or("Check provider setup.")
@@ -330,6 +343,7 @@ async fn handle_ws_command(
                     }
                 } else {
                     WsServerEvent::ChatSetupRequired {
+                        history_message,
                         provider,
                         session_id: session_id.clone().unwrap_or_default(),
                         request_id,
@@ -362,8 +376,8 @@ async fn handle_ws_command(
             if let Err(error) = state
                 .start_agent_session_with_request(
                     provider,
-                    project_path,
-                    prompt,
+                    project_path.clone(),
+                    prompt.clone(),
                     session_id,
                     model,
                     effort,
@@ -373,7 +387,7 @@ async fn handle_ws_command(
                     runtime,
                     direct_ai_config,
                     Some(user.id.clone()),
-                    request_id,
+                    request_id.clone(),
                 )
                 .await
             {
@@ -402,8 +416,15 @@ async fn handle_ws_command(
                     }
                 }
                 if !recovery_sent {
+                    let explanation = if matches!(error, iowb_core::CoreError::Conflict(_)) { error.to_string() } else { "Failed to start session.".into() };
+                    let problem = serde_json::json!({ "code": "chat_start_failed", "message": explanation, "action": "retry" });
+                    let history_message = persist_rejected_chat_send(
+                        state, &user.id, provider, runtime, requested_session_id.as_deref().unwrap(),
+                        request_id.as_deref(), &project_path, &prompt, &problem,
+                    ).await.ok();
                     let _ = direct_tx
                         .send(WsServerEvent::Error {
+                            history_message,
                             message: "failed to start session".to_string(),
                             details: Some(error.to_string()),
                             session_id: requested_session_id,
@@ -420,6 +441,7 @@ async fn handle_ws_command(
             Err(error) => {
                 let _ = direct_tx
                     .send(WsServerEvent::Error {
+                        history_message: None,
                         message: "failed to abort session".to_string(),
                         details: Some(error.to_string()),
                         session_id: Some(session_id),
@@ -435,6 +457,7 @@ async fn handle_ws_command(
             {
                 let _ = direct_tx
                     .send(WsServerEvent::Error {
+                        history_message: None,
                         message: "failed to write process input".to_string(),
                         details: Some(error.to_string()),
                         session_id: None,
@@ -454,6 +477,7 @@ async fn handle_ws_command(
             {
                 let _ = direct_tx
                     .send(WsServerEvent::Error {
+                        history_message: None,
                         message: "failed to resize process".to_string(),
                         details: Some(error.to_string()),
                         session_id: None,
@@ -568,7 +592,7 @@ fn requested_chat_runtime(
     // inference uses stored metadata, never a newly submitted model.
     let exists = session_id
         .and_then(|id| state.storage.get_session_summary(id).ok().flatten())
-        .is_some();
+        .is_some_and(|session| !rejected_chat_draft(state, &session));
     if exists || requested.is_none() {
         resolve_session_chat_runtime(state, user_id, provider, session_id, None)
     } else {

@@ -61,6 +61,7 @@ async fn process_agent_event(
                     &context.hub,
                     key,
                     WsServerEvent::Error {
+                        history_message: None,
                         message: "agent output stream failed".to_string(),
                         details: Some(message),
                         session_id: Some(context.session_id.clone()),
@@ -199,6 +200,7 @@ async fn finish_codex_app_server_outcome(
                             &context.hub,
                             key,
                             WsServerEvent::Error {
+                                history_message: None,
                                 message:
                                     "Codex completed without a final assistant response"
                                         .to_string(),

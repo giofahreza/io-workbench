@@ -458,7 +458,17 @@ function connectWs() {
         return;
       }
       if (payload.sessionId && !isActiveChatSessionEvent(payload)) return;
-      appendChatLine(`[error] ${payload.message}${payload.details ? `: ${payload.details}` : ""}`);
+      if (payload.historyMessage) {
+        const rejected = payload.historyMessage.metadata?.phase === "rejected";
+        const attempt = state.chatSetupAttempt;
+        if (rejected && attempt && payload.historyMessage.metadata?.requestId === attempt.requestId) {
+          handleChatSetupRequired({ ...payload, requestId: attempt.requestId });
+        } else {
+          rememberChatErrorMessage(payload);
+        }
+      } else {
+        appendChatLine(`[error] ${payload.message}${payload.details ? `: ${payload.details}` : ""}`);
+      }
     }
   });
 

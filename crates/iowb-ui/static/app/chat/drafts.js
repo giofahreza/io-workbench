@@ -221,6 +221,9 @@ async function saveChatPromptDraftNow() {
   const sessionId = currentChatDraftSessionId();
   const prompt = qs("#chat-prompt");
   if (!prompt) return;
+  // On startup the input is empty until this session's draft is loaded.
+  // Saving that placeholder would delete the durable retry draft.
+  if (sessionId && state.chatPromptDraftSessionId !== sessionId) return;
   const content = prompt.value || "";
   writeLocalChatPromptDraft(content, sessionId);
   if (!sessionId) return;
@@ -253,7 +256,7 @@ function clearRemoteChatPromptDraft(sessionId) {
     window.clearTimeout(state.chatPromptDraftSaveTimer);
     state.chatPromptDraftSaveTimer = null;
   }
-  api(`/api/sessions/${encodeURIComponent(id)}/draft`, { method: "DELETE" }).catch((error) => {
+  return api(`/api/sessions/${encodeURIComponent(id)}/draft`, { method: "DELETE" }).catch((error) => {
     console.warn("Unable to clear prompt draft", error);
   });
 }

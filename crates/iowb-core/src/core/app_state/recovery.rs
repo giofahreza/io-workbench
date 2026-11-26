@@ -27,6 +27,7 @@ impl AppState {
                 TokenUsageCompleteness::Missing,
             );
             self.ws_hub.publish(WsServerEvent::Error {
+                history_message: None,
                 message: "Codex context compaction failed".to_string(),
                 details: Some(message),
                 session_id: Some(task.session.id.clone()),
@@ -98,6 +99,7 @@ impl AppState {
                 TokenUsageCompleteness::Missing,
             );
             self.ws_hub.publish(WsServerEvent::Error {
+                history_message: None,
                 message: "Codex context compaction could not be activated".to_string(),
                 details: Some(message),
                 session_id: Some(task.session.id.clone()),

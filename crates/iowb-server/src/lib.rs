@@ -21,6 +21,7 @@ include!("server/configuration.rs");
 include!("server/direct_ai.rs");
 include!("server/provider_runtime.rs");
 include!("server/chat_readiness.rs");
+include!("server/chat_errors.rs");
 include!("server/tools_and_compat.rs");
 
 #[cfg(test)]

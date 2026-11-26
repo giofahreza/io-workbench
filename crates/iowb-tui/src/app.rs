@@ -657,6 +657,7 @@ impl App {
                 message,
                 details,
                 session_id,
+                ..
             } => {
                 let ours = session_id.is_none() || session_id == current;
                 if ours {
@@ -1853,6 +1854,7 @@ mod tests {
         let (mut app, _rx, _ws) = open_chat();
         app.chat.running = true;
         app.update(Msg::Ws(WsServerEvent::Error {
+            history_message: None,
             message: "failed to spawn agent provider".into(),
             details: Some("failed to spawn agent provider: claude: No such file".into()),
             session_id: Some("s1".into()),
@@ -1864,6 +1866,7 @@ mod tests {
         );
 
         app.update(Msg::Ws(WsServerEvent::Error {
+            history_message: None,
             message: "bad request".into(),
             details: Some("missing prompt".into()),
             session_id: None,

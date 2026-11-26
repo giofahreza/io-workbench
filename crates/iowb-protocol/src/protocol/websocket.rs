@@ -82,6 +82,9 @@ pub enum WsServerEvent {
     },
     Error {
         message: String,
+        /// The durable, user-visible error entry. Absent for connection errors.
+        #[serde(default, rename = "historyMessage", skip_serializing_if = "Option::is_none")]
+        history_message: Option<ChatMessage>,
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<String>,
         #[serde(rename = "sessionId", default, skip_serializing_if = "Option::is_none")]
@@ -100,6 +103,8 @@ pub enum WsServerEvent {
     /// from arbitrary provider stderr. Older clients can ignore this event.
     ChatSetupRequired {
         provider: Provider,
+        #[serde(default, rename = "historyMessage", skip_serializing_if = "Option::is_none")]
+        history_message: Option<ChatMessage>,
         #[serde(rename = "sessionId")]
         session_id: String,
         #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]

@@ -670,3 +670,13 @@
 .chat-jump-latest.hidden {
   display: none;
 }
+
+.chat-error-history {
+  text-align: left;
+  border: 1px solid var(--danger, #d65c5c);
+  border-radius: 8px;
+  padding: 12px;
+  white-space: pre-wrap;
+}
+.chat-error-history p { margin: 6px 0; }
+.chat-error-history a { margin-left: 12px; }

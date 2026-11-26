@@ -269,7 +269,7 @@ function renderChatManualCompactionCard(sessionId = state.chatSessionId) {
 
 function selectedChatCanManualCompact() {
   const sid = String(state.chatSessionId || "").trim();
-  if (!sid || sid.startsWith("local-") || !canLoadProtectedData()) return false;
+  if (!sid || (sid.startsWith("local-") && !findChatSession(sid)) || !canLoadProtectedData()) return false;
   const session = findChatSession(sid) || cachedChatSession(sid)?.session || {};
   const provider = String(sessionProvider(session) || chatCliValue() || "").toLowerCase();
   if (provider !== "codex") return false;

@@ -459,6 +459,7 @@ impl AppState {
                     TokenUsageCompleteness::Missing,
                 );
                 state.ws_hub.publish(WsServerEvent::Error {
+                    history_message: None,
                     message: "Codex retry could not be started".to_string(),
                     details: Some(message),
                     session_id: Some(session_id_for_task.clone()),

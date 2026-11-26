@@ -47,6 +47,7 @@ impl AgentRuntimeManager {
                         &context.hub,
                         &key,
                         WsServerEvent::Error {
+                            history_message: None,
                             message: "failed to prepare agent command".to_string(),
                             details: Some(error_message.clone()),
                             session_id: Some(context.session_id.clone()),
@@ -111,6 +112,7 @@ impl AgentRuntimeManager {
                         &context.hub,
                         &key,
                         WsServerEvent::Error {
+                            history_message: None,
                             message: "IO Gateway is not configured".to_string(),
                             details: Some(error_message.clone()),
                             session_id: Some(context.session_id.clone()),
@@ -182,12 +184,14 @@ impl AgentRuntimeManager {
                         &key,
                         if context.request_id.is_some() && matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) {
                             WsServerEvent::ChatSetupRequired {
+                                history_message: None,
                                 provider: context.provider, session_id: context.session_id.clone(),
                                 request_id: context.request_id.clone(), code: "provider_cli_unavailable".into(),
                                 message: "The provider CLI became unavailable. Check its installation and permissions for the Workbench service user, then Recheck setup.".into(),
                                 action: "install".into(), docs_url: None,
                             }
                         } else { WsServerEvent::Error {
+                            history_message: None,
                             message: "failed to spawn agent provider".to_string(),
                             details: Some(error_message.clone()),
                             session_id: Some(context.session_id.clone()),
@@ -360,6 +364,7 @@ impl AgentRuntimeManager {
                                             }
                                             Err(error_output) => {
                                                 manager.publish(&context.hub, &key, WsServerEvent::Error {
+                                                    history_message: None,
                                                     message: "Codex completed without a final assistant response".to_string(),
                                                     details: Some(
                                                         "The Codex process exited successfully, but its event stream did not contain a final assistant message. The accumulated CLI transcript was not saved as the reply."
@@ -416,6 +421,7 @@ impl AgentRuntimeManager {
                                     let persisted_output = provider_specific_final
                                         .unwrap_or_else(|| output.clone());
                                     manager.publish(&context.hub, &key, WsServerEvent::Error {
+                                        history_message: None,
                                         message: "agent process wait failed".to_string(),
                                         details: Some(error.to_string()),
                                         session_id: Some(context.session_id.clone()),
@@ -495,6 +501,7 @@ impl AgentRuntimeManager {
                     &context.hub,
                     &key,
                     WsServerEvent::Error {
+                        history_message: None,
                         message: "failed to prepare Codex app-server".to_string(),
                         details: Some(error_message.clone()),
                         session_id: Some(context.session_id.clone()),
@@ -608,6 +615,7 @@ impl AgentRuntimeManager {
                             &context.hub,
                             &key,
                             WsServerEvent::Error {
+                                history_message: None,
                                 message: "Codex app-server live turn failed".to_string(),
                                 details: Some(error_message.clone()),
                                 session_id: Some(context.session_id.clone()),
@@ -631,6 +639,7 @@ impl AgentRuntimeManager {
                             &context.hub,
                             &key,
                             WsServerEvent::Error {
+                                history_message: None,
                                 message: "Codex app-server task failed".to_string(),
                                 details: Some(error_message.clone()),
                                 session_id: Some(context.session_id.clone()),
@@ -681,6 +690,7 @@ impl AgentRuntimeManager {
                 &context.hub,
                 &key,
                 WsServerEvent::Error {
+                    history_message: None,
                     message: "Direct AI gateway is not configured".to_string(),
                     details: Some(error_message.clone()),
                     session_id: Some(context.session_id.clone()),
@@ -710,6 +720,7 @@ impl AgentRuntimeManager {
                 &context.hub,
                 &key,
                 WsServerEvent::Error {
+                    history_message: None,
                     message: error_message.clone(),
                     details: None,
                     session_id: Some(context.session_id.clone()),
@@ -817,6 +828,7 @@ impl AgentRuntimeManager {
                         Err(error) => {
                             let error_message = format!("Direct AI gateway request failed\n\n{error}");
                             manager.publish(&context.hub, &key, WsServerEvent::Error {
+                                history_message: None,
                                 message: "Direct AI gateway request failed".to_string(),
                                 details: Some(error_message.clone()),
                                 session_id: Some(context.session_id.clone()),
@@ -926,6 +938,9 @@ impl AgentRuntimeManager {
     }
 
     async fn publish(&self, hub: &WsHub, key: &str, event: WsServerEvent) {
+        // Cache the same durable ID that live delivery receives, so replay
+        // cannot create a second error in the client's conversation.
+        let event = hub.prepare_event(event);
         {
             let mut runs = self.runs.write().await;
             if let Some(record) = runs.get_mut(key) {
@@ -982,6 +997,7 @@ impl AgentRuntimeManager {
                             &context.hub,
                             key,
                             WsServerEvent::Error {
+                                history_message: None,
                                 message: "clean context could not be activated".to_string(),
                                 details: Some(message),
                                 session_id: Some(context.session_id.clone()),
@@ -1308,6 +1324,7 @@ impl AgentRuntimeManager {
                 &context.hub,
                 &key,
                 WsServerEvent::Error {
+                    history_message: None,
                     message: "clean-context retry could not start".to_string(),
                     details: Some(message),
                     session_id: Some(session_id),
@@ -1329,6 +1346,7 @@ impl AgentRuntimeManager {
                             &context.hub,
                             &key,
                             WsServerEvent::Error {
+                                history_message: None,
                                 message: "clean-context retry could not start".to_string(),
                                 details: Some(message),
                                 session_id: Some(session_id),
@@ -1362,6 +1380,7 @@ impl AgentRuntimeManager {
                 &context.hub,
                 &key,
                 WsServerEvent::Error {
+                    history_message: None,
                     message: "clean-context retry could not start".to_string(),
                     details: Some(message),
                     session_id: Some(session_id),
@@ -1407,6 +1426,7 @@ impl AgentRuntimeManager {
                 &context.hub,
                 &key,
                 WsServerEvent::Error {
+                    history_message: None,
                     message: "clean-context retry could not start".to_string(),
                     details: Some(message),
                     session_id: Some(session_id.clone()),

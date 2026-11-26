@@ -195,6 +195,45 @@ impl Storage {
         self.with_connection(|conn| insert_message_conn(conn, session_id, message))
     }
 
+    /// Save an error and (for a rejected send) its retry draft atomically.
+    /// Stable message IDs make redelivery idempotent. Existing session routing
+    /// and newer nonempty drafts must never be overwritten by an error.
+    pub fn persist_chat_error(
+        &self,
+        session: &SessionSummary,
+        message: &ChatMessage,
+        draft: Option<(&str, &str)>,
+    ) -> Result<()> {
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                params![session.id], |row| row.get(0),
+            )?;
+            if !exists {
+                upsert_session_conn(&tx, session)?;
+            }
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO messages (id, session_id, role, content, timestamp, metadata) VALUES (?1, ?2, 'system', ?3, ?4, ?5)",
+                params![message.id, session.id, message.content, message.timestamp.to_rfc3339(), serde_json::to_string(&message.metadata)?],
+            )?;
+            if inserted > 0 {
+                tx.execute(
+                    "UPDATE sessions SET message_count = (SELECT COUNT(*) FROM messages WHERE session_id = ?1), last_activity = MAX(last_activity, ?2) WHERE id = ?1",
+                    params![session.id, message.timestamp.to_rfc3339()],
+                )?;
+                if let Some((user_id, content)) = draft {
+                    tx.execute(
+                        "INSERT INTO session_drafts (user_id, session_id, content, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(user_id, session_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at WHERE trim(session_drafts.content) = ''",
+                        params![user_id, session.id, content, message.timestamp.to_rfc3339()],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn materialize_session_messages(
         &self,
         session_id: &str,

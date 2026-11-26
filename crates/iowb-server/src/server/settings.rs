@@ -565,7 +565,7 @@ async fn chat_provider_models(
         .session_id
         .as_deref()
         .and_then(|id| state.storage.get_session_summary(id).ok().flatten());
-    catalog["pinned"] = Value::Bool(stored.is_some());
+    catalog["pinned"] = Value::Bool(stored.as_ref().is_some_and(|session| !rejected_chat_draft(&state, session)));
     if runtime == ChatRuntime::NativeCli
         && catalog["ready"] == true
         && let Some(session) = stored.filter(|session| session.provider == provider)

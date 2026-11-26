@@ -548,34 +548,18 @@ function handleChatSetupRequired(payload) {
   clearChatProcessing();
   rememberSidebarSessionStatus({ sessionId: payload.sessionId, provider: payload.provider, status: "failed" });
   // Restore only this rejected draft, never replace text entered since send.
-  if (!qs("#chat-prompt")?.value.trim()) {
+  const rejected = payload.historyMessage?.metadata?.phase !== "runtime";
+  if (rejected && !qs("#chat-prompt")?.value.trim()) {
     setChatPromptValue(attempt.draft);
+    noteChatPromptUserEdit(attempt.draft);
+    state.chatPromptDraftSessionId = payload.sessionId;
     writeLocalChatPromptDraft(attempt.draft, payload.sessionId);
   }
-  const card = document.createElement("div");
-  card.className = "chat-setup-card"; card.setAttribute("role", "alert");
-  const message = document.createElement("p"); message.textContent = payload.message;
-  card.append(message);
-  const url = safeProviderDocsUrl(payload.docsUrl);
-  if (url) {
-    const link = document.createElement("a"); link.href = url; link.target = "_blank";
-    link.rel = "noopener noreferrer"; link.textContent = "Official setup guide"; card.append(link);
+  if (payload.historyMessage) {
+    rememberChatErrorMessage(payload, rejected ? attempt.optimisticMessageId : null);
+  } else {
+    appendChatLine(`[error] ${payload.message}`);
   }
-  const action = document.createElement("button"); action.type = "button";
-  action.textContent = payload.action === "new_chat" ? "Start new chat" : "Recheck setup";
-  action.onclick = async () => {
-    if (!isActiveChatSessionEvent(payload)) return;
-    if (payload.action === "new_chat") {
-      const draft = qs("#chat-prompt")?.value || attempt.draft;
-      await startNewChatForProject(attempt.projectPath);
-      state.newChatRuntime = "io_gateway";
-      setChatPromptValue(draft); writeLocalChatPromptDraft(draft, "");
-    }
-    togglePromptConfigPanel(true);
-    await loadChatModelsIntoSelect(chatCliValue(), true);
-  };
-  card.append(action);
-  qs("#chat-output")?.append(card);
   updateChatComposerState();
 }
 
@@ -805,4 +789,21 @@ function renderVirtualList(target, key, items, options) {
     });
   }
   options.bind?.(target);
+}
+
+// Merge the same durable row used by snapshots and replay. Rejected prompts
+// are drafts; remove their optimistic user row so history does not imply a run.
+function rememberChatErrorMessage(payload, rejectedMessageId = null) {
+  const message = payload.historyMessage;
+  const sessionId = payload.sessionId;
+  if (!message || !sessionId || !isActiveChatSessionEvent(payload)) return;
+  const previous = chatHistoryWindow.sessionId === sessionId ? chatHistoryWindow.messages : [];
+  const messages = previous.filter((entry) => entry.id !== rejectedMessageId);
+  if (!messages.some((entry) => entry.id === message.id)) messages.push(message);
+  chatHistoryWindow = {
+    ...chatHistoryWindow, sessionId, messages,
+    totalCount: Math.max(messages.length, (chatHistoryWindow.totalCount || 0) + messages.length - previous.length),
+  };
+  reconcileChatMessages(messages);
+  rememberCurrentChatSession({ sessionId, messages, live: false, status: "failed" });
 }

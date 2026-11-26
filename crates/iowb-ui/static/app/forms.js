@@ -662,6 +662,9 @@ function bindForms() {
     };
     if (sessionId) message.sessionId = sessionId;
     state.chatSetupAttempt = { sessionId, requestId: message.requestId, draft: draftContent, projectPath, handled: false };
+    // Finish clearing the old draft before sending: a late DELETE must not
+    // erase the retry draft saved by a quick server rejection.
+    if (sessionId) await clearRemoteChatPromptDraft(sessionId);
     try {
       state.ws.send(JSON.stringify(message));
     } catch (error) {
@@ -682,7 +685,7 @@ function bindForms() {
         savePreferences();
       }
       writeLocalChatPromptDraft("", sessionId);
-      if (currentChatDraftSessionId() === sessionId) clearRemoteChatPromptDraft(sessionId);
+
     }
     state.pendingChatSessionId = "";
     clearChatPromptInput();
@@ -691,7 +694,8 @@ function bindForms() {
 
     // Show the user prompt in the chat with right-aligned styling, plus the
     // current overrides footer so the data below the prompt is visible.
-    const optimisticMessageId = `local-user-${Date.now()}`;
+    const optimisticMessageId = `local-user-${message.requestId}`;
+    state.chatSetupAttempt.optimisticMessageId = optimisticMessageId;
     noteChatSessionEvent(sessionId);
     appendUserPromptToChat(prompt, {
       id: optimisticMessageId, cli, model, effort, mode, thinking, fast, sentAt: startedAt,

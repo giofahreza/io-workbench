@@ -110,19 +110,89 @@ impl Default for WatchManager {
 #[derive(Clone)]
 pub struct WsHub {
     tx: broadcast::Sender<WsServerEvent>,
+    storage: Option<Storage>,
 }
 
 impl WsHub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(iowb_protocol::WS_EVENT_CHANNEL_CAPACITY);
-        Self { tx }
+        Self { tx, storage: None }
+    }
+
+    pub fn with_storage(storage: Storage) -> Self {
+        Self {
+            storage: Some(storage),
+            ..Self::new()
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<WsServerEvent> {
         self.tx.subscribe()
     }
 
+    /// Persist session errors before delivery, including when no client is
+    /// connected. Connection-only warnings have no session and stay transient.
+    pub fn prepare_event(&self, mut event: WsServerEvent) -> WsServerEvent {
+        let (message, session_id, history_message, metadata) = match &mut event {
+            WsServerEvent::Error {
+                message,
+                session_id: Some(session_id),
+                history_message,
+                ..
+            } => (
+                message,
+                session_id,
+                history_message,
+                serde_json::json!({
+                    "kind": "chat_error", "code": "chat_runtime_error", "phase": "runtime", "status": "failed"
+                }),
+            ),
+            WsServerEvent::ChatSetupRequired {
+                message,
+                session_id,
+                history_message,
+                code,
+                action,
+                docs_url,
+                request_id,
+                ..
+            } => (
+                message,
+                session_id,
+                history_message,
+                serde_json::json!({
+                    "kind": "chat_error", "code": code, "phase": "runtime", "status": "failed",
+                    "action": action, "docsUrl": docs_url, "requestId": request_id,
+                }),
+            ),
+            _ => return event,
+        };
+        if history_message.is_none()
+            && let Some(storage) = &self.storage
+        {
+            match storage.get_session_summary(session_id) {
+                Ok(Some(session)) => {
+                    let entry = ChatMessage {
+                        id: new_id("chat-error"),
+                        role: MessageRole::System,
+                        content: message.chars().take(4096).collect(),
+                        timestamp: Utc::now(),
+                        metadata,
+                    };
+                    match storage.persist_chat_error(&session, &entry, None) {
+                        Ok(()) => *history_message = Some(entry),
+                        Err(error) => warn!(%session_id, %error, "could not persist chat error"),
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => warn!(%session_id, %error, "could not load failed chat"),
+            }
+        }
+        event
+    }
+
     pub fn publish(&self, event: WsServerEvent) {
+        let event = self.prepare_event(event);
         let _ = self.tx.send(event);
     }
 }
