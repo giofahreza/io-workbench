@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+axum.workspace = true
 bcrypt.workspace = true
 chrono.workspace = true
 dirs.workspace = true

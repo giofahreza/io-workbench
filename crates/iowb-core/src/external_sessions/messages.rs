@@ -36,12 +36,13 @@ fn load_claude_messages(record: &ExternalSessionRecord) -> Vec<ChatMessage> {
         if role == MessageRole::User {
             content = visible_user_text(&content);
         }
-        push_message(
+        push_message_with_metadata(
             &mut messages,
             record,
             role,
             content,
             value_timestamp(entry.get("timestamp")),
+            if role == MessageRole::User { json!({"nativeUserUuid":entry.get("uuid")}) } else { json!({}) },
         );
         for block in entry
             .get("message")

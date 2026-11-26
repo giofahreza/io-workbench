@@ -28,6 +28,30 @@ impl AgentRuntimeManager {
             if codex_app_server_live_enabled(&context) {
                 return self.start_codex_app_server_live(context).await;
             }
+            if context.provider == Provider::Claude && context.runtime == ChatRuntime::NativeCli {
+                let attempted = context.durable_run_id.as_deref()
+                    .map(|id| context.storage.native_run_submission(id)).transpose()?.flatten();
+                if attempted.as_ref().is_some_and(|(transport, _)| transport != "claude_bridge") {
+                    return Err(CoreError::Conflict("Claude delivery was previously attempted in a separate runtime. Inspect the native conversation before retrying; this prompt was not resent.".into()));
+                }
+                if let Some(id) = context.native_resume_session_id.as_deref()
+                    && let Some(client) = claude_bridge::Client::discover(id, &context.project_path).await?
+                {
+                    if attempted.is_some() {
+                        // A new helper with an empty ledger cannot establish
+                        // that an earlier submission was never accepted.
+                        client.receipt(context.durable_run_id.as_deref().unwrap()).await
+                            .map_err(|_| CoreError::Conflict("The Claude bridge has no verifiable receipt for the previous delivery. Inspect the native conversation before retrying; this prompt was not resent.".into()))?;
+                    }
+                    return self.start_claude_bridge(context, client).await;
+                }
+                if attempted.is_some() {
+                    return Err(CoreError::Conflict("Claude delivery was previously attempted. Inspect the native conversation before retrying; this prompt was not resent.".into()));
+                }
+                if claude_bridge::private_owner(&context.project_path, context.native_resume_session_id.as_deref()) {
+                    return Err(CoreError::Conflict("This Claude chat may be owned by a separate CLI runtime. Finish its turn and exit, or reopen it with `io-workbench claude --resume <native-session-id>` to keep the terminal open. No message was sent.".into()));
+                }
+            }
 
             let mut command = match resolve_agent_command(
                 runtime_provider,
@@ -173,6 +197,15 @@ impl AgentRuntimeManager {
             }
             isolate_agent_process(&mut child_command);
 
+            // Persist intent before the child can accept input. If persistence
+            // fails, there is no orphan provider and no untracked delivery.
+            if context.provider == Provider::Claude && context.runtime == ChatRuntime::NativeCli
+                && let Some(run_id) = context.durable_run_id.as_deref()
+                && let Err(error) = context.storage.record_native_run_submission(run_id, "claude_print", None)
+            {
+                self.finish(&key, &context, iowb_protocol::SessionRuntimeStatus::Failed, None, None).await;
+                return Err(error.into());
+            }
             let mut child = match child_command.spawn() {
                 Ok(child) => child,
                 Err(error) => {

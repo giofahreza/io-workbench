@@ -2234,6 +2234,7 @@ dependencies = [
 name = "iowb-core"
 version = "0.1.5"
 dependencies = [
+ "axum",
  "bcrypt",
  "chrono",
  "dirs",

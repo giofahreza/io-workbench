@@ -178,7 +178,18 @@ fn merge_mapped_claude_messages(
     stored: Vec<ChatMessage>,
     external: Vec<ChatMessage>,
 ) -> Vec<ChatMessage> {
+    let native_users = stored.iter().filter(|message| message.role == MessageRole::User)
+        .filter_map(|message| message.metadata.get("nativeUserUuid").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
     let key = |message: &ChatMessage| {
+        if message.role == MessageRole::User {
+            if let Some(id) = message.metadata.get("nativeUserUuid").and_then(Value::as_str)
+                && native_users.contains(id)
+            { return format!("user-native\0{id}"); }
+            if let Some(input) = message.metadata.get("nativeInput").and_then(Value::as_str) {
+                return format!("user\0{}", input.trim());
+            }
+        }
         if message.role == MessageRole::Tool
             && let Some(call_id) = message
                 .metadata

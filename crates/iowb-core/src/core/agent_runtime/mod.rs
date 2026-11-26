@@ -2,6 +2,7 @@
 // process ownership so each implementation file remains easy to navigate.
 include!("types.rs");
 include!("manager.rs");
+include!("claude.rs");
 include!("usage.rs");
 include!("codex_usage.rs");
 include!("process_ownership.rs");

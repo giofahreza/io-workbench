@@ -1,5 +1,6 @@
 // Core runtime state, sessions, provider execution, and recovery are split
 // by responsibility below while remaining one private module namespace.
+pub mod claude_bridge;
 mod codex_app_server;
 mod external_sessions;
 

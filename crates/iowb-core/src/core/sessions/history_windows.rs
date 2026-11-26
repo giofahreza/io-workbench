@@ -60,7 +60,7 @@ impl SessionManager {
                 && session.runtime == Some(ChatRuntime::NativeCli)
                 && session.native_rollout_owned_by_provider
         });
-        if record.summary.id == session_id && shared_native.is_none() {
+        if record.summary.id == session_id && shared_native.is_none() && record.summary.provider != Provider::Claude {
             if offset.is_none() {
                 let page = self.external_messages_tail(&record, limit).await;
                 return Ok((!page.0.is_empty()).then_some(page));

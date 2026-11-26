@@ -19,8 +19,8 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_EXTERNAL_TOOL_CONTENT_BYTES: usize = 128 * 1024;
 const EXTERNAL_TOOL_CONTENT_TAIL_BYTES: usize = 32 * 1024;
-pub(crate) const EXTERNAL_HISTORY_PARSER_VERSION: u32 = 2;
-pub(crate) const EXTERNAL_MESSAGE_PARSER_VERSION: u32 = 2;
+pub(crate) const EXTERNAL_HISTORY_PARSER_VERSION: u32 = 3;
+pub(crate) const EXTERNAL_MESSAGE_PARSER_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExternalSessionRecord {
@@ -62,6 +62,10 @@ struct SessionBuilder {
     message_count: usize,
     last_activity: Option<DateTime<Utc>>,
     model: Option<String>,
+}
+
+fn claude_config_directory(home: &Path) -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".claude"))
 }
 
 struct CodexSessionMeta {

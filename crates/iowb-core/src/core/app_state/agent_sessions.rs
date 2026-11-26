@@ -169,6 +169,23 @@ impl AppState {
             (false, None)
         };
 
+        if provider == Provider::Claude && runtime == ChatRuntime::NativeCli {
+            let bridge = if let Some(id) = native_resume_session_id.as_deref() {
+                claude_bridge::Client::discover(id, &resolved_project_path).await?
+            } else { None };
+            if let Some(client) = bridge {
+                if mode.is_some() || thinking.is_some() || fast.is_some() {
+                    return Err(CoreError::Conflict("Keep native Claude session settings while attached. Change permission, thinking, or fast settings in the terminal before sending; no message was sent.".into()));
+                }
+                let status = client.read(None).await?;
+                if status["busy"] == true || status["stopped"] == true {
+                    return Err(CoreError::Conflict("Claude is busy or stopped in the terminal. Finish the turn or type a message there to continue; no message was sent.".into()));
+                }
+            } else if claude_bridge::private_owner(&resolved_project_path, native_resume_session_id.as_deref()) {
+                return Err(CoreError::Conflict("A separate Claude CLI still owns this project. Exit that chat, or reopen it with `io-workbench claude --resume <native-session-id>` to keep the CLI open; no message was sent.".into()));
+            }
+        }
+
         let native_before_turn_id = if provider == Provider::Codex {
             if let Some(native_session_id) = native_resume_session_id.as_deref() {
                 match self.codex_app_server.read_thread(native_session_id).await {

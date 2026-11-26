@@ -1,6 +1,6 @@
 #[cfg(test)]
 fn discover_claude(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
-    let root = home.join(".claude/projects");
+    let root = claude_config_directory(home).join("projects");
     for path in files_below(&root, 2, "jsonl") {
         if path
             .file_name()
@@ -574,6 +574,7 @@ fn finish_builder(
         .unwrap_or_else(|| DateTime::from_timestamp(0, 0).expect("Unix epoch is valid"));
     Some(ExternalSessionRecord {
         summary: SessionSummary {
+            runtime: (provider == Provider::Claude).then_some(ChatRuntime::NativeCli),
             id: builder.id,
             provider,
             external: true,

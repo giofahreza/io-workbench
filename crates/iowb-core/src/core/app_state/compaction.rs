@@ -120,7 +120,7 @@ impl AppState {
         validate_recovered_agent_runtime_config(provider, runtime, direct_ai_config.as_ref())?;
 
         let session = self.sessions.set_active(&run.session_id, true).await?;
-        let recovery_prompt = if provider == Provider::Codex {
+        let recovery_prompt = if provider == Provider::Codex || (provider == Provider::Claude && runtime == ChatRuntime::NativeCli) {
             run.prompt.clone()
         } else {
             durable_chat_recovery_prompt(&run.prompt)

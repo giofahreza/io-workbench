@@ -17,7 +17,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[command(bin_name = "io-workbench")]
 #[command(version, about = "Rust-first workspace server and client suite")]
 #[command(
-    after_help = "Examples:\n  io-workbench doctor\n  io-workbench doctor --require-running --json\n  io-workbench setup"
+    after_help = "Examples:\n  io-workbench doctor\n  io-workbench doctor --require-running --json\n  io-workbench setup\n  io-workbench claude --resume <native-session-id>"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,6 +40,19 @@ struct Cli {
 enum Command {
     Start,
     Status,
+    /// Open native Claude with live Workbench session switching enabled.
+    Claude {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Private helper owned by the Claude terminal mod.
+    #[command(hide = true)]
+    ClaudeBridge {
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        cwd: PathBuf,
+    },
     /// Inspect local configuration, optional host tools, and the running health endpoint.
     Doctor(DoctorArgs),
     /// Print a safe, non-mutating first-run and repair checklist.
@@ -189,6 +202,17 @@ pub fn run() -> anyhow::Result<()> {
     unsafe {
         env::remove_var("IO_WORKBENCH_TOKEN");
     }
+    if let Some(Command::ClaudeBridge { session_id, cwd }) = &cli.command {
+        return tokio::runtime::Runtime::new()?
+            .block_on(iowb_core::claude_bridge::serve(
+                session_id.clone(),
+                cwd.clone(),
+            ))
+            .map_err(Into::into);
+    }
+    if let Some(Command::Claude { args }) = &cli.command {
+        return run_claude_terminal(&config, args);
+    }
     init_tracing();
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -216,8 +240,38 @@ pub fn run() -> anyhow::Result<()> {
                 println!("io-workbench {}", iowb_server::VERSION);
                 Ok(())
             }
+            Command::Claude { .. } | Command::ClaudeBridge { .. } => {
+                unreachable!("handled before runtime startup")
+            }
         }
     })
+}
+
+fn run_claude_terminal(config: &AppConfig, args: &[String]) -> anyhow::Result<()> {
+    let root = iowb_core::claude_bridge::prepare_plugin(&config.config_dir)?;
+    let mut command = std::process::Command::new(iowb_core::provider_executable(
+        iowb_protocol::Provider::Claude,
+    ));
+    command
+        .arg("--plugin-dir")
+        .arg(root)
+        .args(args)
+        .env("IO_WORKBENCH_CLAUDE_BRIDGE_BIN", env::current_exe()?)
+        .env_remove("IO_WORKBENCH_TOKEN");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec().into())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("Claude exited with {status}")
+        }
+    }
 }
 
 fn init_tracing() {

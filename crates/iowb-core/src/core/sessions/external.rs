@@ -255,7 +255,7 @@ impl SessionManager {
                 && session.runtime == Some(ChatRuntime::NativeCli)
                 && session.native_rollout_owned_by_provider
         });
-        if record.summary.id == session_id && shared_native.is_none() {
+        if record.summary.id == session_id && shared_native.is_none() && record.summary.provider != Provider::Claude {
             return Ok(Some(external.as_ref().clone()));
         }
 

@@ -106,7 +106,7 @@ fn sync_claude_sources(
     storage: &Storage,
     records: &mut Vec<ExternalSessionRecord>,
 ) -> iowb_storage::Result<()> {
-    let root = home.join(".claude/projects");
+    let root = claude_config_directory(home).join("projects");
     if !root.is_dir() {
         return Ok(());
     }

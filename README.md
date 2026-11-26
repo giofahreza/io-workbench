@@ -87,6 +87,7 @@ Repository design and operator material lives in [`docs/`](docs/):
 - [Agentic Board / Kanban design](docs/design/kanban.md)
 - [Codex app-server migration plan](docs/migrations/codex-app-server.md)
 - [Codex model settings and token accounting](docs/codex-configuration.md)
+- [Claude CLI continuation and live switching](docs/architecture/claude-session-switching.md)
 
 ## Project layout
 
