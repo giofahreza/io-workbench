@@ -64,7 +64,6 @@ for (const topic of [
   "install-and-update",
   "web-workspace",
   "mobile",
-  "desktop-client",
   "remote-access",
   "agents-and-sessions",
   "projects-files-git",
@@ -93,7 +92,6 @@ for (const category of ["get-started", "workbench", "operations", "reference"]) 
 for (const topic of [
   "web-workspace",
   "mobile-clients",
-  "native-desktop-client",
   "agents-and-providers",
   "projects-and-git",
   "database-and-terminal",

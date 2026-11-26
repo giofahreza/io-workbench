@@ -42,10 +42,6 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "text/html; charset=utf-8",
             bytes: include_bytes!("../static/docs/mobile/index.html"),
         }),
-        "docs/desktop-client" | "docs/desktop-client/" => Some(UiAsset {
-            content_type: "text/html; charset=utf-8",
-            bytes: include_bytes!("../static/docs/desktop-client/index.html"),
-        }),
         "docs/remote-access" | "docs/remote-access/" => Some(UiAsset {
             content_type: "text/html; charset=utf-8",
             bytes: include_bytes!("../static/docs/remote-access/index.html"),
@@ -121,10 +117,6 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
         "docs/topic/mobile-clients" | "docs/topic/mobile-clients/" => Some(UiAsset {
             content_type: "text/html; charset=utf-8",
             bytes: include_bytes!("../static/docs/topic/mobile-clients/index.html"),
-        }),
-        "docs/topic/native-desktop-client" | "docs/topic/native-desktop-client/" => Some(UiAsset {
-            content_type: "text/html; charset=utf-8",
-            bytes: include_bytes!("../static/docs/topic/native-desktop-client/index.html"),
         }),
         "docs/topic/agents-and-providers" | "docs/topic/agents-and-providers/" => Some(UiAsset {
             content_type: "text/html; charset=utf-8",
@@ -1420,11 +1412,6 @@ mod tests {
             ),
             ("docs/web-workspace", "web-workspace", "Web workspace"),
             ("docs/mobile", "mobile", "Mobile apps"),
-            (
-                "docs/desktop-client",
-                "desktop-client",
-                "Native desktop client",
-            ),
             ("docs/remote-access", "remote-access", "Remote access"),
             (
                 "docs/agents-and-sessions",
@@ -1499,11 +1486,6 @@ mod tests {
                 "docs/topic/mobile-clients",
                 "topic-mobile-clients",
                 "Mobile clients",
-            ),
-            (
-                "docs/topic/native-desktop-client",
-                "topic-native-desktop-client",
-                "Native desktop client",
             ),
             (
                 "docs/topic/agents-and-providers",
@@ -1582,7 +1564,6 @@ mod tests {
         assert!(docs_home.contains(r#"href="/docs/web-workspace/""#));
         assert!(docs_home.contains(r#"href="/docs/install-and-update/""#));
         assert!(docs_home.contains(r#"href="/docs/mobile/""#));
-        assert!(docs_home.contains(r#"href="/docs/desktop-client/""#));
         assert!(docs_home.contains(r#"href="/docs/keyboard-mappings/""#));
         assert!(docs_home.contains(r#"href="/docs/topic/operations-and-api/""#));
         assert!(search_index.contains(r#""href": "/docs/mobile/""#));

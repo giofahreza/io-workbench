@@ -50,11 +50,6 @@ const topicCategories = [
     description: "Android, browser/PWA, iPhone/iPad, connection profiles, and remote handheld controls.",
   },
   {
-    title: "Native desktop client",
-    slug: "native-desktop-client",
-    description: "The source-built wxWidgets client for local or remote io-workbench hosts.",
-  },
-  {
     title: "Agents and providers",
     slug: "agents-and-providers",
     description: "Claude, Codex, Gemini, CLI readiness, prompts, sessions, and delivery automation.",
@@ -248,7 +243,7 @@ const pageDefinitions = [
           ["Open the local address", "Visit <code>http://127.0.0.1:8787</code> in a browser running on the host."],
           ["Complete setup mode", "When no local user exists, the server presents first-user setup. Create the account that will own this local workbench."],
           ["Keep authentication on", "Authentication is enabled by default. After setup, protected REST endpoints and WebSocket upgrades require your authenticated browser session or another supported credential."],
-          ["Add a host project", "In the sidebar, choose <strong>+ Add project</strong>, browse to an existing host directory, and add it. That browser picker adds existing directories only. Create or Git-clone the directory through a trusted host workflow first, or use the separate " + docLink("desktop-client", "native desktop") + " or protected workspace-API flow when it fits your setup."],
+          ["Add a host project", "In the sidebar, choose <strong>+ Add project</strong>, browse to an existing host directory, and add it. That browser picker adds existing directories only. Create or Git-clone the directory through a trusted host workflow first, or use the protected workspace-API flow when it fits your setup."],
         ]),
         note("Default storage", "Unless overridden, configuration is stored under <code>~/.io-workbench</code>, the server database is <code>~/.io-workbench/io-workbench.db</code>, and the workspace root starts at the host user home directory."),
       ].join("\n")),
@@ -274,7 +269,7 @@ const pageDefinitions = [
         paragraph("For a persistent deployment, keep the configuration/data volume backed up, use a service manager or orchestrator rather than a foreground shell, and re-run the health check after an image or configuration update."),
       ].join("\n")),
       section("Continue with a real workflow", [
-        paragraph("Use " + docLink("install-and-update", "Install and update") + " for release packages and device-specific installers, the " + docLink("web-workspace", "web workspace guide") + " for the first browser session, " + docLink("mobile", "mobile apps") + " for a phone client, " + docLink("desktop-client", "native desktop client") + " for the wxWidgets control surface, and " + docLink("deployment-and-recovery", "Deployment and recovery") + " before making the host persistent. If the server will be reached from another device, configure " + docLink("remote-access", "remote access") + " before putting a public hostname into a client."),
+        paragraph("Use " + docLink("install-and-update", "Install and update") + " for release packages and device-specific installers, the " + docLink("web-workspace", "web workspace guide") + " for the first browser session, " + docLink("mobile", "mobile apps") + " for a phone client, and " + docLink("deployment-and-recovery", "Deployment and recovery") + " before making the host persistent. If the server will be reached from another device, configure " + docLink("remote-access", "remote access") + " before putting a public hostname into a client."),
       ].join("\n")),
     ].join("\n"),
   },
@@ -399,7 +394,7 @@ const pageDefinitions = [
         steps([
           ["Open the server URL", "Use the local address from " + docLink("quick-start", "Quick start") + ", or the HTTPS address configured by your remote-access boundary."],
           ["Sign in or finish setup", "First-user setup creates the local account. The standard password form requires a username of at least 3 characters and a password of at least 6 characters."],
-          ["Add an existing host project", "In the sidebar, choose <strong>+ Add project</strong>, browse to an existing directory on the host, then add it. The browser picker does not create or clone folders. Prepare the directory through a trusted host workflow first, or use the separate native-desktop/protected-API workspace flow when appropriate."],
+          ["Add an existing host project", "In the sidebar, choose <strong>+ Add project</strong>, browse to an existing directory on the host, then add it. The browser picker does not create or clone folders. Prepare the directory through a trusted host workflow first, or use the protected-API workspace flow when appropriate."],
           ["Check the host tools", "Open <strong>Settings → Agents → CLI Status</strong>. Treat its installed/authenticated result as a readiness hint, then prove the selected provider with one small, non-destructive task before opening a paid or long-running session."],
         ]),
       ].join("\n")),
@@ -594,64 +589,6 @@ const pageDefinitions = [
     ].join("\n"),
   },
   {
-    slug: "desktop-client",
-    title: "Native desktop client",
-    group: "Get started",
-    type: "Tutorial",
-    summary: "Build and use the source-built wxWidgets desktop client to control a local or remote io-workbench host.",
-    keywords: "desktop native wxwidgets cmake local remote connect login setup websocket libvterm browser launcher start local github clone workspace",
-    body: [
-      lead("Use the native desktop client when you want a wxWidgets/Scintilla control surface for an io-workbench host. It does not move projects, provider CLIs, databases, or PTYs onto the desktop machine; those remain on the connected host."),
-      section("Choose the right desktop route", table(
-        ["Route", "What it is", "Use it when"],
-        [
-          ["<strong>Browser launcher</strong>", "<code>apps/desktop/io-workbench-desktop.sh</code> starts a local release server, waits for <code>/health</code>, opens the default browser, and shuts down that child server when the launcher exits.", "You want the normal " + docLink("web-workspace", "Web workspace") + " opened quickly on the local machine."],
-          ["<strong>Native desktop client</strong>", "A separate C++/wxWidgets program that talks to a local or cloud io-workbench server over REST and WebSocket.", "You want native desktop controls for the connected host and are comfortable building the client from source."],
-        ],
-      )),
-      section("Build the native client from source", [
-        paragraph("The native project requires CMake 3.20+, a C++17 compiler, wxWidgets, libcurl, and nlohmann JSON. On Linux, install the documented packages, then build from the repository root."),
-        codeCard("sudo apt install cmake g++ libwxgtk3.2-dev libcurl4-openssl-dev nlohmann-json3-dev libvterm-dev\n\ncmake -S apps/desktop/native -B apps/desktop/native/build\ncmake --build apps/desktop/native/build\n./apps/desktop/native/build/iowb-native-desktop", "Debian/Ubuntu source build"),
-        list([
-          "<strong>macOS</strong>: install <code>cmake wxwidgets curl nlohmann-json libvterm</code> with Homebrew, then use the same CMake commands.",
-          "<strong>Windows</strong>: the CMake project has a Windows packaging target, but this repository does not document a tested package-manager prerequisite recipe. Build only after supplying compatible CMake, wxWidgets, curl, and JSON dependencies.",
-          "<strong>Optional features</strong>: configure with <code>-DIOWB_DESKTOP_ENABLE_WEBSOCKET=OFF</code> or <code>-DIOWB_DESKTOP_ENABLE_LIBVTERM=OFF</code> if a dependency is unavailable.",
-        ]),
-      ].join("\n")),
-      section("Start a local host from the desktop client", [
-        codeCard("cargo build --release -p iowb-cli --bin io-workbench\nIO_WORKBENCH_DESKTOP_BIN=\"$PWD/target/release/io-workbench\" \\\n  ./apps/desktop/native/build/iowb-native-desktop", "Build host, then launch native client"),
-        steps([
-          ["Open the connection bar", "Start the native application, then choose <strong>Start Local</strong>."],
-          ["Wait for the local host", "The client starts <code>io-workbench start --host 127.0.0.1 --port 8787</code>, polls its health endpoint, then connects to it."],
-          ["Finish setup or login", "For first-user setup or a password-based host, use <strong>Login / Setup</strong>. For a token host, paste the existing bearer token into the connection-bar <strong>Token</strong> field, then choose Connect."],
-          ["Select the host project", "Add, create, or select a project, then work in Chat, Files, Git, Database, Terminal, Settings, or Tools against that host."],
-        ]),
-        note("Use an external service for a custom or persistent host", "<strong>Start Local</strong> always targets <code>127.0.0.1:8787</code> and can stop only the child process it started. For another host/port or a service that should survive the desktop app, start io-workbench outside the client and use Connect."),
-      ].join("\n")),
-      section("Connect to a remote host", steps([
-        ["Enter the server root URL", "Use an address such as <code>https://workbench.example</code>, not a documentation path such as <code>/docs/</code>."],
-        ["Choose Connect", "The client checks host health and authentication state, then loads projects, settings, and process information after a successful connection."],
-        ["Authenticate with the matching native control", "<strong>Login / Setup</strong> is a username/password dialog for setup and password-based hosts. For an existing bearer token, paste it into the connection-bar <strong>Token</strong> field, then choose Connect. The native client has no dedicated OTP field, so use Web/mobile or an already-issued bearer token for a TOTP-only deployment."],
-        ["Keep transport secure", "For a remote hostname, use HTTPS; the client maps that to WSS for its live stream. Follow the " + docLink("remote-access", "Remote access") + " boundary guidance and keep server auth enabled."],
-      ])),
-      section("Use the desktop work loop", [
-        cards([
-          ["Chat", "Run project-scoped work", "Choose the host project and provider, set the prompt configuration, send a bounded task, and inspect persisted output."],
-          ["Files and Git", "Make source evidence visible", "Review/edit host files and Git state before accepting or synchronizing a change."],
-          ["Database and Terminal", "Validate on the host", "Inspect data, run a narrow SQL check, or operate the selected project’s server-hosted PTY."],
-        ], true),
-        paragraph("The native tabs are a control surface: Chat, Files, Git, Database, Settings, Terminal, and Tools all act on the connected io-workbench host rather than making a second local workspace."),
-      ].join("\n")),
-      section("Know the current limits", list([
-        "<strong>Release host package versus native desktop client</strong>: tagged Linux/macOS/Windows packages install the <code>io-workbench</code> host server, not this separate wxWidgets executable. Build this native client from source; use " + docLink("install-and-update", "Install and update") + " when you need the released host binary.",
-        "<strong>WebSocket is optional at build time</strong>: without libcurl WebSocket support, REST-backed project, file, and Git workflows remain, but live process-output streaming is unavailable.",
-        "<strong>libvterm is optional at build time</strong>: without it, the terminal falls back to basic styled ANSI text instead of the richer native terminal buffer.",
-        "<strong>Login persistence depends on the platform secret store</strong>: if it is unavailable, expect to log in or paste a token again after restarting the client.",
-      ])),
-      section("Continue with", paragraph("Use " + docLink("projects-files-git", "Projects, files, and Git") + " for review flow, " + docLink("terminal-and-mobile", "Terminal and mobile controls") + " for PTY behavior, and " + docLink("security-and-boundaries", "Security and boundaries") + " before connecting a desktop client to a remote host.")),
-    ].join("\n"),
-  },
-  {
     slug: "remote-access",
     title: "Remote access",
     group: "Get started",
@@ -742,7 +679,7 @@ const pageDefinitions = [
         note("Optional host preflight", "Before adding a directory, run <code>cargo run -p iowb-cli --bin io-workbench -- sandbox /srv/projects/example</code> on the host to verify that the configured workspace root accepts that path."),
       ].join("\n")),
       section("Create or clone outside the browser picker", [
-        paragraph("The existing-folder restriction belongs to the current Web picker, not to every io-workbench client. The " + docLink("desktop-client", "native desktop client") + " has create-workspace and GitHub-clone flows. For controlled automation, the protected <code>POST /api/projects/create-workspace</code> route also accepts a <code>workspaceType</code> of <code>new</code> and can clone a <code>githubUrl</code> into that new workspace; <code>GET /api/projects/clone-progress</code> streams clone progress."),
+        paragraph("The existing-folder restriction belongs to the current Web picker, not to every io-workbench client. For controlled automation, the protected <code>POST /api/projects/create-workspace</code> route also accepts a <code>workspaceType</code> of <code>new</code> and can clone a <code>githubUrl</code> into that new workspace; <code>GET /api/projects/clone-progress</code> streams clone progress."),
         note("Keep clone scope narrow", "A GitHub clone is accepted only for a new workspace, and every requested path is still checked against the configured workspace root. Read the running " + docLink("api", "API reference") + " before automating the request shape or credential handling."),
       ].join("\n")),
       section("Review changes before shipping", compactSteps([
@@ -755,7 +692,7 @@ const pageDefinitions = [
       section("What the Git surface supports", cards([
         ["Inspect", "Status and history", "Review status, repository history, file diffs, branches, remotes, and conflict state without leaving the selected project."],
         ["Change", "Stage and commit", "Stage selected work, create commits, and use generated messages only as a starting point for review."],
-        ["Synchronize", "Remote operations", "Fetch, pull, push, publish, and manage branches/remotes where host credentials allow it. The browser picker adds existing folders; use a trusted host workflow, the native desktop flow, or the protected workspace API when a new clone is needed."],
+        ["Synchronize", "Remote operations", "Fetch, pull, push, publish, and manage branches/remotes where host credentials allow it. The browser picker adds existing folders; use a trusted host workflow or the protected workspace API when a new clone is needed."],
         ["Recover", "Dangerous actions need intent", "Discarding changes or deleting untracked files affects the host filesystem; inspect the target and use the narrowest action."],
       ])),
       section("Project boundary controls", paragraph("The server's workspace root and file limits define what can be read or changed. Review " + docLink("security-and-boundaries", "Security and boundaries") + " before opening a broader filesystem scope or command integration.")),
@@ -930,7 +867,7 @@ const pageDefinitions = [
         list([
           "<strong>OTP wins over token</strong>: when both variables are set, the server uses OTP mode rather than token mode.",
           "<strong>Token or OTP always enforces authentication</strong>: either variable requires auth even when <code>IO_WORKBENCH_AUTH_REQUIRED=false</code>.",
-          "<strong>Token or OTP disables first-user registration</strong>: configure the chosen secret before exposing the server, then use the matching documented client flow. Native desktop has password/setup dialogs plus a bearer-token field, but no dedicated OTP field.",
+          "<strong>Token or OTP disables first-user registration</strong>: configure the chosen secret before exposing the server, then use the matching documented client flow.",
           "<strong>Do not confuse this with IO Gateway settings</strong>: Settings → IO Gateway has a separate optional Secret OTP for that integration. It does not configure io-workbench server-login TOTP.",
         ]),
         note("Protect the secret", "Store a token or TOTP secret in the service/container secret environment, not in browser/mobile code, chat history, screenshots, or a public shell profile.", true),
@@ -1247,11 +1184,11 @@ const pageDefinitions = [
 
 const pageRelationships = {
   "quick-start": {
-    topics: ["Web workspace", "Mobile clients", "Native desktop client", "Remote access and security"],
+    topics: ["Web workspace", "Mobile clients", "Remote access and security"],
     seeAlso: ["install-and-update", "web-workspace", "mobile", "deployment-and-recovery"],
   },
   "install-and-update": {
-    topics: ["Mobile clients", "Native desktop client", "Remote access and security", "Operations and API"],
+    topics: ["Mobile clients", "Remote access and security", "Operations and API"],
     seeAlso: ["quick-start", "mobile", "deployment-and-recovery", "remote-access"],
   },
   "web-workspace": {
@@ -1262,29 +1199,25 @@ const pageRelationships = {
     topics: ["Mobile clients", "Database and terminal", "Remote access and security"],
     seeAlso: ["install-and-update", "remote-access", "terminal-and-mobile", "database-workspace"],
   },
-  "desktop-client": {
-    topics: ["Native desktop client", "Projects and Git", "Remote access and security"],
-    seeAlso: ["install-and-update", "projects-files-git", "terminal-and-mobile", "remote-access"],
-  },
   "remote-access": {
-    topics: ["Mobile clients", "Native desktop client", "Remote access and security"],
-    seeAlso: ["security-and-boundaries", "mobile", "desktop-client", "deployment-and-recovery"],
+    topics: ["Mobile clients", "Remote access and security"],
+    seeAlso: ["security-and-boundaries", "mobile", "deployment-and-recovery"],
   },
   "agents-and-sessions": {
     topics: ["Web workspace", "Agents and providers", "Projects and Git"],
     seeAlso: ["web-workspace", "projects-files-git", "configuration", "boards-and-tools"],
   },
   "projects-files-git": {
-    topics: ["Web workspace", "Native desktop client", "Projects and Git"],
-    seeAlso: ["web-workspace", "desktop-client", "terminal-and-mobile", "security-and-boundaries"],
+    topics: ["Web workspace", "Projects and Git"],
+    seeAlso: ["web-workspace", "terminal-and-mobile", "security-and-boundaries"],
   },
   "database-workspace": {
-    topics: ["Web workspace", "Mobile clients", "Native desktop client", "Database and terminal"],
+    topics: ["Web workspace", "Mobile clients", "Database and terminal"],
     seeAlso: ["terminal-and-mobile", "mobile", "web-workspace", "projects-files-git"],
   },
   "terminal-and-mobile": {
-    topics: ["Web workspace", "Mobile clients", "Native desktop client", "Database and terminal"],
-    seeAlso: ["web-workspace", "mobile", "desktop-client", "security-and-boundaries"],
+    topics: ["Web workspace", "Mobile clients", "Database and terminal"],
+    seeAlso: ["web-workspace", "mobile", "security-and-boundaries"],
   },
   "boards-and-tools": {
     topics: ["Agents and providers", "Operations and API"],
@@ -1307,8 +1240,8 @@ const pageRelationships = {
     seeAlso: ["agents-and-sessions", "boards-and-tools", "configuration", "security-and-boundaries"],
   },
   troubleshooting: {
-    topics: ["Mobile clients", "Native desktop client", "Remote access and security", "Operations and API"],
-    seeAlso: ["configuration", "remote-access", "mobile", "desktop-client"],
+    topics: ["Mobile clients", "Remote access and security", "Operations and API"],
+    seeAlso: ["configuration", "remote-access", "mobile"],
   },
   api: {
     topics: ["Projects and Git", "Remote access and security", "Operations and API"],
@@ -1390,7 +1323,7 @@ function renderSidebar(activeSlug) {
     '<div class="docs-sidebar-heading"><span><i aria-hidden="true"></i> Documentation map</span><strong>Find the next useful route.</strong></div>',
     '<div class="docs-search-panel"><label class="docs-search" for="docs-search"><span>Search the docs</span><input id="docs-search" type="search" autocomplete="off" placeholder="Install, Git, terminal…" aria-controls="docs-search-results" aria-expanded="false" /></label><div id="docs-search-results" class="docs-search-results" aria-live="polite"></div></div>',
     '<nav class="docs-nav" aria-label="Documentation navigation">',
-    '<a class="docs-home-link' + (activeSlug ? "" : " is-active") + '" href="/docs/" data-doc-link data-title="Documentation" data-category="Product documentation" data-summary="Install and use io-workbench from web, native desktop, and mobile clients." data-keywords="documentation overview install web desktop mobile remote agents database terminal"' + (activeSlug ? "" : ' aria-current="page"') + "><span>Documentation home</span></a>",
+    '<a class="docs-home-link' + (activeSlug ? "" : " is-active") + '" href="/docs/" data-doc-link data-title="Documentation" data-category="Product documentation" data-summary="Install and use io-workbench from web and mobile clients." data-keywords="documentation overview install web mobile remote agents database terminal"' + (activeSlug ? "" : ' aria-current="page"') + "><span>Documentation home</span></a>",
     groupsHtml,
     '<div class="docs-nav-group"><p class="docs-nav-label">Browse topics</p>',
     topicCategories.map((topic) => topicSidebarLink(topic, activeSlug)).join(""),
@@ -1489,13 +1422,13 @@ function renderShell(title, description, activeSlug, article) {
 }
 
 function renderHome() {
-  const startPages = ["quick-start", "install-and-update", "web-workspace", "mobile", "desktop-client", "remote-access", "deployment-and-recovery"]
+  const startPages = ["quick-start", "install-and-update", "web-workspace", "mobile", "remote-access", "deployment-and-recovery"]
     .map((slug) => pages.find((page) => page.slug === slug))
     .filter(Boolean);
   const article = [
     '<article id="docs-content" class="docs-content docs-article docs-index-page" data-page-slug="" data-page-group="">',
     renderHeading("Product documentation", "Documentation", '<dl class="docs-meta"><div><dt>Product</dt><dd>io-workbench</dd></div><div><dt>Docs version</dt><dd>' + docsVersion + "</dd></div><div><dt>Updated</dt><dd>" + updated + "</dd></div></dl>"),
-    lead("Install and operate a self-hosted remote workbench for configured Claude, Codex, and Gemini CLIs. These guides cover release binaries, Android APKs, Web, native desktop, and mobile flows—not just the feature list."),
+    lead("Install and operate a self-hosted remote workbench for configured Claude, Codex, and Gemini CLIs. These guides cover release binaries, Android APKs, Web, and mobile flows—not just the feature list."),
     '<div class="docs-index-brief"><div><span class="docs-card-kicker">First session</span><p>Start with the route that matches the surface in your hand. The work stays connected to the same host.</p></div><a class="docs-action" href="/docs/quick-start/">Begin with Quick start <span aria-hidden="true">↗</span></a></div>',
     section("Choose your route", pageList(startPages.map((page) => ({
       title: page.title,
@@ -1504,7 +1437,7 @@ function renderHome() {
     })))),
     section("How the product fits together", cards([
       ["1. Host", "Run io-workbench where the work lives", "The server owns repositories, CLIs, provider credentials, database connectivity, shell processes, and storage."],
-      ["2. Control surface", "Use Web, native desktop, or mobile", "Sign in from a browser, source-built native desktop client, Android client, or PWA to operate the same selected project remotely."],
+      ["2. Control surface", "Use Web or mobile", "Sign in from a browser, Android client, or PWA to operate the same selected project remotely."],
       ["3. Evidence loop", "Review before shipping", "Use agent output with files, Git, database results, terminal validation, and board state instead of trusting a chat-only summary."],
     ], true)),
     section("Guide map", groups.map((group) => [
@@ -1527,7 +1460,7 @@ function renderHome() {
     ])),
     "</article>",
   ].join("\n");
-  return renderShell("Documentation", "io-workbench installation, web workspace, native desktop, mobile client, remote access, workflow, configuration, and troubleshooting documentation.", "", article);
+  return renderShell("Documentation", "io-workbench installation, web workspace, mobile client, remote access, workflow, configuration, and troubleshooting documentation.", "", article);
 }
 
 function renderCategory(group) {
@@ -1592,9 +1525,9 @@ function buildSearchIndex() {
         title: "Documentation",
         category: "Product documentation",
         type: "Main page",
-        summary: "Install and operate io-workbench from Web, native desktop, and mobile clients.",
+        summary: "Install and operate io-workbench from Web and mobile clients.",
         href: "/docs/",
-        keywords: "documentation overview install web native desktop mobile remote workbench",
+        keywords: "documentation overview install web mobile remote workbench",
         headings: ["Start with the path you need", "How the product fits together", "Guide map", "Browse by task", "Product boundaries"],
         excerpt: "io-workbench is a self-hosted remote workbench for configured agent CLIs, files, Git, databases, terminals, and reviewable delivery work.",
       },

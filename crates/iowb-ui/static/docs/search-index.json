@@ -6,9 +6,9 @@
       "title": "Documentation",
       "category": "Product documentation",
       "type": "Main page",
-      "summary": "Install and operate io-workbench from Web, native desktop, and mobile clients.",
+      "summary": "Install and operate io-workbench from Web and mobile clients.",
       "href": "/docs/",
-      "keywords": "documentation overview install web native desktop mobile remote workbench",
+      "keywords": "documentation overview install web mobile remote workbench",
       "headings": [
         "Start with the path you need",
         "How the product fits together",
@@ -24,7 +24,7 @@
       "type": "Tutorial",
       "summary": "Install a released host or source build, create the first account, and prove a local workspace is ready.",
       "href": "/docs/quick-start/",
-      "keywords": "install release binary linux macos windows source rust cargo git docker first user setup account workspace health provider cli claude codex gemini Web workspace Mobile clients Native desktop client Remote access and security",
+      "keywords": "install release binary linux macos windows source rust cargo git docker first user setup account workspace health provider cli claude codex gemini Web workspace Mobile clients Remote access and security",
       "headings": [
         "What runs where",
         "The source of truth",
@@ -46,7 +46,7 @@
       "type": "Installation guide",
       "summary": "Install checked release builds on Linux, macOS, Windows, or Android and choose a safe remote or Termux-local host setup.",
       "href": "/docs/install-and-update/",
-      "keywords": "install update release binary curl powershell windows macos linux android apk termux local runtime localhost sha256 checksum github releases arm64 x86_64 systemd launchagent launchd io gateway codex claude gemini security Mobile clients Native desktop client Remote access and security Operations and API",
+      "keywords": "install update release binary curl powershell windows macos linux android apk termux local runtime localhost sha256 checksum github releases arm64 x86_64 systemd launchagent launchd io gateway codex claude gemini security Mobile clients Remote access and security Operations and API",
       "headings": [
         "Choose the right release asset",
         "Linux and macOS: install the current host",
@@ -113,33 +113,12 @@
       "excerpt": "Mobile clients are control surfaces for a running io-workbench server. Most use a remote host; Android can optionally use a separately installed Termux host on the same device. In every route, the app itself does not run agent CLIs, workspace processes, or PTYs: those remain in the connected server environment. Choose the mobile surface Surface Best for Current delivery Android native A dedicated mobile experience wi"
     },
     {
-      "title": "Native desktop client",
-      "category": "Get started",
-      "type": "Tutorial",
-      "summary": "Build and use the source-built wxWidgets desktop client to control a local or remote io-workbench host.",
-      "href": "/docs/desktop-client/",
-      "keywords": "desktop native wxwidgets cmake local remote connect login setup websocket libvterm browser launcher start local github clone workspace Native desktop client Projects and Git Remote access and security",
-      "headings": [
-        "Choose the right desktop route",
-        "Build the native client from source",
-        "Start a local host from the desktop client",
-        "Connect to a remote host",
-        "Use the desktop work loop",
-        "Run project-scoped work",
-        "Make source evidence visible",
-        "Validate on the host",
-        "Know the current limits",
-        "Continue with"
-      ],
-      "excerpt": "Use the native desktop client when you want a wxWidgets/Scintilla control surface for an io-workbench host. It does not move projects, provider CLIs, databases, or PTYs onto the desktop machine; those remain on the connected host. Choose the right desktop route Route What it is Use it when Browser launcher apps/desktop/io-workbench-desktop.sh starts a local release server, waits for /health , opens the default browse"
-    },
-    {
       "title": "Remote access",
       "category": "Get started",
       "type": "How-to guide",
       "summary": "Reach an io-workbench host from another browser or phone without exposing a development listener carelessly.",
       "href": "/docs/remote-access/",
-      "keywords": "remote access lan host port vpn reverse proxy cloudflare tunnel https wss websocket mobile security auth Mobile clients Native desktop client Remote access and security",
+      "keywords": "remote access lan host port vpn reverse proxy cloudflare tunnel https wss websocket mobile security auth Mobile clients Remote access and security",
       "headings": [
         "Choose a boundary",
         "Temporarily listen on a trusted LAN",
@@ -169,7 +148,7 @@
       "type": "How-to guide",
       "summary": "Keep host directories, file edits, diffs, branches, and remote Git operations in one reviewable project context.",
       "href": "/docs/projects-files-git/",
-      "keywords": "projects files editor upload search replace markdown git diff commit branch remote fetch pull push clone workspace Web workspace Native desktop client Projects and Git",
+      "keywords": "projects files editor upload search replace markdown git diff commit branch remote fetch pull push clone workspace Web workspace Projects and Git",
       "headings": [
         "Add the right project to the Web workspace",
         "Create or clone outside the browser picker",
@@ -189,7 +168,7 @@
       "type": "How-to guide",
       "summary": "Save connections, inspect schemas, run SQL, work with paginated data, and understand browser versus Android clipboard capabilities.",
       "href": "/docs/database-workspace/",
-      "keywords": "database sqlite postgresql mysql mariadb schema relationships sql query pagination json import export transfer copy paste android navicat Web workspace Mobile clients Native desktop client Database and terminal",
+      "keywords": "database sqlite postgresql mysql mariadb schema relationships sql query pagination json import export transfer copy paste android navicat Web workspace Mobile clients Database and terminal",
       "headings": [
         "Supported connection types",
         "Inspect and query data safely",
@@ -204,7 +183,7 @@
       "type": "How-to guide",
       "summary": "Operate a live server-hosted PTY from the browser or Android, including a separately hosted local Termux server.",
       "href": "/docs/terminal-and-mobile/",
-      "keywords": "terminal pty remote shell process resize input output abort copy paste android termux esc tab ctrl alt arrows Web workspace Mobile clients Native desktop client Database and terminal",
+      "keywords": "terminal pty remote shell process resize input output abort copy paste android termux esc tab ctrl alt arrows Web workspace Mobile clients Database and terminal",
       "headings": [
         "Start a terminal in the correct project",
         "Browser and Android controls",
@@ -308,7 +287,7 @@
       "type": "Troubleshooting",
       "summary": "Diagnose host startup, authentication, provider CLI, project, WebSocket, mobile, and remote-access failures.",
       "href": "/docs/troubleshooting/",
-      "keywords": "troubleshooting health login auth token otp cli status project websocket mobile android termux local runtime pwa remote proxy wss Mobile clients Native desktop client Remote access and security Operations and API",
+      "keywords": "troubleshooting health login auth token otp cli status project websocket mobile android termux local runtime pwa remote proxy wss Mobile clients Remote access and security Operations and API",
       "headings": [
         "First checks",
         "Common symptoms",
@@ -422,19 +401,6 @@
         "Related topics"
       ],
       "excerpt": "Android, browser/PWA, iPhone/iPad, connection profiles, and remote handheld controls."
-    },
-    {
-      "title": "Native desktop client",
-      "category": "Topic",
-      "type": "Topic",
-      "summary": "The source-built wxWidgets client for local or remote io-workbench hosts.",
-      "href": "/docs/topic/native-desktop-client/",
-      "keywords": "native desktop client documentation topic",
-      "headings": [
-        "Guides for this topic",
-        "Related topics"
-      ],
-      "excerpt": "The source-built wxWidgets client for local or remote io-workbench hosts."
     },
     {
       "title": "Agents and providers",
