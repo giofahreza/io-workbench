@@ -64,6 +64,35 @@
   background: transparent;
 }
 
+.composer-input-row { position: relative; }
+#chat-slash-commands {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  max-height: min(16rem, 40vh);
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  box-shadow: 0 -3px 16px rgb(0 0 0 / 12%);
+  z-index: 8;
+}
+#chat-slash-commands button {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 0;
+  text-align: left;
+  white-space: normal;
+  color: var(--text);
+  background: transparent;
+}
+#chat-slash-commands button.selected,
+#chat-slash-commands button:focus-visible { background: var(--panel-soft, var(--line)); }
+
 .prompt-config-panel {
   width: min(896px, 100%);
   margin: 0 auto 7px;
@@ -314,7 +343,8 @@
   gap: 4px;
   width: min(896px, 100%);
   margin: 0 auto;
-  overflow: hidden;
+  /* The slash-command menu opens above this row and must remain clickable. */
+  overflow: visible;
   border: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
   border-radius: 10px;
   padding: 7px;

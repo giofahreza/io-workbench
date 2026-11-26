@@ -112,6 +112,29 @@ impl AppState {
             ));
         }
 
+        let command_session_id = if iowb_protocol::leading_chat_command(&prompt).is_some() {
+            if let Some(id) = session_id.as_deref() {
+                self.sessions.get(id).await.ok().map(|session| session.id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let execution_prompt = self
+            .resolve_chat_command_prompt(
+                iowb_protocol::ChatCommandContext {
+                    provider,
+                    project_path: resolved_project_path.display().to_string(),
+                    session_id: command_session_id,
+                    model: model.clone(),
+                    runtime,
+                },
+                &prompt,
+                user_id.as_deref().unwrap_or("local"),
+            )
+            .await?;
+
         let enforce_context_limit = provider == Provider::Codex
             && runtime == ChatRuntime::IoGateway
             && self.codex_context_limit_enabled(user_id.as_deref())?;
@@ -269,7 +292,7 @@ impl AppState {
             user_id,
             session.id.clone(),
             provider.as_str(),
-            prompt.clone(),
+            execution_prompt.clone(),
             resolved_project_path.display().to_string(),
         );
         durable_run.native_session_id = native_resume_session_id.clone();
@@ -294,6 +317,12 @@ impl AppState {
                 "fast": fast.unwrap_or(false),
                 "sentAt": now.to_rfc3339(),
             });
+            if matches!(provider, Provider::Codex | Provider::Claude)
+                && runtime == ChatRuntime::NativeCli
+                && execution_prompt != prompt
+            {
+                user_metadata["nativeInput"] = Value::String(execution_prompt.clone());
+            }
             if let Some(native_before_turn_id) = native_before_turn_id.as_deref()
                 && let Some(metadata) = user_metadata.as_object_mut()
             {
@@ -392,7 +421,7 @@ impl AppState {
                 response_id: new_id("response"),
                 sequence: Arc::new(AtomicU64::new(0)),
                 project_path: resolved_project_path,
-                prompt,
+                prompt: execution_prompt,
                 model,
                 runtime,
                 effort: effort.clone(),

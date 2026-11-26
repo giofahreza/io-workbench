@@ -2,6 +2,7 @@
 struct ClaudeLiveOutputNormalizer {
     pending_line: String,
     pending_session_id: Option<String>,
+    pending_init: Option<Value>,
     observed_session_id: Option<String>,
     streamed_text: String,
     streamed_thinking: bool,
@@ -85,6 +86,18 @@ impl ClaudeLiveOutputNormalizer {
         let Some(event_type) = event.get("type").and_then(Value::as_str) else {
             return String::new();
         };
+        if event_type == "system" && event.get("subtype").and_then(Value::as_str) == Some("init") {
+            let strings = |key: &str| {
+                event.get(key).and_then(Value::as_array).into_iter().flatten()
+                    .filter_map(Value::as_str).take(512).collect::<Vec<_>>()
+            };
+            let servers = event.get("mcp_servers").and_then(Value::as_array).into_iter().flatten()
+                .take(64).map(|server| serde_json::json!({"name": server.get("name"), "status": server.get("status")}))
+                .collect::<Vec<_>>();
+            self.pending_init = event.get("slash_commands").and_then(Value::as_array).map(|_| {
+                serde_json::json!({"names": strings("slash_commands"), "terminal": strings("terminal_slash_commands"), "mcpServers": servers})
+            });
+        }
         if event_type == "stream_event" {
             self.saw_stream_event = true;
             return event
@@ -176,6 +189,10 @@ impl ClaudeLiveOutputNormalizer {
                 }
             }
             "tool_use" => self.record_history_tool(event, false),
+            "system" if event.get("subtype").and_then(Value::as_str) == Some("compact_boundary") => {
+                self.record_history(MessageRole::System, "context_compaction", "", None,
+                    "Claude compacted its native context. Earlier messages remain visible in Workbench.".into());
+            }
             "tool_result" | "tool_use_result" => self.record_history_tool(event, true),
             _ => {}
         }

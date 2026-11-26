@@ -565,6 +565,19 @@ impl AgentRuntimeManager {
             options.args = vec!["app-server".into(), "--stdio".into()];
         }
         let mut turn_params = codex_app_server_live_turn_params(&context);
+        if let Some(name) = context
+            .prompt
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.strip_prefix('$'))
+            && let Ok(skills) = self
+                .codex_app_server
+                .list_skills(&context.project_path)
+                .await
+            && let Some(input) = chat_commands::codex_skill_input(&skills, name)
+        {
+            turn_params.input.push(input);
+        }
         apply_codex_live_profile_defaults(&mut turn_params, launch_options.as_ref());
         let client = self.codex_app_server.clone();
         let manager = self.clone();

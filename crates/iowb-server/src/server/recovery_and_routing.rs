@@ -323,6 +323,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/settings/direct-ai/models", get(direct_ai_models))
         .route("/api/chat/models", get(chat_provider_models))
+        .route("/api/chat/commands", get(chat_commands_catalog))
+        .route("/api/chat/commands/prepare", post(prepare_chat_command))
         .route(
             "/api/settings/api-keys",
             get(list_api_keys).post(create_api_key),

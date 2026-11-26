@@ -1,4 +1,22 @@
 impl CodexAppServerClient {
+    pub(crate) async fn list_skills(&self, cwd: &std::path::Path) -> Result<Value> {
+        self.request(
+            "skills/list",
+            json!({"cwds": [cwd], "forceReload": true}),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_mcp_status(&self) -> Result<Value> {
+        self.request(
+            "mcpServerStatus/list",
+            json!({"detail": "toolsAndAuthOnly"}),
+            None,
+        )
+        .await
+    }
+
     pub(crate) fn new(command: impl Into<OsString>, request_timeout: Duration) -> Self {
         Self {
             command: command.into(),

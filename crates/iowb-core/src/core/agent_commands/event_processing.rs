@@ -32,6 +32,8 @@ async fn process_agent_event(
                 && let Some(normalizer) = claude_normalizer.as_mut()
             {
                 let visible_chunks = normalizer.push_chunks(&data);
+                chat_commands::persist_claude_commands(context, normalizer.pending_init.take())
+                    .await;
                 let native_session_id = normalizer.take_session_id();
                 persist_native_session_id(context, native_session_id).await;
                 for visible in visible_chunks {
@@ -100,6 +102,7 @@ async fn flush_claude_live_output(
     };
     let visible = normalizer.finish();
     let native_session_id = normalizer.take_session_id();
+    chat_commands::persist_claude_commands(context, normalizer.pending_init.take()).await;
     persist_native_session_id(context, native_session_id).await;
     publish_agent_output(manager, context, key, output, visible).await;
 }
@@ -174,6 +177,9 @@ async fn process_codex_app_server_live_event(
             let _ = acknowledgement.send(result);
         }
         CodexAppServerLiveTurnEvent::Notification { method, params } => {
+            if method == "skills/changed" {
+                chat_commands::invalidate_command_catalog(&context.storage);
+            }
             let visible = normalizer.push_notification(&method, &params);
             publish_agent_output(manager, context, key, output, visible).await;
         }

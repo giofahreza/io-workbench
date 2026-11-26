@@ -298,6 +298,71 @@ fn draw_chat(frame: &mut Frame, app: &App) {
     draw_messages(frame, app, body);
     draw_input(frame, app, input);
     draw_footer(frame, app, footer);
+    let commands = app.command_matches();
+    if app.command_ui.models.is_some() || !commands.is_empty() {
+        let lines: Vec<Line> = if let Some(models) = &app.command_ui.models {
+            if models.is_empty() {
+                vec![Line::from("Loading models…")]
+            } else {
+                models
+                    .iter()
+                    .enumerate()
+                    .map(|(index, model)| {
+                        let label = if model.is_empty() {
+                            "CLI default"
+                        } else {
+                            model
+                        };
+                        let line = Line::from(format!(" {label}"));
+                        if index == app.command_ui.selected {
+                            line.reversed()
+                        } else {
+                            line
+                        }
+                    })
+                    .collect()
+            }
+        } else {
+            commands
+                .iter()
+                .enumerate()
+                .map(|(index, command)| {
+                    let line = Line::from(format!(
+                        " /{} {} — {} · {}",
+                        command.name,
+                        command.argument_hint,
+                        command.reason.as_deref().unwrap_or(&command.description),
+                        command.source
+                    ));
+                    if index == app.command_ui.selected.min(commands.len() - 1) {
+                        line.reversed()
+                    } else if !command.available {
+                        line.dim()
+                    } else {
+                        line
+                    }
+                })
+                .collect()
+        };
+        let height = (lines.len() as u16 + 2).min(12).min(body.height);
+        let menu = Rect::new(area.x, input.y.saturating_sub(height), area.width, height);
+        frame.render_widget(Clear, menu);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .scroll((
+                    app.command_ui
+                        .selected
+                        .saturating_sub(height.saturating_sub(3) as usize)
+                        as u16,
+                    0,
+                ))
+                .block(
+                    Block::bordered()
+                        .title(" Commands · ↑↓ choose · Tab/Enter select · Esc close "),
+                ),
+            menu,
+        );
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {

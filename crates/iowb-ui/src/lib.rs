@@ -356,6 +356,10 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app/chat/recovery.js"),
         }),
+        "app/chat/slash-commands.js" => Some(UiAsset {
+            content_type: "text/javascript; charset=utf-8",
+            bytes: include_bytes!("../static/app/chat/slash-commands.js"),
+        }),
         "app/chat/stream.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app/chat/stream.js"),

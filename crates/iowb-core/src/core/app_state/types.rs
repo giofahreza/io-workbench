@@ -14,4 +14,5 @@ pub struct AppState {
     pub ws_hub: WsHub,
     codex_app_server: CodexAppServerClient,
     codex_app_server_mutation: Arc<Mutex<()>>,
+    chat_command_cache: Arc<Mutex<chat_commands::CommandCatalogCache>>,
 }

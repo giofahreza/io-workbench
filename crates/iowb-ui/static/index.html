@@ -305,7 +305,8 @@
               </div>
             </div>
             <div class="composer-input-row">
-              <textarea id="chat-prompt" class="chat-input-placeholder" rows="1" placeholder="Ask the agent" title="Focus chat prompt (Alt+I)" aria-keyshortcuts="Alt+i"></textarea>
+              <div id="chat-slash-commands" role="listbox" aria-label="Chat commands" hidden></div>
+              <textarea id="chat-prompt" class="chat-input-placeholder" rows="1" placeholder="Ask the agent, or / for commands" title="Focus chat prompt (Alt+I)" aria-keyshortcuts="Alt+i" aria-controls="chat-slash-commands" aria-expanded="false"></textarea>
               <button id="prompt-config-toggle" class="icon-button" type="button" aria-label="Prompt config" title="Prompt config" data-symbol="flask-conical" aria-expanded="false" aria-controls="prompt-config-panel"></button>
               <button id="chat-submit" type="submit" class="primary-action icon-button" aria-label="Send" title="Send" data-symbol="send"></button>
             </div>

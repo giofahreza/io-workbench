@@ -285,6 +285,79 @@ impl Api {
         self.get(&["api", "auth", "status"], &[]).await
     }
 
+    pub async fn chat_commands(
+        &self,
+        context: &iowb_protocol::ChatCommandContext,
+    ) -> Result<iowb_protocol::ChatCommandCatalog, ApiError> {
+        let mut query = vec![
+            ("provider", context.provider.as_str().to_string()),
+            ("projectPath", context.project_path.clone()),
+        ];
+        if let Some(id) = &context.session_id {
+            query.push(("sessionId", id.clone()));
+        }
+        if let Some(model) = &context.model {
+            query.push(("model", model.clone()));
+        }
+        self.get(&["api", "chat", "commands"], &query).await
+    }
+
+    pub async fn prepare_chat_command(
+        &self,
+        context: iowb_protocol::ChatCommandContext,
+        prompt: String,
+    ) -> Result<iowb_protocol::PreparedChatCommand, ApiError> {
+        let body = serde_json::to_value(iowb_protocol::PrepareChatCommandRequest {
+            context,
+            prompt,
+            command_id: None,
+        })
+        .map_err(|error| ApiError::local(error.to_string()))?;
+        self.send(
+            Method::POST,
+            self.url(&["api", "chat", "commands", "prepare"], &[])?,
+            Some(body),
+        )
+        .await
+    }
+
+    pub async fn compact_chat(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<Value, ApiError> {
+        self.send(
+            Method::POST,
+            self.url(&["api", "sessions", session_id, "compact"], &[])?,
+            Some(serde_json::json!({"requestId": request_id})),
+        )
+        .await
+    }
+
+    pub async fn chat_models(
+        &self,
+        provider: iowb_protocol::Provider,
+    ) -> Result<Vec<String>, ApiError> {
+        let result: Value = self
+            .get(
+                &["api", "chat", "models"],
+                &[("provider", provider.as_str().to_string())],
+            )
+            .await?;
+        Ok(result
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|model| {
+                model
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect())
+    }
+
     pub async fn login(
         &self,
         username: &str,

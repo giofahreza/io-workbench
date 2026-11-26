@@ -2,6 +2,7 @@
 include!("protocol/preamble.rs");
 include!("protocol/foundations.rs");
 include!("protocol/sessions.rs");
+include!("protocol/chat_commands.rs");
 include!("protocol/files_and_git.rs");
 include!("protocol/auth_and_process.rs");
 include!("protocol/database.rs");

@@ -23,6 +23,7 @@ impl AppState {
             ws_hub: WsHub::with_storage(storage),
             codex_app_server: default_codex_app_server_client(),
             codex_app_server_mutation: Arc::new(Mutex::new(())),
+            chat_command_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         info!(

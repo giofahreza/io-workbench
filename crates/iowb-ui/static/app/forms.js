@@ -1,4 +1,5 @@
 function bindForms() {
+  bindChatSlashCommands();
   window.addEventListener("beforeunload", (event) => {
     if (!state.currentFileDirty) return;
     event.preventDefault();
@@ -430,6 +431,7 @@ function bindForms() {
   });
   qs("#chat-prompt").addEventListener("focus", autosizeChatPrompt);
   qs("#chat-prompt").addEventListener("keydown", (event) => {
+    if (handleChatSlashKeydown(event)) return;
     if (handleChatEditFromHereKeydown(event)) return;
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
@@ -518,6 +520,8 @@ function bindForms() {
 
   qs("#chat-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    const draftContent = qs("#chat-prompt").value.trim();
+    if (await interceptChatSlashCommand(draftContent)) return;
     const recovery = state.chatRecoveryBySession[state.chatSessionId || ""];
     if (chatRecoveryBlocksNormalSend(recovery)) {
       renderChatRecoveryCard(state.chatSessionId);
@@ -540,7 +544,6 @@ function bindForms() {
       showError(new Error("Pick a CLI (Codex, Claude, or Gemini) before sending a prompt."));
       return;
     }
-    const draftContent = qs("#chat-prompt").value.trim();
     const prompt = chatPromptWithImages(draftContent);
     if (!prompt) return;
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {

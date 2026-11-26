@@ -10,6 +10,7 @@ const APP_MODULES = Object.freeze([
   "/app/chat/history.js",
   "/app/chat/render.js",
   "/app/chat/recovery.js",
+  "/app/chat/slash-commands.js",
   "/app/chat/stream.js",
   "/app/chat/settings.js",
   "/app/workspace/files.js",

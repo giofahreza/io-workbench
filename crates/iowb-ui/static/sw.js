@@ -24,6 +24,7 @@ const CORE_ASSETS = [
   `/app/chat/history.js?v=${APP_VERSION}`,
   `/app/chat/render.js?v=${APP_VERSION}`,
   `/app/chat/recovery.js?v=${APP_VERSION}`,
+  `/app/chat/slash-commands.js?v=${APP_VERSION}`,
   `/app/chat/stream.js?v=${APP_VERSION}`,
   `/app/chat/settings.js?v=${APP_VERSION}`,
   `/app/workspace/files.js?v=${APP_VERSION}`,

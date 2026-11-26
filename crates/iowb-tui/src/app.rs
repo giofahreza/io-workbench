@@ -2,9 +2,9 @@ use std::cell::Cell;
 
 use chrono::Utc;
 use iowb_protocol::{
-    ChatMessage, ForkSessionResponse, MessageRole, MessagesResponse, ProjectSessionsPage,
-    ProjectSummary, SessionRuntimeStatus, SessionSnapshotResponse, SessionSummary, WsClientCommand,
-    WsServerEvent,
+    ChatCommandAction, ChatMessage, ForkSessionResponse, MessageRole, MessagesResponse,
+    ProjectSessionsPage, ProjectSummary, SessionRuntimeStatus, SessionSnapshotResponse,
+    SessionSummary, WsClientCommand, WsServerEvent,
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::UnboundedSender;
@@ -61,6 +61,23 @@ pub enum Msg {
         result: Result<MessagesResponse, ApiError>,
     },
     Forked(Result<ForkSessionResponse, ApiError>),
+    Commands {
+        scope: String,
+        result: Result<iowb_protocol::ChatCommandCatalog, ApiError>,
+    },
+    PreparedCommand {
+        scope: String,
+        prompt: String,
+        result: Result<iowb_protocol::PreparedChatCommand, ApiError>,
+    },
+    CommandDone {
+        scope: String,
+        result: Result<serde_json::Value, ApiError>,
+    },
+    CommandModels {
+        scope: String,
+        result: Result<Vec<String>, ApiError>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +295,7 @@ enum EscIntent {
 const ESC_TICKS: usize = 8;
 
 pub struct App {
+    pub command_ui: CommandUi,
     pub screen: Screen,
     pub login: LoginForm,
     pub chat: Chat,
@@ -344,6 +362,7 @@ impl App {
             Vec::new()
         };
         Self {
+            command_ui: CommandUi::default(),
             screen: Screen::Login,
             login: LoginForm {
                 server: server.clone(),
@@ -399,6 +418,7 @@ impl App {
             Msg::Wheel { up } => self.handle_wheel(up),
             Msg::Tick => {
                 self.tick = self.tick.wrapping_add(1);
+                self.maybe_load_commands();
                 if let Some((_, ticks)) = &mut self.notice {
                     *ticks = ticks.saturating_sub(1);
                     if *ticks == 0 {
@@ -466,6 +486,38 @@ impl App {
             } => self.on_snapshot(session_id, reset, result),
             Msg::Older { session_id, result } => self.on_older(session_id, result),
             Msg::Forked(result) => self.on_forked(result),
+            Msg::Commands { scope, result } => self.on_commands(scope, result),
+            Msg::PreparedCommand {
+                scope,
+                prompt,
+                result,
+            } => self.on_prepared_command(scope, prompt, result),
+            Msg::CommandDone { scope, result } => {
+                if self.command_scope() == scope {
+                    self.command_ui.preparing = false;
+                    match result {
+                        Ok(_) => {
+                            self.command_ui.compact_request = None;
+                            if self.chat.input.text().trim() == "/compact" {
+                                self.chat.input.clear();
+                            }
+                            self.notify("Compaction accepted; waiting for the provider.");
+                        }
+                        Err(error) => self.notify(error.message),
+                    }
+                }
+            }
+            Msg::CommandModels { scope, result } => {
+                if self.command_scope() == scope {
+                    match result {
+                        Ok(models) => self.command_ui.models = Some(models),
+                        Err(error) => {
+                            self.command_ui.models = None;
+                            self.notify(error.message);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -494,6 +546,7 @@ impl App {
     }
 
     fn sign_out(&mut self, message: &str, is_error: bool) {
+        self.command_ui = CommandUi::default();
         self.config.token = None;
         self.config.last_session_id = None;
         self.persist();
@@ -867,6 +920,7 @@ impl App {
     }
 
     fn open_session(&mut self, session_id: String) {
+        self.command_ui = CommandUi::default();
         self.switcher = None;
         let show_tools = self.chat.show_tools;
         self.chat = Chat::opening(session_id.clone());
@@ -883,6 +937,10 @@ impl App {
     }
 
     fn send_prompt(&mut self) {
+        self.send_prompt_checked(false);
+    }
+
+    fn send_prompt_checked(&mut self, validated: bool) {
         let prompt = self.chat.input.text().trim().to_string();
         if prompt.is_empty() {
             return;
@@ -891,6 +949,10 @@ impl App {
             self.notify("Open a chat first (Ctrl+K).");
             return;
         };
+        if !validated && iowb_protocol::leading_chat_command(&prompt).is_some() {
+            self.prepare_command(prompt);
+            return;
+        }
         if self.chat.running {
             self.notify("A reply is still running. Esc stops it.");
             return;
@@ -1072,6 +1134,9 @@ impl App {
     /// get in the way of typing are Esc, Ctrl combinations, the paging keys and
     /// Up/Down once the cursor has no row left to move to.
     fn chat_key(&mut self, key: KeyEvent) {
+        if self.command_key(key) {
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if key.code != KeyCode::Esc {
             self.esc_armed = None;
@@ -1439,6 +1504,8 @@ impl App {
         }
     }
 }
+
+include!("app_commands.rs");
 
 #[cfg(test)]
 mod tests {

@@ -15,6 +15,7 @@ include!("server/files_and_uploads.rs");
 include!("server/settings.rs");
 include!("server/provider_settings.rs");
 include!("server/session_api.rs");
+include!("server/chat_commands.rs");
 include!("server/processes_and_websocket.rs");
 include!("server/notifications_and_watch.rs");
 include!("server/configuration.rs");
