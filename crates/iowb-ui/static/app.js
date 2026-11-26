@@ -1,7 +1,7 @@
 "use strict";
 
 const TOKEN_STORAGE_KEY = "iowb.token";
-const APP_VERSION = "20261124-terminal-01";
+const APP_VERSION = "20261126-claude-session-switching-01";
 const APP_MODULES = Object.freeze([
   "/app/core.js",
   "/app/sidebar.js",
