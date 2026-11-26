@@ -102,7 +102,8 @@ impl SessionManager {
             }
         } else if session.provider == Provider::Codex
             && session.native_session_id.is_some()
-            && !session.native_rollout_owned_by_provider
+            && (!session.native_rollout_owned_by_provider
+                || session.runtime == Some(ChatRuntime::NativeCli))
             && !self.storage.has_active_context_rollover(&session.id)?
         {
             if let Some(record) = self.external_record_for_messages(&session.id).await {

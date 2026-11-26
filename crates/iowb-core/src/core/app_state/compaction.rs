@@ -120,7 +120,11 @@ impl AppState {
         validate_recovered_agent_runtime_config(provider, runtime, direct_ai_config.as_ref())?;
 
         let session = self.sessions.set_active(&run.session_id, true).await?;
-        let recovery_prompt = durable_chat_recovery_prompt(&run.prompt);
+        let recovery_prompt = if provider == Provider::Codex {
+            run.prompt.clone()
+        } else {
+            durable_chat_recovery_prompt(&run.prompt)
+        };
         let direct_ai_messages =
             if should_use_direct_ai_gateway_runtime(provider, run.model.as_deref()) {
                 let mut messages =

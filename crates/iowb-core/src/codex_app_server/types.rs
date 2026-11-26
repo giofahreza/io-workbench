@@ -36,6 +36,16 @@ pub(crate) struct CodexAppServerClient {
 pub(crate) struct CodexAppServerLaunchOptions {
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<(String, String)>,
+    pub(crate) transport: CodexAppServerTransport,
+    pub(crate) codex_home: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum CodexAppServerTransport {
+    #[default]
+    Stdio,
+    NativeDaemon,
+    UnixSocket(PathBuf),
 }
 
 #[derive(Debug, Clone)]
@@ -50,14 +60,34 @@ pub(crate) struct CodexAppServerLiveTurnParams {
     pub(crate) service_tier: Option<String>,
     pub(crate) approval_policy: Option<Value>,
     pub(crate) sandbox_policy: Option<Value>,
+    pub(crate) durable_submission: bool,
+    pub(crate) recovery: Option<CodexTurnRecovery>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodexTurnRecovery {
+    pub(crate) submission_started: bool,
+    pub(crate) turn_id: Option<String>,
 }
 
 #[derive(Debug)]
 pub(crate) enum CodexAppServerLiveTurnEvent {
-    UsageBaseline { token_usage: Value },
-    ThreadAssociated { thread_id: String },
-    TurnAssociated { turn_id: String },
-    Notification { method: String, params: Value },
+    UsageBaseline {
+        token_usage: Value,
+    },
+    ThreadAssociated {
+        thread_id: String,
+    },
+    TurnAssociated {
+        turn_id: String,
+    },
+    SubmissionStarted {
+        acknowledgement: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    Notification {
+        method: String,
+        params: Value,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

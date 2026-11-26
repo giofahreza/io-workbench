@@ -104,7 +104,7 @@ fn finish_claude_builders(
 }
 
 fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
-    let root = home.join(".codex/sessions");
+    let root = external_codex_home(home).join("sessions");
     if discover_codex_index(home, records) {
         return;
     }
@@ -116,6 +116,7 @@ fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
         let mut subagent = false;
         let mut forked_from_id = None;
         let mut found_session_meta = false;
+        let mut runtime = ChatRuntime::NativeCli;
         for_each_json_line(&path, |entry| {
             let timestamp = value_timestamp(entry.get("timestamp"));
             builder.last_activity = latest(builder.last_activity, timestamp);
@@ -123,6 +124,7 @@ fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
                 Some("session_meta") => {
                     let payload = entry.get("payload").unwrap_or(&Value::Null);
                     if !found_session_meta && let Some(meta) = codex_session_meta(payload) {
+                        runtime = codex_origin_runtime(payload.get("model_provider").and_then(Value::as_str));
                         builder.id = meta.id;
                         builder.project_path = meta.project_path;
                         builder.model = meta.model;
@@ -188,6 +190,7 @@ fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
                 .to_string();
         }
         if let Some(mut record) = finish_builder(builder, Provider::Codex, path, fallback_time) {
+            record.summary.runtime = Some(runtime);
             record.summary.message_count = count_external_messages(&record);
             candidates.push((record, forked_from_id));
         }
@@ -196,7 +199,7 @@ fn discover_codex(home: &Path, records: &mut Vec<ExternalSessionRecord>) {
 }
 
 fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -> bool {
-    let codex_dir = home.join(".codex");
+    let codex_dir = external_codex_home(home);
     let Some(database_path) = newest_matching_file(&codex_dir, "state_", "sqlite") else {
         return false;
     };
@@ -206,13 +209,14 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
     ) else {
         return false;
     };
+    let provider_column = if connection.prepare("SELECT model_provider FROM threads LIMIT 0").is_ok() { "t.model_provider" } else { "NULL" };
     let Ok(mut statement) = connection.prepare(
-        r#"
+        &format!(r#"
         SELECT t.id, t.rollout_path, t.cwd, t.title, t.first_user_message,
                t.updated_at_ms, t.updated_at, t.model, t.thread_source,
                COUNT(*) OVER (
                    PARTITION BY t.cwd, t.first_user_message
-               ) AS possible_resume_count
+               ) AS possible_resume_count, {provider_column}
         FROM threads AS t
         WHERE t.archived = 0
           AND t.first_user_message <> ''
@@ -224,7 +228,7 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
               WHERE edge.child_thread_id = t.id
           )
         ORDER BY t.updated_at_ms DESC
-        "#,
+        "#),
     ) else {
         return false;
     };
@@ -240,6 +244,7 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
             row.get::<_, Option<String>>(7)?,
             row.get::<_, Option<String>>(8)?,
             row.get::<_, i64>(9)?,
+            row.get::<_, Option<String>>(10)?,
         ))
     }) else {
         return false;
@@ -258,6 +263,7 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
             model,
             thread_source,
             possible_resume_count,
+            model_provider,
         ) = row;
         if is_codex_subagent_thread_source(thread_source.as_deref()) {
             continue;
@@ -301,6 +307,7 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
                     last_activity,
                     active: false,
                     model,
+                    runtime: Some(codex_origin_runtime(model_provider.as_deref())),
                     last_message_at: Some(last_activity),
                     title_source: Some(SessionTitleSource::External),
                     ..Default::default()
@@ -314,6 +321,18 @@ fn discover_codex_index(home: &Path, records: &mut Vec<ExternalSessionRecord>) -
     let found = !discovered.is_empty();
     records.extend(discovered);
     found
+}
+
+fn codex_origin_runtime(provider: Option<&str>) -> ChatRuntime {
+    if provider == Some("iowb_gateway") { ChatRuntime::IoGateway } else { ChatRuntime::NativeCli }
+}
+
+fn external_codex_home(home: &Path) -> PathBuf {
+    if dirs::home_dir().as_deref() == Some(home) {
+        std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"))
+    } else {
+        home.join(".codex")
+    }
 }
 
 fn codex_session_meta(payload: &Value) -> Option<CodexSessionMeta> {

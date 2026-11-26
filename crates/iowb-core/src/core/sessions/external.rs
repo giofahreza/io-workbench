@@ -250,11 +250,23 @@ impl SessionManager {
         if external.is_empty() {
             return Ok(None);
         }
-        if record.summary.id == session_id {
+        let shared_native = self.get_stored(session_id).filter(|session| {
+            session.provider == Provider::Codex
+                && session.runtime == Some(ChatRuntime::NativeCli)
+                && session.native_rollout_owned_by_provider
+        });
+        if record.summary.id == session_id && shared_native.is_none() {
             return Ok(Some(external.as_ref().clone()));
         }
 
         let stored = self.messages(session_id)?;
+        if let Some(session) = shared_native {
+            return Ok(Some(merge_shared_codex_messages(
+                stored,
+                external.as_ref().clone(),
+                session.external,
+            )));
+        }
         let merge = if record.summary.provider == Provider::Claude {
             merge_mapped_claude_messages
         } else {

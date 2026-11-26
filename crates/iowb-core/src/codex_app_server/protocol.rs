@@ -15,6 +15,11 @@ fn app_server_response_error(error: &Value) -> CoreError {
         .and_then(Value::as_str)
         .unwrap_or("unknown app-server error");
     let detail = error.get("data").map(Value::to_string);
+    if code == Some(-32600) && message.contains("already has an active writer") {
+        return CoreError::Conflict(format!(
+            "This Codex chat is owned by a separate CLI runtime. Exit that chat to release it, or reopen it with `codex --remote unix:// resume <session-id>` to keep the CLI open while switching. No lock was removed and no fork was created. Native error: {message}"
+        ));
+    }
     CoreError::InvalidInput(match (code, detail) {
         (Some(code), Some(detail)) => {
             format!("Codex app-server error {code}: {message} ({detail})")
@@ -38,6 +43,9 @@ fn app_server_command(command: &OsString, launch_options: &CodexAppServerLaunchO
     child_command.env_remove("IO_WORKBENCH_TOKEN");
     for (key, value) in &launch_options.env {
         child_command.env(key, value);
+    }
+    if let Some(home) = launch_options.codex_home.as_deref() {
+        child_command.env("CODEX_HOME", home);
     }
     child_command
 }
@@ -98,7 +106,7 @@ fn append_stderr_bounded(output: &mut String, chunk: &str) {
     output.drain(..trim_at);
 }
 
-async fn write_json_line(stdin: &mut tokio::process::ChildStdin, value: &Value) -> Result<()> {
+async fn write_json_line(stdin: &mut AppServerWriter, value: &Value) -> Result<()> {
     let mut encoded = serde_json::to_vec(value)?;
     encoded.push(b'\n');
     stdin.write_all(&encoded).await?;
@@ -106,10 +114,7 @@ async fn write_json_line(stdin: &mut tokio::process::ChildStdin, value: &Value) 
     Ok(())
 }
 
-async fn wait_for_context_compaction(
-    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    thread_id: &str,
-) -> Result<()> {
+async fn wait_for_context_compaction(lines: &mut AppServerLines, thread_id: &str) -> Result<()> {
     while let Some(line) = lines.next_line().await? {
         let value: Value = serde_json::from_str(&line)?;
         let method = value.get("method").and_then(Value::as_str).unwrap_or("");
@@ -232,30 +237,16 @@ fn app_server_turn_error_suffix(turn: &Value) -> String {
     }
 }
 
-async fn read_response(
-    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    expected_id: i64,
-) -> Result<Value> {
+async fn read_response(lines: &mut AppServerLines, expected_id: i64) -> Result<Value> {
     while let Some(line) = lines.next_line().await? {
         let value: Value = serde_json::from_str(&line)?;
-        if value.get("id").and_then(Value::as_i64) != Some(expected_id) {
+        if value.get("method").is_some()
+            || value.get("id").and_then(Value::as_i64) != Some(expected_id)
+        {
             continue;
         }
         if let Some(error) = value.get("error") {
-            let code = error.get("code").and_then(Value::as_i64);
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown app-server error");
-            let detail = error.get("data").map(Value::to_string);
-            return Err(CoreError::InvalidInput(match (code, detail) {
-                (Some(code), Some(detail)) => {
-                    format!("Codex app-server error {code}: {message} ({detail})")
-                }
-                (Some(code), None) => format!("Codex app-server error {code}: {message}"),
-                (None, Some(detail)) => format!("Codex app-server error: {message} ({detail})"),
-                (None, None) => format!("Codex app-server error: {message}"),
-            }));
+            return Err(app_server_response_error(error));
         }
         return value.get("result").cloned().ok_or_else(|| {
             CoreError::InvalidInput(

@@ -463,7 +463,8 @@ async function loadChatModelsIntoSelect(provider, refresh = false) {
       : `<option value="">No models available</option>`;
     const values = entries.map((m) => m.value);
     const preferred = String(state.preferences.chatModel ?? "").trim();
-    if (values.includes(preferred)) select.value = preferred;
+    if (body.nativeSessionSettings === true && values.includes("")) select.value = "";
+    else if (values.includes(preferred)) select.value = preferred;
     else if (values.includes(current)) select.value = current;
     else select.value = values[0] ?? "";
     state.preferences.chatModel = select.value;

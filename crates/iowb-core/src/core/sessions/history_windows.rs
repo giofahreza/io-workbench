@@ -55,7 +55,12 @@ impl SessionManager {
         let Some(record) = self.external_record_for_messages(session_id).await else {
             return Ok(None);
         };
-        if record.summary.id == session_id {
+        let shared_native = self.get_stored(session_id).filter(|session| {
+            session.provider == Provider::Codex
+                && session.runtime == Some(ChatRuntime::NativeCli)
+                && session.native_rollout_owned_by_provider
+        });
+        if record.summary.id == session_id && shared_native.is_none() {
             if offset.is_none() {
                 let page = self.external_messages_tail(&record, limit).await;
                 return Ok((!page.0.is_empty()).then_some(page));
@@ -86,7 +91,12 @@ impl SessionManager {
         }
 
         let key = format!(
-            "mapped:{session_id}:{}",
+            "{}:{session_id}:{}",
+            if shared_native.is_some() {
+                "shared-native"
+            } else {
+                "mapped"
+            },
             external_session_cache_key(&record)
         );
         for _ in 0..2 {
@@ -109,7 +119,12 @@ impl SessionManager {
             } else {
                 merge_mapped_external_messages
             };
-            let messages = Arc::new(merge(self.messages(session_id)?, external.as_ref().clone()));
+            let stored = self.messages(session_id)?;
+            let messages = Arc::new(if let Some(session) = shared_native.as_ref() {
+                merge_shared_codex_messages(stored, external.as_ref().clone(), session.external)
+            } else {
+                merge(stored, external.as_ref().clone())
+            });
             if self.storage.message_history_version(session_id)? != version
                 || external_file_fingerprint(&record.file_path) != fingerprint
             {

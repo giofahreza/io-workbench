@@ -1,4 +1,40 @@
 impl AppState {
+    pub async fn native_chat_configuration(
+        &self,
+        provider: Provider,
+        session_id: Option<&str>,
+    ) -> Option<SessionSummary> {
+        let session_id = session_id?;
+        if !matches!(provider, Provider::Codex | Provider::Claude)
+            || self.storage.has_active_context_rollover(session_id).ok()?
+        {
+            return None;
+        }
+        if let Some(session) = self
+            .sessions
+            .get_stored(session_id)
+            .filter(|session| !session.external)
+        {
+            return (session.provider == provider
+                && session.runtime == Some(ChatRuntime::NativeCli)
+                && session.native_session_id.is_some()
+                && session.native_rollout_owned_by_provider)
+                .then_some(session);
+        }
+        let mut record = self
+            .sessions
+            .external_record(session_id, Some(provider), None)
+            .await;
+        if record.is_none() && Uuid::parse_str(session_id).is_ok() {
+            self.sessions.external_cache.write().await.loaded_at = None;
+            record = self
+                .sessions
+                .external_record(session_id, Some(provider), None)
+                .await;
+        }
+        record.map(|record| record.summary)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn start_agent_session_scoped(
         &self,
@@ -19,6 +55,51 @@ impl AppState {
     ) -> Result<SessionSummary> {
         let project_path = project_path.into();
         let prompt = prompt.into();
+        let _admission = if let Some(id) = session_id.as_deref() {
+            Some(self.agents.lock_admission(provider, id).await)
+        } else {
+            None
+        };
+        let requested_run_id =
+            request_id
+                .as_deref()
+                .zip(session_id.as_deref())
+                .map(|(request, session)| {
+                    let scope = serde_json::json!([user_id, provider.as_str(), session, request])
+                        .to_string();
+                    format!("run_{}", hex::encode(Sha256::digest(scope.as_bytes())))
+                });
+        if let Some(run_id) = requested_run_id.as_deref()
+            && let Some(run) = self.storage.get_durable_chat_run(run_id)?
+        {
+            let original_prompt = run
+                .user_message_id
+                .as_deref()
+                .and_then(|id| {
+                    self.storage
+                        .message_by_id(&run.session_id, id)
+                        .ok()
+                        .flatten()
+                })
+                .map(|message| message.content)
+                .unwrap_or_else(|| run.prompt.clone());
+            if original_prompt != prompt || run.project_path != project_path {
+                return Err(CoreError::Conflict(
+                    "This request id was already used for another message".into(),
+                ));
+            }
+            if run.status == "rejected" {
+                return Err(CoreError::Conflict(run.last_error.unwrap_or_else(|| {
+                    "This message was not sent; retry with a new request id".into()
+                })));
+            }
+            return self.sessions.get(&run.session_id).await;
+        }
+        if let Some(id) = session_id.as_deref()
+            && self.agents.is_running(provider, id).await
+        {
+            return Err(CoreError::Conflict("This chat already has a running turn. Wait for it to finish; no additional message was sent.".into()));
+        }
         let resolved_project_path = self
             .path_validator
             .validate_path(PathBuf::from(&project_path), false)
@@ -165,7 +246,7 @@ impl AppState {
                 Some("superseded by a newer turn in the same session"),
             )?;
         }
-        let durable_run_id = new_id("run");
+        let durable_run_id = requested_run_id.unwrap_or_else(|| new_id("run"));
         let mut durable_run = StoredDurableChatRun::new(
             durable_run_id.clone(),
             user_id,

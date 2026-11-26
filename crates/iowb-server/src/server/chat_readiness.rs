@@ -196,6 +196,25 @@ fn chat_setup_problem(code: &str, message: &str, action: &str, docs: Option<&str
     serde_json::json!({ "code": code, "message": message, "action": action, "docsUrl": docs })
 }
 
+fn apply_imported_chat_catalog(catalog: &mut Value, imported: Option<&SessionSummary>) {
+    if !imported.is_some_and(|session| session.runtime == Some(ChatRuntime::NativeCli)) {
+        return;
+    }
+    catalog["nativeSessionSettings"] = Value::Bool(true);
+    if catalog.pointer("/problem/code").and_then(Value::as_str) == Some("provider_auth_required")
+        && catalog.pointer("/readiness/installed").and_then(Value::as_bool) == Some(true)
+    {
+        catalog["problem"] = Value::Null;
+        catalog["ready"] = Value::Bool(true);
+        catalog["readiness"]["authState"] = serde_json::json!("configured_unverified");
+    }
+    if catalog["ready"] == true && let Some(models) = catalog["models"].as_array_mut() {
+        models.retain(|model| model["value"].as_str() != Some(""));
+        let provider = if imported.is_some_and(|session| session.provider == Provider::Claude) { "Claude" } else { "Codex" };
+        models.insert(0, serde_json::json!({"value": "", "label": format!("Keep native {provider} session settings")}));
+    }
+}
+
 fn native_model_problem(runtime: ChatRuntime, model: Option<&str>) -> Option<Value> {
     let model = model.map(str::trim).filter(|s| !s.is_empty())?;
     if runtime == ChatRuntime::NativeCli && is_io_gateway_model(model) {

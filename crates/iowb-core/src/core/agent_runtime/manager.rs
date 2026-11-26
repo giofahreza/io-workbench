@@ -2,6 +2,7 @@ impl AgentRuntimeManager {
     pub fn new(max_runs: usize) -> Self {
         Self {
             runs: Arc::new(RwLock::new(HashMap::new())),
+            admissions: Arc::new(Mutex::new(HashMap::new())),
             codex_app_server: default_codex_app_server_client(),
             max_runs,
             max_replay_events: 256,
@@ -75,7 +76,7 @@ impl AgentRuntimeManager {
             }
             let (abort_tx, abort_rx) = oneshot::channel();
 
-            self.register(key.clone(), abort_tx).await;
+            self.register(key.clone(), abort_tx).await?;
 
             self.publish(
                 &context.hub,
@@ -474,7 +475,7 @@ impl AgentRuntimeManager {
         let key = agent_run_key(context.provider, &context.session_id);
         let (abort_tx, abort_rx) = oneshot::channel();
 
-        self.register(key.clone(), abort_tx).await;
+        self.register(key.clone(), abort_tx).await?;
 
         self.publish(
             &context.hub,
@@ -490,54 +491,51 @@ impl AgentRuntimeManager {
         )
         .await;
 
-        let launch_options = match codex_app_server_launch_options(
+        let mut launch_options = match codex_app_server_launch_options(
             context.runtime,
             context.direct_ai_config.as_ref(),
         ) {
             Ok(options) => options,
             Err(error) => {
                 let error_message = error.to_string();
-                self.publish(
-                    &context.hub,
-                    &key,
-                    WsServerEvent::Error {
-                        history_message: None,
-                        message: "failed to prepare Codex app-server".to_string(),
-                        details: Some(error_message.clone()),
-                        session_id: Some(context.session_id.clone()),
-                    },
-                )
-                .await;
+                let rejected = self
+                    .reject_unaccepted_codex_send(&key, &context, &error)
+                    .await;
+                if !rejected {
+                    self.publish(
+                        &context.hub,
+                        &key,
+                        WsServerEvent::Error {
+                            history_message: None,
+                            message: "failed to prepare Codex app-server".to_string(),
+                            details: Some(error_message.clone()),
+                            session_id: Some(context.session_id.clone()),
+                        },
+                    )
+                    .await;
+                }
                 self.finish(
                     &key,
                     &context,
                     iowb_protocol::SessionRuntimeStatus::Failed,
-                    Some(error_message),
+                    None,
                     None,
                 )
                 .await;
                 return Ok(());
             }
         };
+        if context.runtime == ChatRuntime::NativeCli
+            && context.native_resume_session_id.is_some()
+            && let Some(options) = launch_options.as_mut()
+        {
+            options.args = vec!["app-server".into(), "--stdio".into()];
+        }
         let mut turn_params = codex_app_server_live_turn_params(&context);
         apply_codex_live_profile_defaults(&mut turn_params, launch_options.as_ref());
         let client = self.codex_app_server.clone();
         let manager = self.clone();
         let (event_tx, mut event_rx) = mpsc::channel::<CodexAppServerLiveTurnEvent>(256);
-
-        self.publish(
-            &context.hub,
-            &key,
-            WsServerEvent::SessionStatus {
-                provider: context.provider,
-                session_id: context.session_id.clone(),
-                status: iowb_protocol::SessionRuntimeStatus::Running,
-                response_id: Some(context.response_id.clone()),
-                sequence: Some(context.next_sequence()),
-                latest_user_prompt: Some(context.prompt.clone()),
-            },
-        )
-        .await;
 
         tokio::spawn(async move {
             let mut output = String::new();
@@ -610,24 +608,34 @@ impl AgentRuntimeManager {
                 }
                 Ok(Err(error)) => {
                     let error_message = error.to_string();
-                    manager
-                        .publish(
-                            &context.hub,
-                            &key,
-                            WsServerEvent::Error {
-                                history_message: None,
-                                message: "Codex app-server live turn failed".to_string(),
-                                details: Some(error_message.clone()),
-                                session_id: Some(context.session_id.clone()),
-                            },
-                        )
+                    let rejected = manager
+                        .reject_unaccepted_codex_send(&key, &context, &error)
                         .await;
+                    if !rejected {
+                        if let Some(run_id) = context.durable_run_id.as_deref() {
+                            let _ = context
+                                .storage
+                                .mark_durable_chat_run_failed(run_id, &error_message);
+                        }
+                        manager
+                            .publish(
+                                &context.hub,
+                                &key,
+                                WsServerEvent::Error {
+                                    history_message: None,
+                                    message: "Codex app-server live turn failed".to_string(),
+                                    details: Some(error_message.clone()),
+                                    session_id: Some(context.session_id.clone()),
+                                },
+                            )
+                            .await;
+                    }
                     manager
                         .finish(
                             &key,
                             &context,
                             iowb_protocol::SessionRuntimeStatus::Failed,
-                            Some(error_message),
+                            (!output.trim().is_empty()).then_some(output.clone()),
                             run_usage,
                         )
                         .await;
@@ -666,7 +674,7 @@ impl AgentRuntimeManager {
         let (abort_tx, abort_rx) = oneshot::channel();
         let key = agent_run_key(context.provider, &context.session_id);
 
-        self.register(key.clone(), abort_tx).await;
+        self.register(key.clone(), abort_tx).await?;
 
         self.publish(
             &context.hub,
@@ -858,8 +866,113 @@ impl AgentRuntimeManager {
         Ok(())
     }
 
-    async fn register(&self, key: String, abort_tx: oneshot::Sender<()>) {
+    async fn lock_admission(
+        &self,
+        provider: Provider,
+        session_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = agent_run_key(provider, session_id);
+        let lock = {
+            let mut admissions = self.admissions.lock().await;
+            admissions.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = admissions.get(&key).and_then(std::sync::Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                admissions.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    async fn reject_unaccepted_codex_send(
+        &self,
+        key: &str,
+        context: &AgentStartContext,
+        error: &CoreError,
+    ) -> bool {
+        let Some(run_id) = context.durable_run_id.as_deref() else {
+            return false;
+        };
+        let Ok(Some(run)) = context.storage.get_durable_chat_run(run_id) else {
+            return false;
+        };
+        let Ok(submission) = context.storage.codex_run_submission(run_id) else {
+            return false;
+        };
+        let message = error.to_string();
+        let known_rejection = message.contains("owned by a separate CLI runtime")
+            || message.contains("still running a turn in this chat")
+            || message.contains("different CODEX_HOME");
+        if submission.is_some() && !known_rejection {
+            return false;
+        }
+        let original_prompt = run
+            .user_message_id
+            .as_deref()
+            .and_then(|id| {
+                context
+                    .storage
+                    .message_by_id(&run.session_id, id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|message| message.content)
+            .unwrap_or_else(|| run.prompt.clone());
+        if !context
+            .storage
+            .reject_codex_run_before_acceptance(run_id, &message)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let code = if message.contains("owned by a separate CLI runtime") {
+            "codex_thread_owned"
+        } else if message.contains("still running a turn") {
+            "codex_thread_busy"
+        } else {
+            "codex_start_failed"
+        };
+        let history_message = context.storage.get_session_summary(&context.session_id).ok().flatten().and_then(|session| {
+            let entry = ChatMessage {
+                id: format!("chat-error:{run_id}"), role: MessageRole::System, content: message.clone(), timestamp: Utc::now(),
+                metadata: serde_json::json!({"kind":"chat_error", "phase":"rejected", "status":"failed", "code":code,
+                    "requestId":context.request_id, "action":"retry", "durableRunId":run_id}),
+            };
+            context.storage.persist_chat_error(&session, &entry, run.user_id.as_deref().map(|user| (user, original_prompt.as_str()))).ok().map(|_| entry)
+        });
+        if let Ok(Some(session)) = context.storage.get_session_summary(&context.session_id) {
+            let _ = context.sessions.remember_persisted_session(session).await;
+        }
+        self.publish(
+            &context.hub,
+            key,
+            WsServerEvent::ChatSetupRequired {
+                history_message,
+                provider: context.provider,
+                session_id: context.session_id.clone(),
+                request_id: context.request_id.clone(),
+                code: code.into(),
+                message,
+                action: "retry".into(),
+                docs_url: None,
+            },
+        )
+        .await;
+        true
+    }
+
+    async fn register(&self, key: String, abort_tx: oneshot::Sender<()>) -> Result<()> {
         let mut runs = self.runs.write().await;
+        if runs
+            .get(&key)
+            .is_some_and(|record| record.abort_tx.is_some())
+        {
+            return Err(CoreError::Conflict(
+                "This chat already has a running turn".into(),
+            ));
+        }
         runs.insert(
             key,
             AgentRuntimeRecord {
@@ -872,6 +985,7 @@ impl AgentRuntimeManager {
         while runs.len() > self.max_runs {
             if let Some(oldest_key) = runs
                 .iter()
+                .filter(|(_, record)| record.abort_tx.is_none())
                 .min_by_key(|(_, record)| record.last_activity)
                 .map(|(key, _)| key.clone())
             {
@@ -880,6 +994,7 @@ impl AgentRuntimeManager {
                 break;
             }
         }
+        Ok(())
     }
 
     async fn is_running(&self, provider: Provider, session_id: &str) -> bool {
@@ -973,14 +1088,25 @@ impl AgentRuntimeManager {
     ) -> Option<ContextRolloverFollowUp> {
         let mut status = status;
         let received_at = Utc::now();
-        let output = assistant_output
-            .filter(|output| !output.trim().is_empty())
-            .or_else(|| match status {
-                iowb_protocol::SessionRuntimeStatus::Failed => Some("Failed".to_string()),
-                iowb_protocol::SessionRuntimeStatus::Aborted => Some("Aborted".to_string()),
-                _ => None,
-            })
-            .map(|output| bound_agent_final_text(&output));
+        let rejected = context
+            .durable_run_id
+            .as_deref()
+            .and_then(|id| context.storage.get_durable_chat_run(id).ok().flatten())
+            .is_some_and(|run| run.status == "rejected");
+        let suppress_failure_output =
+            rejected || (context.native_rollout_owned_by_provider && assistant_output.is_none());
+        let output = if suppress_failure_output {
+            None
+        } else {
+            assistant_output
+                .filter(|output| !output.trim().is_empty())
+                .or_else(|| match status {
+                    iowb_protocol::SessionRuntimeStatus::Failed => Some("Failed".to_string()),
+                    iowb_protocol::SessionRuntimeStatus::Aborted => Some("Aborted".to_string()),
+                    _ => None,
+                })
+                .map(|output| bound_agent_final_text(&output))
+        };
         let mut rollover_completed_atomically = false;
         let mut rollover_follow_up = None;
         if let Some(rollover_id) = context.context_rollover_id.as_deref() {
@@ -1171,7 +1297,10 @@ impl AgentRuntimeManager {
             })
             .ok();
 
-        if !rollover_completed_atomically && let Some(run_id) = context.durable_run_id.as_deref() {
+        if !rollover_completed_atomically
+            && !rejected
+            && let Some(run_id) = context.durable_run_id.as_deref()
+        {
             let terminal_result = match status {
                 iowb_protocol::SessionRuntimeStatus::Completed => {
                     context.storage.mark_durable_chat_run_completed(run_id)

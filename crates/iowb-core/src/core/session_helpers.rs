@@ -262,6 +262,52 @@ fn merge_mapped_external_messages(
     external
 }
 
+fn merge_shared_codex_messages(
+    stored: Vec<ChatMessage>,
+    mut external: Vec<ChatMessage>,
+    include_prior_history: bool,
+) -> Vec<ChatMessage> {
+    let key = |message: &ChatMessage| {
+        if message.role == MessageRole::User
+            && let Some(input) = message.metadata.get("nativeInput").and_then(Value::as_str)
+        {
+            return format!("user\0{}", input.trim());
+        }
+        message_match_key(message)
+    };
+    if !include_prior_history
+        && let Some(first_user) = stored
+            .iter()
+            .find(|message| message.role == MessageRole::User)
+    {
+        if let Some(start) = external
+            .iter()
+            .position(|message| key(message) == key(first_user))
+        {
+            external.drain(..start);
+        } else {
+            external.retain(|message| message.timestamp >= first_user.timestamp);
+        }
+    }
+    let stored_keys = stored.iter().map(&key).collect::<Vec<_>>();
+    let external_keys = external.iter().map(&key).collect::<Vec<_>>();
+    let mut merged = Vec::new();
+    let mut stored_cursor = 0;
+    let mut external_cursor = 0;
+    for (stored_index, external_index) in ordered_text_matches(&stored_keys, &external_keys) {
+        merged.extend_from_slice(&stored[stored_cursor..stored_index]);
+        merged.extend_from_slice(&external[external_cursor..external_index]);
+        let mut matched = stored[stored_index].clone();
+        matched.timestamp = external[external_index].timestamp;
+        merged.push(matched);
+        stored_cursor = stored_index + 1;
+        external_cursor = external_index + 1;
+    }
+    merged.extend_from_slice(&external[external_cursor..]);
+    merged.extend_from_slice(&stored[stored_cursor..]);
+    merged
+}
+
 fn merge_active_context_external_messages(
     stored: Vec<ChatMessage>,
     external: Vec<ChatMessage>,

@@ -1,4 +1,60 @@
 impl Storage {
+    pub fn native_run_submission(&self, run_id: &str) -> Result<Option<(String, Option<String>)>> {
+        self.with_connection(|conn| {
+            conn.query_row("SELECT transport, native_turn_id FROM native_run_submissions WHERE run_id = ?1", params![run_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional().map_err(StorageError::from)
+        })
+    }
+
+    pub fn record_native_run_submission(&self, run_id: &str, transport: &str, turn_id: Option<&str>) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute("INSERT INTO native_run_submissions (run_id, transport, native_turn_id, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(run_id) DO UPDATE SET native_turn_id = COALESCE(excluded.native_turn_id, native_run_submissions.native_turn_id)", params![run_id, transport, turn_id, Utc::now().to_rfc3339()])?;
+            Ok(())
+        })
+    }
+
+    pub fn codex_run_submission(&self, run_id: &str) -> Result<Option<(String, Option<String>)>> {
+        self.with_connection(|conn| {
+            conn.query_row("SELECT run_id, native_turn_id FROM codex_run_submissions WHERE run_id = ?1",
+                params![run_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional().map_err(StorageError::from)
+        })
+    }
+
+    pub fn record_codex_run_submission(&self, run_id: &str, native_turn_id: Option<&str>) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO codex_run_submissions (run_id, native_turn_id, created_at) VALUES (?1, ?2, ?3) ON CONFLICT(run_id) DO UPDATE SET native_turn_id = COALESCE(excluded.native_turn_id, codex_run_submissions.native_turn_id)",
+                params![run_id, native_turn_id, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn reject_codex_run_before_acceptance(&self, run_id: &str, error: &str) -> Result<bool> {
+        self.reject_native_run_before_acceptance(run_id, error)
+    }
+
+    pub fn reject_native_run_before_acceptance(&self, run_id: &str, error: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let accepted: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM codex_run_submissions WHERE run_id = ?1 AND native_turn_id IS NOT NULL)", params![run_id], |row| row.get(0))?;
+            let native_accepted: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM native_run_submissions WHERE run_id = ?1 AND native_turn_id IS NOT NULL)", params![run_id], |row| row.get(0))?;
+            if accepted || native_accepted { return Ok(false); }
+            let run: Option<(String, Option<String>)> = tx.query_row(
+                "SELECT session_id, user_message_id FROM durable_chat_runs WHERE id = ?1 AND status IN ('running', 'recovering')",
+                params![run_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            let Some((session_id, user_message_id)) = run else { return Ok(false); };
+            let removed = tx.execute("DELETE FROM messages WHERE id = ?1 AND session_id = ?2 AND role = 'user'", params![user_message_id, session_id])?;
+            let now = Utc::now().to_rfc3339();
+            tx.execute("UPDATE durable_chat_runs SET status = 'rejected', last_error = ?2, updated_at = ?3, completed_at = ?3 WHERE id = ?1", params![run_id, error, now])?;
+            tx.execute("UPDATE sessions SET active = 0, message_count = MAX(0, message_count - ?2) WHERE id = ?1", params![session_id, removed])?;
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
     pub fn get_durable_chat_run(&self, run_id: &str) -> Result<Option<StoredDurableChatRun>> {
         self.with_connection(|conn| {
             conn.query_row(

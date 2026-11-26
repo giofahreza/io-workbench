@@ -154,12 +154,19 @@ impl SessionManager {
     ) -> Result<SessionSummary> {
         let id = session_id.unwrap_or_else(|| new_id("session"));
         let now = Utc::now();
+        let imported = if external {
+            self.external_record(&id, Some(provider), None)
+                .await
+                .map(|record| record.summary)
+        } else {
+            None
+        };
         let mut sessions = self.sessions.write().await;
         // A persisted row may have been evicted from the bounded in-memory
         // cache. Seed from storage so continuation never drops classification
         // metadata such as board ownership.
         if !sessions.contains_key(&id)
-            && let Some(stored) = self.storage.get_session_summary(&id)?
+            && let Some(stored) = self.storage.get_session_summary(&id)?.or(imported)
         {
             sessions.insert(id.clone(), stored);
         }
@@ -488,6 +495,7 @@ impl SessionManager {
                 && session.provider == Provider::Codex
                 && session.native_session_id.is_some()
                 && session.native_rollout_owned_by_provider
+                && session.runtime != Some(ChatRuntime::NativeCli)
         }))
     }
 

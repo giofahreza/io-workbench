@@ -8,7 +8,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use iowb_protocol::{ChatMessage, MessageRole, Provider, SessionSummary, SessionTitleSource};
+use iowb_protocol::{ChatMessage, ChatRuntime, MessageRole, Provider, SessionSummary, SessionTitleSource};
 use iowb_storage::{Storage, StoredExternalHistorySource, StoredExternalSessionRecord};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -19,7 +19,7 @@ use std::os::unix::fs::MetadataExt;
 
 const MAX_EXTERNAL_TOOL_CONTENT_BYTES: usize = 128 * 1024;
 const EXTERNAL_TOOL_CONTENT_TAIL_BYTES: usize = 32 * 1024;
-pub(crate) const EXTERNAL_HISTORY_PARSER_VERSION: u32 = 1;
+pub(crate) const EXTERNAL_HISTORY_PARSER_VERSION: u32 = 2;
 pub(crate) const EXTERNAL_MESSAGE_PARSER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]

@@ -303,13 +303,22 @@ fn codex_app_server_launch_options(
             IO_WORKBENCH_GATEWAY_KEY_ENV.to_string(),
             config.api_key.clone(),
         ));
-    } else if args.len() == 1 {
-        return Ok(None);
     }
     args.push("--stdio".to_string());
+    let transport = if runtime == ChatRuntime::NativeCli {
+        env::var_os("IO_WORKBENCH_CODEX_APP_SERVER_SOCKET")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .map(CodexAppServerTransport::UnixSocket)
+            .unwrap_or(CodexAppServerTransport::NativeDaemon)
+    } else {
+        CodexAppServerTransport::Stdio
+    };
     Ok(Some(CodexAppServerLaunchOptions {
         args,
         env: launch_env,
+        transport,
+        codex_home: None,
     }))
 }
 
@@ -317,7 +326,10 @@ fn codex_app_server_live_enabled(context: &AgentStartContext) -> bool {
     codex_app_server_live_enabled_for(
         context.provider,
         context.runtime,
-        env_bool(CODEX_APP_SERVER_LIVE_ENV, false),
+        env_bool(
+            CODEX_APP_SERVER_LIVE_ENV,
+            context.runtime == ChatRuntime::NativeCli,
+        ),
         env_bool(CODEX_APP_SERVER_LIVE_IO_GATEWAY_ENV, false),
         codex_app_server_live_cli_override_configured(),
     )
@@ -392,11 +404,25 @@ fn codex_app_server_live_turn_params(context: &AgentStartContext) -> CodexAppSer
         model_provider: None,
         effort,
         service_tier,
-        approval_policy: Some(serde_json::json!("never")),
+        approval_policy: (context.runtime != ChatRuntime::NativeCli)
+            .then(|| serde_json::json!("never")),
         sandbox_policy: codex_app_server_sandbox_policy(
             context.mode.as_deref(),
             &context.project_path,
         ),
+        durable_submission: context.durable_run_id.is_some(),
+        recovery: context
+            .durable_run_id
+            .as_deref()
+            .and_then(|id| context.storage.get_durable_chat_run(id).ok().flatten())
+            .filter(|run| run.status == "recovering")
+            .map(|run| {
+                let submission = context.storage.codex_run_submission(&run.id).ok().flatten();
+                CodexTurnRecovery {
+                    submission_started: submission.is_some(),
+                    turn_id: submission.and_then(|(_, turn_id)| turn_id),
+                }
+            }),
     }
 }
 

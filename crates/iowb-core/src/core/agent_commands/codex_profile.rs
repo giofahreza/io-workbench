@@ -115,6 +115,11 @@ fn apply_codex_live_profile_defaults(
     params: &mut CodexAppServerLiveTurnParams,
     options: Option<&CodexAppServerLaunchOptions>,
 ) {
+    if params.thread_id.is_some()
+        && options.is_some_and(|options| options.transport != CodexAppServerTransport::Stdio)
+    {
+        return;
+    }
     let Some(options) = options else {
         return;
     };

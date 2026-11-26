@@ -48,7 +48,7 @@ use uuid::Uuid;
 use codex_app_server::{
     CodexAppServerClient, CodexAppServerLaunchOptions, CodexAppServerLiveTurnEvent,
     CodexAppServerLiveTurnOutcome, CodexAppServerLiveTurnParams, CodexAppServerTurnTerminalStatus,
-    CodexThreadSnapshot,
+    CodexThreadSnapshot, CodexAppServerTransport, CodexTurnRecovery,
 };
 use external_sessions::{
     EXTERNAL_MESSAGE_PARSER_VERSION, ExternalFileFingerprint, ExternalSessionRecord, external_file_fingerprint,

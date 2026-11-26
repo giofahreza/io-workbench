@@ -79,28 +79,11 @@ impl CodexAppServerClient {
                 "Codex thread id is required for compaction".to_string(),
             ));
         }
-        let command = self.command.clone();
         let launch_options = launch_options.cloned().unwrap_or_default();
         let compact_timeout = self.request_timeout.max(Duration::from_secs(120));
-        let mut child_command = app_server_command(&command, &launch_options);
-        let mut child = child_command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-        let stderr = start_stderr_capture(&mut child, "compaction");
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            CoreError::Io(std::io::Error::other(
-                "Codex app-server stdin was unavailable",
-            ))
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            CoreError::Io(std::io::Error::other(
-                "Codex app-server stdout was unavailable",
-            ))
-        })?;
-        let mut lines = BufReader::new(stdout).lines();
+        let (mut connection, mut stdin, mut lines) =
+            self.connect(&launch_options, "compaction").await?;
+        let stderr = connection.stderr.clone();
 
         let result = timeout(compact_timeout, async {
             write_json_line(
@@ -121,7 +104,10 @@ impl CodexAppServerClient {
                 }),
             )
             .await?;
-            let _ = read_response(&mut lines, 1).await?;
+            let initialized = read_response(&mut lines, 1).await?;
+            if connection.shared {
+                validate_shared_codex_home(&initialized, launch_options.codex_home.as_deref())?;
+            }
             write_json_line(&mut stdin, &json!({ "method": "initialized" })).await?;
             write_json_line(
                 &mut stdin,
@@ -161,8 +147,7 @@ impl CodexAppServerClient {
             log_captured_stderr(&stderr, "compaction").await;
         }
         let _ = stdin.shutdown().await;
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        connection.close().await;
         result
     }
 
@@ -173,33 +158,17 @@ impl CodexAppServerClient {
         abort_rx: oneshot::Receiver<()>,
         events: mpsc::Sender<CodexAppServerLiveTurnEvent>,
     ) -> Result<CodexAppServerLiveTurnOutcome> {
-        let command = self.command.clone();
         let launch_options = launch_options.cloned().unwrap_or_default();
         let request_timeout = self.request_timeout;
-        let mut child_command = app_server_command(&command, &launch_options);
-        let mut child = child_command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-        let stderr = start_stderr_capture(&mut child, "live turn");
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            CoreError::Io(std::io::Error::other(
-                "Codex app-server stdin was unavailable",
-            ))
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            CoreError::Io(std::io::Error::other(
-                "Codex app-server stdout was unavailable",
-            ))
-        })?;
-        let mut lines = BufReader::new(stdout).lines();
+        let mut abort_rx = abort_rx;
+        let (mut connection, mut stdin, mut lines) =
+            self.connect(&launch_options, "live turn").await?;
+        let stderr = connection.stderr.clone();
 
         let result = async {
             timeout(
                 request_timeout,
-                initialize_app_server(&mut stdin, &mut lines, &events),
+                initialize_app_server(&mut stdin, &mut lines, &events, connection.shared, launch_options.codex_home.as_deref()),
             )
             .await
             .map_err(|_| live_turn_setup_timeout("initialize", request_timeout))??;
@@ -216,7 +185,7 @@ impl CodexAppServerClient {
             };
             let thread_id = timeout(
                 thread_timeout,
-                start_or_resume_thread(&mut stdin, &mut lines, &params, &events),
+                start_or_resume_thread(&mut stdin, &mut lines, &params, &events, connection.shared),
             )
             .await
             .map_err(|_| live_turn_setup_timeout("start or resume thread", thread_timeout))??;
@@ -225,35 +194,69 @@ impl CodexAppServerClient {
                     thread_id: thread_id.clone(),
                 })
                 .await;
-            let turn_id = timeout(
-                request_timeout,
-                start_turn(&mut stdin, &mut lines, &params, &thread_id, &events),
-            )
-            .await
-            .map_err(|_| live_turn_setup_timeout("start turn", request_timeout))??;
-            if let Some(turn_id) = turn_id.as_deref() {
+            if params.recovery.is_some() {
+                let recovered = timeout(request_timeout.max(Duration::from_secs(120)),
+                    recover_existing_turn(&mut stdin, &mut lines, &params, &thread_id, &events, request_timeout)).await
+                    .map_err(|_| live_turn_setup_timeout("reconcile native turn", request_timeout.max(Duration::from_secs(120))))??;
+                if let Some(turn) = recovered {
+                    let turn_id = replay_recovered_turn(&turn, &thread_id, &events).await?;
+                    return Ok::<_, CoreError>((thread_id, Some(turn_id), Some(turn)));
+                }
+                if !connection.shared && params.recovery.as_ref().is_some_and(|recovery| recovery.submission_started) {
+                    return Err(CoreError::Conflict("Codex submission outcome is uncertain. No matching native turn was found; Workbench did not resend the message.".into()));
+                }
+            }
+            if !matches!(abort_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                return Ok::<_, CoreError>((thread_id, None, Some(json!({"status":"interrupted", "items":[]}))));
+            }
+            let start = start_turn(&mut stdin, &mut lines, &params, &thread_id, &events, connection.shared, request_timeout, &mut abort_rx);
+            let (turn_id, recovered) = if connection.shared {
+                start.await?
+            } else {
+                timeout(request_timeout, start).await
+                    .map_err(|_| live_turn_setup_timeout("start turn", request_timeout))??
+            };
+            if let Some(turn) = recovered.as_ref().filter(|turn| turn.get("id").is_some()) {
+                replay_recovered_turn(turn, &thread_id, &events).await?;
+            } else if let Some(turn_id) = turn_id.as_deref() {
                 let _ = events
                     .send(CodexAppServerLiveTurnEvent::TurnAssociated {
                         turn_id: turn_id.to_string(),
                     })
                     .await;
             }
-            Ok::<_, CoreError>((thread_id, turn_id))
+            Ok::<_, CoreError>((thread_id, turn_id, recovered))
         }
         .await;
 
-        let (thread_id, mut turn_id) = match result {
+        let (thread_id, mut turn_id, recovered) = match result {
             Ok(value) => value,
             Err(error) => {
                 log_captured_stderr(&stderr, "live turn setup").await;
                 let _ = stdin.shutdown().await;
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                connection.close().await;
                 return Err(error);
             }
         };
 
-        let mut abort_rx = abort_rx;
+        if let Some(turn) = recovered.as_ref()
+            && turn.get("status").and_then(Value::as_str) != Some("inProgress")
+        {
+            let status = match turn.get("status").and_then(Value::as_str) {
+                Some("completed") => CodexAppServerTurnTerminalStatus::Completed,
+                Some("interrupted") => CodexAppServerTurnTerminalStatus::Interrupted,
+                _ => CodexAppServerTurnTerminalStatus::Failed,
+            };
+            let _ = stdin.shutdown().await;
+            connection.close().await;
+            return Ok(CodexAppServerLiveTurnOutcome {
+                thread_id,
+                turn_id,
+                status,
+                turn: recovered,
+            });
+        }
+
         let mut interrupt_request_id = 4_i64;
         let mut abort_deadline: Option<std::pin::Pin<Box<Sleep>>> = None;
         let mut abort_requested = false;
@@ -274,6 +277,7 @@ impl CodexAppServerClient {
                         &mut turn_id,
                         &mut saw_current_turn_notification,
                         &events,
+                        connection.shared,
                     ).await? {
                         break Ok(outcome);
                     }
@@ -327,8 +331,7 @@ impl CodexAppServerClient {
             log_captured_stderr(&stderr, "live turn").await;
         }
         let _ = stdin.shutdown().await;
-        let _ = child.start_kill();
-        let _ = timeout(Duration::from_secs(1), child.wait()).await;
+        connection.close().await;
         outcome
     }
 
@@ -339,27 +342,10 @@ impl CodexAppServerClient {
         launch_options: Option<&CodexAppServerLaunchOptions>,
     ) -> Result<Value> {
         let method = method.to_string();
-        let command = self.command.clone();
         let launch_options = launch_options.cloned().unwrap_or_default();
-        let mut child_command = app_server_command(&command, &launch_options);
-        let mut child = child_command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-        let stderr = start_stderr_capture(&mut child, "request");
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            CoreError::Io(std::io::Error::other(
-                "Codex app-server stdin was unavailable",
-            ))
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            CoreError::Io(std::io::Error::other(
-                "Codex app-server stdout was unavailable",
-            ))
-        })?;
-        let mut lines = BufReader::new(stdout).lines();
+        let (mut connection, mut stdin, mut lines) =
+            self.connect(&launch_options, "request").await?;
+        let stderr = connection.stderr.clone();
 
         let result = timeout(self.request_timeout, async {
             write_json_line(
@@ -380,7 +366,10 @@ impl CodexAppServerClient {
                 }),
             )
             .await?;
-            let _ = read_response(&mut lines, 1).await?;
+            let initialized = read_response(&mut lines, 1).await?;
+            if connection.shared {
+                validate_shared_codex_home(&initialized, launch_options.codex_home.as_deref())?;
+            }
             write_json_line(&mut stdin, &json!({ "method": "initialized" })).await?;
             write_json_line(
                 &mut stdin,
@@ -409,8 +398,7 @@ impl CodexAppServerClient {
             log_captured_stderr(&stderr, "request").await;
         }
         let _ = stdin.shutdown().await;
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        connection.close().await;
         result
     }
 }

@@ -1,5 +1,10 @@
 # Codex App-Server Migration Plan
 
+Current native continuation and shared-daemon behavior is documented in
+[Codex session switching](../architecture/codex-session-switching.md). Native
+live turns now default to the shared path; gateway live turns remain opt-in.
+The steps below retain the original migration plan for historical context.
+
 ## Goal
 
 Migrate live Codex chat execution from `codex exec --json` to `codex app-server --stdio` while keeping the existing io-workbench client protocol stable.
@@ -59,7 +64,6 @@ Avoid changing these in the first pass unless a verified compatibility bug force
 
 - `crates/iowb-ui/static/app.js`
 - `apps/mobile/shared/...`
-- `apps/desktop/native/...`
 
 ## Implementation Steps
 

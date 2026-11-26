@@ -1,6 +1,7 @@
 #[derive(Clone)]
 pub struct AgentRuntimeManager {
     runs: Arc<RwLock<HashMap<String, AgentRuntimeRecord>>>,
+    admissions: Arc<Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
     codex_app_server: CodexAppServerClient,
     max_runs: usize,
     max_replay_events: usize,

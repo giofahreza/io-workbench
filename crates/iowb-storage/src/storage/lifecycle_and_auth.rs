@@ -215,6 +215,19 @@ impl Storage {
                     native_before_turn_id TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS codex_run_submissions (
+                    run_id TEXT PRIMARY KEY,
+                    native_turn_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS native_run_submissions (
+                    run_id TEXT PRIMARY KEY,
+                    transport TEXT NOT NULL,
+                    native_turn_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_durable_chat_runs_recoverable
                     ON durable_chat_runs(status, auto_resume, resume_attempts, updated_at);
 

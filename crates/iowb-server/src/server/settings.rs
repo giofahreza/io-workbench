@@ -552,20 +552,22 @@ async fn chat_provider_models(
         Some(name) => parse_provider_param(name)?,
         None => Provider::Codex,
     };
-    let runtime = requested_chat_runtime(
+    let imported = state.native_chat_configuration(provider, query.session_id.as_deref()).await;
+    let runtime = imported.as_ref().and_then(|session| session.runtime).unwrap_or_else(|| requested_chat_runtime(
         &state,
         &user.0.id,
         provider,
         query.session_id.as_deref(),
         query.runtime,
-    );
+    ));
     let mut catalog =
         chat_route_catalog(&state, &user.0.id, provider, runtime, query.refresh).await;
+    apply_imported_chat_catalog(&mut catalog, imported.as_ref());
     let stored = query
         .session_id
         .as_deref()
         .and_then(|id| state.storage.get_session_summary(id).ok().flatten());
-    catalog["pinned"] = Value::Bool(stored.as_ref().is_some_and(|session| !rejected_chat_draft(&state, session)));
+    catalog["pinned"] = Value::Bool(imported.is_some() || stored.as_ref().is_some_and(|session| !rejected_chat_draft(&state, session)));
     if runtime == ChatRuntime::NativeCli
         && catalog["ready"] == true
         && let Some(session) = stored.filter(|session| session.provider == provider)

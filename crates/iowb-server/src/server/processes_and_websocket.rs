@@ -268,13 +268,14 @@ async fn handle_ws_command(
             fast,
         } => {
             let session_id = Some(session_id.unwrap_or_else(|| new_id("session")));
-            let runtime = requested_chat_runtime(
+            let imported = state.native_chat_configuration(provider, session_id.as_deref()).await;
+            let runtime = imported.as_ref().and_then(|session| session.runtime).unwrap_or_else(|| requested_chat_runtime(
                 state,
                 &user.id,
                 provider,
                 session_id.as_deref(),
                 requested_runtime,
-            );
+            ));
             // Context recovery takes precedence over unrelated setup checks.
             if let Some(id) = session_id.as_deref()
                 && let Ok(Some(recovery)) = state.context_recovery(id).await
@@ -292,6 +293,10 @@ async fn handle_ws_command(
             let mut model = model
                 .map(|m| m.trim().to_string())
                 .filter(|m| !m.is_empty());
+            let inherit_native = runtime == ChatRuntime::NativeCli && imported.as_ref().is_some_and(|session| {
+                model.as_deref().is_none_or(|model| session.model.as_deref() == Some(model))
+            });
+            if inherit_native { model = None; }
             let mut problem = native_model_problem(runtime, model.as_deref());
             if let Some(session) = session_id
                 .as_deref()
@@ -306,7 +311,8 @@ async fn handle_ws_command(
                 ));
             }
             if problem.is_none() {
-                let catalog = chat_route_catalog(state, &user.id, provider, runtime, true).await;
+                let mut catalog = chat_route_catalog(state, &user.id, provider, runtime, true).await;
+                apply_imported_chat_catalog(&mut catalog, imported.as_ref());
                 problem = catalog.get("problem").filter(|v| !v.is_null()).cloned();
                 if problem.is_none() {
                     let stored = session_id
@@ -369,6 +375,7 @@ async fn handle_ws_command(
             } else {
                 (model, effort, mode, thinking)
             };
+            let fast = if inherit_native { None } else { fast };
             let direct_ai_config = (runtime == ChatRuntime::IoGateway)
                 .then(|| direct_ai_runtime_config_for_user(state, &user.id, provider))
                 .flatten();

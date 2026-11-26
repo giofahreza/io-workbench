@@ -198,7 +198,7 @@ fn sync_codex_sources(
     storage: &Storage,
     records: &mut Vec<ExternalSessionRecord>,
 ) -> iowb_storage::Result<()> {
-    let codex_dir = home.join(".codex");
+    let codex_dir = external_codex_home(home);
     let (source_path, fingerprint) =
         if let Some(index) = newest_matching_file(&codex_dir, "state_", "sqlite") {
             let fingerprint = codex_sqlite_fingerprint(&index);

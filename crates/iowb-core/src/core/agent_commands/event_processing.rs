@@ -137,7 +137,41 @@ async fn process_codex_app_server_live_event(
         }
         CodexAppServerLiveTurnEvent::TurnAssociated { turn_id } => {
             debug_assert!(!turn_id.trim().is_empty());
+            if let Some(run_id) = context.durable_run_id.as_deref()
+                && let Err(error) = context
+                    .storage
+                    .record_codex_run_submission(run_id, Some(&turn_id))
+            {
+                warn!(%error, run_id, "could not persist native Codex turn association");
+            }
             normalizer.associate_usage_turn(turn_id);
+            manager
+                .publish(
+                    &context.hub,
+                    key,
+                    WsServerEvent::SessionStatus {
+                        provider: context.provider,
+                        session_id: context.session_id.clone(),
+                        status: iowb_protocol::SessionRuntimeStatus::Running,
+                        response_id: Some(context.response_id.clone()),
+                        sequence: Some(context.next_sequence()),
+                        latest_user_prompt: Some(context.prompt.clone()),
+                    },
+                )
+                .await;
+        }
+        CodexAppServerLiveTurnEvent::SubmissionStarted { acknowledgement } => {
+            let result = context
+                .durable_run_id
+                .as_deref()
+                .ok_or_else(|| "Codex submission has no durable run".to_string())
+                .and_then(|run_id| {
+                    context
+                        .storage
+                        .record_codex_run_submission(run_id, None)
+                        .map_err(|error| error.to_string())
+                });
+            let _ = acknowledgement.send(result);
         }
         CodexAppServerLiveTurnEvent::Notification { method, params } => {
             let visible = normalizer.push_notification(&method, &params);
