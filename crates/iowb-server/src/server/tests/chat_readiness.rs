@@ -252,9 +252,10 @@ async fn gateway_disabled_and_gemini_incompatible_routes_fail_before_launch() {
 }
 
 #[tokio::test]
-async fn mismatch_event_preserves_request_identity_and_does_not_create_session() {
+async fn mismatch_event_preserves_request_identity_and_creates_retryable_draft() {
     let (root, state) = board_scope_test_state().await;
     let (tx, mut rx) = mpsc::channel(4);
+    state.storage.create_user("test", "test", "test-hash").unwrap();
     let user = iowb_protocol::UserProfile {
         id: "test".into(),
         username: "test".into(),
@@ -298,7 +299,15 @@ async fn mismatch_event_preserves_request_identity_and_does_not_create_session()
             }
             other => panic!("unexpected {other:?}"),
         }
-        assert!(state.storage.get_session_summary(&id).unwrap().is_none());
+        let saved = state.storage.get_session_summary(&id).unwrap().unwrap();
+        assert!(!saved.active);
+        assert!(saved.native_session_id.is_none());
+        assert_eq!(saved.message_count, 1);
+        assert_eq!(state.storage.get_session_draft("test", &id).unwrap().content, "must not execute");
+        let rows = state.storage.list_messages(&id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].role, MessageRole::System);
+        assert_eq!(rows[0].metadata["kind"], "chat_error");
         assert!(state.sessions.list_active().await.is_empty());
     }
     drop(state);
@@ -476,6 +485,44 @@ async fn chat_gateway_requires_an_explicit_url_even_with_a_saved_credential() {
             "http://127.0.0.1:1/custom"
         );
     }
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn rejected_send_is_durable_idempotent_and_preserves_existing_route_and_newer_draft() {
+    let (root, state) = board_scope_test_state().await;
+    let problem = chat_setup_problem("chat_model_unavailable", "Select an available model for this chat route and retry.", "choose_model", None);
+    state.storage.create_user("test", "test", "test-hash").unwrap();
+    let id = "persistent-rejection";
+    let first = persist_rejected_chat_send(&state, "test", Provider::Codex, ChatRuntime::NativeCli, id, Some("attempt-1"), root.to_str().unwrap(), "retry me", &problem).await.unwrap();
+    let duplicate = persist_rejected_chat_send(&state, "test", Provider::Codex, ChatRuntime::NativeCli, id, Some("attempt-1"), root.to_str().unwrap(), "retry me", &problem).await.unwrap();
+    assert_eq!(first.id, duplicate.id);
+    assert_eq!(state.storage.list_messages(id).unwrap().len(), 1);
+    assert_eq!(state.storage.get_session_draft("test", id).unwrap().content, "retry me");
+    state.storage.set_session_draft("test", id, "newer typing").unwrap();
+    persist_rejected_chat_send(&state, "test", Provider::Codex, ChatRuntime::IoGateway, id, Some("attempt-2"), root.to_str().unwrap(), "older request", &problem).await.unwrap();
+    assert_eq!(state.storage.get_session_draft("test", id).unwrap().content, "newer typing");
+    assert_eq!(state.storage.get_session_summary(id).unwrap().unwrap().runtime, Some(ChatRuntime::NativeCli));
+    assert_eq!(state.storage.list_messages(id).unwrap().len(), 2);
+    assert!(state.storage.latest_user_message_id(id).unwrap().is_none());
+    let hub = iowb_core::WsHub::with_storage(state.storage.clone());
+    let mut events = hub.subscribe();
+    hub.publish(WsServerEvent::Error { message: "Runtime failed".into(), details: Some("private diagnostics".into()), session_id: Some(id.into()), history_message: None });
+    let event = events.recv().await.unwrap();
+    let WsServerEvent::Error { history_message: Some(saved), .. } = event else { panic!("missing history") };
+    assert_eq!(saved.content, "Runtime failed");
+    assert!(!serde_json::to_string(&saved).unwrap().contains("private diagnostics"));
+    hub.publish(WsServerEvent::Error { message: "Runtime failed".into(), details: None, session_id: Some(id.into()), history_message: Some(saved) });
+    assert_eq!(state.storage.list_messages(id).unwrap().len(), 3, "replay uses the same durable row");
+    hub.publish(WsServerEvent::ChatSetupRequired {
+        provider: Provider::Codex, session_id: id.into(), request_id: Some("spawn-race".into()),
+        code: "provider_cli_unavailable".into(), message: "The provider CLI became unavailable.".into(),
+        action: "install".into(), docs_url: None, history_message: None,
+    });
+    assert_eq!(state.storage.list_messages(id).unwrap().len(), 4, "asynchronous setup failures are durable too");
+    hub.publish(WsServerEvent::Error { message: "connection warning".into(), details: None, session_id: None, history_message: None });
+    assert_eq!(state.storage.list_messages(id).unwrap().len(), 4, "global warnings do not attach to a chat");
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }

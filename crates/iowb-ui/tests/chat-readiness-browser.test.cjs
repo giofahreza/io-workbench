@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { openChatScrollPage } = require('./fixtures/chat-scroll-page.cjs');
 
-test('provider setup and scoped new-chat recovery work in desktop and narrow browsers', {
+test('provider setup and durable scoped rejection work in desktop and narrow browsers', {
   skip: !process.env.PLAYWRIGHT_MODULE,
 }, async () => {
   const { chromium } = require(process.env.PLAYWRIGHT_MODULE);
@@ -37,18 +37,22 @@ test('provider setup and scoped new-chat recovery work in desktop and narrow bro
         fixture.send({ type: 'chat_setup_required', requestId: 'old-attempt', code: 'chat_runtime_mismatch', action: 'new_chat', message: 'Stale error must be ignored' });
         await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 100)));
         assert.equal(await page.locator('#chat-output .chat-setup-card').count(), 0);
-        fixture.send({ type: 'chat_setup_required', requestId: 'new-attempt', code: 'chat_runtime_mismatch', action: 'new_chat', message: 'Native chat requires a new gateway chat. <img src=x onerror="window.injected=true">' });
-        await page.locator('#chat-output .chat-setup-card').waitFor();
-        assert.equal(await page.locator('#chat-output .chat-setup-card img').count(), 0);
+        const message = 'Native chat requires a new gateway chat. <img src=x onerror="window.injected=true">';
+        const rejection = { type: 'chat_setup_required', requestId: 'new-attempt', code: 'chat_runtime_mismatch', action: 'new_chat', message,
+          historyMessage: { id: 'durable-setup-error', role: 'system', content: message, timestamp: '2026-09-30T01:01:00Z',
+            metadata: { kind: 'chat_error', phase: 'rejected', code: 'chat_runtime_mismatch', action: 'new_chat' } } };
+        fixture.send(rejection);
+        const errorRow = page.locator('#chat-output [data-chat-history-key="durable-setup-error"]');
+        await errorRow.waitFor();
+        assert.equal(await errorRow.locator('img').count(), 0);
         assert.equal(await page.evaluate(() => window.injected), undefined);
+        assert.match(await errorRow.innerText(), /Native chat requires a new gateway chat/);
         assert.equal(await page.locator('#chat-prompt').inputValue(), 'Preserve this prompt');
-        assert.equal(await page.locator('#chat-output [data-chat-history-key]').count(), previousRows);
-        fixture.send({ type: 'chat_setup_required', requestId: 'new-attempt', code: 'chat_runtime_mismatch', action: 'new_chat', message: 'Duplicate' });
+        assert.equal(await page.locator('#chat-output [data-chat-history-key]').count(), previousRows + 1);
+        fixture.send(rejection);
         await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 100)));
-        assert.equal(await page.locator('#chat-output .chat-setup-card').count(), 1);
-        await page.locator('#chat-output .chat-setup-card button').click();
-        await page.waitForFunction(() => state.chatSessionId === '' && state.newChatRuntime === 'io_gateway');
-        assert.equal(await page.locator('#chat-prompt').inputValue(), 'Preserve this prompt');
+        assert.equal(await errorRow.count(), 1);
+        assert.equal(await page.locator('#chat-output [data-chat-history-key]').count(), previousRows + 1);
         assert.deepEqual(fixture.errors, []);
       } finally { await fixture.close(); }
     }

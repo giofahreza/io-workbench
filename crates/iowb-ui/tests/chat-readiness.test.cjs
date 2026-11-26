@@ -118,3 +118,38 @@ test('offline Recheck retains documentation only for the same provider, session 
     assert.equal(run(c,'state.rendered.problem.docsUrl'),change?null:'https://developers.openai.com/codex/cli/');
   }
 });
+
+test('durable rejection replaces only its optimistic prompt and deduplicates live replay', () => {
+  const c = fixture();
+  run(c, `
+    let chatHistoryWindow = {sessionId:'session-a', totalCount:3, offset:0, messages:[
+      {id:'old',role:'assistant',content:'Previous answer'},
+      {id:'other-send',role:'user',content:'Other prompt'},
+      {id:'rejected-send',role:'user',content:'Rejected prompt'},
+    ]};
+    reconcileChatMessages = (messages) => { state.renderedMessages = messages; };
+    rememberCurrentChatSession = (patch) => { state.saved = patch; };
+    const rejection = {sessionId:'session-a',historyMessage:{id:'error-1',role:'system',content:'Select an available model for this chat route and retry.',metadata:{kind:'chat_error'}}};
+    rememberChatErrorMessage(rejection, 'rejected-send');
+    rememberChatErrorMessage(rejection, 'rejected-send');
+  `);
+  assert.equal(run(c, 'state.saved.messages.length'), 3);
+  assert.equal(run(c, 'state.saved.messages.filter(m=>m.id === "error-1").length'), 1);
+  assert.equal(run(c, 'state.saved.messages.some(m=>m.id === "rejected-send")'), false);
+  assert.equal(run(c, 'state.saved.messages.some(m=>m.id === "other-send")'), true);
+  assert.equal(run(c, 'state.saved.live'), false);
+});
+
+test('startup does not save an empty placeholder over an unloaded remote retry draft', async () => {
+  const c = vm.createContext({ console });
+  vm.runInContext(readFileSync(join(__dirname, '../static/app/chat/drafts.js'), 'utf8'), c);
+  run(c, `
+    const state = {chatPromptDraftSessionId:'',chatPromptDraftSaveTimer:null};
+    stagedChatEdit = () => null;
+    currentChatDraftSessionId = () => 'failed-chat';
+    qs = () => ({value:''});
+    writeLocalChatPromptDraft = () => { throw new Error('unloaded input must not overwrite local draft'); };
+    api = () => { throw new Error('unloaded input must not delete remote draft'); };
+  `);
+  await run(c, 'saveChatPromptDraftNow()');
+});

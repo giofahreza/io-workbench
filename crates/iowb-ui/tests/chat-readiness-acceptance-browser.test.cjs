@@ -6,7 +6,7 @@ const enabled={skip:!process.env.PLAYWRIGHT_MODULE,timeout:120000};
 const docs={codex:'https://developers.openai.com/codex/cli/',claude:'https://code.claude.com/docs/en/setup',gemini:'https://geminicli.com/docs/get-started/installation/'};
 async function browserTest(callback){
   const {chromium}=require(process.env.PLAYWRIGHT_MODULE);
-  const browser=await chromium.launch({headless:true});
+  const browser=await chromium.launch({headless:true,...(process.env.CHROME_EXECUTABLE?{executablePath:process.env.CHROME_EXECUTABLE}:{})});
   try{await callback(browser);}finally{await browser.close();}
 }
 async function provider(page,p){
@@ -133,25 +133,26 @@ test('RT-016..022 ER-001/003/004: actual WebSocket dispatch, old connections, re
     await page.waitForFunction(()=>state.ws?.readyState===WebSocket.OPEN);
     assert.equal(await page.evaluate(()=>state.ws===window.__oldSetupSocket),false,'a replacement connection is established');
     await page.evaluate(()=>window.__oldSetupSocket.dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'chat_setup_required',sessionId:state.chatSessionId,requestId:'active-request',code:'chat_runtime_mismatch',message:'OLD CONNECTION',action:'new_chat'})})));
-    assert.equal(await page.locator('#chat-output .chat-setup-card').count(),0);
+    assert.equal(await page.locator('#chat-output [data-chat-history-key="durable-scoped-mismatch"]').count(),0);
     const dispatch=async payload=>page.evaluate(payload=>state.ws.dispatchEvent(new MessageEvent('message',{data:JSON.stringify(payload)})),payload);
-    const base={type:'chat_setup_required',sessionId:f.session.id,requestId:'active-request',code:'chat_runtime_mismatch',message:'Correct scoped mismatch',action:'new_chat'};
+    const base={type:'chat_setup_required',sessionId:f.session.id,requestId:'active-request',code:'chat_runtime_mismatch',message:'Correct scoped mismatch',action:'new_chat',
+      historyMessage:{id:'durable-scoped-mismatch',role:'system',content:'Correct scoped mismatch',timestamp:'2026-09-30T01:01:00Z',metadata:{kind:'chat_error',phase:'rejected',code:'chat_runtime_mismatch',action:'new_chat'}}};
     for(const override of [{requestId:'old-request'},{requestId:null},{sessionId:'other-session'}])await dispatch({...base,...override});
-    assert.equal(await page.locator('#chat-output .chat-setup-card').count(),0);
+    assert.equal(await page.locator('#chat-output [data-chat-history-key="durable-scoped-mismatch"]').count(),0);
     for(const message of ['model not supported when using an account','model is not supported when using Codex with a ChatGPT account']) {
       await dispatch({type:'error',sessionId:f.session.id,message});
-      assert.equal(await page.locator('#chat-output .chat-setup-card').count(),0);
+      assert.equal(await page.locator('#chat-output [data-chat-history-key="durable-scoped-mismatch"]').count(),0);
       assert.ok((await page.locator('#chat-output').innerText()).includes(message));
     }
     const before=await page.locator('#chat-output').innerText();
     await dispatch({type:'error',message:'System-only connection failure'});
     assert.equal(await page.locator('#chat-output').innerText(),before,'sessionless errors must not be appended to the selected provider chat');
     await dispatch(base);await dispatch(base);
-    assert.equal(await page.locator('#chat-output .chat-setup-card').count(),1);
+    assert.equal(await page.locator('#chat-output [data-chat-history-key="durable-scoped-mismatch"]').count(),1);
     await page.evaluate(()=>{window.__oldSetupSocket=state.ws;connectWs();});
     await page.waitForFunction(()=>state.ws?.readyState===WebSocket.OPEN);
     await dispatch(base);
-    assert.equal(await page.locator('#chat-output .chat-setup-card').count(),1);
+    assert.equal(await page.locator('#chat-output [data-chat-history-key="durable-scoped-mismatch"]').count(),1);
     assert.deepEqual(f.errors,[]);
   }finally{await f.close();}
 }));

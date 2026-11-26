@@ -134,3 +134,22 @@
             activated_at: None,
         }
     }
+
+    #[test]
+    fn chat_error_and_retry_draft_survive_reopening_database() {
+        let (storage, root) = temporary_storage("chat-error");
+        storage.create_user("user", "user", "test-hash").unwrap();
+        let session = test_session("failed-first-send", false);
+        let mut error = test_message("chat-error:request-1", MessageRole::System, "Select an available model for this chat route and retry.", 0);
+        error.metadata = serde_json::json!({"kind":"chat_error","phase":"rejected","requestId":"request-1"});
+        storage.persist_chat_error(&session, &error, Some(("user", "retry this prompt"))).unwrap();
+        storage.persist_chat_error(&session, &error, Some(("user", "duplicate"))).unwrap();
+        assert_eq!(storage.list_messages(&session.id).unwrap().len(), 1);
+        drop(storage);
+        let reopened = Storage::open(root.join("test.db")).unwrap();
+        assert_eq!(reopened.list_messages(&session.id).unwrap()[0].id, error.id);
+        assert_eq!(reopened.get_session_summary(&session.id).unwrap().unwrap().message_count, 1);
+        assert_eq!(reopened.get_session_draft("user", &session.id).unwrap().content, "retry this prompt");
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }

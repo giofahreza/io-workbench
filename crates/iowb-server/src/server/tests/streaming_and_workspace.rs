@@ -266,6 +266,7 @@
             done: false,
         };
         let board_error = WsServerEvent::Error {
+            history_message: None,
             message: "board error".to_string(),
             details: None,
             session_id: Some("board-chat".to_string()),
