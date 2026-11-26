@@ -36,6 +36,26 @@ fn claude_live_history_matches_native_uuid_when_cli_repeats_the_same_prompt() {
     );
 }
 
+#[test]
+fn claude_expanded_command_history_retains_the_users_visible_command() {
+    let local = ChatMessage {
+        id: "local-command".into(),
+        role: MessageRole::User,
+        content: "/review".into(),
+        timestamp: Utc::now(),
+        metadata: serde_json::json!({"nativeInput":"Review this patch"}),
+    };
+    let native = ChatMessage {
+        id: "native-command".into(),
+        content: "Review this patch".into(),
+        metadata: Value::Null,
+        ..local.clone()
+    };
+    let merged = merge_mapped_claude_messages(vec![local.clone()], vec![native]);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].content, "/review");
+}
+
 fn claude_history_events(streamed: bool, final_text: &str) -> String {
     let progress = serde_json::json!({"type": "assistant", "message": {
         "content": [{"type": "text", "text": "Checking the fixture."}]

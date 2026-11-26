@@ -29,6 +29,7 @@ include!("server/tools_and_compat.rs");
 mod tests {
     include!("server/tests/chat_runtime_routing.rs");
     include!("server/tests/chat_readiness.rs");
+    include!("server/tests/chat_commands.rs");
     include!("server/tests/message_usage_metadata.rs");
     include!("server/tests/project_sessions_paging.rs");
     include!("server/tests/streaming_and_workspace.rs");
