@@ -75,14 +75,27 @@ async fn fetch_direct_ai_models_inner(
                 && u.username().is_empty()
                 && u.password().is_none()
         });
-        if parsed.is_none() {
+        let Some(mut parsed) = parsed else {
             return Err(ServerError::new(
                 StatusCode::BAD_REQUEST,
                 "Invalid IO Gateway URL.",
             ));
+        };
+        // IO Gateway's Codex runtime catalog includes large instruction
+        // templates. Model discovery needs only IDs, labels and visibility.
+        // Keep inference URLs and other providers' catalog requests unchanged.
+        if matches!(
+            config.get("mode").and_then(Value::as_str),
+            Some("proxy" | "aiproxy")
+        ) && parsed
+            .path()
+            .trim_end_matches('/')
+            .ends_with("/codex/models")
+        {
+            parsed.query_pairs_mut().append_pair("view", "discovery");
         }
         let response = match client
-            .get(&url)
+            .get(parsed)
             .bearer_auth(&api_key)
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
