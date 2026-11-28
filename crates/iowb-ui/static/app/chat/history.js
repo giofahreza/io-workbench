@@ -147,14 +147,6 @@ function compactChatCacheSession(session) {
     "active",
     "pending",
     "external",
-    "boardSession",
-    "board_session",
-    "boardId",
-    "board_id",
-    "boardRunId",
-    "board_run_id",
-    "boardTaskId",
-    "board_task_id",
     "model",
     "effort",
     "mode",
@@ -406,7 +398,6 @@ function rememberCurrentChatSession(patch = {}) {
   const cached = cachedChatSession(sessionId);
   const entries = chatCacheEntries().filter((entry) => entry.key !== key);
   const session = patch.session || findChatSession(sessionId) || cached?.session || null;
-  const boardSession = isBoardChatSession(session, sessionId);
   const projectPath = patch.projectPath || sessionProjectPath(session, activeProjectPath());
   const messages = Array.isArray(patch.messages)
     ? patch.messages
@@ -421,7 +412,7 @@ function rememberCurrentChatSession(patch = {}) {
     key,
     sessionId,
     projectPath,
-    session: boardSession && session ? { ...session, boardSession: true } : session,
+    session,
     status: patch.status || (session ? sidebarSessionStatus(session) : "") || (chatSessionIsLive(sessionId) ? "running" : "completed"),
     messages: split.messages.slice(-MAX_CHAT_TRANSCRIPT_CACHE_MESSAGES),
     offset: Math.max(0, offset + Math.max(0, split.messages.length - MAX_CHAT_TRANSCRIPT_CACHE_MESSAGES)),
@@ -434,7 +425,6 @@ function rememberCurrentChatSession(patch = {}) {
   });
   state.chatTranscriptCache.entries = entries.slice(-MAX_CHAT_TRANSCRIPT_CACHE);
   persistChatTranscriptCache();
-  if (boardSession) hideBoardChatSessionsFromLists();
 }
 
 function preserveActiveChatStreamSnapshot(sessionId = state.chatSessionId || state.pendingChatSessionId) {
@@ -471,10 +461,6 @@ function renderCachedChatSession(sessionId) {
   chatHistoryDemandSessionId = "";
   chatOlderHistoryRequest = null;
   state.chatOlderMessagesLoadingSessionId = "";
-  if (isBoardChatSession(cached.session, sessionId)) {
-    state.boardChatSessionIds.add(sessionId);
-    hideBoardChatSessionsFromLists();
-  }
   const split = splitCachedStreamingMessage(cached.messages, sessionId);
   const messages = split.messages;
   const streamingBuffer = String(cached.streamingBuffer || split.streamingBuffer || state.chatOutputBuffersBySession[sessionId] || "");
@@ -512,7 +498,6 @@ function renderCachedChatSession(sessionId) {
 function rememberBackgroundChatOutput(payload = {}) {
   const sessionId = (payload.sessionId || "").trim();
   if (!sessionId || isActiveChatSessionEvent(payload)) return false;
-  if (state.boardChatSessionIds.has(sessionId)) return false;
   const cached = cachedChatSession(sessionId);
   const session = findChatSession(sessionId) || cached?.session || null;
   if (!cached && !session) return false;

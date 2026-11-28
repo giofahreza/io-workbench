@@ -6,7 +6,6 @@ function renderSessions() {
   }
   const filter = qs("#sessions-filter")?.value.trim().toLowerCase() || "";
   const sessions = state.sessions.filter((session) => {
-    if (isBoardChatSession(session)) return false;
     const haystack = [
       session.id,
       session.title,

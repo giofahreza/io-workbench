@@ -67,7 +67,7 @@
       "type": "Tutorial",
       "summary": "Use the browser UI from first sign-in through a reviewable agent, code, Git, data, and terminal loop.",
       "href": "/docs/web-workspace/",
-      "keywords": "web workspace browser ui sign in add existing project command palette database shell agent prompt config claude codex gemini files git board reconnect Web workspace Agents and providers Projects and Git Database and terminal",
+      "keywords": "web workspace browser ui sign in add existing project command palette database shell agent prompt config claude codex gemini files git reconnect Web workspace Agents and providers Projects and Git Database and terminal",
       "headings": [
         "First browser session",
         "Start an agent session",
@@ -196,18 +196,17 @@
       "excerpt": "The browser calls this surface Shell ; it is a real PTY backed by the selected project on the server. It is for running host commands, watching output, resizing the terminal, and stopping processes—not an output-only command log. On Android's optional local route, the selected server is separately hosted in Termux. Start a terminal in the correct project 1 Select the project The Shell starts against the selected serv"
     },
     {
-      "title": "Boards and tools",
+      "title": "Tools",
       "category": "Operate safely",
       "type": "How-to guide",
-      "summary": "Turn broad work into reviewable tasks with the Agentic Board and deliberately configured command-backed tools.",
-      "href": "/docs/boards-and-tools/",
-      "keywords": "agentic board tasks validation qa approval mcp commands plugins taskmaster watchers automation notifications Agents and providers Operations and API",
+      "summary": "Understand the deliberately configured, command-backed tools: MCP, commands and plugins, Taskmaster, watchers, and notifications.",
+      "href": "/docs/tools/",
+      "keywords": "mcp commands plugins taskmaster watchers automation notifications Agents and providers Operations and API",
       "headings": [
-        "Run a controlled delivery loop",
         "Command-backed integrations",
         "Configure first, automate second"
       ],
-      "excerpt": "The Agentic Board and tool integrations make work reviewable rather than opaque. Use them to break a broad goal into scoped tasks, provider choices, validation evidence, and explicit approval boundaries. Run a controlled delivery loop 1 Select the project and open Board Keep the task scope tied to the same host project whose files, Git state, database, and Shell you will review. 2 Author the board request Enter a Boa"
+      "excerpt": "Tool integrations are command-backed: each one runs on the host with the authority you give it. Configure them deliberately and review what they can change before giving a remote client access. Command-backed integrations Integration What it can do Operator responsibility MCP Start/stop/list configured MCP processes and run command-backed tools with persisted run history. Configure the host command and arguments deli"
     },
     {
       "title": "Security and boundaries",
@@ -317,7 +316,7 @@
       "type": "Reference",
       "summary": "Use the Web workspace and mobile keyboard shortcuts without mistaking the desktop browser map for the Android or PWA map.",
       "href": "/docs/keyboard-mappings/",
-      "keywords": "keyboard mappings keyboard shortcuts keymap hotkeys web browser desktop android mobile pwa ctrl cmd alt home prompt editor git board terminal database alt+k alt+arrow-down alt+p alt+m ctrl/cmd+k ctrl/cmd+s ctrl/cmd+f ctrl/cmd+enter ctrl+tab ctrl+shift+tab ctrl/cmd+space ctrl+k cmd+k ctrl+s cmd+s ctrl+f cmd+f ctrl+enter cmd+enter ctrl+space cmd+space f5 f6 f7 Web workspace Mobile clients Database and terminal",
+      "keywords": "keyboard mappings keyboard shortcuts keymap hotkeys web browser desktop android mobile pwa ctrl cmd alt home prompt editor git terminal database alt+k alt+arrow-down alt+p alt+m ctrl/cmd+k ctrl/cmd+s ctrl/cmd+f ctrl/cmd+enter ctrl+tab ctrl+shift+tab ctrl/cmd+space ctrl+k cmd+k ctrl+s cmd+s ctrl+f cmd+f ctrl+enter cmd+enter ctrl+space cmd+space f5 f6 f7 Web workspace Mobile clients Database and terminal",
       "headings": [
         "Read the notation",
         "Everyday shortcuts shared by Web and mobile",

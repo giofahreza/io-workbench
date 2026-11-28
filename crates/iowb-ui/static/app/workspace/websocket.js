@@ -53,7 +53,6 @@ function connectWs() {
     }
     if (payload.type === "projects_updated") {
       state.projects = payload.projects || [];
-      hideBoardChatSessionsFromLists();
       syncProjectOrder();
       renderProjects();
     }
@@ -61,9 +60,8 @@ function connectWs() {
       scheduleProjectFilesRefresh(payload);
     }
     if (payload.type === "active_sessions") {
-      state.sessions = (payload.sessions || []).filter((session) => !isBoardChatSession(session));
+      state.sessions = payload.sessions || [];
       state.sessions.forEach(mergeSessionIntoProjects);
-      hideBoardChatSessionsFromLists();
       renderSidebarProjects();
       renderSessions();
     }
@@ -496,17 +494,10 @@ function connectWs() {
 
 function sendWorkspaceSubscription() {
   if (state.ws?.readyState !== WebSocket.OPEN) return false;
-  const boardSessionId = String(state.boardWsSessionId || "").trim();
   state.ws.send(JSON.stringify({
     type: "subscribe",
     topics: ["sessions", "processes", "projects"],
-    sessionIds: boardSessionId ? [boardSessionId] : [],
     processIds: state.currentShellProcess ? [state.currentShellProcess] : [],
   }));
   return true;
-}
-
-function setBoardChatWsSubscription(sessionId = "") {
-  state.boardWsSessionId = String(sessionId || "").trim();
-  sendWorkspaceSubscription();
 }

@@ -411,9 +411,6 @@ function chatMetadataDetailModel(meta = {}, trigger = null) {
     ["Ongoing", context.running ? "Yes" : "No"],
     ["Pinned", chatMetadataBoolean(context.pinned)],
     ["External", chatMetadataBoolean(chatMetadataFirst(session, "external"))],
-    ["Board session", chatMetadataBoolean(chatMetadataFirst(session, "boardSession", "board_session"))],
-    ["Board ID", chatMetadataFirst(session, "boardId", "board_id", "boardRunId", "board_run_id")],
-    ["Board task ID", chatMetadataFirst(session, "boardTaskId", "board_task_id")],
     ["Open in chat", context.chatOpen ? "Yes" : "No"],
     ["Running", context.running ? "Yes" : "No"],
     ["Starting", context.processing && !context.response.activeResponseId ? "Yes" : "No"],
@@ -1215,12 +1212,7 @@ async function performChatHistoryLoad(sessionId, opts = {}) {
     const rawSnapshotSession = body?.session || findChatSession(sessionId);
     const snapshotSession = newerEvents && rawSnapshotSession
       ? { ...rawSnapshotSession, active: chatSessionIsLive(sessionId) } : rawSnapshotSession;
-    const boardSession = isBoardChatSession(snapshotSession, sessionId);
     const snapshotLive = Boolean(snapshotSession?.active);
-    if (boardSession) {
-      state.boardChatSessionIds.add(sessionId);
-      if (snapshotSession?.id) state.boardChatSessionIds.add(snapshotSession.id);
-    }
     if (!loadingOlder && !newerEvents && state.chatRecoveryBySession[sessionId] === recoveryBeforeRequest) {
       rememberChatRecovery(sessionId, body?.recovery || null);
     }
@@ -1232,13 +1224,9 @@ async function performChatHistoryLoad(sessionId, opts = {}) {
       if (snapshotSession.projectPath) {
         setActiveProject(snapshotSession.projectPath);
       }
-      if (boardSession) {
-        hideBoardChatSessionsFromLists();
-      } else {
-        state.sessions = (state.sessions || []).filter((session) => session?.id !== snapshotSession.id);
-        state.sessions.push(snapshotSession);
-        mergeSessionIntoProjects(snapshotSession);
-      }
+      state.sessions = (state.sessions || []).filter((session) => session?.id !== snapshotSession.id);
+      state.sessions.push(snapshotSession);
+      mergeSessionIntoProjects(snapshotSession);
       if (!newerEvents) {
         rememberSidebarSessionStatus({
           sessionId: snapshotSession.id,
@@ -1332,9 +1320,7 @@ async function performChatHistoryLoad(sessionId, opts = {}) {
       live: snapshotLive,
       status: snapshotStatus,
     });
-    if (!boardSession) {
-      persistActiveChatSelection(sessionId, snapshotSession?.projectPath || activeProjectPath());
-    }
+    persistActiveChatSelection(sessionId, snapshotSession?.projectPath || activeProjectPath());
     if (typeof updateMainHeader === "function") updateMainHeader();
     updateChatEmptyState();
     return true;
@@ -1456,19 +1442,12 @@ async function pickChatSession(sessionId, projectPath, options = {}) {
   });
   preserveActiveChatStreamSnapshot();
   state.chatEditFromHere.staged = null;
-  if (options.boardSession === true) {
-    state.boardChatSessionIds.add(id);
-    hideBoardChatSessionsFromLists();
-  }
-  setBoardChatWsSubscription(options.boardSession === true ? id : "");
   const session = findChatSession(id);
   state.pendingChatSessionId = id;
   state.chatSessionId = id;
   ensureChatPromptHistoryScope(id);
-  if (options.boardSession !== true) {
-    state.preferences.lastChatSessionId = id;
-    savePreferences();
-  }
+  state.preferences.lastChatSessionId = id;
+  savePreferences();
   if (projectPath) setActiveProject(projectPath);
   await switchView("chat");
   if (session?.pending) {
@@ -1479,9 +1458,7 @@ async function pickChatSession(sessionId, projectPath, options = {}) {
   }
   state.pendingChatSessionId = "";
   const renderedCached = options.forceSnapshot === true ? false : renderCachedChatSession(id);
-  if (options.boardSession !== true) {
-    persistActiveChatSelection(id, projectPath || sessionProjectPath(session, activeProjectPath()));
-  }
+  persistActiveChatSelection(id, projectPath || sessionProjectPath(session, activeProjectPath()));
   if (renderedCached) {
     scheduleChatReconciliation(id, { reportFailure: true });
     await loadChatPromptDraft(id).catch((error) => {
@@ -1491,7 +1468,6 @@ async function pickChatSession(sessionId, projectPath, options = {}) {
     return;
   }
   await loadChatHistoryForSession(id, { forceBottom: true });
-  if (options.boardSession === true) hideBoardChatSessionsFromLists();
   await loadChatPromptDraft(id);
   await loadChatPromptHistory(id);
 }
@@ -1512,7 +1488,6 @@ async function startNewChatForProject(projectPath) {
   });
   preserveActiveChatStreamSnapshot();
   state.chatEditFromHere.staged = null;
-  setBoardChatWsSubscription("");
   setActiveProject(projectPath);
   state.chatSessionId = "";
   state.pendingChatSessionId = "";
@@ -1550,18 +1525,15 @@ function pickDefaultChatSession() {
   const allSessions = []
     .concat(
       ...(state.projects || []).map((p) => (p.sessions || [])
-        .filter((s) => !isBoardChatSession(s))
         .map((s) => ({ ...s, projectPath: p.path }))),
     )
-    .concat((state.sessions || []).filter((s) => !isBoardChatSession(s)).map((s) => ({ ...s })));
+    .concat((state.sessions || []).map((s) => ({ ...s })));
   if (!allSessions.length) return null;
   const activePath = activeProjectPath();
   const activeProject = activePath
     ? (state.projects || []).find((p) => p.path === activePath)
     : null;
-  const activeSessions = activeProject
-    ? (activeProject.sessions || []).filter((session) => !isBoardChatSession(session))
-    : [];
+  const activeSessions = activeProject ? (activeProject.sessions || []) : [];
   if (activeSessions.length) {
     return activeSessions
       .slice()
@@ -1570,12 +1542,11 @@ function pickDefaultChatSession() {
   // No active project (or no sessions in it): pick topmost project with the
   // most recent chat history.
   const projectsWithSessions = (state.projects || [])
-    .filter((p) => (p.sessions || []).some((session) => !isBoardChatSession(session)));
+    .filter((p) => (p.sessions || []).length > 0);
   if (!projectsWithSessions.length) return null;
   // Collect all sessions, attach their project path, and pick the newest.
   return projectsWithSessions
     .flatMap((p) => (p.sessions || [])
-      .filter((s) => !isBoardChatSession(s))
       .map((s) => ({ ...s, projectPath: p.path })))
     .sort((a, b) => new Date(b.lastActivity || 0) - new Date(a.lastActivity || 0))[0];
 }
@@ -1597,7 +1568,6 @@ function activeProjectChatSessions() {
 
 function currentChatNavigationEntries() {
   const current = findChatSession(state.chatSessionId);
-  if (isSelectedBoardChatSession()) return [];
   if (current && isChatSessionPinned(current, sessionProjectPath(current, activeProjectPath()))) {
     return pinnedChatEntries();
   }

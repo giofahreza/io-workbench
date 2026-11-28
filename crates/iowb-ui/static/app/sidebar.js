@@ -317,9 +317,6 @@ function setActiveProject(projectPath) {
   const nextProjectPath = projectPath || "";
   const projectChanged = nextProjectPath !== state.activeProjectPath;
   if (projectChanged) {
-    state.boardLoadRequestId += 1;
-    state.board = null;
-    state.boardLoading = false;
     state.fileLoadRequestId += 1;
     state.fileLoading = false;
     state.fileProjectPath = "";
@@ -378,10 +375,9 @@ function sessionMatchesSidebarSearch(session) {
 
 function sidebarSessions() {
   if (state.sessions.length) {
-    return state.sessions.filter((session) => !isBoardChatSession(session));
+    return state.sessions;
   }
   return state.projects.flatMap((project) => (project.sessions || [])
-    .filter((session) => !isBoardChatSession(session))
     .map((session) => ({
       ...session,
       projectName: project.name,
@@ -391,7 +387,7 @@ function sidebarSessions() {
 
 function sidebarProjectSessions(project) {
   return (project.sessions || [])
-    .filter((session) => session?.id && !isBoardChatSession(session))
+    .filter((session) => session?.id)
     .map((session) => ({
       ...session,
       projectName: project.name,
@@ -587,10 +583,8 @@ function pinnedChatEntries() {
   const entries = [];
   const pinned = normalizePinnedChatSessions(state.pinnedChatSessions);
   for (const pin of pinned) {
-    if (state.boardChatSessionIds.has(pin.sessionId)) continue;
     const project = (state.projects || []).find((item) => item.path === pin.projectPath || item.name === pin.projectName);
     const session = findChatSession(pin.sessionId);
-    if (isBoardChatSession(session, pin.sessionId)) continue;
     const projectPath = pin.projectPath || sessionProjectPath(session, project?.path || "");
     if (!session) {
       entries.push({
@@ -617,7 +611,7 @@ function pinnedChatEntries() {
 
 function togglePinnedChatSession(sessionId, projectPath = "", provider = "") {
   const session = findChatSession(sessionId);
-  if (!session || isBoardChatSession(session, sessionId)) return;
+  if (!session) return;
   const path = sessionProjectPath(session, projectPath);
   const project = (state.projects || []).find((item) => item.path === path || item.name === session.projectName);
   const normalizedProvider = provider || sessionProvider(session);
@@ -889,15 +883,11 @@ function rememberSidebarSessionStatus(payload = {}) {
   if (!sessionId) return;
   const status = normalizeSidebarSessionStatus(payload.status);
   if (!status) return;
-  if (state.boardChatSessionIds.has(sessionId) && !isActiveChatSessionEvent({ sessionId })) {
-    return;
-  }
   state.sessionStatusById[sessionId] = {
     status,
     provider: payload.provider || "",
     updatedAt: new Date().toISOString(),
   };
-  if (state.boardChatSessionIds.has(sessionId)) return;
   renderSidebarProjects();
   renderPinnedSidebarSessions();
 }
@@ -962,7 +952,7 @@ function findChatSession(sessionId) {
 }
 
 function mergeSessionIntoProjects(session) {
-  if (!session?.id || isBoardChatSession(session)) return;
+  if (!session?.id) return;
   state.projects = (state.projects || []).map((project) => {
     const matchesProject = session.projectPath && project.path === session.projectPath;
     const hasSession = (project.sessions || []).some((item) => item.id === session.id);
@@ -990,44 +980,6 @@ function hideChatSessionFromLists(sessionId) {
   for (const project of state.projects || []) {
     if (Array.isArray(project.sessions)) {
       project.sessions = project.sessions.filter((session) => session.id !== sessionId);
-    }
-  }
-}
-
-function isBoardChatSession(session, sessionId = session?.id) {
-  const id = String(sessionId || "").trim();
-  return Boolean(
-    session?.boardSession
-    || session?.board_session
-    || session?.boardId
-    || session?.board_id
-    || session?.boardRunId
-    || session?.board_run_id
-    || session?.boardTaskId
-    || session?.board_task_id,
-  ) || Boolean(id && state.boardChatSessionIds.has(id));
-}
-
-function isSelectedBoardChatSession(sessionId = state.chatSessionId) {
-  return isBoardChatSession(
-    findChatSession(sessionId) || cachedChatSession(sessionId)?.session,
-    sessionId,
-  );
-}
-
-function hideBoardChatSessionsFromLists() {
-  for (const session of state.sessions || []) {
-    if (isBoardChatSession(session) && session?.id) state.boardChatSessionIds.add(session.id);
-  }
-  for (const project of state.projects || []) {
-    for (const session of project.sessions || []) {
-      if (isBoardChatSession(session) && session?.id) state.boardChatSessionIds.add(session.id);
-    }
-  }
-  state.sessions = (state.sessions || []).filter((session) => !isBoardChatSession(session));
-  for (const project of state.projects || []) {
-    if (Array.isArray(project.sessions)) {
-      project.sessions = project.sessions.filter((session) => !isBoardChatSession(session));
     }
   }
 }
@@ -1121,7 +1073,7 @@ function closeSessionContextMenu() {
 }
 
 function openSessionContextMenu(session, projectPath, x, y) {
-  if (!session?.id || isBoardChatSession(session)) return;
+  if (!session?.id) return;
   closeFileContextMenu();
   closeSessionContextMenu();
   state.sessionContextMenu = { sessionId: session.id };

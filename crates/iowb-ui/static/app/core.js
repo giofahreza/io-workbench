@@ -290,11 +290,6 @@ const state = {
     showHidden: false,
     loading: false,
   },
-  board: null,
-  boardChatSessionIds: new Set(),
-  boardWsSessionId: "",
-  boardLoading: false,
-  boardLoadRequestId: 0,
 };
 
 const qs = (selector) => document.querySelector(selector);
@@ -418,7 +413,6 @@ function attachAuthProtectedShell() {
 }
 
 const VIEW_NAMES = {
-  board: "Board",
   files: "Project Files",
   chat: "Chat",
   shell: "Shell",
@@ -428,7 +422,6 @@ const VIEW_NAMES = {
 };
 
 const VIEW_SUBTITLES = {
-  board: "Track agentic boards and task progress.",
   files: "Browse, edit, upload, and organize project files.",
   chat: "Start or resume agent sessions in the selected project.",
   shell: "Run a PTY-backed terminal in the selected project.",
@@ -496,11 +489,6 @@ function activeProjectPath(selector = "#active-project") {
   const selected = qs(selector)?.value || state.activeProjectPath || state.projects[0]?.path || "";
   if (!selected) return "";
   return state.projects.some((project) => project.path === selected) ? selected : state.projects[0]?.path || "";
-}
-
-function activeProjectName(selectId = "#active-project") {
-  const path = qs(selectId)?.value || activeProjectPath(selectId);
-  return state.projects.find((project) => project.path === path)?.name || "";
 }
 
 function activeProjectRecord(selectId = "#active-project") {

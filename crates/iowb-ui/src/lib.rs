@@ -62,9 +62,9 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "text/html; charset=utf-8",
             bytes: include_bytes!("../static/docs/terminal-and-mobile/index.html"),
         }),
-        "docs/boards-and-tools" | "docs/boards-and-tools/" => Some(UiAsset {
+        "docs/tools" | "docs/tools/" => Some(UiAsset {
             content_type: "text/html; charset=utf-8",
-            bytes: include_bytes!("../static/docs/boards-and-tools/index.html"),
+            bytes: include_bytes!("../static/docs/tools/index.html"),
         }),
         "docs/security-and-boundaries" | "docs/security-and-boundaries/" => Some(UiAsset {
             content_type: "text/html; charset=utf-8",
@@ -202,16 +202,6 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "image/webp",
             bytes: include_bytes!(
                 "../static/images/landing/terminal-session-dark-mobile-20260907.webp"
-            ),
-        }),
-        "images/landing/agentic-board-dark-20260907.webp" => Some(UiAsset {
-            content_type: "image/webp",
-            bytes: include_bytes!("../static/images/landing/agentic-board-dark-20260907.webp"),
-        }),
-        "images/landing/agentic-board-dark-mobile-20260907.webp" => Some(UiAsset {
-            content_type: "image/webp",
-            bytes: include_bytes!(
-                "../static/images/landing/agentic-board-dark-mobile-20260907.webp"
             ),
         }),
         "icons/codex.svg" => Some(UiAsset {
@@ -440,10 +430,6 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app/navigation.js"),
         }),
-        "app/board.js" => Some(UiAsset {
-            content_type: "application/javascript; charset=utf-8",
-            bytes: include_bytes!("../static/app/board.js"),
-        }),
         "app/commands.js" => Some(UiAsset {
             content_type: "application/javascript; charset=utf-8",
             bytes: include_bytes!("../static/app/commands.js"),
@@ -483,10 +469,6 @@ pub fn get_asset(path: &str) -> Option<UiAsset> {
         "styles/output.css" => Some(UiAsset {
             content_type: "text/css; charset=utf-8",
             bytes: include_bytes!("../static/styles/output.css"),
-        }),
-        "styles/board.css" => Some(UiAsset {
-            content_type: "text/css; charset=utf-8",
-            bytes: include_bytes!("../static/styles/board.css"),
         }),
         "styles/responsive/large.css" => Some(UiAsset {
             content_type: "text/css; charset=utf-8",
@@ -666,7 +648,6 @@ mod tests {
             "app/workspace/settings.js",
             "app/workspace/websocket.js",
             "app/navigation.js",
-            "app/board.js",
             "app/commands.js",
             "app/forms.js",
             "app/startup.js",
@@ -689,7 +670,6 @@ mod tests {
             "styles/chat.css",
             "styles/shell-and-git.css",
             "styles/output.css",
-            "styles/board.css",
             "styles/responsive/large.css",
             "styles/responsive/mobile.css",
             "styles/responsive/touch-and-small.css",
@@ -715,6 +695,9 @@ mod tests {
         assert!(source.contains("chat-history-loading"));
         assert!(source.contains("before_timestamp"));
         assert!(source.contains("acceptsOrderedChatResponseEvent"));
+        assert!(
+            source.contains("if (payload.sessionId && !isActiveChatSessionEvent(payload)) return;")
+        );
         assert!(source.contains("replayToolLine"));
     }
 
@@ -864,103 +847,7 @@ mod tests {
         assert!(project_sessions.contains("(project.sessions || [])"));
         assert!(!project_sessions.contains("state.sessions"));
         assert!(!project_sessions.contains("slice(0, 12)"));
-    }
-
-    #[test]
-    fn board_task_transcripts_are_read_only_and_use_complete_snapshots() {
-        let source = app_source();
-        let opener = source
-            .split_once("async function openBoardTaskTranscript(taskId) {")
-            .map(|(_, rest)| rest)
-            .expect("board task chat opener")
-            .split_once("\n}\n\nfunction renderBoardCard")
-            .map(|(body, _)| body)
-            .expect("board task chat opener end");
-        let snapshot_merge = source
-            .split_once("async function loadChatHistoryForSession(sessionId, opts = {}) {")
-            .map(|(_, rest)| rest)
-            .expect("chat snapshot loader")
-            .split_once("\n}\n\nfunction scheduleChatReconciliation")
-            .map(|(body, _)| body)
-            .expect("chat snapshot loader end");
-
-        assert!(source.contains("task?.providerSessionId"));
-        assert!(source.contains("task?.provider_session_id"));
-        assert!(source.contains("data-board-view-transcript"));
-        assert!(source.contains("async function loadBoardSessionTranscript(sessionId)"));
-        assert!(opener.contains("loadBoardSessionTranscript(sessionId)"));
-        assert!(!source.contains("data-board-open-chat=\""));
-        assert!(source.contains("return Boolean(boardTaskSessionId(task));"));
-        assert!(
-            snapshot_merge
-                .contains("const boardSession = isBoardChatSession(snapshotSession, sessionId);")
-        );
-        assert!(snapshot_merge.contains("hideBoardChatSessionsFromLists();"));
-        assert!(source.contains("state.sessions = (payload.sessions || []).filter((session) => !isBoardChatSession(session));"));
-        assert!(source.contains(
-            "state.boardChatSessionIds.has(sessionId) && !isActiveChatSessionEvent({ sessionId })"
-        ));
-        assert!(source.contains("if (state.boardChatSessionIds.has(sessionId)) return false;"));
-        assert!(source.contains(
-            "state.projects = payload.projects || [];\n      hideBoardChatSessionsFromLists();"
-        ));
-        assert!(source.contains(
-            "state.projects = body.projects || [];\n  hideBoardChatSessionsFromLists();"
-        ));
-        assert!(source.contains("sessionIds: boardSessionId ? [boardSessionId] : []"));
-        assert!(
-            source
-                .contains("setBoardChatWsSubscription(options.boardSession === true ? id : \"\");")
-        );
-        assert!(source.contains(
-            "if (view !== \"chat\" && state.boardWsSessionId) setBoardChatWsSubscription(\"\");"
-        ));
-        assert!(source.contains("if (isSelectedBoardChatSession()) {\n      setBoardChatWsSubscription(state.chatSessionId);"));
-        assert!(source.contains("setBoardChatWsSubscription(destination.id);"));
-        assert!(
-            source.contains("if (payload.sessionId && !isActiveChatSessionEvent(payload)) return;")
-        );
-    }
-
-    #[test]
-    fn board_is_project_scoped_and_its_workspace_stays_usable() {
-        let html = asset_text("index.html");
-        let source = app_source();
-        let styles = styles_source();
-        let board_styles = asset_text("styles/board.css");
-        let main_tabs = html
-            .split_once(r#"<nav class="main-tab-switcher""#)
-            .map(|(_, rest)| rest)
-            .expect("main tab switcher")
-            .split_once("</nav>")
-            .map(|(tabs, _)| tabs)
-            .expect("main tab switcher end");
-
-        assert!(main_tabs.contains(r#"data-view="board""#));
-        assert!(!main_tabs.contains(r#"data-view="chat""#));
-        assert!(source.contains(r#"await switchView("board").catch(showError);"#));
         assert!(source.contains("data-sidebar-project-sessions-toggle"));
-        assert!(source.contains("boardLoadRequestId"));
-        assert!(html.contains(r#"id="board-config-modal""#));
-        assert!(html.contains(r#"data-board-config-open"#));
-        assert!(html.contains(r#"id="board-config-open" class="icon-button" type="button" aria-label="Configure board" title="Configure board" data-symbol="settings-2" data-board-config-open"#));
-        assert!(html.contains("<fieldset class=\"board-config-group\">"));
-        assert!(!html.contains(r#"class="board-advanced-options""#));
-        assert!(html.contains(r#"id="board-start-submit""#));
-        assert!(html.contains(r#"id="board-task-submit""#));
-        assert!(styles.contains(".view.active.workbench-panel.board-panel"));
-        assert!(styles.contains("overflow: auto;"));
-        assert!(styles.contains(".board-config-modal"));
-        assert!(styles.contains(".board-config-dialog"));
-        assert!(styles.contains(".board-compose-row.board-create-mode"));
-        assert!(styles.contains("grid-template-columns: repeat(5, minmax(260px, 82vw));"));
-        assert!(!styles.contains("grid-template-columns: repeat(6, minmax(260px, 82vw));"));
-        assert!(source.contains("withButtonLoading(submit, async () => {"));
-        assert!(board_styles.contains("grid-template-rows: none;"));
-        assert!(
-            html.find("id=\"board-columns\"").expect("board columns")
-                < html.find("id=\"board-details\"").expect("board details")
-        );
     }
 
     #[test]
@@ -969,7 +856,7 @@ mod tests {
         let startup = asset_text("app/startup.js");
 
         assert!(navigation.contains(
-            "const WORKSPACE_SHORTCUT_VIEWS = Object.freeze([\"files\", \"chat\", \"git\", \"board\"]);"
+            "const WORKSPACE_SHORTCUT_VIEWS = Object.freeze([\"files\", \"chat\", \"git\"]);"
         ));
         assert!(navigation.contains("function workspaceShortcutDirection(event)"));
         assert!(navigation.contains("function chatShortcutAction(event)"));
@@ -990,76 +877,10 @@ mod tests {
     }
 
     #[test]
-    fn board_config_modal_matches_mobile_execution_controls() {
-        let html = asset_text("index.html");
-        let source = app_source();
-
-        for id in [
-            "board-next-provider",
-            "board-next-model",
-            "board-reasoning-effort",
-            "board-thinking",
-            "board-fast",
-            "board-scheduled-start",
-            "board-tools-preset",
-            "board-rag-index-on-bootstrap",
-            "board-rag-query-enabled",
-            "board-rag-ingest-task-results",
-            "board-rag-ingest-validation-errors",
-            "board-rag-scopes",
-            "board-task-model-breakdown",
-            "board-task-model-implementation",
-            "board-task-model-qa",
-            "board-task-model-qa-fix",
-            "board-task-model-agents",
-            "board-task-model-final-qa",
-            "board-tool-repair-enabled",
-            "board-tool-repair-retries",
-            "board-auto-retry-reset-attempts",
-        ] {
-            assert!(html.contains(&format!(r#"id="{id}""#)), "missing {id}");
-        }
-        for capability in [
-            "reasoningEffort",
-            "taskModelOverrides",
-            "toolsSettings",
-            "scheduledStartAt",
-            "ingestTaskResults",
-            "ingestValidationErrors",
-            "repairMalformedToolCalls",
-            "malformedToolCallRepairRetries",
-            "resetAttempts",
-            "saveBoardConfiguration",
-            "bindBoardConfigModal",
-        ] {
-            assert!(source.contains(capability), "missing {capability}");
-        }
-        assert!(source.contains("Tool repair:"));
-        assert!(source.contains("modelStrategy.reasoningEffort ?? modelStrategy.effort"));
-        let save_configuration = source
-            .split_once("async function saveBoardConfiguration()")
-            .map(|(_, value)| value)
-            .expect("save board configuration function");
-        assert!(
-            save_configuration
-                .find("/model-strategy")
-                .expect("model strategy update")
-                < save_configuration
-                    .find("/model\", {")
-                    .expect("model update"),
-            "save the explicit model after the strategy-derived model"
-        );
-    }
-
-    #[test]
-    fn openapi_documents_board_scope_and_direct_snapshot_access() {
+    fn openapi_documents_direct_snapshot_access() {
         let source = asset_text("openapi.json");
 
-        assert!(source.contains("\"boardSession\""));
-        assert!(source.contains("\"boardId\""));
-        assert!(source.contains("\"boardTaskId\""));
         assert!(source.contains("\"/api/sessions/{session_id}/snapshot\""));
-        assert!(source.contains("excluded from ordinary project/session discovery"));
     }
 
     #[test]
@@ -1372,8 +1193,6 @@ mod tests {
             "images/landing/database-query-dark-mobile-20260907.webp",
             "images/landing/terminal-session-dark-20260907.webp",
             "images/landing/terminal-session-dark-mobile-20260907.webp",
-            "images/landing/agentic-board-dark-20260907.webp",
-            "images/landing/agentic-board-dark-mobile-20260907.webp",
         ];
 
         for asset_path in asset_paths {
@@ -1437,11 +1256,7 @@ mod tests {
                 "terminal-and-mobile",
                 "Terminal and mobile controls",
             ),
-            (
-                "docs/boards-and-tools",
-                "boards-and-tools",
-                "Boards and tools",
-            ),
+            ("docs/tools", "tools", "Tools"),
             (
                 "docs/security-and-boundaries",
                 "security-and-boundaries",

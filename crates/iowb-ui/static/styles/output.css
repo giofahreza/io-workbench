@@ -556,13 +556,13 @@ body.sidebar-collapsed .bottom-nav {
 }
 
 body:not(.auth-active):not(.auth-pending) .bottom-nav {
-  grid-template-columns: 34px minmax(0, 1fr) minmax(184px, auto);
+  grid-template-columns: 34px minmax(0, 1fr) minmax(148px, auto);
   box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
 }
 
 body:not(.auth-active):not(.auth-pending) .bottom-nav-tabs {
   display: grid;
-  grid-template-columns: repeat(5, 34px);
+  grid-template-columns: repeat(4, 34px);
   justify-content: end;
 }
 

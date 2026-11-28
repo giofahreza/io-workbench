@@ -6,11 +6,11 @@ function bindNavigation() {
   });
 }
 
-// Keep keyboard workspace navigation deliberately focused on the four views
+// Keep keyboard workspace navigation deliberately focused on the three views
 // that make up the everyday project loop. Shell, settings, and database stay
 // directly available through their own navigation controls instead of making
 // this shortcut unpredictable.
-const WORKSPACE_SHORTCUT_VIEWS = Object.freeze(["files", "chat", "git", "board"]);
+const WORKSPACE_SHORTCUT_VIEWS = Object.freeze(["files", "chat", "git"]);
 
 function workspaceShortcutDirection(event) {
   if (!event || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return 0;
@@ -193,9 +193,9 @@ function activeView() {
 }
 
 function syncNavigationState(view = activeView()) {
-  const primaryMobileViews = new Set(["chat", "files", "shell", "git", "board", "database"]);
+  const primaryMobileViews = new Set(["chat", "files", "shell", "git", "database"]);
   qs("#bottom-more")?.classList.toggle("active", !primaryMobileViews.has(view));
-  qs(".more-nav")?.classList.toggle("active", !["chat", "files", "shell", "git", "board", "database"].includes(view));
+  qs(".more-nav")?.classList.toggle("active", !["chat", "files", "shell", "git", "database"].includes(view));
 }
 
 async function switchView(view) {
@@ -205,7 +205,6 @@ async function switchView(view) {
     return false;
   }
   if (view !== "chat") closeChatEditFromHerePicker();
-  if (view !== "chat" && state.boardWsSessionId) setBoardChatWsSubscription("");
   if (view !== "files" && state.fileEditorFullView) setFileEditorFullView(false, { restoreFocus: false });
   document.querySelectorAll("button[data-view]").forEach((item) => item.classList.remove("active"));
   document.querySelectorAll(".view").forEach((item) => {
@@ -235,16 +234,12 @@ async function switchView(view) {
     scheduleShellFit(true);
   }
   if (view === "chat") {
-    if (isSelectedBoardChatSession()) {
-      setBoardChatWsSubscription(state.chatSessionId);
-    }
     updateChatEmptyState();
   }
   return true;
 }
 
 async function loadView(view) {
-  if (view === "board") await loadBoard();
   if (view === "files") await loadFiles();
   if (view === "git") await loadGitStatus();
   if (view === "shell") await loadProcesses();
@@ -268,8 +263,7 @@ async function loadView(view) {
 
 async function refreshCurrentView() {
   const view = activeView();
-  if (view === "board") await loadBoard();
-  else if (view === "files") await loadFiles();
+  if (view === "files") await loadFiles();
   else if (view === "git") await loadGitStatus();
   else if (view === "database") await loadDbConnections();
   else if (view === "settings") {

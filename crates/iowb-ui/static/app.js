@@ -1,7 +1,7 @@
 "use strict";
 
 const TOKEN_STORAGE_KEY = "iowb.token";
-const APP_VERSION = "20261126-claude-session-switching-01";
+const APP_VERSION = "20261127-legacy-removal-01";
 const APP_MODULES = Object.freeze([
   "/app/core.js",
   "/app/sidebar.js",
@@ -29,7 +29,6 @@ const APP_MODULES = Object.freeze([
   "/app/workspace/settings.js",
   "/app/workspace/websocket.js",
   "/app/navigation.js",
-  "/app/board.js",
   "/app/commands.js",
   "/app/forms.js",
   "/app/startup.js",

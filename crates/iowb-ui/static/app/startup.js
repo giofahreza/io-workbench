@@ -64,9 +64,6 @@ function showError(error) {
   } else if (qs("#files-view")?.classList.contains("active")) {
     const status = qs("#file-editor-status");
     if (status) status.textContent = message;
-  } else if (qs("#board-view")?.classList.contains("active")) {
-    const status = qs("#board-status");
-    if (status) status.textContent = message;
   } else if (qs("#settings-view")?.classList.contains("active")) {
     setOutput("#settings-json", message, "error-output");
   } else {

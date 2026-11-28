@@ -3,35 +3,6 @@
   .main-content-header > #view-subtitle {
     display: none;
   }
-
-  .view.active.workbench-panel.board-panel {
-    padding: 12px;
-  }
-
-  .board-header {
-    display: grid;
-  }
-
-  .board-header-actions {
-    align-items: stretch;
-  }
-
-  .board-header-actions select {
-    min-width: 0;
-    flex: 1;
-  }
-
-  .board-compose-row {
-    grid-template-columns: 1fr;
-  }
-
-  .board-form-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .board-columns {
-    grid-template-columns: repeat(5, minmax(260px, 82vw));
-  }
 }
 
 .shell-process-list {
@@ -375,7 +346,7 @@ th {
     left: auto;
     z-index: 800;
     display: grid;
-    grid-template-columns: 44px minmax(0, 0.72fr) minmax(238px, auto);
+    grid-template-columns: 44px minmax(0, 0.72fr) minmax(192px, auto);
     align-items: center;
     gap: 8px;
     width: 100%;
@@ -387,27 +358,6 @@ th {
     background: var(--panel);
     box-shadow: none;
     transform: none;
-  }
-
-  .view.active.board-panel {
-    overflow: auto;
-  }
-
-  .board-workbench {
-    grid-template-rows: none;
-    height: auto;
-    min-height: 100%;
-  }
-
-  .board-columns {
-    height: min(62vh, 560px);
-    min-height: 420px;
-    overflow-x: auto;
-    overflow-y: hidden;
-  }
-
-  .board-column {
-    min-height: 100%;
   }
 
   .bottom-nav button {
@@ -431,7 +381,7 @@ th {
 
   .bottom-nav-tabs {
     display: grid;
-    grid-template-columns: repeat(5, 44px);
+    grid-template-columns: repeat(4, 44px);
     gap: 2px;
     justify-content: end;
     border-radius: 8px;
@@ -457,7 +407,7 @@ th {
     }
 
     .bottom-nav-tabs {
-      grid-template-columns: repeat(5, minmax(44px, 1fr));
+      grid-template-columns: repeat(4, minmax(44px, 1fr));
       width: 100%;
       min-width: 0;
     }

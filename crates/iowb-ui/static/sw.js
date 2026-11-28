@@ -1,4 +1,4 @@
-const APP_VERSION = "20261126-claude-session-switching-01";
+const APP_VERSION = "20261127-legacy-removal-01";
 const CACHE_NAME = `io-workbench-web-${APP_VERSION}`;
 const CORE_ASSETS = [
   "/",
@@ -13,7 +13,6 @@ const CORE_ASSETS = [
   `/styles/chat.css?v=${APP_VERSION}`,
   `/styles/shell-and-git.css?v=${APP_VERSION}`,
   `/styles/output.css?v=${APP_VERSION}`,
-  `/styles/board.css?v=${APP_VERSION}`,
   `/styles/responsive/large.css?v=${APP_VERSION}`,
   `/styles/responsive/mobile.css?v=${APP_VERSION}`,
   `/styles/responsive/touch-and-small.css?v=${APP_VERSION}`,
@@ -44,7 +43,6 @@ const CORE_ASSETS = [
   `/app/workspace/settings.js?v=${APP_VERSION}`,
   `/app/workspace/websocket.js?v=${APP_VERSION}`,
   `/app/navigation.js?v=${APP_VERSION}`,
-  `/app/board.js?v=${APP_VERSION}`,
   `/app/commands.js?v=${APP_VERSION}`,
   `/app/forms.js?v=${APP_VERSION}`,
   `/app/startup.js?v=${APP_VERSION}`,

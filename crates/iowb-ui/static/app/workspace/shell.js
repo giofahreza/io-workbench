@@ -89,7 +89,6 @@ async function runTool(event) {
     commands: "/api/commands/run",
     plugins: "/api/plugins/run",
     taskmaster: "/api/taskmaster/run",
-    danger: "/api/danger/boards",
     notifications: "/api/notifications/push",
   }[kind];
   const payload = parseJsonField("#tool-payload", {});

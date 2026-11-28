@@ -140,63 +140,6 @@ function bindForms() {
   qs("#refresh-tool-runs").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadToolRuns).catch(showError));
   qs("#refresh-metrics").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadMetrics).catch(showError));
   qs("#refresh-settings").addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadSettings).catch(showError));
-  qs("#board-refresh")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, loadBoard).catch(showError));
-  qs("#board-resume")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardAction("resume")).catch(showError));
-  qs("#board-pause")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardAction("pause")).catch(showError));
-  qs("#board-abort")?.addEventListener("click", (event) => withButtonLoading(event.currentTarget, () => boardAction("abort")).catch(showError));
-  qs("#board-start-form")?.addEventListener("submit", (event) => withButtonLoading(event.submitter, () => createBoard(event)).catch(showError));
-  qs("#board-task-form")?.addEventListener("submit", (event) => withButtonLoading(event.submitter, () => addBoardTask(event)).catch(showError));
-  bindBoardConfigModal();
-  qs("#board-details")?.addEventListener("click", (event) => {
-    const transcriptButton = event.target.closest("[data-board-view-transcript]");
-    if (transcriptButton && transcriptButton.dataset.boardViewTranscript === "breakdown") {
-      openBoardTranscriptModal(
-        "Backlog breakdown transcript",
-        state.board?.backlogBreakdown?.transcript || [],
-      );
-    }
-  });
-  qs("#board-columns")?.addEventListener("click", (event) => {
-    const detailsButton = event.target.closest("[data-board-open-details]");
-    if (detailsButton) {
-      openBoardTaskDetails(detailsButton.dataset.boardOpenDetails);
-      return;
-    }
-    const discussionButton = event.target.closest("[data-board-discuss-task]");
-    if (discussionButton) {
-      openBoardDiscussionModal(discussionButton.dataset.boardDiscussTask);
-      return;
-    }
-    const breakdownButton = event.target.closest("[data-board-breakdown-task]");
-    if (breakdownButton) {
-      withButtonLoading(breakdownButton, () => breakdownBoardTask(breakdownButton.dataset.boardBreakdownTask)).catch(showError);
-      return;
-    }
-    const transcriptButton = event.target.closest("[data-board-view-transcript]");
-    if (transcriptButton) {
-      openBoardTaskTranscript(transcriptButton.dataset.boardViewTranscript).catch(showError);
-      return;
-    }
-    const chatSessionButton = event.target.closest("[data-board-open-chat-session]");
-    if (chatSessionButton) {
-      openBoardTaskChatSession(chatSessionButton.dataset.boardOpenChatSession).catch(showError);
-      return;
-    }
-    const retryButton = event.target.closest("[data-board-retry-task]");
-    if (retryButton) {
-      if (!window.confirm("Retry this task as a transient/environment failure?")) return;
-      withButtonLoading(
-        retryButton,
-        () => retryBoardTask(retryButton.dataset.boardRetryTask),
-      ).catch(showError);
-      return;
-    }
-    const moveButton = event.target.closest("[data-board-task-status]");
-    if (moveButton) {
-      withButtonLoading(moveButton, () => moveBoardTask(moveButton.dataset.boardTaskId, moveButton.dataset.boardTaskStatus)).catch(showError);
-      return;
-    }
-  });
   document.querySelectorAll("[data-chat-provider-option]").forEach((button) => {
     button.addEventListener("click", () => chooseNewChatProvider(button.dataset.chatProviderOption));
   });
@@ -584,20 +527,11 @@ function bindForms() {
         showError(new Error("The server did not return the replacement chat session."));
         return;
       }
-      const boardReplacement = isBoardChatSession(destination)
-        || state.boardChatSessionIds.has(stagedEdit.sourceSessionId);
-      if (boardReplacement) {
-        state.boardChatSessionIds.add(destination.id);
-        hideBoardChatSessionsFromLists();
-        setBoardChatWsSubscription(destination.id);
-      } else {
-        setBoardChatWsSubscription("");
-        state.sessions = (state.sessions || [])
-          .filter((session) => session?.id !== destination.id)
-          .concat(destination);
-        mergeSessionIntoProjects(destination);
-        transferPinnedChatSession(stagedEdit.sourceSessionId, destination);
-      }
+      state.sessions = (state.sessions || [])
+        .filter((session) => session?.id !== destination.id)
+        .concat(destination);
+      mergeSessionIntoProjects(destination);
+      transferPinnedChatSession(stagedEdit.sourceSessionId, destination);
       if (replacement.sourceHidden === true) {
         hideChatSessionFromLists(stagedEdit.sourceSessionId);
       }
@@ -683,10 +617,8 @@ function bindForms() {
     renderChatProviderPicker();
     if (sessionId) {
       state.chatSessionId = sessionId;
-      if (!isSelectedBoardChatSession(sessionId)) {
-        state.preferences.lastChatSessionId = sessionId;
-        savePreferences();
-      }
+      state.preferences.lastChatSessionId = sessionId;
+      savePreferences();
       writeLocalChatPromptDraft("", sessionId);
 
     }
@@ -722,9 +654,7 @@ function bindForms() {
       ),
       messages: nextMessages,
     };
-    if (!isSelectedBoardChatSession(sessionId)) {
-      persistActiveChatSelection(sessionId, projectPath);
-    }
+    persistActiveChatSelection(sessionId, projectPath);
     rememberCurrentChatSession({
       sessionId,
       projectPath,

@@ -434,7 +434,7 @@ function renderSidebarProjects() {
         <button type="button" class="project-drag-handle" data-sidebar-drag-handle="${escapeHtml(project.path)}" aria-label="Drag to reorder ${escapeHtml(displayName)}" title="Drag to reorder">
           <i></i><i></i><i></i><i></i><i></i><i></i>
         </button>
-        <button type="button" class="sidebar-item project-sidebar-item" data-sidebar-project="${escapeHtml(project.path)}" aria-label="Open board for ${escapeHtml(displayName)}"${active ? ' aria-current="page"' : ""}>
+        <button type="button" class="sidebar-item project-sidebar-item" data-sidebar-project="${escapeHtml(project.path)}" aria-label="Select ${escapeHtml(displayName)}"${active ? ' aria-current="true"' : ""}>
           <span class="project-sidebar-text">
             <strong>${escapeHtml(displayName)}</strong>
             <span>${escapeHtml(project.path)}</span>
@@ -460,7 +460,7 @@ function renderSidebarProjects() {
       event.stopPropagation();
       const path = button.dataset.sidebarProject;
       setActiveProject(path);
-      await switchView("board").catch(showError);
+      await loadView(activeView()).catch(showError);
     });
   });
   target.querySelectorAll("[data-sidebar-project-sessions-toggle]").forEach((button) => {

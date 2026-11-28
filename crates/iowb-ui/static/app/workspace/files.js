@@ -27,7 +27,6 @@ async function loadHealth() {
 async function loadProjects() {
   const body = await api("/api/projects?includeSessions=true");
   state.projects = body.projects || [];
-  hideBoardChatSessionsFromLists();
   syncProjectOrder();
   const activeExists = state.projects.some((project) => project.path === state.activeProjectPath);
   if (!activeExists) {

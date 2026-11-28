@@ -27,7 +27,6 @@ function fixture() {
     stagedChatEdit = () => null;
     api = (url) => new Promise((resolve, reject) => requests.push({ url, resolve, reject }));
     findChatSession = () => null;
-    isBoardChatSession = () => false;
     splitCachedStreamingMessage = (messages) => ({ messages });
     sessionProvider = () => 'codex';
     captureChatHistoryAnchor = () => null;

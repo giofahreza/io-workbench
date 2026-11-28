@@ -63,7 +63,7 @@ async function loadProjectSessions() {
     offset += page.length;
     if (Array.isArray(body) || !body.hasMore || !page.length) break;
   }
-  state.sessions = loaded.filter((session) => !isBoardChatSession(session));
+  state.sessions = loaded;
   renderSessions();
   renderJson("#sessions-output", { project, sessions: state.sessions });
 }
