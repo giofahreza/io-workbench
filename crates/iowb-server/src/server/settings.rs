@@ -377,14 +377,11 @@ async fn set_sidebar_active_sessions(
     Extension(user): Extension<AuthenticatedUser>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>> {
-    let pinned_sessions = filter_sidebar_active_sessions(
-        &state,
-        normalize_sidebar_active_sessions(
-            body.get("pinnedSessions")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([])),
-        ),
-    )?;
+    let pinned_sessions = normalize_sidebar_active_sessions(
+        body.get("pinnedSessions")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    );
     state
         .storage
         .set_setting(SIDEBAR_ACTIVE_SESSIONS_KEY, &pinned_sessions)?;
@@ -404,15 +401,13 @@ const SIDEBAR_ACTIVE_SESSIONS_KEY: &str = "sidebar-active-sessions";
 fn load_sidebar_active_sessions(state: &AppState, user_id: &str) -> Result<(Value, bool)> {
     let user_key = user_setting_key(user_id, SIDEBAR_ACTIVE_SESSIONS_KEY);
     if let Some(value) = state.storage.get_setting(&user_key)? {
-        let pinned_sessions =
-            filter_sidebar_active_sessions(state, normalize_sidebar_active_sessions(value))?;
+        let pinned_sessions = normalize_sidebar_active_sessions(value);
         state.storage.set_setting(&user_key, &pinned_sessions)?;
         return Ok((pinned_sessions, true));
     }
 
     if let Some(value) = state.storage.get_setting(SIDEBAR_ACTIVE_SESSIONS_KEY)? {
-        let pinned_sessions =
-            filter_sidebar_active_sessions(state, normalize_sidebar_active_sessions(value))?;
+        let pinned_sessions = normalize_sidebar_active_sessions(value);
         state.storage.set_setting(&user_key, &pinned_sessions)?;
         return Ok((pinned_sessions, true));
     }
@@ -449,27 +444,6 @@ fn normalize_sidebar_active_sessions(value: Value) -> Value {
         normalized.push(item);
     }
     Value::Array(normalized)
-}
-
-fn filter_sidebar_active_sessions(state: &AppState, value: Value) -> Result<Value> {
-    let Value::Array(items) = value else {
-        return Ok(serde_json::json!([]));
-    };
-    let mut visible = Vec::with_capacity(items.len());
-    for item in items {
-        let Some(session_id) = sidebar_active_session_key(&item) else {
-            continue;
-        };
-        if state
-            .storage
-            .get_session_summary(&session_id)?
-            .is_some_and(|session| session.is_board_session())
-        {
-            continue;
-        }
-        visible.push(item);
-    }
-    Ok(Value::Array(visible))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

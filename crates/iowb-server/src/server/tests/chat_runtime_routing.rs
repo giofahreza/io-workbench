@@ -1,6 +1,6 @@
 #[tokio::test(flavor = "current_thread")]
 async fn chat_runtime_legacy_sessions_use_stored_models_not_global_defaults() {
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     let user_id = "runtime-routing-user";
     state
         .storage
@@ -78,7 +78,7 @@ async fn chat_runtime_legacy_sessions_use_stored_models_not_global_defaults() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn chat_runtime_preserves_explicit_session_routes() {
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     let user_id = "runtime-routing-user";
     for (runtime, configured) in [
         (ChatRuntime::NativeCli, "io_gateway"),

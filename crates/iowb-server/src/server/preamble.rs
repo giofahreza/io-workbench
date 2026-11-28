@@ -153,21 +153,6 @@ static CODEX_TOKEN_USAGE_CACHE: OnceLock<tokio::sync::Mutex<CodexTokenUsageCache
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let addr = config.socket_addr();
     let state = AppState::initialize(config).await?;
-    // This upgrade migration must finish before recovery can publish events
-    // and before the listener can serve ordinary project/session discovery.
-    agentic_board::backfill_legacy_board_sessions(&state)
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                error
-                    .body
-                    .details
-                    .as_deref()
-                    .filter(|details| !details.is_empty())
-                    .map(|details| format!("{}: {details}", error.body.error))
-                    .unwrap_or(error.body.error)
-            )
-        })?;
     recover_interrupted_chat_runs(&state).await?;
     spawn_process_event_bridge(state.clone());
     spawn_project_watch_bridge(state.clone());

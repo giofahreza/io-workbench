@@ -1,6 +1,6 @@
 #[tokio::test(flavor = "current_thread")]
 async fn token_usage_snapshot_preserves_durable_reply_usage() {
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     let session = SessionSummary {
         id: "usage-snapshot-session".to_string(),
         provider: Provider::Codex,

@@ -1,6 +1,6 @@
 #[tokio::test(flavor = "current_thread")]
 async fn project_sessions_pages_newest_first_and_keeps_the_legacy_array() {
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     let project_path = root.join("paged-project");
     std::fs::create_dir_all(&project_path).expect("project directory");
     state

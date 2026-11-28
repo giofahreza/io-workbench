@@ -92,7 +92,7 @@ fn route_model_checks_reject_stale_ids_and_preserve_existing_native_models() {
 
 #[tokio::test]
 async fn missing_native_routes_never_offer_cli_default() {
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     for provider in [Provider::Codex, Provider::Claude, Provider::Gemini] {
         for installed in [false, true] {
             let body = chat_route_catalog_with_status(
@@ -132,7 +132,7 @@ async fn gateway_readiness_is_user_scoped_and_needs_cli_but_not_native_login() {
             ] }))
         }))).await.unwrap();
     });
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     state.storage.set_setting(&user_setting_key("alice", "direct-ai"), &serde_json::json!({
         "mode": "aiproxy", "gatewayUrl": format!("http://{address}"), "gatewayApiKey": "fake-key"
     })).unwrap();
@@ -228,7 +228,7 @@ async fn gateway_catalog_reports_auth_empty_and_malformed_without_secrets() {
 
 #[tokio::test]
 async fn gateway_disabled_and_gemini_incompatible_routes_fail_before_launch() {
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     state
         .storage
         .set_setting(
@@ -263,7 +263,7 @@ async fn gateway_disabled_and_gemini_incompatible_routes_fail_before_launch() {
 
 #[tokio::test]
 async fn mismatch_event_preserves_request_identity_and_creates_retryable_draft() {
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     let (tx, mut rx) = mpsc::channel(4);
     state.storage.create_user("test", "test", "test-hash").unwrap();
     let user = iowb_protocol::UserProfile {
@@ -291,7 +291,6 @@ async fn mismatch_event_preserves_request_identity_and_creates_retryable_draft()
                 thinking: None,
                 fast: None,
             },
-            &mut HashSet::new(),
             &mut None,
         )
         .await;
@@ -418,7 +417,7 @@ fn malformed_gemini_credentials_are_not_authentication_evidence() {
 
 #[tokio::test]
 async fn readiness_routes_require_authentication_when_host_auth_is_enabled() {
-    let (root, original) = board_scope_test_state().await;
+    let (root, original) = test_app_state().await;
     let mut config = (*original.config).clone();
     config.auth_required = true;
     let state = AppState::initialize(config).await.unwrap();
@@ -444,7 +443,7 @@ async fn readiness_routes_require_authentication_when_host_auth_is_enabled() {
 
 #[tokio::test]
 async fn chat_gateway_requires_an_explicit_url_even_with_a_saved_credential() {
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     for provider in [Provider::Codex, Provider::Claude] {
         for config in [
             serde_json::json!({"mode":"aiproxy", "gatewayApiKey":"fake-only"}),
@@ -501,7 +500,7 @@ async fn chat_gateway_requires_an_explicit_url_even_with_a_saved_credential() {
 
 #[tokio::test]
 async fn rejected_send_is_durable_idempotent_and_preserves_existing_route_and_newer_draft() {
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     let problem = chat_setup_problem("chat_model_unavailable", "Select an available model for this chat route and retry.", "choose_model", None);
     state.storage.create_user("test", "test", "test-hash").unwrap();
     let id = "persistent-rejection";

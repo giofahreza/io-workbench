@@ -12,7 +12,7 @@ fn chat_command_query_decodes_optional_context_and_refresh() {
 
 #[tokio::test]
 async fn chat_command_api_discovers_and_validates_without_creating_sessions() {
-    let (root, state) = board_scope_test_state().await;
+    let (root, state) = test_app_state().await;
     let commands = root.join(".claude/commands");
     std::fs::create_dir_all(&commands).unwrap();
     std::fs::write(

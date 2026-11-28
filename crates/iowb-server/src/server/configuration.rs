@@ -97,11 +97,7 @@ fn default_notification_preferences() -> Value {
         "events": {
             "actionRequired": true,
             "stop": true,
-            "error": true,
-            "agenticBoardStarted": true,
-            "agenticTaskUpdated": false,
-            "agenticBoardCompleted": true,
-            "agenticBoardNeedsAttention": true
+            "error": true
         }
     })
 }

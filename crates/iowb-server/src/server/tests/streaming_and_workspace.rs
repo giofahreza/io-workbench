@@ -139,9 +139,9 @@
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
-    async fn board_scope_test_state() -> (PathBuf, AppState) {
+    async fn test_app_state() -> (PathBuf, AppState) {
         let root = std::env::temp_dir().join(format!(
-            "iowb-server-board-ws-scope-{}",
+            "iowb-server-test-state-{}",
             uuid::Uuid::new_v4()
         ));
         let config_dir = root.join("config");
@@ -166,7 +166,7 @@
 
     #[tokio::test(flavor = "current_thread")]
     async fn project_registration_returns_while_session_publication_is_blocked() {
-        let (root, state) = board_scope_test_state().await;
+        let (root, state) = test_app_state().await;
         let project_path = root.join("registered-with-slow-sessions");
         std::fs::create_dir_all(&project_path).expect("project directory");
         let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
@@ -203,7 +203,7 @@
 
     #[tokio::test(flavor = "current_thread")]
     async fn invalid_project_registration_does_not_publish_or_persist() {
-        let (root, state) = board_scope_test_state().await;
+        let (root, state) = test_app_state().await;
         let file = root.join("not-a-directory");
         std::fs::write(&file, "fixture").expect("file fixture");
         let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
@@ -221,56 +221,8 @@
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn websocket_board_events_require_exact_validated_subscription() {
-        let (root, state) = board_scope_test_state().await;
-        let now = Utc::now();
-        for session in [
-            SessionSummary {
-                id: "board-chat".to_string(),
-                provider: Provider::Codex,
-                project_path: "/tmp/project".to_string(),
-                title: "Board chat".to_string(),
-                last_activity: now,
-                board_session: true,
-                board_id: Some("board-1".to_string()),
-                board_task_id: Some("task-1".to_string()),
-                ..Default::default()
-            },
-            SessionSummary {
-                id: "ordinary-chat".to_string(),
-                provider: Provider::Codex,
-                project_path: "/tmp/project".to_string(),
-                title: "Ordinary chat".to_string(),
-                last_activity: now,
-                ..Default::default()
-            },
-        ] {
-            state
-                .storage
-                .upsert_session(&session)
-                .expect("persist session");
-            state
-                .sessions
-                .remember_persisted_session(session)
-                .await
-                .expect("cache session");
-        }
-
-        let board_output = WsServerEvent::Output {
-            provider: Provider::Codex,
-            session_id: "board-chat".to_string(),
-            response_id: Some("response-board".to_string()),
-            sequence: Some(1),
-            content: "board output".to_string(),
-            done: false,
-        };
-        let board_error = WsServerEvent::Error {
-            history_message: None,
-            message: "board error".to_string(),
-            details: None,
-            session_id: Some("board-chat".to_string()),
-        };
+    #[test]
+    fn websocket_chat_events_honor_validated_chat_subscriptions() {
         let ordinary_output = WsServerEvent::Output {
             provider: Provider::Codex,
             session_id: "ordinary-chat".to_string(),
@@ -288,62 +240,21 @@
             latest_user_prompt: None,
         };
 
-        let none = HashSet::new();
-        let legacy_chat_subscriptions = None;
-        assert!(!ws_event_visible_to_connection(
-            &state,
-            &board_output,
-            &none,
-            &legacy_chat_subscriptions,
-        ));
-        assert!(!ws_event_visible_to_connection(
-            &state,
-            &board_error,
-            &none,
-            &legacy_chat_subscriptions,
-        ));
-        assert!(ws_event_visible_to_connection(
-            &state,
-            &ordinary_output,
-            &none,
-            &legacy_chat_subscriptions,
-        ));
+        // Clients that omit the list keep receiving every chat's output.
+        assert!(ws_event_visible_to_connection(&ordinary_output, &None));
 
-        let accepted = validated_board_session_subscriptions(
-            &state,
-            vec![
-                " board-chat ".to_string(),
-                "ordinary-chat".to_string(),
-                "missing-chat".to_string(),
-            ],
-        );
-        assert_eq!(accepted, HashSet::from(["board-chat".to_string()]));
-        assert!(ws_event_visible_to_connection(
-            &state,
-            &board_output,
-            &accepted,
-            &legacy_chat_subscriptions,
-        ));
-        assert!(ws_event_visible_to_connection(
-            &state,
-            &board_error,
-            &accepted,
-            &legacy_chat_subscriptions,
-        ));
-
+        // An explicit empty list hides chat output but not status events.
         let no_visible_chat = validated_chat_session_subscriptions(Some(Vec::new()));
         assert!(!ws_event_visible_to_connection(
-            &state,
             &ordinary_output,
-            &none,
             &no_visible_chat,
         ));
         assert!(ws_event_visible_to_connection(
-            &state,
             &ordinary_status,
-            &none,
             &no_visible_chat,
         ));
+
+        // Ids are trimmed and de-duplicated; unknown ids are harmless.
         let selected_chat = validated_chat_session_subscriptions(Some(vec![
             " ordinary-chat ".to_string(),
             "ordinary-chat".to_string(),
@@ -357,14 +268,9 @@
             ])),
         );
         assert!(ws_event_visible_to_connection(
-            &state,
             &ordinary_output,
-            &none,
             &selected_chat,
         ));
-
-        drop(state);
-        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -447,7 +353,6 @@
             .expect("mark run failed");
 
         let (direct_tx, mut direct_rx) = mpsc::channel(4);
-        let mut board_session_subscriptions = HashSet::new();
         let mut chat_session_subscriptions = None;
         handle_ws_command(
             &state,
@@ -471,7 +376,6 @@
                 thinking: None,
                 fast: None,
             },
-            &mut board_session_subscriptions,
             &mut chat_session_subscriptions,
         )
         .await;
@@ -615,24 +519,6 @@
         );
     }
 
-    #[test]
-    fn board_chat_completion_does_not_create_ordinary_push_notification() {
-        let ordinary = SessionSummary {
-            id: "ordinary-chat".to_string(),
-            ..Default::default()
-        };
-        let board = SessionSummary {
-            id: "board-chat".to_string(),
-            board_session: true,
-            board_id: Some("board-1".to_string()),
-            ..Default::default()
-        };
-
-        assert!(chat_completion_push_allowed(None));
-        assert!(chat_completion_push_allowed(Some(&ordinary)));
-        assert!(!chat_completion_push_allowed(Some(&board)));
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn sidebar_active_sessions_treat_user_empty_as_authoritative() {
         let root = std::env::temp_dir().join(format!(
@@ -676,62 +562,6 @@
 
         assert!(initialized);
         assert_eq!(pinned_sessions, serde_json::json!([]));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn sidebar_active_sessions_drop_board_chats() {
-        let root = std::env::temp_dir().join(format!(
-            "iowb-server-sidebar-board-sessions-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let config_dir = root.join("config");
-        std::fs::create_dir_all(&config_dir).expect("config directory");
-        let state = AppState::initialize(AppConfig {
-            host: "127.0.0.1".parse().expect("host"),
-            port: 0,
-            config_dir: config_dir.clone(),
-            database_path: config_dir.join("test.db"),
-            workspace_root: root.clone(),
-            auth_required: false,
-            local_token: None,
-            otp_secret: None,
-            max_sessions: 10,
-            max_scan_depth: 2,
-            max_file_read_bytes: 1024 * 1024,
-        })
-        .await
-        .expect("state initializes");
-        let session = SessionSummary {
-            id: "board-chat".to_string(),
-            provider: Provider::Codex,
-            project_path: "/tmp/project".to_string(),
-            title: "Board chat".to_string(),
-            last_activity: Utc::now(),
-            board_session: true,
-            board_id: Some("board-1".to_string()),
-            ..Default::default()
-        };
-        state
-            .storage
-            .upsert_session(&session)
-            .expect("board session");
-        state
-            .storage
-            .set_setting(
-                &user_setting_key("mobile-user", SIDEBAR_ACTIVE_SESSIONS_KEY),
-                &serde_json::json!([
-                    {"sessionId": "normal-chat"},
-                    {"sessionId": "board-chat"}
-                ]),
-            )
-            .expect("sidebar setting");
-
-        let (pinned, initialized) =
-            load_sidebar_active_sessions(&state, "mobile-user").expect("pinned sessions");
-        assert!(initialized);
-        assert_eq!(pinned, serde_json::json!([{"sessionId": "normal-chat"}]));
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -143,7 +143,7 @@ async fn synthesize_legacy_durable_runs(state: &AppState) -> anyhow::Result<()> 
 
     for session in state
         .storage
-        .list_sessions_including_board()?
+        .list_sessions()?
         .into_iter()
         .filter(|session| session.active && !durable_session_ids.contains(&session.id))
     {
@@ -198,8 +198,6 @@ async fn synthesize_legacy_durable_runs(state: &AppState) -> anyhow::Result<()> 
 }
 
 pub fn build_router(state: AppState) -> Router {
-    agentic_board::recover_active_boards(&state);
-
     let protected_routes = Router::new()
         .route("/api/auth/logout", post(auth_logout))
         .route("/api/auth/user", get(auth_user))
@@ -367,7 +365,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/plugins/install", post(install_plugin))
         .route("/api/plugins/remove", post(remove_plugin))
         .route("/api/plugins/run", post(run_plugin_command))
-        .merge(agentic_board::router())
         .route(
             "/api/devices/fcm-token",
             post(register_fcm_token).delete(delete_fcm_token),

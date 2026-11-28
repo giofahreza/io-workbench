@@ -218,11 +218,6 @@ async fn send_fcm_chat_completed(
     latest_user_prompt: Option<&str>,
 ) -> anyhow::Result<()> {
     let session = state.sessions.get(session_id).await.ok();
-    if !chat_completion_push_allowed(session.as_ref()) {
-        // Board task activity is intentionally absent from ordinary chat
-        // navigation/history, so it must not create an ordinary chat push.
-        return Ok(());
-    }
     let run = state
         .storage
         .latest_durable_chat_run_for_session(session_id)?;
@@ -283,10 +278,6 @@ async fn send_fcm_chat_completed(
         }
     }
     Ok(())
-}
-
-fn chat_completion_push_allowed(session: Option<&SessionSummary>) -> bool {
-    !session.is_some_and(SessionSummary::is_board_session)
 }
 
 fn truncate_notification_text(value: &str, max_chars: usize) -> String {

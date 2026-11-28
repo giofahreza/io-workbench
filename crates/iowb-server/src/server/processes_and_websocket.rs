@@ -76,7 +76,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
     let (direct_tx, mut direct_rx) =
         mpsc::channel::<WsServerEvent>(iowb_protocol::WS_EVENT_CHANNEL_CAPACITY);
     let mut hub_rx = state.ws_hub.subscribe();
-    let mut board_session_subscriptions = HashSet::<String>::new();
     let mut chat_session_subscriptions: Option<HashSet<String>> = None;
 
     let reader_connection_id = connection_id.clone();
@@ -127,18 +126,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
                     &direct_tx,
                     &user,
                     command,
-                    &mut board_session_subscriptions,
                     &mut chat_session_subscriptions,
                 ).await;
             }
             Some(event) = direct_rx.recv() => {
                 let event = state.ws_hub.prepare_event(event);
                 // Direct failures acknowledge this connection's command;
-                // streaming/replayed board events still require subscriptions.
+                // streaming/replayed chat events still require subscriptions.
                 if (matches!(&event, WsServerEvent::Error { .. } | WsServerEvent::ChatSetupRequired { .. } | WsServerEvent::ChatRecoveryRequired { .. }) || ws_event_visible_to_connection(
-                    &state,
                     &event,
-                    &board_session_subscriptions,
                     &chat_session_subscriptions,
                 )) && send_ws_event(&mut sender, event).await.is_err() {
                     break;
@@ -148,9 +144,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user: iowb_protocol::
                 match event {
                     Ok(event) => {
                         if ws_event_visible_to_connection(
-                            &state,
                             &event,
-                            &board_session_subscriptions,
                             &chat_session_subscriptions,
                         ) && send_ws_event(&mut sender, event).await.is_err() {
                             break;
@@ -182,7 +176,6 @@ async fn handle_ws_command(
     direct_tx: &mpsc::Sender<WsServerEvent>,
     user: &iowb_protocol::UserProfile,
     command: WsClientCommand,
-    board_session_subscriptions: &mut HashSet<String>,
     chat_session_subscriptions: &mut Option<HashSet<String>>,
 ) {
     match command {
@@ -195,13 +188,10 @@ async fn handle_ws_command(
                 .await;
         }
         WsClientCommand::Subscribe {
-            session_ids,
             chat_session_ids,
             process_ids,
             ..
         } => {
-            *board_session_subscriptions =
-                validated_board_session_subscriptions(state, session_ids);
             *chat_session_subscriptions = validated_chat_session_subscriptions(chat_session_ids);
             let _ = direct_tx
                 .send(WsServerEvent::ActiveSessions {
@@ -209,12 +199,7 @@ async fn handle_ws_command(
                 })
                 .await;
             for event in state.replay_agent_events().await {
-                if ws_event_visible_to_connection(
-                    state,
-                    &event,
-                    board_session_subscriptions,
-                    chat_session_subscriptions,
-                ) {
+                if ws_event_visible_to_connection(&event, chat_session_subscriptions) {
                     // This command is handled by the same task that drains
                     // `direct_tx`. Waiting on a full channel here would
                     // deadlock a reconnect with many active replays.
@@ -495,18 +480,6 @@ async fn handle_ws_command(
     }
 }
 
-fn validated_board_session_subscriptions(
-    state: &AppState,
-    session_ids: Vec<String>,
-) -> HashSet<String> {
-    session_ids
-        .into_iter()
-        .map(|session_id| session_id.trim().to_string())
-        .filter(|session_id| !session_id.is_empty())
-        .filter(|session_id| state.sessions.is_board_session_cached(session_id))
-        .collect()
-}
-
 fn validated_chat_session_subscriptions(
     session_ids: Option<Vec<String>>,
 ) -> Option<HashSet<String>> {
@@ -535,18 +508,12 @@ fn ws_event_session_id(event: &WsServerEvent) -> Option<&str> {
 }
 
 fn ws_event_visible_to_connection(
-    state: &AppState,
     event: &WsServerEvent,
-    board_session_subscriptions: &HashSet<String>,
     chat_session_subscriptions: &Option<HashSet<String>>,
 ) -> bool {
     let Some(session_id) = ws_event_session_id(event) else {
         return true;
     };
-    let board_session = state.sessions.is_board_session_cached(session_id);
-    if board_session {
-        return board_session_subscriptions.contains(session_id);
-    }
     match event {
         WsServerEvent::Output { .. }
         | WsServerEvent::ChatRecoveryRequired { .. }

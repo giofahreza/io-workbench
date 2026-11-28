@@ -2,10 +2,8 @@
 
 // The server crate is a façade over feature-oriented implementation files.
 // Keeping this list explicit makes the runtime composition easy to scan.
-mod agentic_board;
 mod database;
 mod git;
-mod rag_client;
 
 include!("server/preamble.rs");
 include!("server/recovery_and_routing.rs");
