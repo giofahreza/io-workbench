@@ -13,14 +13,14 @@ The public Workbench contract must remain:
 
 - Clients send `start_session` and `abort_session`.
 - Clients receive the same `session_status`, `output`, `session_metadata`, `error`, and `active_sessions` events.
-- Web, mobile, and desktop rendering must continue to work without client-side protocol changes.
+- Web and mobile rendering must continue to work without client-side protocol changes.
 - Existing `native_cli` and `io_gateway` runtime labels must remain valid.
 - The old `codex exec --json` path must remain available as rollback/fallback.
 
 ## Non-Goals For The First Migration
 
-- Do not expose a new public `app_server` runtime value to web/mobile/desktop yet.
-- Do not redesign chat UI, mobile UI, or desktop UI.
+- Do not expose a new public `app_server` runtime value to web/mobile yet.
+- Do not redesign chat UI or mobile UI.
 - Do not require JavaScript Codex SDK usage.
 - Do not replace Workbench WebSocket protocol with Codex app-server protocol.
 - Do not implement full approval UI in the first pass unless the backend cannot avoid blocking approval requests safely.
@@ -57,7 +57,6 @@ client -> Workbench WS -> codex app-server JSON-RPC -> AppServerLiveTurnAdapter 
 - `crates/iowb-core/src/external_sessions.rs`
 - `crates/iowb-protocol/src/lib.rs` only if an internal enum/metadata field is absolutely necessary
 - `crates/iowb-storage/src/lib.rs` if app-server attempt/source handling needs token usage or native session fixes
-- `crates/iowb-server/src/agentic_board.rs` only if board runtime selection needs an internal branch
 - Tests near the changed Rust modules
 
 Avoid changing these in the first pass unless a verified compatibility bug forces it:
@@ -141,7 +140,6 @@ Avoid changing these in the first pass unless a verified compatibility bug force
    - image-only
    - unsafe path outside project root
    - missing file behavior
-7. Keep desktop mismatch noted separately: desktop currently appends markdown using `image.data`, while upload returns `path`. Do not rely on desktop sending the same marker until fixed.
 
 ### 6. Event Normalization
 
@@ -297,36 +295,7 @@ Preserve current Codex CLI behavior as closely as possible:
 4. Ensure app-server-created rollouts can be discovered/imported.
 5. Ensure Workbench-owned native sessions are not duplicated as separate external sessions.
 
-### 16. Agentic Board
-
-1. Keep board-owned sessions isolated from ordinary chat lists.
-2. Preserve board subscriptions and event replay filtering.
-3. Ensure board Codex provider turns can use the internal app-server path.
-4. Preserve board-selected controls:
-   - model
-   - effort
-   - thinking
-   - fast
-   - `mode = bypass`
-5. Verify board task/session linking still works if provider start fails after session allocation.
-
-### 17. Desktop Native Client
-
-No desktop protocol migration in the first pass.
-
-Backend must keep desktop-compatible Workbench events:
-
-- `session_status`
-- `session_metadata`
-- `output`
-- `error`
-
-Track separately:
-
-- Desktop image upload currently appears to consume `image.data` while server upload returns `image.path`.
-- Do not make app-server image support depend on desktop sending web/mobile marker lines until desktop is fixed.
-
-### 18. Mobile Client Compatibility
+### 16. Mobile Client Compatibility
 
 No mobile protocol migration in the first pass.
 
@@ -341,7 +310,7 @@ Track separately:
 
 - Mobile currently keeps `thinking` in UI state, but its serialized `StartSession` model does not include `thinking`. This is a separate compatibility bug, not required for initial app-server migration.
 
-### 19. Web Client Compatibility
+### 17. Web Client Compatibility
 
 No web protocol migration in the first pass.
 
@@ -353,7 +322,7 @@ Backend must preserve:
 - ordered response id / sequence handling
 - image attachment marker convention
 
-### 20. Tests To Add
+### 18. Tests To Add
 
 Add Rust tests for:
 
@@ -375,9 +344,8 @@ Add Rust tests for:
 16. Existing compaction tests still pass.
 17. Existing durable recovery tests still pass.
 18. Existing external session import tests still pass.
-19. Existing board session behavior still passes.
 
-### 21. Manual Verification
+### 19. Manual Verification
 
 Before updating the running app, manually test:
 
@@ -390,14 +358,12 @@ Before updating the running app, manually test:
 7. Start a text-only prompt after image prompt.
 8. Compact a chat.
 9. Compact and retry a failed chat.
-10. Run an agentic board Codex task.
-11. Check that the session appears in Codex CLI history/session storage.
-12. Confirm old `codex exec --json` fallback still works with the feature flag disabled.
-13. Confirm web UI formatting still collapses tool/thinking sections.
-14. Confirm mobile chat streaming still works.
-15. Confirm desktop chat streaming still works if desktop is in scope for the manual run.
+10. Check that the session appears in Codex CLI history/session storage.
+11. Confirm old `codex exec --json` fallback still works with the feature flag disabled.
+12. Confirm web UI formatting still collapses tool/thinking sections.
+13. Confirm mobile chat streaming still works.
 
-### 22. Rollout Criteria
+### 20. Rollout Criteria
 
 Only update the app running on this machine after:
 
@@ -409,7 +375,7 @@ Only update the app running on this machine after:
 6. No new mobile enum value is persisted.
 7. Existing dirty user changes are preserved.
 
-### 23. Rollback Plan
+### 21. Rollback Plan
 
 If app-server live turns break:
 
@@ -424,5 +390,4 @@ If app-server live turns break:
 1. Should app-server be enabled only for `native_cli` first, leaving `io_gateway` on the old path until separately verified?
 2. What exact feature flag name should be used?
 3. Should approval requests initially auto-decline, fail the turn, or force fallback to old CLI path?
-4. Should desktop image upload mismatch be fixed before or after app-server image support?
-5. Should `CODEX_HOME` be explicitly configurable through Workbench, or should import just auto-detect both `CODEX_HOME` and `~/.codex` shapes?
+4. Should `CODEX_HOME` be explicitly configurable through Workbench, or should import just auto-detect both `CODEX_HOME` and `~/.codex` shapes?

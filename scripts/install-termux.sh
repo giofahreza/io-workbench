@@ -772,49 +772,6 @@ if [ -e "$SOURCE_DIR" ] && [ ! -d "$SOURCE_DIR/.git" ]; then
     fail "$SOURCE_DIR already exists and is not an io-workbench Git checkout; move it aside manually before retrying."
 fi
 
-RAG_WORKSPACE_MEMBER='^[[:space:]]*"rag",[[:space:]]*$'
-recover_interrupted_termux_build() {
-    [ -f "$SOURCE_DIR/Cargo.toml" ] || return 0
-    for working in "$SOURCE_DIR"/.Cargo.toml.termux-build.*.working; do
-        [ -f "$working" ] || continue
-        build_id=${working##*.Cargo.toml.termux-build.}
-        build_id=${build_id%.working}
-        backup="$RUNTIME_HOME/Cargo.toml.termux-build.$build_id.backup"
-        if [ -f "$backup" ]; then
-            note 'discarding the incomplete temporary manifest from an interrupted Termux build.'
-            rm -f "$working" || fail "could not remove $working from the interrupted Termux build."
-        else
-            fail "an interrupted Termux build left $working without its recovery backup; preserve it and remove it manually before retrying."
-        fi
-    done
-    for backup in "$RUNTIME_HOME"/Cargo.toml.termux-build.*.backup; do
-        [ -f "$backup" ] || continue
-        if ! grep -q "$RAG_WORKSPACE_MEMBER" "$SOURCE_DIR/Cargo.toml" && \
-            grep -q "$RAG_WORKSPACE_MEMBER" "$backup"; then
-            if [ "$(sed '/^[[:space:]]*"rag",[[:space:]]*$/d' "$backup")" = "$(cat "$SOURCE_DIR/Cargo.toml")" ]; then
-                note 'restoring the manifest from an interrupted Termux build.'
-                mv "$backup" "$SOURCE_DIR/Cargo.toml" || fail 'could not restore the source manifest from the interrupted build.'
-            else
-                fail "an interrupted Termux build left $SOURCE_DIR/Cargo.toml changed; preserve your work and restore $backup manually before retrying."
-            fi
-        fi
-    done
-    for backup in "$RUNTIME_HOME"/Cargo.lock.termux-build.*.backup; do
-        [ -f "$backup" ] || continue
-        # A lock backup exists only while the paired manifest was temporarily
-        # pruned for a Termux build. At this point the installer-owned checkout
-        # has already restored its manifest, so put the exact lock file back
-        # before Cargo sees the full workspace again.
-        if [ -f "$SOURCE_DIR/Cargo.lock" ]; then
-            mv "$backup" "$SOURCE_DIR/Cargo.lock" || \
-                fail 'could not restore the Cargo lock file from the interrupted Termux build.'
-        else
-            fail "an interrupted Termux build left $SOURCE_DIR/Cargo.lock missing; restore $backup manually before retrying."
-        fi
-    done
-}
-recover_interrupted_termux_build
-
 recover_interrupted_termux_source_overlay() {
     [ "$TERMUX_SOURCE_OVERLAY_ENABLED" -eq 1 ] || return 0
     [ -d "$SOURCE_DIR/.git" ] || return 0
@@ -855,10 +812,8 @@ apply_termux_source_overlay() {
 }
 
 recover_interrupted_termux_source_overlay
-# From this point an overlay can be applied before the Cargo-manifest recovery
-# helpers are defined. Keep the source checkout recoverable even if Android
-# interrupts the installer in that short interval; the later trap adds the
-# manifest restoration as well.
+# From this point an overlay can be applied. Keep the source checkout
+# recoverable even if Android interrupts the installer.
 trap 'record_install_progress_failure; restore_termux_source_overlay; release_install_lock' EXIT
 trap 'restore_termux_source_overlay; release_install_lock; exit 130' HUP INT TERM
 
@@ -876,82 +831,11 @@ fi
 
 apply_termux_source_overlay
 
-# The native RAG implementation and mobile-app source are private Git
-# submodules. The localhost runtime intentionally disables RAG, but Cargo
-# still reads every workspace member before selecting iowb-cli. Temporarily
-# omit the unavailable RAG member only while building, then restore the exact
-# checked-out manifest so retries and ordinary Git updates remain clean.
-TERMUX_BUILD_MANIFEST=
-TERMUX_BUILD_MANIFEST_BACKUP=
-TERMUX_BUILD_MANIFEST_WORKING=
-TERMUX_BUILD_LOCKFILE=
-TERMUX_BUILD_LOCKFILE_BACKUP=
-restore_termux_workspace_manifest() {
-    if [ -n "$TERMUX_BUILD_MANIFEST_WORKING" ] && [ -f "$TERMUX_BUILD_MANIFEST_WORKING" ]; then
-        if rm -f "$TERMUX_BUILD_MANIFEST_WORKING"; then
-            TERMUX_BUILD_MANIFEST_WORKING=
-        else
-            printf '%s\n' "io-workbench Termux: error: could not remove $TERMUX_BUILD_MANIFEST_WORKING" >&2
-            return 1
-        fi
-    fi
-    if [ -n "$TERMUX_BUILD_LOCKFILE_BACKUP" ] && [ -f "$TERMUX_BUILD_LOCKFILE_BACKUP" ]; then
-        if mv "$TERMUX_BUILD_LOCKFILE_BACKUP" "$TERMUX_BUILD_LOCKFILE"; then
-            TERMUX_BUILD_LOCKFILE_BACKUP=
-        else
-            printf '%s\n' "io-workbench Termux: error: could not restore $TERMUX_BUILD_LOCKFILE" >&2
-            return 1
-        fi
-    fi
-    if [ -n "$TERMUX_BUILD_MANIFEST_BACKUP" ] && [ -f "$TERMUX_BUILD_MANIFEST_BACKUP" ]; then
-        if mv "$TERMUX_BUILD_MANIFEST_BACKUP" "$TERMUX_BUILD_MANIFEST"; then
-            TERMUX_BUILD_MANIFEST_BACKUP=
-        else
-            printf '%s\n' "io-workbench Termux: error: could not restore $TERMUX_BUILD_MANIFEST" >&2
-            return 1
-        fi
-    fi
-    return 0
-}
-trap 'record_install_progress_failure; restore_termux_workspace_manifest; restore_termux_source_overlay; release_install_lock' EXIT
-trap 'restore_termux_workspace_manifest; restore_termux_source_overlay; release_install_lock; exit 130' HUP INT TERM
-
 build_termux_binary() {
-    TERMUX_BUILD_MANIFEST="$SOURCE_DIR/Cargo.toml"
-    TERMUX_BUILD_MANIFEST_BACKUP="$RUNTIME_HOME/Cargo.toml.termux-build.$$.backup"
-    TERMUX_BUILD_MANIFEST_WORKING="$SOURCE_DIR/.Cargo.toml.termux-build.$$.working"
-    TERMUX_BUILD_LOCKFILE="$SOURCE_DIR/Cargo.lock"
-    TERMUX_BUILD_LOCKFILE_BACKUP="$RUNTIME_HOME/Cargo.lock.termux-build.$$.backup"
-    cp "$TERMUX_BUILD_MANIFEST" "$TERMUX_BUILD_MANIFEST_BACKUP" || return 1
-    cp "$TERMUX_BUILD_LOCKFILE" "$TERMUX_BUILD_LOCKFILE_BACKUP" || return 1
-    # Write alongside the manifest and atomically replace it only once the
-    # complete pruned form is ready. An Android process kill therefore leaves
-    # either the original or an exactly recoverable manifest.
-    if ! sed '/^[[:space:]]*"rag",[[:space:]]*$/d' "$TERMUX_BUILD_MANIFEST_BACKUP" >"$TERMUX_BUILD_MANIFEST_WORKING"; then
-        restore_termux_workspace_manifest
-        return 1
-    fi
-    if ! mv "$TERMUX_BUILD_MANIFEST_WORKING" "$TERMUX_BUILD_MANIFEST"; then
-        restore_termux_workspace_manifest
-        return 1
-    fi
-    TERMUX_BUILD_MANIFEST_WORKING=
-    if grep -q "$RAG_WORKSPACE_MEMBER" "$TERMUX_BUILD_MANIFEST"; then
-        printf '%s\n' 'could not omit the RAG workspace member from Cargo.toml.' >&2
-        restore_termux_workspace_manifest
-        return 1
-    fi
-    # Pruning one workspace member changes Cargo's generated workspace
-    # metadata in Cargo.lock, so --locked must not be used for this temporary
-    # build. The exact checked-out lock file is restored immediately below.
-    if ! (cd "$SOURCE_DIR" && cargo build --release -j "$CARGO_BUILD_JOBS" -p iowb-cli --bin io-workbench); then
-        return 1
-    fi
-    restore_termux_workspace_manifest
+    (cd "$SOURCE_DIR" && cargo build --release -j "$CARGO_BUILD_JOBS" -p iowb-cli --bin io-workbench)
 }
 
 record_install_progress compiling 4
-note 'RAG is unavailable in the local Termux runtime and remains disabled.'
 note "building with $CARGO_BUILD_JOBS Cargo job(s); raise IO_WORKBENCH_TERMUX_CARGO_JOBS only on devices with ample RAM."
 note 'building the Android/Bionic release binary; this can take several minutes on a phone.'
 run_or_fail 'Rust release build' build_termux_binary
@@ -1124,7 +1008,6 @@ export IO_WORKBENCH_CONFIG_DIR="$CONFIG_DIR"
 export IO_WORKBENCH_WORKSPACE_ROOT="$WORKSPACE_ROOT"
 export IO_WORKBENCH_AUTH_REQUIRED=true
 export IO_WORKBENCH_FCM_ENABLED=false
-export IO_WORKBENCH_RAG_MODE=off
 # Keep a random Termux-private bearer token on fresh local runtimes. This
 # prevents an arbitrary Android app from claiming the unauthenticated
 # first-user setup endpoint over shared loopback. Existing password-based

@@ -106,8 +106,6 @@ jobs:
           test -f "$site_dir/images/landing/database-query-dark-mobile-20260907.webp"
           test -f "$site_dir/images/landing/terminal-session-dark-20260907.webp"
           test -f "$site_dir/images/landing/terminal-session-dark-mobile-20260907.webp"
-          test -f "$site_dir/images/landing/agentic-board-dark-20260907.webp"
-          test -f "$site_dir/images/landing/agentic-board-dark-mobile-20260907.webp"
           test -f "$site_dir/icon.svg"
           test -f "$site_dir/brand-mark.svg"
           test -f "$site_dir/brand-loader.svg"

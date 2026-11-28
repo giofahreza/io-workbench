@@ -16,7 +16,7 @@ while IFS= read -r -d '' file; do
         failed=1
     fi
 done < <(
-    find "$repo_root/crates" "$repo_root/rag" \
+    find "$repo_root/crates" \
         -path '*/vendor' -prune -o \
         -type f \( \
             -name '*.rs' -o \

@@ -4,7 +4,7 @@
 
 [Website](https://workbench.giofahreza.com) · [Documentation](https://workbench.giofahreza.com/docs/) · [Releases](https://github.com/giofahreza/io-workbench/releases)
 
-io-workbench turns the machine where your projects live into a remote, authenticated workspace. Run your configured agent CLIs against the same project context, inspect files and Git changes, work with databases, and use a real server-hosted PTY from the browser, desktop, or mobile client.
+io-workbench turns the machine where your projects live into a remote, authenticated workspace. Run your configured agent CLIs against the same project context, inspect files and Git changes, work with databases, and use a real server-hosted PTY from the browser or the mobile client.
 
 ## Why io-workbench
 
@@ -14,7 +14,7 @@ A remote agent chat is useful, but delivery work also touches source code, branc
 - Review files, diffs, branches, remotes, commits, and workspace changes beside the agent conversation.
 - Use a Navicat-style database workspace for SQLite, PostgreSQL, MySQL, and MariaDB.
 - Run and control a live PTY terminal; Android includes touch-friendly terminal controls and structured database row copy/paste.
-- Plan and review work with the Agentic Board, validation steps, and durable session history.
+- Keep durable session history for every agent conversation.
 
 ## Install
 
@@ -72,7 +72,7 @@ cargo build --release -p iowb-cli --bin io-workbench
 
 ## Documentation
 
-The hosted documentation has complete installation and workflow guides for web, desktop, Android, and PWA clients:
+The hosted documentation has complete installation and workflow guides for web, Android, and PWA clients:
 
 - [Get started](https://workbench.giofahreza.com/docs/quick-start/)
 - [Install and update](https://workbench.giofahreza.com/docs/install-and-update/)
@@ -84,7 +84,6 @@ Repository design and operator material lives in [`docs/`](docs/):
 
 - [Production deployment](docs/deployment.md)
 - [Rust rewrite architecture](docs/architecture/rust-rewrite-plan.md)
-- [Agentic Board / Kanban design](docs/design/kanban.md)
 - [Codex app-server migration plan](docs/migrations/codex-app-server.md)
 - [Codex model settings and token accounting](docs/codex-configuration.md)
 - [Claude CLI continuation and live switching](docs/architecture/claude-session-switching.md)
@@ -101,7 +100,7 @@ crates/
   iowb-fs         File tree, file IO, and path validation
   iowb-process    Tokio process supervision
   iowb-ui         Embedded static UI assets
-apps/             Mobile and desktop clients (submodule)
+apps/             Mobile clients (submodule)
 docs/             Repository architecture, design, migration, and deployment docs
 ```
 

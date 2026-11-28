@@ -21,7 +21,7 @@ The rewrite is mainly motivated by runtime and packaging improvements:
 Keep the current app flow and concept:
 
 - Start a local or remote workspace server.
-- Open a browser, desktop client, or mobile client.
+- Open a browser or mobile client.
 - Browse projects and sessions.
 - Chat with agent sessions.
 - Inspect and edit files.
@@ -72,7 +72,6 @@ io-workbench/
     iowb-ui/         # Rust frontend app
   apps/
     mobile/          # mobile packaging and remote server setup
-    desktop/         # optional desktop packaging later
 ```
 
 ## Runtime Model
@@ -93,7 +92,6 @@ Clients connect to the server:
 ```text
 browser UI     -> HTTP + WebSocket -> Rust server
 mobile app     -> HTTPS/WSS        -> Rust server
-desktop client -> HTTP + WebSocket -> Rust server
 ```
 
 Mobile should remain a remote client. It should not run agent CLIs locally.
@@ -116,7 +114,7 @@ Backend and runtime:
 
 Frontend:
 
-- Prefer a Rust-owned frontend using Dioxus for web/mobile/desktop direction.
+- Prefer a Rust-owned frontend using Dioxus for the web/mobile direction.
 - Keep hard widgets isolated behind interfaces.
 - Allow selective use of mature browser widgets where needed, especially editor and terminal widgets.
 

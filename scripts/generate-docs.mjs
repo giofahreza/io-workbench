@@ -387,7 +387,7 @@ const pageDefinitions = [
     group: "Get started",
     type: "Tutorial",
     summary: "Use the browser UI from first sign-in through a reviewable agent, code, Git, data, and terminal loop.",
-    keywords: "web workspace browser ui sign in add existing project command palette database shell agent prompt config claude codex gemini files git board reconnect",
+    keywords: "web workspace browser ui sign in add existing project command palette database shell agent prompt config claude codex gemini files git reconnect",
     body: [
       lead("The Web workspace is the primary remote desk for an io-workbench host. It gives one authenticated browser view to projects, configured agent CLIs, files, Git evidence, database work, and a live host terminal."),
       section("First browser session", [
@@ -416,7 +416,6 @@ const pageDefinitions = [
           ["<strong>Git</strong>", "Check status and diffs, stage/commit, inspect branches/remotes, and fetch/pull/push when appropriate.", "Git repository, remotes, and credentials."],
           ["<strong>Database</strong>", "Save/test connections, inspect schema, run SQL, and review rows next to the change that affects them.", "Database connections and database access from the server."],
           ["<strong>Shell</strong>", "Run a real PTY in the selected project for test, build, migration, or operational commands.", "Shell process, working directory, output, and process controls."],
-          ["<strong>Board</strong>", "Break broad delivery work into reviewable tasks, validations, and approvals.", "Board state and command-backed integrations configured on the host."],
         ],
       )),
       section("A practical first task", [
@@ -427,7 +426,6 @@ const pageDefinitions = [
           ["Inspect Files and Git", "Open <strong>Files</strong>, select a file from the tree, use Edit or Preview, then Save intentional changes. Open <strong>Git</strong>, select changed rows, review Diff/File Review, stage the intended files, enter a commit message, then use <strong>Commit Selected</strong>."],
           ["Add data evidence when needed", "Open the Command palette with <strong>Command</strong> or <strong>Ctrl/Cmd+K</strong>, select <strong>Open Database Explorer</strong>, then choose <strong>New</strong>. Fill the connection form, use <strong>Test Form</strong>, then <strong>Save Connection</strong>. Select the saved connection and use Explorer or SQL → Run Query for a narrow check."],
           ["Run Shell validation", "Select <strong>Shell</strong> to start or reuse a PTY in the chosen project, then run the relevant test, build, migration, or lint command on the host. Restart replaces that PTY; Stop kills it."],
-          ["Track and close the work", "For reviewable substeps, open <strong>Board</strong>, enter a Board Prompt, choose provider/model and Git Policy (the default is Read Only), then use <strong>Add To Board</strong>. Review the backlog and explicitly start it with <strong>Start board tasks</strong>; creating a backlog does not execute it."],
         ]),
       ].join("\n")),
       section("Web UI boundaries", [
@@ -444,12 +442,12 @@ const pageDefinitions = [
           ["Shortcut", "Desktop Web action"],
           [
             ["<code>Ctrl/Cmd+K</code>", "Open the Command palette."],
-            ["<code>Ctrl/Cmd+,</code> / <code>Ctrl/Cmd+.</code>", "Move backward/forward through Files, Chat, Git, and Board."],
+            ["<code>Ctrl/Cmd+,</code> / <code>Ctrl/Cmd+.</code>", "Move backward/forward through Files, Chat, and Git."],
             ["<code>Alt+,</code> / <code>Alt+.</code>", "Move backward/forward through pinned Chat sessions."],
             ["<code>Ctrl/Cmd+S</code> / <code>Ctrl/Cmd+F</code>", "Save the focused file / focus file search."],
           ],
         ),
-        note("Do not assume mobile-only bindings apply here", "The desktop Web workspace does not use <code>Alt+P</code> to focus an input, <code>Alt+M</code> to open Home, Home-card arrows, or mobile Board-column arrow navigation."),
+        note("Do not assume mobile-only bindings apply here", "The desktop Web workspace does not use <code>Alt+P</code> to focus an input, <code>Alt+M</code> to open Home, or Home-card arrows."),
       ].join("\n")),
       section("Find these guides inside the app", paragraph("Open <strong>Settings → About → Product Docs</strong>, or open <strong>Sidebar → Command</strong> (or <strong>Ctrl/Cmd+K</strong>) and choose <strong>Open Product Docs</strong>.")),
       section("Next steps", paragraph("Pair the web desk with " + docLink("mobile", "mobile access") + " for a phone client, read " + docLink("agents-and-sessions", "Agents and sessions") + " for provider and recovery details, or use " + docLink("settings-and-integrations", "Settings and integrations") + " to configure the richer operational surfaces.")),
@@ -505,7 +503,7 @@ const pageDefinitions = [
         codeCard("io-workbench-local status\nio-workbench-local doctor --require-running\nio-workbench-local logs", "Termux local-host checks after installation"),
         note("Storage and exposure", "Termux private storage is the live host workspace and also holds the generated local token with owner-only permissions. Keep projects under its private <code>~/dev</code> default rather than shared Android storage, leave the listener on <code>127.0.0.1</code>, and do not copy that token into a general clipboard or shared storage. Use a deliberate import/export or backup flow for shared files, and configure a separate authenticated remote-access boundary if the host must ever leave the device.", true),
         note("Provider CLIs stay opt-in", "The Android handoff saves its reviewed installer at <code>~/.local/share/io-workbench/install-termux.sh</code>. Run that command directly in Termux with <code>--with-codex</code>, <code>--with-claude</code>, <code>--with-gemini</code>, or <code>--with-all-clis</code>. It never asks for provider credentials; complete Codex, Claude, or Gemini's own login flow in Termux before expecting agent sessions to work."),
-        note("Local-runtime limits", "The Termux wrapper deliberately disables RAG and FCM/push delivery. The app's <strong>Install</strong> and <strong>Start</strong> controls run the host through Termux's foreground command service while its Termux notification is present. <strong>Stop</strong> ends that host without removing the pairing or projects. A detached <code>io-workbench-local start</code> command can still be reclaimed by Android; use the app control or an active Termux terminal for longer-running work, and restart after a device restart or process stop. Use a conventional Linux, macOS, or Windows host when RAG, push delivery, or a durable service-manager lifecycle is required."),
+        note("Local-runtime limits", "The Termux wrapper deliberately disables FCM/push delivery. The app's <strong>Install</strong> and <strong>Start</strong> controls run the host through Termux's foreground command service while its Termux notification is present. <strong>Stop</strong> ends that host without removing the pairing or projects. A detached <code>io-workbench-local start</code> command can still be reclaimed by Android; use the app control or an active Termux terminal for longer-running work, and restart after a device restart or process stop. Use a conventional Linux, macOS, or Windows host when push delivery or a durable service-manager lifecycle is required."),
       ].join("\n")),
       section("Connect Android to the host", [
         steps([
@@ -543,7 +541,7 @@ const pageDefinitions = [
       section("Mobile capability matrix", table(
         ["Capability", "Android native", "Web harness / PWA / iOS"],
         [
-          ["<strong>Chat, Files, Git, Board</strong>", "Available against a remote host or optional local Termux host.", "Available through the shared Kotlin/JS browser surface against a remote host."],
+          ["<strong>Chat, Files, Git</strong>", "Available against a remote host or optional local Termux host.", "Available through the shared Kotlin/JS browser surface against a remote host."],
           ["<strong>Terminal</strong>", "Native terminal renderer built with Termux components by default; it can use a web-terminal mode when needed. It controls the connected server PTY, including one hosted in separate Termux.", "Browser-rendered remote terminal controls; do not expect Android-native terminal parity on iOS."],
           ["<strong>Database workspace</strong>", "Has a native Database surface for connections, explorer, SQL, paged rows, and Android-specific structured row clipboard actions.", "The mobile web harness currently does not expose the Database tab. Use Android native or the full web workspace for database work."],
           ["<strong>Structured row copy/paste</strong>", "Select rows and copy/paste JSON or CSV with the native Android data grid.", "No mobile-browser row clipboard controls; the full browser database grid also does not currently expose them."],
@@ -561,7 +559,7 @@ const pageDefinitions = [
             ["Unfocused Chat <code>↑</code>/<code>↓</code>", "Scroll the transcript; add <code>Shift</code> for a faster scroll."],
           ],
         ),
-        note("Desktop Web is different", "Do not expect <code>Alt+P</code>, <code>Alt+M</code>, Home-card arrows, or mobile Board-column arrows in the desktop browser workspace."),
+        note("Desktop Web is different", "Do not expect <code>Alt+P</code>, <code>Alt+M</code>, or Home-card arrows in the desktop browser workspace."),
       ].join("\n")),
       section("Use mobile in a real work loop", [
         cards([
@@ -577,7 +575,7 @@ const pageDefinitions = [
         ["Review Files and Git", "Read the host files changed by the task, then inspect Git status/diff before you approve or continue the request."],
         ["Validate in Terminal", "Open the selected server PTY in the project and run the smallest relevant test, build, migration, or inspection command. In the local Android route, this PTY runs in Termux."],
         ["Use Database on Android when needed", "Open <strong>Database → Explorer → Add connection</strong>, enter the connection, use <strong>Test</strong>, then <strong>Save</strong>. Use Explorer or SQL for a narrow check; select/copy/paste structured rows only after confirming the target."],
-        ["Record the result", "Return to Chat or Board with the diff, command result, and any data evidence so the next decision remains reviewable."],
+        ["Record the result", "Return to Chat with the diff, command result, and any data evidence so the next decision remains reviewable."],
       ])),
       section("If connection fails", list([
         "<strong>Wrong URL</strong>: test the address from the phone browser and confirm it points to io-workbench rather than a proxy login HTML page.",
@@ -769,28 +767,20 @@ const pageDefinitions = [
     ].join("\n"),
   },
   {
-    slug: "boards-and-tools",
-    title: "Boards and tools",
+    slug: "tools",
+    title: "Tools",
     group: "Operate safely",
     type: "How-to guide",
-    summary: "Turn broad work into reviewable tasks with the Agentic Board and deliberately configured command-backed tools.",
-    keywords: "agentic board tasks validation qa approval mcp commands plugins taskmaster watchers automation notifications",
+    summary: "Understand the deliberately configured, command-backed tools: MCP, commands and plugins, Taskmaster, watchers, and notifications.",
+    keywords: "mcp commands plugins taskmaster watchers automation notifications",
     body: [
-      lead("The Agentic Board and tool integrations make work reviewable rather than opaque. Use them to break a broad goal into scoped tasks, provider choices, validation evidence, and explicit approval boundaries."),
-      section("Run a controlled delivery loop", steps([
-        ["Select the project and open Board", "Keep the task scope tied to the same host project whose files, Git state, database, and Shell you will review."],
-        ["Author the board request", "Enter a Board Prompt, choose the provider/model and Git Policy, then use <strong>Add To Board</strong>. The default Git Policy is Read Only; change it deliberately only when the task truly needs write authority."],
-        ["Review the backlog before execution", "Inspect the generated tasks, constraints, expected validation, and approval points. Adding a backlog creates reviewable work; it does not start execution."],
-        ["Start intentionally", "Use <strong>Start board tasks</strong> only after the backlog and policy are understood. Confirm the configured provider and command-backed integration before allowing host work."],
-        ["Review progress and evidence", "Use task status, output, Git changes, Shell validation, and database results to decide whether a task should continue, retry, or wait for approval."],
-        ["Close only verified work", "Mark the task done after the code, tests, data effects, and Git evidence match the intended result."],
-      ])),
+      lead("Tool integrations are command-backed: each one runs on the host with the authority you give it. Configure them deliberately and review what they can change before giving a remote client access."),
       section("Command-backed integrations", table(
         ["Integration", "What it can do", "Operator responsibility"],
         [
           ["<strong>MCP</strong>", "Start/stop/list configured MCP processes and run command-backed tools with persisted run history.", "Configure the host command and arguments deliberately; treat tool execution as host execution."],
           ["<strong>Commands and plugins</strong>", "Run slash-command, plugin, and utility integrations.", "Review the command path, environment, arguments, and workspace access before enabling it."],
-          ["<strong>Taskmaster and board actions</strong>", "Coordinate planning, task runs, validation, retries, and delivery state.", "Keep human approvals and validation expectations explicit."],
+          ["<strong>Taskmaster</strong>", "Run the externally configured Taskmaster command (<code>IO_WORKBENCH_TASKMASTER_COMMAND</code>).", "Configure the command and arguments deliberately; treat it as host execution."],
           ["<strong>Watchers and notifications</strong>", "Monitor project roots and send configured notifications.", "Limit watched paths and destinations to what the host operator intends."],
         ],
       )),
@@ -831,7 +821,7 @@ const pageDefinitions = [
       section("Before running a high-impact action", compactSteps([
         ["Confirm the host and project", "Make sure you are connected to the expected server profile and selected project."],
         ["Inspect the target", "Read the diff, SQL, path, process, or command before executing it."],
-        ["Keep evidence", "Use session history, Git, terminal output, and board validation so the action can be reviewed later."],
+        ["Keep evidence", "Use session history, Git, and terminal output so the action can be reviewed later."],
         ["Use a rollback path", "For data, deployment, or destructive file work, know the backup/revert strategy before the action starts."],
       ])),
     ].join("\n"),
@@ -940,7 +930,7 @@ const pageDefinitions = [
             ["<code>DEPLOY_HEALTH_URL</code>", "<code>http://127.0.0.1:8100/health</code>.", "Proves the restarted host locally after the service is replaced."],
             ["<code>DEPLOY_SSH_PORT</code>", "Optional; defaults to port <code>22</code>.", "Overrides the controlled SSH endpoint only when the production layout requires it."],
             ["<code>IOWB_ANDROID_KEYSTORE_BASE64</code>, <code>IOWB_ANDROID_KEYSTORE_PASSWORD</code>, <code>IOWB_ANDROID_KEY_ALIAS</code>, <code>IOWB_ANDROID_KEY_PASSWORD</code>", "One stable Android signing key and its credentials.", "Keeps future APKs installable as updates rather than signature-mismatched new apps."],
-            ["<code>IOWB_SUBMODULES_TOKEN</code>", "Optional read-only Contents token for the private <code>apps</code>/<code>rag</code> submodules.", "Lets the tag workflow check out the same mobile and Rust source that the tag references."],
+            ["<code>IOWB_SUBMODULES_TOKEN</code>", "Optional read-only Contents token for the private <code>apps</code> submodule.", "Lets the tag workflow check out the same mobile and Rust source that the tag references."],
           ],
         ),
         note("Keep Pages and the host separate", "Reserve <code>workbench.giofahreza.com</code> for the GitHub Pages landing/docs CNAME. Do not add it to a Cloudflare Tunnel ingress or use it as a production API URL. If the host needs remote browser or mobile access, choose a different authenticated VPN, proxy, or tunnel hostname and verify its HTTPS/WSS boundary separately."),
@@ -1003,7 +993,7 @@ const pageDefinitions = [
           "<strong>Disable or remove stale integrations</strong> when their command, credential, or access boundary is no longer intended.",
         ]),
       ].join("\n")),
-      section("Continue with", paragraph("Read " + docLink("agents-and-sessions", "Agents and sessions") + " before provider work, " + docLink("boards-and-tools", "Boards and tools") + " before task automation, " + docLink("configuration", "Configuration") + " for environment-backed settings, and " + docLink("security-and-boundaries", "Security and boundaries") + " before extending host control.")),
+      section("Continue with", paragraph("Read " + docLink("agents-and-sessions", "Agents and sessions") + " before provider work, " + docLink("tools", "Tools") + " before tool automation, " + docLink("configuration", "Configuration") + " for environment-backed settings, and " + docLink("security-and-boundaries", "Security and boundaries") + " before extending host control.")),
     ].join("\n"),
   },
   {
@@ -1088,7 +1078,7 @@ const pageDefinitions = [
     group: "Reference",
     type: "Reference",
     summary: "Use the Web workspace and mobile keyboard shortcuts without mistaking the desktop browser map for the Android or PWA map.",
-    keywords: "keyboard mappings keyboard shortcuts keymap hotkeys web browser desktop android mobile pwa ctrl cmd alt home prompt editor git board terminal database alt+k alt+arrow-down alt+p alt+m ctrl/cmd+k ctrl/cmd+s ctrl/cmd+f ctrl/cmd+enter ctrl+tab ctrl+shift+tab ctrl/cmd+space ctrl+k cmd+k ctrl+s cmd+s ctrl+f cmd+f ctrl+enter cmd+enter ctrl+space cmd+space f5 f6 f7",
+    keywords: "keyboard mappings keyboard shortcuts keymap hotkeys web browser desktop android mobile pwa ctrl cmd alt home prompt editor git terminal database alt+k alt+arrow-down alt+p alt+m ctrl/cmd+k ctrl/cmd+s ctrl/cmd+f ctrl/cmd+enter ctrl+tab ctrl+shift+tab ctrl/cmd+space ctrl+k cmd+k ctrl+s cmd+s ctrl+f cmd+f ctrl+enter cmd+enter ctrl+space cmd+space f5 f6 f7",
     body: [
       lead("io-workbench has separate keyboard maps for the desktop <strong>Web workspace</strong> and the mobile <strong>Android / web harness / PWA</strong> clients. The mobile PWA follows the mobile map, not the desktop browser map. Use a physical keyboard for mobile shortcuts."),
       section("Read the notation", table(
@@ -1096,7 +1086,7 @@ const pageDefinitions = [
         [
           ["<code>Ctrl/Cmd</code>", "Use <code>Ctrl</code> on Windows/Linux or <code>Cmd</code> on macOS. A mobile keyboard that sends the Meta/Command modifier follows the same command-style bindings."],
           ["<code>+</code>", "Hold the modifier while pressing the following key. For example, <code>Ctrl/Cmd+.</code> means Ctrl or Command plus period."],
-          ["<code>↑</code>, <code>↓</code>, <code>←</code>, <code>→</code>", "Arrow keys. A mapping is contextual when its table says a prompt, editor, grip, board tabs, or Home is focused."],
+          ["<code>↑</code>, <code>↓</code>, <code>←</code>, <code>→</code>", "Arrow keys. A mapping is contextual when its table says a prompt, editor, grip, or Home is focused."],
           ["<code>Esc</code>", "Dismisses the current app-owned overlay or modal when that surface offers an Escape action. Browser and operating-system reserved shortcuts can still take precedence."],
         ],
       )),
@@ -1106,7 +1096,7 @@ const pageDefinitions = [
           [
             ["<code>Ctrl/Cmd+K</code>", "Anywhere", "Open the Command palette."],
             ["<code>↑</code> / <code>↓</code>, <code>Enter</code>, <code>Esc</code>", "Command palette", "Select previous/next command, run it, or close the palette."],
-            ["<code>Ctrl/Cmd+,</code> / <code>Ctrl/Cmd+.</code>", "Project workspace", "Move backward/forward through <strong>Files → Chat → Git → Board</strong>, wrapping at either end."],
+            ["<code>Ctrl/Cmd+,</code> / <code>Ctrl/Cmd+.</code>", "Project workspace", "Move backward/forward through <strong>Files → Chat → Git</strong>, wrapping at either end."],
             ["<code>Alt+,</code> / <code>Alt+.</code>", "Anywhere with pinned chats", "Open the previous/next pinned Chat session, wrapping at either end."],
             ["<code>Alt+K</code>", "Anywhere", "Open Chat and show Chat config."],
             ["<code>Alt+↓</code>", "Chat transcript", "Jump directly to the latest message at the bottom of the transcript."],
@@ -1131,11 +1121,11 @@ const pageDefinitions = [
             ["<code>Alt+I</code>", "Outside a blocking dialog", "Open Chat and focus the prompt without clearing its draft. Also available as Focus chat prompt in the command palette."],
             ["<code>Enter</code> / <code>Esc</code>", "Inline file or folder name", "Create/rename the item / cancel the inline edit."],
             ["<code>Esc</code>", "Docs search", "Clear and blur the search field."],
-            ["<code>Tab</code> / <code>Shift+Tab</code>", "Git or Board modal", "Keep focus inside the open dialog; <code>Esc</code> closes it."],
+            ["<code>Tab</code> / <code>Shift+Tab</code>", "Git modal", "Keep focus inside the open dialog; <code>Esc</code> closes it."],
             ["Printable keys, <code>Ctrl</code>+letter, and terminal navigation keys", "Shell", "Send input to the server-hosted PTY. Enter, Backspace, Tab, Esc, arrows, Delete, Home, End, Page Up, and Page Down are forwarded; Alt/Meta are not sent by the Web Shell key handler."],
           ],
         ),
-        note("Mobile-only controls are absent", "The desktop Web workspace does <strong>not</strong> bind <code>Alt+P</code>, <code>Alt+M</code>, unfocused-Chat arrow scrolling, Home-card arrows, or Board-column arrow navigation."),
+        note("Mobile-only controls are absent", "The desktop Web workspace does <strong>not</strong> bind <code>Alt+P</code>, <code>Alt+M</code>, unfocused-Chat arrow scrolling, or Home-card arrows."),
       ].join("\n")),
       section("Mobile apps — Android and web harness/PWA", [
         paragraph("The Android app and mobile web harness/PWA share the following hardware-keyboard contract. The PWA is intentionally listed here because it is a mobile client, even though it runs in a browser."),
@@ -1148,7 +1138,6 @@ const pageDefinitions = [
             ["<code>Enter</code>", "Files → Go to line", "Move the editor cursor to the requested line."],
             ["<code>↑</code> / <code>↓</code>", "Home/More", "Focus the previous/next project or session card. At either edge, the card remains focused; arrows do not fall through to page scrolling."],
             ["<code>←</code> / <code>→</code>", "Home/More", "Move focus between the Home navigation controls without activating them."],
-            ["<code>←</code> / <code>→</code>, <code>Home</code> / <code>End</code>", "Focused Board column tabs", "Focus the previous/next column, or the first/last column."],
             ["Terminal keys", "Remote terminal", "Use terminal semantics for host-PTY input. Android forwards standard control/navigation keys; the PWA uses the xterm terminal's native mappings."],
           ],
         ),
@@ -1173,7 +1162,7 @@ const pageDefinitions = [
         ),
       ].join("\n")),
       section("When a shortcut does not work", list([
-        "<strong>Check focus first</strong>: prompt, editor, search, drag grip, board tabs, Home, and terminal mappings apply only to their active control.",
+        "<strong>Check focus first</strong>: prompt, editor, search, drag grip, Home, and terminal mappings apply only to their active control.",
         "<strong>Use a physical keyboard on mobile</strong>: touch controls remain available, but they do not synthesize the hardware-keyboard shortcuts.",
         "<strong>Expect native/browser reservations</strong>: the browser, operating system, keyboard firmware, or an accessibility service can reserve a key combination before io-workbench receives it.",
         "<strong>Keep the surface straight</strong>: use this page's Web table for the desktop browser workspace and its Mobile table for Android or the mobile PWA.",
@@ -1205,7 +1194,7 @@ const pageRelationships = {
   },
   "agents-and-sessions": {
     topics: ["Web workspace", "Agents and providers", "Projects and Git"],
-    seeAlso: ["web-workspace", "projects-files-git", "configuration", "boards-and-tools"],
+    seeAlso: ["web-workspace", "projects-files-git", "configuration", "tools"],
   },
   "projects-files-git": {
     topics: ["Web workspace", "Projects and Git"],
@@ -1219,7 +1208,7 @@ const pageRelationships = {
     topics: ["Web workspace", "Mobile clients", "Database and terminal"],
     seeAlso: ["web-workspace", "mobile", "security-and-boundaries"],
   },
-  "boards-and-tools": {
+  tools: {
     topics: ["Agents and providers", "Operations and API"],
     seeAlso: ["agents-and-sessions", "settings-and-integrations", "security-and-boundaries"],
   },
@@ -1237,7 +1226,7 @@ const pageRelationships = {
   },
   "settings-and-integrations": {
     topics: ["Agents and providers", "Operations and API"],
-    seeAlso: ["agents-and-sessions", "boards-and-tools", "configuration", "security-and-boundaries"],
+    seeAlso: ["agents-and-sessions", "tools", "configuration", "security-and-boundaries"],
   },
   troubleshooting: {
     topics: ["Mobile clients", "Remote access and security", "Operations and API"],
@@ -1438,7 +1427,7 @@ function renderHome() {
     section("How the product fits together", cards([
       ["1. Host", "Run io-workbench where the work lives", "The server owns repositories, CLIs, provider credentials, database connectivity, shell processes, and storage."],
       ["2. Control surface", "Use Web or mobile", "Sign in from a browser, Android client, or PWA to operate the same selected project remotely."],
-      ["3. Evidence loop", "Review before shipping", "Use agent output with files, Git, database results, terminal validation, and board state instead of trusting a chat-only summary."],
+      ["3. Evidence loop", "Review before shipping", "Use agent output with files, Git, database results, and terminal validation instead of trusting a chat-only summary."],
     ], true)),
     section("Guide map", groups.map((group) => [
       '<section class="docs-category" aria-labelledby="category-' + escapeHtml(group.slug) + '">',
