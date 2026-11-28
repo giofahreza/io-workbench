@@ -131,7 +131,8 @@ impl Storage {
 
     /// Return every non-terminal run, including runs which opted out of
     /// recovery or exhausted their retry budget. Startup reconciliation can
-    /// use this to explicitly mark those rows interrupted.
+    /// use this to explicitly mark those rows interrupted. Runs owned by
+    /// retired sessions are excluded: they are never recovered.
     pub fn list_active_durable_chat_runs(&self) -> Result<Vec<StoredDurableChatRun>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(

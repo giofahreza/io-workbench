@@ -70,10 +70,6 @@ impl SessionManager {
         }
         let mut sessions = self.sessions.write().await;
         sessions.remove(session_id);
-        self.board_session_ids
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(session_id);
         Ok(session)
     }
 

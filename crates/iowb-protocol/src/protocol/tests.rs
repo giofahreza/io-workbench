@@ -34,28 +34,7 @@
     }
 
     #[test]
-    fn subscribe_board_session_scope_uses_camel_case_and_defaults_empty() {
-        let scoped: WsClientCommand = serde_json::from_value(json!({
-            "type": "subscribe",
-            "topics": ["sessions"],
-            "sessionIds": ["board-session"]
-        }))
-        .expect("deserialize scoped subscription");
-        match scoped {
-            WsClientCommand::Subscribe {
-                topics,
-                session_ids,
-                chat_session_ids,
-                process_ids,
-            } => {
-                assert_eq!(topics, ["sessions"]);
-                assert_eq!(session_ids, ["board-session"]);
-                assert_eq!(chat_session_ids, None);
-                assert!(process_ids.is_empty());
-            }
-            _ => panic!("expected subscribe"),
-        }
-
+    fn subscribe_chat_and_process_scopes_use_camel_case_and_default_empty() {
         let ordinary: WsClientCommand = serde_json::from_value(json!({
             "type": "subscribe",
             "topics": ["sessions"]
@@ -63,12 +42,13 @@
         .expect("deserialize ordinary subscription");
         match ordinary {
             WsClientCommand::Subscribe {
-                session_ids,
+                topics,
                 chat_session_ids,
-                ..
+                process_ids,
             } => {
-                assert!(session_ids.is_empty());
+                assert_eq!(topics, ["sessions"]);
                 assert_eq!(chat_session_ids, None);
+                assert!(process_ids.is_empty());
             }
             _ => panic!("expected subscribe"),
         }
@@ -142,44 +122,13 @@
     }
 
     #[test]
-    fn board_session_summary_uses_camel_case_scope_fields() {
+    fn session_summary_serializes_native_session_id_in_camel_case() {
         let summary = SessionSummary {
-            board_session: true,
-            board_id: Some("board-1".to_string()),
-            board_task_id: Some("task-1".to_string()),
             native_session_id: Some("native-1".to_string()),
             ..Default::default()
         };
-        let value = serde_json::to_value(summary).expect("serialize board session");
-        assert_eq!(value["boardSession"], true);
-        assert_eq!(value["boardId"], "board-1");
-        assert_eq!(value["boardTaskId"], "task-1");
+        let value = serde_json::to_value(summary).expect("serialize session");
         assert_eq!(value["nativeSessionId"], "native-1");
-    }
-
-    #[test]
-    fn board_session_summary_recognizes_legacy_and_partial_scope_metadata() {
-        let legacy: SessionSummary = serde_json::from_value(serde_json::json!({
-            "id": "legacy-board-session",
-            "boardRunId": "board-legacy"
-        }))
-        .expect("deserialize legacy board scope");
-        assert_eq!(legacy.board_id.as_deref(), Some("board-legacy"));
-        assert!(legacy.is_board_session());
-
-        let board_id_only = SessionSummary {
-            board_id: Some("board-1".to_string()),
-            ..Default::default()
-        };
-        let task_id_only = SessionSummary {
-            board_task_id: Some("task-1".to_string()),
-            ..Default::default()
-        };
-        let ordinary = SessionSummary::default();
-
-        assert!(board_id_only.is_board_session());
-        assert!(task_id_only.is_board_session());
-        assert!(!ordinary.is_board_session());
     }
 
     #[test]

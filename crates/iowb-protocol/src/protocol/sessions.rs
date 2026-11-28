@@ -1,21 +1,3 @@
-impl SessionSummary {
-    /// Board ownership was added after some session rows already existed.
-    /// Treat either explicit ownership id as authoritative even when the
-    /// older `boardSession` boolean was not persisted, or older versions
-    /// called the board id `boardRunId`.
-    pub fn is_board_session(&self) -> bool {
-        self.board_session
-            || self
-                .board_id
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            || self
-                .board_task_id
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-    }
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {

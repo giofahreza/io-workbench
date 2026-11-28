@@ -3,12 +3,7 @@ impl SessionManager {
         // Active sessions are reconciled against durable chat runs by the
         // server after AppState is fully initialized. Clearing them here would
         // destroy the only durable signal that a forced-stop recovery is due.
-        let persisted_sessions = storage.list_sessions_including_board()?;
-        let board_session_ids = persisted_sessions
-            .iter()
-            .filter(|session| session.is_board_session())
-            .map(|session| session.id.clone())
-            .collect();
+        let persisted_sessions = storage.list_sessions()?;
         let sessions = persisted_sessions
             .into_iter()
             .take(max_sessions)
@@ -18,7 +13,6 @@ impl SessionManager {
         Ok(Self {
             storage,
             sessions: Arc::new(RwLock::new(sessions)),
-            board_session_ids: Arc::new(StdRwLock::new(board_session_ids)),
             max_sessions,
             external_home: Arc::new(
                 env_path("IO_WORKBENCH_CLI_HOME")
@@ -89,69 +83,6 @@ impl SessionManager {
         thinking: Option<bool>,
         fast: Option<bool>,
     ) -> Result<SessionSummary> {
-        self.create_or_update_scoped(
-            provider,
-            project_path,
-            session_id,
-            external,
-            model,
-            runtime,
-            effort,
-            mode,
-            thinking,
-            fast,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn create_or_update_board(
-        &self,
-        provider: Provider,
-        project_path: impl Into<String>,
-        session_id: Option<String>,
-        external: bool,
-        model: Option<String>,
-        runtime: Option<ChatRuntime>,
-        effort: Option<String>,
-        mode: Option<String>,
-        thinking: Option<bool>,
-        fast: Option<bool>,
-        board_id: String,
-        board_task_id: Option<String>,
-    ) -> Result<SessionSummary> {
-        self.create_or_update_scoped(
-            provider,
-            project_path,
-            session_id,
-            external,
-            model,
-            runtime,
-            effort,
-            mode,
-            thinking,
-            fast,
-            Some((board_id, board_task_id)),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn create_or_update_scoped(
-        &self,
-        provider: Provider,
-        project_path: impl Into<String>,
-        session_id: Option<String>,
-        external: bool,
-        model: Option<String>,
-        runtime: Option<ChatRuntime>,
-        effort: Option<String>,
-        mode: Option<String>,
-        thinking: Option<bool>,
-        fast: Option<bool>,
-        board_scope: Option<(String, Option<String>)>,
-    ) -> Result<SessionSummary> {
         let id = session_id.unwrap_or_else(|| new_id("session"));
         let now = Utc::now();
         let imported = if external {
@@ -163,8 +94,8 @@ impl SessionManager {
         };
         let mut sessions = self.sessions.write().await;
         // A persisted row may have been evicted from the bounded in-memory
-        // cache. Seed from storage so continuation never drops classification
-        // metadata such as board ownership.
+        // cache. Seed from storage so continuation never drops persisted
+        // metadata.
         if !sessions.contains_key(&id)
             && let Some(stored) = self.storage.get_session_summary(&id)?.or(imported)
         {
@@ -176,9 +107,6 @@ impl SessionManager {
                 id: id.clone(),
                 provider,
                 external,
-                board_session: false,
-                board_id: None,
-                board_task_id: None,
                 project_path: project_path.into(),
                 title: "New Session".to_string(),
                 message_count: 0,
@@ -225,59 +153,11 @@ impl SessionManager {
         session.last_activity = now;
         session.active = true;
         session.token_usage = None;
-        if let Some((board_id, board_task_id)) = board_scope {
-            if board_id.trim().is_empty() {
-                return Err(CoreError::InvalidInput(
-                    "board id must not be empty".to_string(),
-                ));
-            }
-            session.board_session = true;
-            session.board_id = Some(board_id);
-            session.board_task_id = board_task_id.filter(|value| !value.trim().is_empty());
-        }
 
         self.storage.upsert_session(session)?;
-        if session.is_board_session() {
-            self.board_session_ids
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(id.clone());
-        }
         let updated = session.clone();
         self.evict_if_needed(&mut sessions)?;
         Ok(updated)
-    }
-
-    pub async fn mark_board_session(
-        &self,
-        session_id: &str,
-        board_id: impl Into<String>,
-        board_task_id: Option<String>,
-    ) -> Result<SessionSummary> {
-        let board_id = board_id.into();
-        if board_id.trim().is_empty() {
-            return Err(CoreError::InvalidInput(
-                "board id must not be empty".to_string(),
-            ));
-        }
-        let mut sessions = self.sessions.write().await;
-        if !sessions.contains_key(session_id)
-            && let Some(stored) = self.storage.get_session_summary(session_id)?
-        {
-            sessions.insert(session_id.to_string(), stored);
-        }
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| CoreError::SessionNotFound(session_id.to_string()))?;
-        session.board_session = true;
-        session.board_id = Some(board_id);
-        session.board_task_id = board_task_id.filter(|value| !value.trim().is_empty());
-        self.storage.upsert_session(session)?;
-        self.board_session_ids
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(session_id.to_string());
-        Ok(session.clone())
     }
 
     pub async fn append_message(
@@ -555,7 +435,7 @@ impl SessionManager {
                 .read()
                 .await
                 .values()
-                .filter(|session| session.active && !session.is_board_session())
+                .filter(|session| session.active)
                 .cloned()
                 .collect()
         };

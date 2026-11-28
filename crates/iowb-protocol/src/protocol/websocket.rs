@@ -8,11 +8,6 @@ pub enum WsClientCommand {
     Subscribe {
         #[serde(default)]
         topics: Vec<String>,
-        /// Board-owned chats are excluded from the ordinary session stream.
-        /// A client must name the exact board session it has opened before
-        /// live or replayed chat events for that session are delivered.
-        #[serde(default, rename = "sessionIds")]
-        session_ids: Vec<String>,
         /// Ordinary chat output remains broadcast to legacy clients when this
         /// field is absent. Mobile clients send an explicit list so hidden
         /// chat sessions do not stream into the visible UI.

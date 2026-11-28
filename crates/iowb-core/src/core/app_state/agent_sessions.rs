@@ -50,7 +50,6 @@ impl AppState {
         runtime: ChatRuntime,
         direct_ai_config: Option<DirectAiRuntimeConfig>,
         user_id: Option<String>,
-        board_scope: Option<(String, Option<String>)>,
         request_id: Option<String>,
     ) -> Result<SessionSummary> {
         let project_path = project_path.into();
@@ -238,39 +237,21 @@ impl AppState {
             None
         };
 
-        let mut session = if let Some((board_id, board_task_id)) = board_scope {
-            self.sessions
-                .create_or_update_board(
-                    provider,
-                    resolved_project_path.display().to_string(),
-                    session_id,
-                    external,
-                    model.clone(),
-                    Some(runtime),
-                    effort.clone(),
-                    mode.clone(),
-                    thinking,
-                    fast,
-                    board_id,
-                    board_task_id,
-                )
-                .await?
-        } else {
-            self.sessions
-                .create_or_update(
-                    provider,
-                    resolved_project_path.display().to_string(),
-                    session_id,
-                    external,
-                    model.clone(),
-                    Some(runtime),
-                    effort.clone(),
-                    mode.clone(),
-                    thinking,
-                    fast,
-                )
-                .await?
-        };
+        let mut session = self
+            .sessions
+            .create_or_update(
+                provider,
+                resolved_project_path.display().to_string(),
+                session_id,
+                external,
+                model.clone(),
+                Some(runtime),
+                effort.clone(),
+                mode.clone(),
+                thinking,
+                fast,
+            )
+            .await?;
 
         // The durable row is committed before the provider starts. If the
         // server is killed at any point after this write, startup recovery has
@@ -578,9 +559,6 @@ impl AppState {
             id: destination_id,
             provider: source.provider,
             external: false,
-            board_session: source.is_board_session(),
-            board_id: source.board_id.clone(),
-            board_task_id: source.board_task_id.clone(),
             native_session_id: native_forked_thread_id.clone(),
             native_rollout_owned_by_provider: source.native_rollout_owned_by_provider,
             title_source: Some(SessionTitleSource::Prompt),

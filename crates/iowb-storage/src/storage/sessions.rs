@@ -3,17 +3,9 @@ impl Storage {
         self.with_connection(|conn| upsert_session_conn(conn, session))
     }
 
+    /// Persisted sessions for discovery, recovery and the in-memory manager.
+    /// Replaced fork sources and retired sessions are excluded.
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
-        Ok(self
-            .list_sessions_including_board()?
-            .into_iter()
-            .filter(|session| !session.is_board_session())
-            .collect())
-    }
-
-    /// Raw persisted session loading for recovery and the in-memory manager.
-    /// Unlike user-facing discovery this deliberately retains board chats.
-    pub fn list_sessions_including_board(&self) -> Result<Vec<SessionSummary>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 r#"
@@ -323,31 +315,6 @@ impl Storage {
         })
     }
 
-    /// Project-scoped identity/metadata for internal compatibility reads. Includes board
-    /// sessions, but excludes replaced fork sources exactly like ordinary session discovery.
-    /// Persisted message_count is sufficient here: no message or lifetime-usage aggregation.
-    /// Callers can filter parsed DateTime values without losing legacy offset/precision support.
-    pub fn list_session_summaries_for_project(&self, project_path: &str) -> Result<Vec<SessionSummary>> {
-        self.with_connection(|conn| {
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT s.id, s.provider, s.project_path, s.title, s.message_count,
-                       s.last_activity, s.active, s.model, s.metadata
-                FROM sessions s
-                WHERE s.project_path = ?1
-                  AND NOT EXISTS (
-                      SELECT 1 FROM session_forks f
-                      WHERE f.source_session_id = s.id AND f.replaces_source = 1
-                  )
-                ORDER BY last_activity DESC, metadata
-                "#,
-            )?;
-            let rows = stmt.query_map(params![project_path], map_session_row)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(StorageError::from)
-        })
-    }
-
     pub fn list_sessions_for_project(&self, project_path: &str) -> Result<Vec<SessionSummary>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
@@ -373,10 +340,7 @@ impl Storage {
             let rows = stmt.query_map(params![project_path], map_session_row)?;
             let mut sessions = Vec::new();
             for row in rows {
-                let session = row?;
-                if !session.is_board_session() {
-                    sessions.push(session);
-                }
+                sessions.push(row?);
             }
             drop(stmt);
             attach_session_usage_conn(conn, &mut sessions)?;

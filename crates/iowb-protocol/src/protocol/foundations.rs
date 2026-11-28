@@ -404,23 +404,6 @@ pub struct SessionSummary {
     pub provider: Provider,
     #[serde(default)]
     pub external: bool,
-    /// Sessions created by the agentic Kanban board are directly addressable
-    /// chats, but are kept out of ordinary project/session discovery.
-    #[serde(default, rename = "boardSession")]
-    pub board_session: bool,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "boardId",
-        alias = "boardRunId"
-    )]
-    pub board_id: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        rename = "boardTaskId"
-    )]
-    pub board_task_id: Option<String>,
     /// Native CLI thread/session id associated with an internal workbench
     /// session. Clients use this to offer a direct `codex resume` command.
     #[serde(

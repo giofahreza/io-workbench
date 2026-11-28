@@ -2,7 +2,6 @@
 pub struct SessionManager {
     storage: Storage,
     sessions: Arc<RwLock<HashMap<String, SessionSummary>>>,
-    board_session_ids: Arc<StdRwLock<HashSet<String>>>,
     max_sessions: usize,
     external_home: Arc<PathBuf>,
     external_cache: Arc<RwLock<ExternalSessionCache>>,

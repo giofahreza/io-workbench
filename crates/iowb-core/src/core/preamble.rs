@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{
-        Arc, RwLock as StdRwLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},

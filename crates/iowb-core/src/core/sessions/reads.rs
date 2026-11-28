@@ -14,9 +14,6 @@ impl SessionManager {
             if !same_project_path(&record.summary.project_path, project_path) {
                 continue;
             }
-            if record.summary.is_board_session() {
-                continue;
-            }
             let mut external_summary = record.summary.clone();
             external_summary.message_count = self.external_record_message_count(&record).await;
             if let Some(existing) = sessions.iter_mut().find(|session| {

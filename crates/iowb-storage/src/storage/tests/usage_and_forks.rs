@@ -1318,3 +1318,66 @@
         drop(storage);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
+
+    #[test]
+    fn project_session_listing_excludes_replaced_sources_and_reads_legacy_timestamps() {
+        let (storage, root) = temporary_storage("project-listing");
+        for id in ["ordinary", "other", "replaced", "retained", "destination"] {
+            let mut session = test_session(id, false);
+            session.project_path = if id == "other" {
+                "/other"
+            } else {
+                "/tmp/project"
+            }
+            .into();
+            storage.upsert_session(&session).unwrap();
+        }
+        storage
+            .with_connection(|conn| {
+                for (id, replaces) in [("replaced", 1), ("retained", 0)] {
+                    conn.execute(
+                        "INSERT INTO session_forks (user_id,source_session_id,before_message_id,request_id,destination_session_id,created_at,replaces_source) VALUES ('u',?1,'m',?1,'destination','2026-10-05T00:00:00Z',?2)",
+                        params![id, replaces],
+                    )?;
+                }
+                for (id, time) in [
+                    ("ordinary", "2026-10-05T07:00:00+07:00"),
+                    ("retained", "2026-10-05T00:04:00.000001Z"),
+                    ("destination", "2026-10-05 00:02:00"),
+                ] {
+                    conn.execute(
+                        "UPDATE sessions SET last_activity=?2 WHERE id=?1",
+                        params![id, time],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let listed = storage.list_sessions_for_project("/tmp/project").unwrap();
+        let mut ids = listed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["destination", "ordinary", "retained"]);
+
+        // Offsets, sub-second precision and space-separated legacy timestamps
+        // all land on the right side of a time window.
+        let start = DateTime::parse_from_rfc3339("2026-10-05T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = start + chrono::Duration::minutes(4);
+        let mut eligible = listed
+            .iter()
+            .filter(|s| s.last_activity >= start && s.last_activity <= end)
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>();
+        eligible.sort();
+        assert_eq!(eligible, vec!["destination", "ordinary"]);
+        assert!(
+            storage
+                .list_sessions_for_project("/missing")
+                .unwrap()
+                .is_empty()
+        );
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }

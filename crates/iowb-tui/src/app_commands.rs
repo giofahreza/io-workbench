@@ -183,9 +183,6 @@ impl App {
                     session.active = false;
                     session.message_count = 0;
                     session.title = "New chat".to_string();
-                    session.board_session = false;
-                    session.board_id = None;
-                    session.board_task_id = None;
                     self.chat = Chat {
                         current_id: Some(session.id.clone()),
                         session: Some(session.clone()),
@@ -194,7 +191,6 @@ impl App {
                     self.command_ui = CommandUi::default();
                     self.send_ws(WsClientCommand::Subscribe {
                         topics: vec!["sessions".into()],
-                        session_ids: Vec::new(),
                         chat_session_ids: Some(vec![session.id]),
                         process_ids: Vec::new(),
                     });

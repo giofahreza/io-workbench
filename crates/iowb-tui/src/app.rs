@@ -929,7 +929,6 @@ impl App {
         self.persist();
         self.send_ws(WsClientCommand::Subscribe {
             topics: vec!["sessions".into()],
-            session_ids: Vec::new(),
             chat_session_ids: Some(vec![session_id.clone()]),
             process_ids: Vec::new(),
         });

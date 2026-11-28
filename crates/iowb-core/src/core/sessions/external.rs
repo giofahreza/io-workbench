@@ -25,25 +25,9 @@ impl SessionManager {
     }
 
     pub async fn remember_persisted_session(&self, session: SessionSummary) -> Result<()> {
-        if session.is_board_session() {
-            self.board_session_ids
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(session.id.clone());
-        }
         let mut sessions = self.sessions.write().await;
         sessions.insert(session.id.clone(), session);
         self.evict_if_needed(&mut sessions)
-    }
-
-    /// Board visibility is checked for every streamed WebSocket event. Keep
-    /// this lookup entirely in memory so output chunks never contend on the
-    /// single SQLite connection.
-    pub fn is_board_session_cached(&self, session_id: &str) -> bool {
-        self.board_session_ids
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(session_id)
     }
 
     fn get_stored(&self, session_id: &str) -> Option<SessionSummary> {

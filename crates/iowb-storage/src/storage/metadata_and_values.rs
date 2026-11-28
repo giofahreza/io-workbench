@@ -4,15 +4,6 @@ fn serialize_session_metadata(session: &SessionSummary) -> String {
     if session.external {
         value.insert("external".into(), json!(true));
     }
-    if session.is_board_session() {
-        value.insert("boardSession".into(), json!(true));
-    }
-    if let Some(board_id) = session.board_id.as_ref() {
-        value.insert("boardId".into(), json!(board_id));
-    }
-    if let Some(board_task_id) = session.board_task_id.as_ref() {
-        value.insert("boardTaskId".into(), json!(board_task_id));
-    }
     if let Some(native_session_id) = session.native_session_id.as_ref() {
         value.insert("nativeSessionId".into(), json!(native_session_id));
     }
@@ -75,22 +66,6 @@ fn merge_metadata_into(session: &mut SessionSummary, value: serde_json::Value) {
     use serde_json::Value;
     if let Some(v) = value.get("external").and_then(Value::as_bool) {
         session.external = v;
-    }
-    if let Some(v) = value.get("boardSession").and_then(Value::as_bool) {
-        session.board_session = v;
-    }
-    if let Some(v) = value
-        .get("boardId")
-        .or_else(|| value.get("boardRunId"))
-        .and_then(Value::as_str)
-    {
-        session.board_id = Some(v.to_string());
-    }
-    if let Some(v) = value.get("boardTaskId").and_then(Value::as_str) {
-        session.board_task_id = Some(v.to_string());
-    }
-    if session.is_board_session() {
-        session.board_session = true;
     }
     if let Some(v) = value.get("nativeSessionId").and_then(Value::as_str) {
         session.native_session_id = Some(v.to_string());

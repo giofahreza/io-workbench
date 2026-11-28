@@ -264,7 +264,6 @@ mod tests {
         commands
             .send(WsClientCommand::Subscribe {
                 topics: vec!["sessions".into()],
-                session_ids: Vec::new(),
                 chat_session_ids: Some(vec!["abc".into()]),
                 process_ids: Vec::new(),
             })

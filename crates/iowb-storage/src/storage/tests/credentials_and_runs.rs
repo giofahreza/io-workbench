@@ -49,7 +49,7 @@
     fn durable_chat_run_round_trips_and_updates_native_session_id() {
         let (storage, root) = temporary_storage("durable-round-trip");
         let mut run = StoredDurableChatRun::new(
-            "board-1",
+            "run-1",
             Some("user-1".to_string()),
             "ui-session-1",
             "codex",
